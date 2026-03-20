@@ -1,0 +1,35 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(rue
+    VERSION 0.1.0
+    DESCRIPTION "A strongly-typed DSL and high-performance HTTP gateway runtime"
+    LANGUAGES CXX C
+)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Core compiler flags per DESIGN.md: no exceptions, no RTTI, no C++ stdlib
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffunction-sections -fdata-sections -Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -flto")
+set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
+
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
+
+# Third-party: Arena allocator
+# Build Arena as a subdirectory but override its flags since it uses stdlib
+# We only link against it; our code does not include stdlib headers
+add_subdirectory(third_party/Arena EXCLUDE_FROM_ALL)
+
+# Project include paths
+include_directories(include)
+
+add_subdirectory(src)
+add_subdirectory(tests)

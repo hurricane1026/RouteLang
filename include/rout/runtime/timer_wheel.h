@@ -1,0 +1,65 @@
+#pragma once
+
+#include "rout/common/types.h"
+
+namespace rout {
+
+struct Connection;  // forward decl
+
+// Timer wheel — O(1) add, refresh, tick.
+// 60 slots, 1-second resolution, driven by single timerfd per shard.
+//
+// Usage:
+//   wheel.add(&conn, 60);      // timeout in 60 seconds
+//   wheel.refresh(&conn, 60);  // reset on activity
+//   wheel.tick(close_fn);      // called every second, closes expired
+
+struct TimerWheel {
+    static constexpr u32 kSlots = 64;  // power of 2 for fast modulo
+
+    ListNode slots[kSlots];
+    u32 cursor;
+
+    void init() {
+        cursor = 0;
+        for (u32 i = 0; i < kSlots; i++) {
+            slots[i].init();
+        }
+    }
+
+    // Add connection with timeout in `seconds` from now. O(1).
+    void add(Connection* c, u32 seconds);
+
+    // Remove and re-add with new timeout. O(1).
+    void refresh(Connection* c, u32 seconds);
+
+    // Remove from wheel (e.g., connection closing). O(1).
+    void remove(Connection* c);
+
+    // Advance cursor, call `on_expire` for each expired connection.
+    // Returns number of expired connections.
+    template <typename Fn>
+    u32 tick(Fn on_expire) {
+        u32 count = 0;
+        ListNode* head = &slots[cursor & (kSlots - 1)];
+        ListNode* node = head->next;
+        while (node != head) {
+            ListNode* next = node->next;
+            node->remove();
+            node->init();
+            // container_of: timer_node is at a known offset in Connection
+            auto* conn =
+                reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - timer_node_offset());
+            on_expire(conn);
+            count++;
+            node = next;
+        }
+        cursor++;
+        return count;
+    }
+
+    // Offset of timer_node within Connection. Defined in .cc after Connection is complete.
+    static u64 timer_node_offset();
+};
+
+}  // namespace rout

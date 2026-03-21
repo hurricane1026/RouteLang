@@ -6,6 +6,7 @@ add_library(rue_runtime STATIC
     runtime/epoll_backend.cc
     runtime/timer_wheel.cc
     runtime/socket.cc
+    runtime/http_parser.cc
 
 )
 

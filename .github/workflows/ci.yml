@@ -112,7 +112,7 @@ jobs:
           # Extract line coverage from TOTAL row and enforce >= 95%
           LINE_COV=$(grep '^TOTAL' build/coverage.txt | awk '{print $(NF-2)}' | tr -d '%')
           echo "Line coverage: ${LINE_COV}%"
-          if awk "BEGIN { exit ($LINE_COV >= 95) }"; then
+          if awk "BEGIN { exit !($LINE_COV >= 95) }"; then
             echo "ERROR: Line coverage ${LINE_COV}% is below 95% threshold"
             exit 1
           fi

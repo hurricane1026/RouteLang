@@ -66,7 +66,6 @@ struct Arena {
             return p;
         }
         // Use aligned header size, matching Block::data() offset
-        // Use aligned header size, matching Block::data() offset
         constexpr u64 kHdr = (sizeof(Block) + 15) & ~static_cast<u64>(15);
         if (size > static_cast<u64>(-1) - kHdr) return nullptr;
         u64 needed = size + kHdr;

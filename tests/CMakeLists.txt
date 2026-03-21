@@ -17,10 +17,10 @@ target_include_directories(test_integration PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-add_executable(test_arena test_arena.cc)
+add_executable(test_arena test_arena.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_include_directories(test_arena PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
-add_executable(test_expected test_expected.cc)
+add_executable(test_expected test_expected.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_include_directories(test_expected PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
 add_custom_target(check

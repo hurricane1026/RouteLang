@@ -11,12 +11,11 @@
 // Monadic:
 //   parse("42").and_then(validate).or_else(log_error);
 
-// Placement new — no <new> header in -nostdlib++
-#ifndef RUE_PLACEMENT_NEW_DEFINED
-#define RUE_PLACEMENT_NEW_DEFINED
-inline void* operator new(decltype(sizeof(0)), void* p) noexcept {
-    return p;
-}
+// Placement new — declaration only; definition lives in a single TU.
+// Guarded so mixed inclusion with <new> or arena.h won't conflict.
+#ifndef RUE_PLACEMENT_NEW_DECLARED
+#define RUE_PLACEMENT_NEW_DECLARED
+void* operator new(decltype(sizeof(0)), void* p) noexcept;
 #endif
 
 namespace core {

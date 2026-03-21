@@ -3,6 +3,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Placement new — declaration only; definition lives in src/placement_new.cc.
+#ifndef RUE_PLACEMENT_NEW_DECLARED
+#define RUE_PLACEMENT_NEW_DECLARED
+void* operator new(decltype(sizeof(0)), void* p) noexcept;
+#endif
+
 namespace rout {
 
 using u8 = uint8_t;

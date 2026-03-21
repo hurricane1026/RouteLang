@@ -176,7 +176,7 @@ public:
     constexpr Expected()
         requires(IsDefaultConstructible<T>::value)
     {
-        stor_.construct_val(T{});
+        stor_.construct_val();
     }
 
     // Implicit from T (value)

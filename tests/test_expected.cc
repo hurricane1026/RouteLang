@@ -1,5 +1,5 @@
 // Compile: clang++ -std=c++23 -fno-exceptions -fno-rtti -I../include
-// test_expected.cpp -o test_expected
+// test_expected.cc -o test_expected
 #include "core/expected.h"
 
 using core::Expected;

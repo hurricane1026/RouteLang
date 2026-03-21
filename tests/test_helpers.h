@@ -81,8 +81,27 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         this->free_conn(c);
     }
 
-    // Inject + dispatch convenience
+    // Inject + dispatch convenience.
+    // For Recv events with result>0, simulates what a real backend does:
+    // append mock data into the connection's recv_buf (backend no longer resets).
+    // Syncs ev.result to actual committed bytes, or -ENOBUFS if buffer full.
     void inject_and_dispatch(IoEvent ev) {
+        if (ev.type == IoEventType::Recv && ev.result > 0 && ev.conn_id < kMaxConns) {
+            auto& buf = conns[ev.conn_id].recv_buf;
+            u32 n = static_cast<u32>(ev.result);
+            u32 avail = buf.write_avail();
+            if (avail == 0) {
+                ev.result = -ENOBUFS;
+            } else {
+                if (n > avail) n = avail;
+                // Write deterministic mock bytes before commit so data()-based
+                // tests see meaningful content (repeating 0x00..0xFF pattern).
+                u8* dst = buf.write_ptr();
+                for (u32 j = 0; j < n; j++) dst[j] = static_cast<u8>(j & 0xFF);
+                buf.commit(n);
+                ev.result = static_cast<i32>(n);
+            }
+        }
         backend.inject(ev);
         IoEvent events[8];
         u32 n = backend.wait(events, 8);
@@ -198,7 +217,7 @@ struct LoopThread {
         IoEvent events[256];
         i32 iters = 0;
         while (lp->running) {
-            u32 n = lp->backend.wait(events, 256);
+            u32 n = lp->backend.wait(events, 256, lp->conns, RealLoop::kMaxConns);
             for (u32 i = 0; i < n; i++) lp->dispatch(events[i]);
             if (++iters >= lt->max_iters) break;
         }

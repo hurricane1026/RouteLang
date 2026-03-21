@@ -15,7 +15,7 @@ namespace rout {
 //   void add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
 //   void add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
 //   void cancel(i32 fd, u32 conn_id);
-//   u32  wait(IoEvent* events, u32 max_events);
+//   u32  wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
 //
 // Proactor model: wait() returns completed I/O events.
 // - io_uring: native proactor, I/O is already done when CQE arrives

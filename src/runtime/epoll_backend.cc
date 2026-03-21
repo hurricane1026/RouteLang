@@ -33,7 +33,10 @@ i32 EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
     epoll_fd = -1;
     timer_fd = -1;
     pending_count = 0;
-    for (u32 i = 0; i < kMaxFdMap; i++) fd_map[i] = -1;
+    for (u32 i = 0; i < kMaxFdMap; i++) {
+        fd_map[i] = -1;
+        send_state[i] = {nullptr, -1, 0, 0};
+    }
 
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd < 0) return -errno;
@@ -116,14 +119,39 @@ void EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
         return;
     }
 
-    // Partial send or EAGAIN: register for EPOLLOUT
-    // TODO: store outstanding send state (buf/len/offset) keyed by conn_id,
-    // complete the send inside wait() on EPOLLOUT, then emit Send completion.
-    // Current behavior emits result=0 (readiness), which callbacks treat as success.
+    // Partial send or EAGAIN: track remaining bytes, register for EPOLLOUT.
+    // wait() will complete the send on writability and emit the real byte count.
+    // Store the original source pointer and fd — the source may be recv_buf (proxy),
+    // not always send_buf, and fd may be upstream_fd.
+    u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
+    if (conn_id < kMaxFdMap) {
+        send_state[conn_id].src = buf;
+        send_state[conn_id].fd = fd;
+        send_state[conn_id].offset = sent;
+        send_state[conn_id].remaining = len - sent;
+    }
     struct epoll_event ev;
     ev.events = EPOLLOUT;
     ev.data.u64 = encode_data(conn_id, IoEventType::Send);
-    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+    i32 rc = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+    if (rc < 0 && errno == ENOENT) {
+        rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    }
+    if (rc < 0) {
+        // epoll registration failed — clear send_state and emit error completion.
+        // Error must always be delivered (no silent drop) to prevent stuck connections.
+        i32 err = errno;
+        if (conn_id < kMaxFdMap) {
+            send_state[conn_id] = {nullptr, -1, 0, 0};
+        }
+        if (pending_count >= 64) pending_count = 63;  // evict oldest to guarantee space
+        pending_completions[pending_count].conn_id = conn_id;
+        pending_completions[pending_count].type = IoEventType::Send;
+        pending_completions[pending_count].result = -err;
+        pending_completions[pending_count].buf_id = 0;
+        pending_completions[pending_count].has_buf = 0;
+        pending_count++;
+    }
 }
 
 void EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len) {
@@ -173,7 +201,7 @@ void EpollBackend::cancel(i32 fd, u32 /*conn_id*/) {
 
 // --- Wait ---
 
-u32 EpollBackend::wait(IoEvent* events, u32 max_events) {
+u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns) {
     u32 out = 0;
 
     // First, drain pending synthetic completions
@@ -220,27 +248,51 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events) {
             }
         } else if (conn_id == kTimerConnId) {
             // Timer tick — read timerfd to acknowledge
-            u64 ticks;
-            (void)read(timer_fd, &ticks, sizeof(ticks));
+            u64 ticks = 0;
+            ssize_t rr = read(timer_fd, &ticks, sizeof(ticks));
+            if (rr != static_cast<ssize_t>(sizeof(ticks))) continue;  // short/error read
             if (out < max_events) {
                 events[out].conn_id = 0;
                 events[out].type = IoEventType::Timeout;
-                events[out].result = static_cast<i32>(ticks);
+                // Clamp ticks to avoid i32 overflow on long stalls
+                events[out].result = (ticks > 0x7FFFFFFF) ? 0x7FFFFFFF : static_cast<i32>(ticks);
                 events[out].buf_id = 0;
                 events[out].has_buf = 0;
                 out++;
             }
         } else if (ep_events[i].events & EPOLLIN) {
-            // Readiness → do recv now, emit completion
-            // TODO: recv into Connection::recv_buf instead of stack tmp_buf so
-            // callbacks (especially proxy) can access the received data.
+            // Readiness → recv directly into Connection::recv_buf
             i32 fd = (conn_id < kMaxFdMap) ? fd_map[conn_id] : -1;
             if (fd < 0) continue;
-            u8 tmp_buf[4096];
-            ssize_t nr = recv(fd, tmp_buf, sizeof(tmp_buf), 0);
+            // Append recv data into Connection::recv_buf.
+            // Buffer is NOT reset here — callback resets when it consumes data.
+            // This allows multi-packet requests to accumulate.
+            i32 result = 0;
+            if (conn_id < max_conns) {
+                auto& buf = conns[conn_id].recv_buf;
+                u32 avail = buf.write_avail();
+                if (avail > 0) {
+                    ssize_t nr;
+                    do {
+                        nr = recv(fd, buf.write_ptr(), avail, 0);
+                    } while (nr < 0 && errno == EINTR);
+                    if (nr > 0) {
+                        buf.commit(static_cast<u32>(nr));
+                        result = static_cast<i32>(nr);
+                    } else if (nr == 0) {
+                        result = 0;  // EOF
+                    } else {
+                        result = -errno;
+                    }
+                } else {
+                    result = -ENOBUFS;  // recv buffer full
+                }
+            } else {
+                result = -EINVAL;  // invalid conn_id
+            }
             events[out].conn_id = conn_id;
             events[out].type = IoEventType::Recv;
-            events[out].result = static_cast<i32>(nr < 0 ? -errno : nr);
+            events[out].result = result;
             events[out].buf_id = 0;
             events[out].has_buf = 0;
             out++;
@@ -257,12 +309,71 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events) {
                 events[out].buf_id = 0;
                 events[out].has_buf = 0;
             } else {
-                // Send readiness — the upper layer should retry send
-                events[out].conn_id = conn_id;
-                events[out].type = IoEventType::Send;
-                events[out].result = 0;  // signal: ready to send
-                events[out].buf_id = 0;
-                events[out].has_buf = 0;
+                // EPOLLOUT: complete the outstanding partial send.
+                // Source pointer and fd are stored in send_state (set by add_send),
+                // not read from Connection — the source may be recv_buf (proxy).
+                if (conn_id >= kMaxFdMap) continue;
+                auto& ss = send_state[conn_id];
+                if (ss.remaining == 0 || !ss.src || ss.fd < 0) {
+                    // No outstanding send — switch the fd that was registered
+                    // for EPOLLOUT back to EPOLLIN. Use fd_map (the client fd
+                    // for this conn_id) since ss.fd may be stale/cleared.
+                    i32 rfd = (conn_id < kMaxFdMap) ? fd_map[conn_id] : -1;
+                    if (rfd >= 0) {
+                        struct epoll_event rev;
+                        rev.events = EPOLLIN;
+                        rev.data.u64 = encode_data(conn_id, IoEventType::Recv);
+                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, rfd, &rev);
+                    }
+                    continue;
+                }
+                const u8* src = ss.src;
+                bool done = false;
+                bool eagain = false;
+                // Loop to send remaining bytes (socket may accept partial again)
+                while (ss.remaining > 0) {
+                    ssize_t nw;
+                    do {
+                        nw = send(ss.fd, src + ss.offset, ss.remaining, MSG_NOSIGNAL);
+                    } while (nw < 0 && errno == EINTR);
+                    if (nw > 0) {
+                        ss.offset += static_cast<u32>(nw);
+                        ss.remaining -= static_cast<u32>(nw);
+                    } else if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        // Still can't send — stay registered for EPOLLOUT, don't emit event
+                        eagain = true;
+                        break;
+                    } else {
+                        // Error or nw==0 — emit error completion (nw==0 treated as EPIPE)
+                        events[out].conn_id = conn_id;
+                        events[out].type = IoEventType::Send;
+                        events[out].result = (nw < 0) ? -errno : -EPIPE;
+                        events[out].buf_id = 0;
+                        events[out].has_buf = 0;
+                        ss.remaining = 0;
+                        done = true;
+                        break;
+                    }
+                }
+                if (eagain) continue;  // no event, retry on next EPOLLOUT
+                if (!done) {
+                    // All bytes sent — emit completion with total byte count
+                    events[out].conn_id = conn_id;
+                    events[out].type = IoEventType::Send;
+                    events[out].result = static_cast<i32>(ss.offset);
+                    events[out].buf_id = 0;
+                    events[out].has_buf = 0;
+                }
+                // Send finished (success or error) — clear state and switch
+                // the fd back to EPOLLIN immediately (don't wait for spurious EPOLLOUT).
+                i32 send_fd = ss.fd;
+                ss = {nullptr, -1, 0, 0};
+                if (send_fd >= 0) {
+                    struct epoll_event rev;
+                    rev.events = EPOLLIN;
+                    rev.data.u64 = encode_data(conn_id, IoEventType::Recv);
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, send_fd, &rev);
+                }
             }
             out++;
         }

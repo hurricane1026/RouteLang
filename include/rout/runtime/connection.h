@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rout/common/buffer.h"
 #include "rout/common/types.h"
 #include "rout/runtime/io_event.h"
 
@@ -39,11 +40,15 @@ struct Connection {
 
     bool keep_alive;
 
-    // Buffers (simplified for Phase 1)
-    u8 recv_buf[4096];
-    u32 recv_len;
-    u8 send_buf[4096];
-    u32 send_len;
+    // Recv buffer: Buffer wraps recv_storage_ for typestate-safe I/O.
+    // Backend recv's directly via write_ptr()/commit(); callbacks read via data()/len().
+    u8 recv_storage[4096];
+    Buffer recv_buf;
+
+    // Send buffer: Buffer wraps send_storage for typestate-safe I/O.
+    // Callbacks write via write()/data(); backend reads via data()/len() for send().
+    u8 send_storage[4096];
+    Buffer send_buf;
 
     void reset() {
         on_complete = nullptr;
@@ -60,8 +65,8 @@ struct Connection {
         handler_state = 0;
         handler_ctx = nullptr;
         keep_alive = false;
-        recv_len = 0;
-        send_len = 0;
+        recv_buf.bind(recv_storage, sizeof(recv_storage));
+        send_buf.bind(send_storage, sizeof(send_storage));
     }
 };
 

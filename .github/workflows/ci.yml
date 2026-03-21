@@ -103,27 +103,32 @@ jobs:
 
       - name: Run tests
         run: |
+          LLVM_PROFILE_FILE=build/test_buffer.profraw ./build/tests/test_buffer
+          LLVM_PROFILE_FILE=build/test_types.profraw ./build/tests/test_types
           LLVM_PROFILE_FILE=build/test_network.profraw ./build/tests/test_network
           LLVM_PROFILE_FILE=build/test_integration.profraw ./build/tests/test_integration
           LLVM_PROFILE_FILE=build/test_arena.profraw ./build/tests/test_arena
           LLVM_PROFILE_FILE=build/test_expected.profraw ./build/tests/test_expected
           LLVM_PROFILE_FILE=build/test_http_parser.profraw ./build/tests/test_http_parser
-          LLVM_PROFILE_FILE=build/test_buffer.profraw ./build/tests/test_buffer
 
       - name: Generate coverage report
         run: |
           llvm-profdata merge build/*.profraw -o build/merged.profdata
 
-          # Report for runtime code (exclude test framework and unused utility headers)
+          # Report for runtime code (exclude test framework and unused utility headers).
+          # io_uring_backend is excluded: requires kernel 6.0+ and io_uring permissions,
+          # which are unreliable in CI. It is tested via conditional integration tests.
           llvm-cov report \
             --instr-profile=build/merged.profdata \
+            --object build/tests/test_buffer \
+            --object build/tests/test_types \
             --object build/tests/test_network \
             --object build/tests/test_integration \
             --object build/tests/test_arena \
             --object build/tests/test_http_parser \
             --object build/tests/test_expected \
-            --object build/tests/test_buffer \
-            --sources include/rout/runtime/ src/runtime/ | tee build/coverage.txt
+            --sources include/rout/common/ include/rout/runtime/ src/runtime/ \
+            --ignore-filename-regex='io_uring_backend' | tee build/coverage.txt
 
           cat build/coverage.txt
 

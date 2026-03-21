@@ -2,7 +2,8 @@
 // Ported scenarios from clapdb/Arena test suite where applicable,
 // adapted to our no-stdlib Arena API.
 #include "rout/runtime/arena.h"
-#include "rout/test.h"
+
+#include "test.h"
 
 using namespace rout;
 

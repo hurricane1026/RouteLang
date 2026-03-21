@@ -1,0 +1,139 @@
+#include "char_tables.h"
+#include "simd.h"
+
+#include <immintrin.h>  // AVX2
+
+namespace rout::simd {
+
+u32 find_header_end(const u8* buf, u32 len, u32 from) {
+    u32 start = from > 3 ? from - 3 : 0;
+    u32 pos = start;
+    const __m256i vcr = _mm256_set1_epi8('\r');
+
+    while (pos + 32 <= len) {
+        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + pos));
+        u32 mask = static_cast<u32>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vcr)));
+        while (mask) {
+            u32 bit = static_cast<u32>(__builtin_ctz(mask));
+            u32 idx = pos + bit;
+            if (idx + 3 < len && buf[idx + 1] == '\n' && buf[idx + 2] == '\r' &&
+                buf[idx + 3] == '\n') {
+                return idx + 4;
+            }
+            mask &= mask - 1;
+        }
+        pos += 32;
+    }
+    // SSE2-width tail (16 bytes)
+    const __m128i vcr128 = _mm_set1_epi8('\r');
+    while (pos + 16 <= len) {
+        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + pos));
+        int mask128 = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, vcr128));
+        while (mask128) {
+            u32 bit = static_cast<u32>(__builtin_ctz(static_cast<u32>(mask128)));
+            u32 idx = pos + bit;
+            if (idx + 3 < len && buf[idx + 1] == '\n' && buf[idx + 2] == '\r' &&
+                buf[idx + 3] == '\n')
+                return idx + 4;
+            mask128 &= mask128 - 1;
+        }
+        pos += 16;
+    }
+    for (; pos + 3 < len; pos++) {
+        if (buf[pos] == '\r' && buf[pos + 1] == '\n' && buf[pos + 2] == '\r' &&
+            buf[pos + 3] == '\n')
+            return pos + 4;
+    }
+    return 0;
+}
+
+u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
+    const __m256i vcr = _mm256_set1_epi8('\r');
+    const __m256i v20 = _mm256_set1_epi8(0x20);
+    const __m256i vht = _mm256_set1_epi8(0x09);
+    const __m256i vdel = _mm256_set1_epi8(0x7F);
+
+    while (pos + 32 <= end) {
+        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + pos));
+        u32 cr_mask = static_cast<u32>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vcr)));
+        // bad: (< 0x20 && != HT) || == DEL
+        __m256i lt20 = _mm256_cmpgt_epi8(v20, chunk);  // v20 > chunk ≡ chunk < v20 (signed)
+        __m256i bad = _mm256_or_si256(_mm256_andnot_si256(_mm256_cmpeq_epi8(chunk, vht), lt20),
+                                      _mm256_cmpeq_epi8(chunk, vdel));
+        u32 bad_mask = static_cast<u32>(_mm256_movemask_epi8(bad));
+
+        if (cr_mask | bad_mask) {
+            if (cr_mask) {
+                u32 cr_pos = static_cast<u32>(__builtin_ctz(cr_mask));
+                u32 real_bad = (bad_mask & ((1u << cr_pos) - 1)) & ~cr_mask;
+                if (real_bad) return static_cast<u32>(-1);
+                return pos + cr_pos;
+            }
+            if (bad_mask & ~cr_mask) return static_cast<u32>(-1);
+        }
+        pos += 32;
+    }
+    // Scalar tail
+    while (pos < end) {
+        if (buf[pos] == '\r') return pos;
+        if (!kHeaderValueTable[buf[pos]]) return static_cast<u32>(-1);
+        pos++;
+    }
+    return end;
+}
+
+u32 scan_uri(const u8* buf, u32 pos, u32 end) {
+    const __m256i vsp = _mm256_set1_epi8(' ');
+    const __m256i v21 = _mm256_set1_epi8(0x21);
+    const __m256i v7f = _mm256_set1_epi8(0x7F);
+
+    while (pos + 32 <= end) {
+        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + pos));
+        u32 sp_mask = static_cast<u32>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vsp)));
+        u32 bad_mask = static_cast<u32>(_mm256_movemask_epi8(
+            _mm256_or_si256(_mm256_cmpgt_epi8(v21, chunk), _mm256_cmpeq_epi8(chunk, v7f))));
+
+        if (sp_mask) {
+            u32 sp_pos = static_cast<u32>(__builtin_ctz(sp_mask));
+            u32 real_bad = (bad_mask & ((1u << sp_pos) - 1)) & ~sp_mask;
+            if (real_bad) return static_cast<u32>(-1);
+            return pos + sp_pos;
+        }
+        if (bad_mask) return static_cast<u32>(-1);
+        pos += 32;
+    }
+    while (pos < end) {
+        if (buf[pos] == ' ') return pos;
+        if (!kUriTable[buf[pos]]) return static_cast<u32>(-1);
+        pos++;
+    }
+    return end;
+}
+
+u32 scan_header_name(const u8* buf, u32 pos, u32 end) {
+    const __m256i vcolon = _mm256_set1_epi8(':');
+
+    while (pos + 32 <= end) {
+        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + pos));
+        u32 mask = static_cast<u32>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vcolon)));
+        if (mask) {
+            u32 colon_pos = static_cast<u32>(__builtin_ctz(mask));
+            for (u32 j = pos; j < pos + colon_pos; j++) {
+                if (!kTokenTable[buf[j]]) return static_cast<u32>(-1);
+            }
+            return pos + colon_pos;
+        }
+        for (u32 j = pos; j < pos + 32; j++) {
+            if (!kTokenTable[buf[j]]) return static_cast<u32>(-1);
+        }
+        pos += 32;
+    }
+    while (pos < end) {
+        if (buf[pos] == ':') return pos;
+        if (!kTokenTable[buf[pos]]) return static_cast<u32>(-1);
+        pos++;
+    }
+    return static_cast<u32>(-1);
+}
+
+}  // namespace rout::simd

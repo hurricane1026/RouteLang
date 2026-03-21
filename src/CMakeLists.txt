@@ -1,5 +1,6 @@
 # SIMD architecture selection
 set(SIMD_ARCH "auto" CACHE STRING "SIMD architecture: auto, scalar, sse2, avx2, avx512, neon, sve")
+set_property(CACHE SIMD_ARCH PROPERTY STRINGS auto scalar sse2 avx2 avx512 neon sve)
 
 if(SIMD_ARCH STREQUAL "auto")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
@@ -28,9 +29,11 @@ elseif(SIMD_ARCH STREQUAL "neon")
 elseif(SIMD_ARCH STREQUAL "sve")
     set(SIMD_SOURCE runtime/simd/sve.cc)
     set(SIMD_FLAGS "-march=armv8-a+sve")
-else()
+elseif(SIMD_ARCH STREQUAL "scalar")
     set(SIMD_SOURCE runtime/simd/scalar.cc)
     set(SIMD_FLAGS "")
+else()
+    message(FATAL_ERROR "Unknown SIMD_ARCH '${SIMD_ARCH}'. Valid options: auto, scalar, sse2, avx2, avx512, neon, sve")
 endif()
 
 # Runtime library

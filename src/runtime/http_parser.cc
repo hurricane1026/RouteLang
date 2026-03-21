@@ -72,15 +72,14 @@ static inline bool str_ci_eq(const u8* a, const char* b, u32 len) {
 
 static inline i64 parse_uint(const u8* p, u32 len) {
     if (UNLIKELY(len == 0)) return -1;
-    u64 val = 0;
+    u32 val = 0;
     for (u32 i = 0; i < len; i++) {
         u32 d = p[i] - '0';
         if (UNLIKELY(d > 9)) return -1;
-        u64 next = val * 10 + d;
-        if (UNLIKELY(next < val)) return -1;
-        val = next;
+        // Pre-multiply overflow check: val * 10 + d <= 0xFFFFFFFF
+        if (UNLIKELY(val > (0xFFFFFFFFU - d) / 10)) return -1;
+        val = val * 10 + d;
     }
-    if (UNLIKELY(val > 0xFFFFFFFF)) return -1;
     return static_cast<i64>(val);
 }
 

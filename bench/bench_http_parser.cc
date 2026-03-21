@@ -131,9 +131,10 @@ int main() {
 
         // --- llhttp parser ---
         llhttp_t llhttp_parser;
+        llhttp_init(&llhttp_parser, HTTP_REQUEST, &llhttp_settings);
 
         b.run("llhttp", [&] {
-            llhttp_init(&llhttp_parser, HTTP_REQUEST, &llhttp_settings);
+            llhttp_reset(&llhttp_parser);
             auto err = llhttp_execute(&llhttp_parser, payload.data, payload.len);
             bench::do_not_optimize(&err);
             bench::do_not_optimize(&llhttp_parser);

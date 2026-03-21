@@ -20,10 +20,14 @@ target_include_directories(test_integration PRIVATE
 add_executable(test_arena test_arena.cc)
 target_include_directories(test_arena PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
+add_executable(test_expected test_expected.cc)
+target_include_directories(test_expected PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
 add_custom_target(check
     COMMAND test_network
     COMMAND test_integration
     COMMAND test_arena
-    DEPENDS test_network test_integration test_arena
+    COMMAND test_expected
+    DEPENDS test_network test_integration test_arena test_expected
     COMMENT "Running all tests..."
 )

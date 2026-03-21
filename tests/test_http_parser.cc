@@ -1054,6 +1054,56 @@ TEST(ContentLength, Overflow) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
 }
 
+TEST(ContentLength, MaxU32PlusOne) {
+    HttpParser parser;
+    ParsedRequest req;
+    // 4294967296 = UINT32_MAX + 1 — must overflow
+    auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 4294967296\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(ContentLength, MaxU32PlusFive) {
+    HttpParser parser;
+    ParsedRequest req;
+    // 4294967300 — overflows u32
+    auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 4294967300\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(ContentLength, ElevenDigits) {
+    HttpParser parser;
+    ParsedRequest req;
+    // 42949672950 — 11 digits, overflows
+    auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 42949672950\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(ContentLength, MaxU32MinusOne) {
+    HttpParser parser;
+    ParsedRequest req;
+    // 4294967294 = UINT32_MAX - 1 — valid
+    auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 4294967294\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, 4294967294u);
+}
+
+TEST(ContentLength, ManyLeadingZeroes) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Many leading zeroes — valid, parses to 1
+    auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 00000000001\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, 1u);
+}
+
+TEST(ContentLength, AllZeroes) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 0000000000\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, 0u);
+}
+
 TEST(ContentLength, SpacesInMiddle) {
     HttpParser parser;
     ParsedRequest req;

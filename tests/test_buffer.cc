@@ -443,6 +443,35 @@ TEST(copilot3, read_empty_view_no_memcpy_crash) {
 // #5: test_buffer is in check target (verified by CMakeLists.txt)
 // This test itself running proves it.
 
+// === Copilot round 4: overlapping read/write safe with memmove ===
+
+// read into overlapping region of same backing storage
+TEST(copilot4, read_overlapping_dst_safe) {
+    u8 storage[32];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("abcdefgh"), 8);
+    // Read into the same storage at offset 4 — overlaps with src
+    View view = buf.release();
+    view.read(storage + 4, 8);
+    // With memcpy this would be UB. With memmove it's safe.
+    CHECK_EQ(storage[4], 'a');
+    CHECK_EQ(storage[7], 'd');
+}
+
+// write from overlapping src within same backing storage
+TEST(copilot4, write_overlapping_src_safe) {
+    u8 storage[32];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("abcd"), 4);
+    // Write from within the same storage (overlap with existing data)
+    buf.write(storage, 4);  // appends "abcd" again from overlapping src
+    CHECK_EQ(buf.len(), 8u);
+    u8 out[16];
+    buf.read(out, sizeof(out));
+    CHECK_EQ(out[0], 'a');
+    CHECK_EQ(out[4], 'a');
+}
+
 int main(int argc, char** argv) {
     return rout::test::run_all(argc, argv);
 }

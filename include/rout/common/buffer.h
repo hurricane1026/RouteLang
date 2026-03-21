@@ -42,7 +42,7 @@ struct View {
     u32 read(u8* dst, u32 max) const noexcept {
         if (!ptr_ || max == 0) return 0;
         u32 n = len_ < max ? len_ : max;
-        if (n > 0) __builtin_memcpy(dst, ptr_, n);
+        if (n > 0) __builtin_memmove(dst, ptr_, n);
         return n;
     }
 
@@ -107,7 +107,7 @@ struct Buffer {
         u32 avail = cap_ - len_;
         u32 to_write = n < avail ? n : avail;
         if (to_write > 0) {
-            __builtin_memcpy(ptr_ + len_, src, to_write);
+            __builtin_memmove(ptr_ + len_, src, to_write);
             len_ += to_write;
         }
         return to_write;
@@ -117,7 +117,7 @@ struct Buffer {
     u32 read(u8* dst, u32 max) const noexcept {
         if (!ptr_ || max == 0) return 0;
         u32 n = len_ < max ? len_ : max;
-        if (n > 0) __builtin_memcpy(dst, ptr_, n);
+        if (n > 0) __builtin_memmove(dst, ptr_, n);
         return n;
     }
 

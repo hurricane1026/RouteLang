@@ -15,8 +15,9 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
-SRC_FILES=$(find "$PROJECT_DIR/include/rout" "$PROJECT_DIR/src" "$PROJECT_DIR/tests" \
-    -name '*.h' -o -name '*.cc' | grep -v third_party)
+SRC_FILES=$(find "$PROJECT_DIR/include" "$PROJECT_DIR/src" "$PROJECT_DIR/tests" \
+    "$PROJECT_DIR/testing" "$PROJECT_DIR/bench" \
+    -name '*.h' -o -name '*.cc' 2>/dev/null | grep -v third_party)
 
 # ---- Configure (if needed) ----
 configure() {
@@ -39,16 +40,9 @@ build() {
 # ---- Test ----
 test() {
     configure
-    echo "=== Building tests ==="
-    ninja -C "$BUILD_DIR" test_network test_integration test_arena test_expected
-    echo "=== Running mock tests ==="
-    "$BUILD_DIR/tests/test_network"
-    echo "=== Running integration tests ==="
-    "$BUILD_DIR/tests/test_integration"
-    echo "=== Running arena tests ==="
-    "$BUILD_DIR/tests/test_arena"
-    echo "=== Running expected tests ==="
-    "$BUILD_DIR/tests/test_expected"
+    build
+    echo "=== Running all tests ==="
+    ninja -C "$BUILD_DIR" check
 }
 
 # ---- Coverage ----
@@ -67,6 +61,8 @@ coverage() {
     LLVM_PROFILE_FILE="$BUILD_DIR-cov/test_integration.profraw" "$BUILD_DIR-cov/tests/test_integration"
     LLVM_PROFILE_FILE="$BUILD_DIR-cov/test_arena.profraw" "$BUILD_DIR-cov/tests/test_arena"
     LLVM_PROFILE_FILE="$BUILD_DIR-cov/test_expected.profraw" "$BUILD_DIR-cov/tests/test_expected"
+    LLVM_PROFILE_FILE="$BUILD_DIR-cov/test_http_parser.profraw" "$BUILD_DIR-cov/tests/test_http_parser"
+    LLVM_PROFILE_FILE="$BUILD_DIR-cov/test_buffer.profraw" "$BUILD_DIR-cov/tests/test_buffer"
 
     echo "=== Coverage report ==="
     llvm-profdata merge "$BUILD_DIR-cov"/*.profraw -o "$BUILD_DIR-cov/merged.profdata"
@@ -75,6 +71,9 @@ coverage() {
         --object "$BUILD_DIR-cov/tests/test_network" \
         --object "$BUILD_DIR-cov/tests/test_integration" \
         --object "$BUILD_DIR-cov/tests/test_arena" \
+        --object "$BUILD_DIR-cov/tests/test_http_parser" \
+        --object "$BUILD_DIR-cov/tests/test_expected" \
+        --object "$BUILD_DIR-cov/tests/test_buffer" \
         --sources include/rout/ src/
 }
 
@@ -82,7 +81,16 @@ coverage() {
 tidy() {
     configure
     echo "=== Running clang-tidy ==="
-    local src_cc=$(find "$PROJECT_DIR/src" -name '*.cc' | grep -v third_party)
+    # Exclude all arch-specific SIMD backends — they require target intrinsic
+    # headers that may not be available on the host (e.g. sse2.cc on ARM).
+    # Only lint the scalar backend and the main parser code.
+    local src_cc=$(find "$PROJECT_DIR/src" -name '*.cc' \
+        ! -path '*/simd/sse2.cc' \
+        ! -path '*/simd/avx2.cc' \
+        ! -path '*/simd/avx512.cc' \
+        ! -path '*/simd/neon.cc' \
+        ! -path '*/simd/sve.cc' | \
+        grep -v third_party)
     clang-tidy -p "$BUILD_DIR" $src_cc 2>&1 | grep -E "warning:|error:" || echo "No issues found."
 }
 
@@ -129,7 +137,7 @@ all() {
 # ---- Main ----
 case "${1:-test}" in
     build)       build ;;
-    test)        build && test ;;
+    test)        test ;;
     tidy)        tidy ;;
     format)      format_check ;;
     format-fix)  format_fix ;;

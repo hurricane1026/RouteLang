@@ -1,5 +1,5 @@
 // Verify the test framework itself works.
-#include "rout/test.h"
+#include "test.h"
 
 TEST(framework, check_pass) {
     CHECK(1 + 1 == 2);

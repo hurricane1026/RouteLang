@@ -2717,6 +2717,641 @@ TEST(NginxIncremental, WebSocketByteByByte) {
     CHECK_EQ(req.header_count, 5u);
 }
 
+// ============================================================================
+// TEST SUITE: Request smuggling attack vectors
+// ============================================================================
+
+TEST(Smuggling, CLCLDifferent) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Classic CL-CL smuggling: two different Content-Length values
+    auto s = parse_one(
+        "POST / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Content-Length: 6\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(Smuggling, CLTEChunked) {
+    HttpParser parser;
+    ParsedRequest req;
+    // CL-TE smuggling: Content-Length + Transfer-Encoding: chunked
+    auto s = parse_one(
+        "POST / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Content-Length: 13\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(Smuggling, TECLChunked) {
+    HttpParser parser;
+    ParsedRequest req;
+    // TE-CL smuggling: Transfer-Encoding first, then Content-Length
+    auto s = parse_one(
+        "POST / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Content-Length: 6\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(Smuggling, CLTEWithOtherHeaders) {
+    HttpParser parser;
+    ParsedRequest req;
+    // CL-TE hidden among many headers
+    auto s = parse_one(
+        "POST /api HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Accept: */*\r\n"
+        "Content-Length: 100\r\n"
+        "X-Custom: foo\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Cookie: session=abc\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(Smuggling, CLZeroTEChunked) {
+    HttpParser parser;
+    ParsedRequest req;
+    // CL:0 + TE:chunked — still a conflict
+    auto s = parse_one(
+        "POST / HTTP/1.1\r\n"
+        "Content-Length: 0\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(Smuggling, TEChunkedInList) {
+    HttpParser parser;
+    ParsedRequest req;
+    // chunked buried in a TE token list + CL
+    auto s = parse_one(
+        "POST / HTTP/1.1\r\n"
+        "Transfer-Encoding: gzip, chunked\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+// ============================================================================
+// TEST SUITE: Transfer-Encoding token parsing edge cases
+// ============================================================================
+
+TEST(TETokens, ChunkedOnly) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.chunked);
+}
+
+TEST(TETokens, GzipChunked) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s =
+        parse_one("POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.chunked);
+}
+
+TEST(TETokens, ChunkedGzip) {
+    HttpParser parser;
+    ParsedRequest req;
+    // chunked first, then gzip — chunked still detected
+    auto s =
+        parse_one("POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.chunked);
+}
+
+TEST(TETokens, GzipOnly) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.chunked);
+}
+
+TEST(TETokens, DeflateIdentity) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s =
+        parse_one("POST / HTTP/1.1\r\nTransfer-Encoding: deflate, identity\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.chunked);
+}
+
+TEST(TETokens, ChunkedWithSpaces) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("POST / HTTP/1.1\r\nTransfer-Encoding:  chunked \r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.chunked);
+}
+
+TEST(TETokens, ChunkedCaseMixed) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.chunked);
+}
+
+TEST(TETokens, NotchunkedSubstring) {
+    HttpParser parser;
+    ParsedRequest req;
+    // "notchunked" must NOT be detected as chunked (suffix match would fail here)
+    auto s = parse_one("POST / HTTP/1.1\r\nTransfer-Encoding: notchunked\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.chunked);
+}
+
+TEST(TETokens, ChunkedExtSuffix) {
+    HttpParser parser;
+    ParsedRequest req;
+    // "chunkedx" is not "chunked"
+    auto s = parse_one("POST / HTTP/1.1\r\nTransfer-Encoding: chunkedx\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.chunked);
+}
+
+// ============================================================================
+// TEST SUITE: obs-text (0x80-0xFF) in header values
+// ============================================================================
+
+TEST(ObsText, Latin1InValue) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Düsseldorf — UTF-8: D\xC3\xBCsseldorf
+    auto s = parse_one(
+        "GET / HTTP/1.1\r\n"
+        "City: D\xC3\xBCsseldorf\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+}
+
+TEST(ObsText, AllHighBytes) {
+    // Every byte 0x80-0xFF should be valid in header value
+    HttpParser parser;
+    ParsedRequest req;
+    u32 tested = 0;
+    for (u32 c = 0x80; c <= 0xFF; c++) {
+        u8 buf[64];
+        u32 pos = 0;
+        const char prefix[] = "GET / HTTP/1.1\r\nX: ";
+        __builtin_memcpy(buf + pos, prefix, sizeof(prefix) - 1);
+        pos += sizeof(prefix) - 1;
+        buf[pos++] = static_cast<u8>(c);
+        const char suffix[] = "\r\n\r\n";
+        __builtin_memcpy(buf + pos, suffix, sizeof(suffix) - 1);
+        pos += sizeof(suffix) - 1;
+
+        auto s = parse_raw(buf, pos, &req, &parser);
+        CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+        tested++;
+    }
+    CHECK_EQ(tested, 128u);
+}
+
+TEST(ObsText, HighBytesInUriRejected) {
+    // Bytes 0x80-0xFF must be rejected in URI
+    HttpParser parser;
+    ParsedRequest req;
+    u32 tested = 0;
+    for (u32 c = 0x80; c <= 0xFF; c++) {
+        u8 buf[64];
+        u32 pos = 0;
+        const char prefix[] = "GET /";
+        __builtin_memcpy(buf + pos, prefix, sizeof(prefix) - 1);
+        pos += sizeof(prefix) - 1;
+        buf[pos++] = static_cast<u8>(c);
+        const char suffix[] = " HTTP/1.1\r\n\r\n";
+        __builtin_memcpy(buf + pos, suffix, sizeof(suffix) - 1);
+        pos += sizeof(suffix) - 1;
+
+        auto s = parse_raw(buf, pos, &req, &parser);
+        CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+        tested++;
+    }
+    CHECK_EQ(tested, 128u);
+}
+
+// ============================================================================
+// TEST SUITE: Incremental parsing — precise split points
+// ============================================================================
+
+TEST(IncrSplit, SplitInCRLFCRLF) {
+    HttpParser parser;
+    ParsedRequest req;
+    const char* raw = "GET / HTTP/1.1\r\n\r\n";
+    auto len = static_cast<u32>(__builtin_strlen(raw));
+
+    // Split right before final \r\n (at the \r of \r\n\r\n)
+    for (u32 split = len - 4; split <= len - 1; split++) {
+        parser.reset();
+        auto s1 = parser.parse(reinterpret_cast<const u8*>(raw), split, &req);
+        CHECK_EQ(static_cast<u8>(s1), static_cast<u8>(ParseStatus::Incomplete));
+
+        auto s2 = parser.parse(reinterpret_cast<const u8*>(raw), len, &req);
+        CHECK_EQ(static_cast<u8>(s2), static_cast<u8>(ParseStatus::Complete));
+    }
+}
+
+TEST(IncrSplit, SplitInVersion) {
+    HttpParser parser;
+    ParsedRequest req;
+    const char* raw = "GET / HTTP/1.1\r\n\r\n";
+    auto len = static_cast<u32>(__builtin_strlen(raw));
+
+    // Split in the middle of "HTTP/1.1"
+    for (u32 split = 6; split <= 13; split++) {
+        parser.reset();
+        auto s1 = parser.parse(reinterpret_cast<const u8*>(raw), split, &req);
+        CHECK_EQ(static_cast<u8>(s1), static_cast<u8>(ParseStatus::Incomplete));
+
+        auto s2 = parser.parse(reinterpret_cast<const u8*>(raw), len, &req);
+        CHECK_EQ(static_cast<u8>(s2), static_cast<u8>(ParseStatus::Complete));
+    }
+}
+
+TEST(IncrSplit, SplitInHeaderValue) {
+    HttpParser parser;
+    ParsedRequest req;
+    const char* raw =
+        "GET / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "\r\n";
+    auto len = static_cast<u32>(__builtin_strlen(raw));
+
+    // Split at every position within the header value "example.com"
+    for (u32 split = 22; split <= 33; split++) {
+        parser.reset();
+        auto s1 = parser.parse(reinterpret_cast<const u8*>(raw), split, &req);
+        CHECK_EQ(static_cast<u8>(s1), static_cast<u8>(ParseStatus::Incomplete));
+
+        auto s2 = parser.parse(reinterpret_cast<const u8*>(raw), len, &req);
+        CHECK_EQ(static_cast<u8>(s2), static_cast<u8>(ParseStatus::Complete));
+    }
+}
+
+TEST(IncrSplit, SplitBetweenHeaders) {
+    HttpParser parser;
+    ParsedRequest req;
+    const char* raw =
+        "GET / HTTP/1.1\r\n"
+        "Host: a\r\n"
+        "Accept: b\r\n"
+        "\r\n";
+    auto len = static_cast<u32>(__builtin_strlen(raw));
+
+    // Split between the two headers (at the \r\n boundary)
+    // "GET / HTTP/1.1\r\nHost: a\r\n" = 27 bytes
+    parser.reset();
+    auto s1 = parser.parse(reinterpret_cast<const u8*>(raw), 27, &req);
+    CHECK_EQ(static_cast<u8>(s1), static_cast<u8>(ParseStatus::Incomplete));
+
+    auto s2 = parser.parse(reinterpret_cast<const u8*>(raw), len, &req);
+    CHECK_EQ(static_cast<u8>(s2), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.header_count, 2u);
+}
+
+// ============================================================================
+// TEST SUITE: Header value edge cases
+// ============================================================================
+
+TEST(HeaderValueEdge, SingleChar) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("GET / HTTP/1.1\r\nX: a\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.headers[0].value.eq(Str{"a", 1}));
+}
+
+TEST(HeaderValueEdge, OnlySpaces) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Value "   " should be trimmed to empty
+    auto s = parse_one("GET / HTTP/1.1\r\nX:   \r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.headers[0].value.eq(Str{"", 0}));
+}
+
+TEST(HeaderValueEdge, EqualsInValue) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one(
+        "GET / HTTP/1.1\r\n"
+        "Authorization: Basic dXNlcjpwYXNz\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.headers[0].value.eq(Str{"Basic dXNlcjpwYXNz", 18}));
+}
+
+TEST(HeaderValueEdge, SemicolonInValue) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one(
+        "GET / HTTP/1.1\r\n"
+        "Cookie: a=1; b=2; c=3\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.headers[0].value.eq(Str{"a=1; b=2; c=3", 13}));
+}
+
+TEST(HeaderValueEdge, ColonInValue) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one(
+        "GET / HTTP/1.1\r\n"
+        "Host: example.com:8080\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.headers[0].value.eq(Str{"example.com:8080", 16}));
+}
+
+TEST(HeaderValueEdge, VeryLongValue) {
+    // Header value of exactly 1000 chars
+    u8 buf[2048];
+    u32 pos = 0;
+    const char prefix[] = "GET / HTTP/1.1\r\nX-Big: ";
+    __builtin_memcpy(buf + pos, prefix, sizeof(prefix) - 1);
+    pos += sizeof(prefix) - 1;
+    for (u32 i = 0; i < 1000; i++) buf[pos++] = static_cast<u8>('a' + (i % 26));
+    const char suffix[] = "\r\n\r\n";
+    __builtin_memcpy(buf + pos, suffix, sizeof(suffix) - 1);
+    pos += sizeof(suffix) - 1;
+
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_raw(buf, pos, &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.headers[0].value.len, 1000u);
+}
+
+// ============================================================================
+// TEST SUITE: Multiple semantic headers interaction
+// ============================================================================
+
+TEST(MultiSemantic, CLThenConnection) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one(
+        "POST / HTTP/1.1\r\n"
+        "Content-Length: 10\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, 10u);
+    CHECK(!req.keep_alive);
+}
+
+TEST(MultiSemantic, ConnectionThenCL) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one(
+        "POST / HTTP/1.1\r\n"
+        "Connection: keep-alive\r\n"
+        "Content-Length: 42\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.keep_alive);
+    CHECK_EQ(req.content_length, 42u);
+}
+
+TEST(MultiSemantic, TEGzipWithCLAllowed) {
+    HttpParser parser;
+    ParsedRequest req;
+    // TE: gzip (not chunked) + CL is fine
+    auto s = parse_one(
+        "POST / HTTP/1.1\r\n"
+        "Transfer-Encoding: gzip\r\n"
+        "Content-Length: 100\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.chunked);
+    CHECK_EQ(req.content_length, 100u);
+}
+
+TEST(MultiSemantic, AllThreeNonConflicting) {
+    HttpParser parser;
+    ParsedRequest req;
+    // CL + Connection + non-chunked TE — no conflict
+    auto s = parse_one(
+        "POST / HTTP/1.1\r\n"
+        "Content-Length: 50\r\n"
+        "Connection: keep-alive\r\n"
+        "Transfer-Encoding: identity\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, 50u);
+    CHECK(req.keep_alive);
+    CHECK(!req.chunked);
+}
+
+// ============================================================================
+// TEST SUITE: URI high-byte and special char coverage
+// ============================================================================
+
+TEST(URIChars, AtSign) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("GET /user@host HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path.eq(Str{"/user@host", 10}));
+}
+
+TEST(URIChars, Tilde) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("GET /~user HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path.eq(Str{"/~user", 6}));
+}
+
+TEST(URIChars, Semicolons) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("GET /path;params HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path.eq(Str{"/path;params", 12}));
+}
+
+TEST(URIChars, Brackets) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("GET /path[0] HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+}
+
+TEST(URIChars, Braces) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("GET /path{id} HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+}
+
+TEST(URIChars, BackslashInURI) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("GET /path\\file HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+}
+
+TEST(URIChars, DoubleSlash) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("GET //path HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path.eq(Str{"//path", 6}));
+}
+
+TEST(URIChars, JustSlash) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("GET / HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path.eq(Str{"/", 1}));
+}
+
+TEST(URIChars, Asterisk) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_one("OPTIONS * HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path.eq(Str{"*", 1}));
+}
+
+TEST(URIChars, LongQueryString) {
+    u8 buf[512];
+    u32 pos = 0;
+    const char prefix[] = "GET /search?q=";
+    __builtin_memcpy(buf + pos, prefix, sizeof(prefix) - 1);
+    pos += sizeof(prefix) - 1;
+    for (u32 i = 0; i < 200; i++) buf[pos++] = static_cast<u8>('a' + (i % 26));
+    const char suffix[] = "&page=1 HTTP/1.1\r\n\r\n";
+    __builtin_memcpy(buf + pos, suffix, sizeof(suffix) - 1);
+    pos += sizeof(suffix) - 1;
+
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_raw(buf, pos, &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.path.len, 217u);  // /search?q= (10) + 200 + &page=1 (7)
+}
+
+// ============================================================================
+// TEST SUITE: Header count boundary
+// ============================================================================
+
+TEST(HeaderCount, Exactly63) {
+    u8 buf[8192];
+    u32 pos = 0;
+    const char rl[] = "GET / HTTP/1.1\r\n";
+    __builtin_memcpy(buf + pos, rl, sizeof(rl) - 1);
+    pos += sizeof(rl) - 1;
+    for (u32 i = 0; i < 63; i++) {
+        buf[pos++] = 'X';
+        buf[pos++] = '-';
+        buf[pos++] = static_cast<u8>('A' + (i / 26));
+        buf[pos++] = static_cast<u8>('A' + (i % 26));
+        const char val[] = ": v\r\n";
+        __builtin_memcpy(buf + pos, val, sizeof(val) - 1);
+        pos += sizeof(val) - 1;
+    }
+    buf[pos++] = '\r';
+    buf[pos++] = '\n';
+
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_raw(buf, pos, &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.header_count, 63u);
+}
+
+TEST(HeaderCount, Exactly64) {
+    u8 buf[8192];
+    u32 pos = 0;
+    const char rl[] = "GET / HTTP/1.1\r\n";
+    __builtin_memcpy(buf + pos, rl, sizeof(rl) - 1);
+    pos += sizeof(rl) - 1;
+    for (u32 i = 0; i < 64; i++) {
+        buf[pos++] = 'X';
+        buf[pos++] = '-';
+        buf[pos++] = static_cast<u8>('A' + (i / 26));
+        buf[pos++] = static_cast<u8>('A' + (i % 26));
+        const char val[] = ": v\r\n";
+        __builtin_memcpy(buf + pos, val, sizeof(val) - 1);
+        pos += sizeof(val) - 1;
+    }
+    buf[pos++] = '\r';
+    buf[pos++] = '\n';
+
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_raw(buf, pos, &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.header_count, 64u);
+}
+
+TEST(HeaderCount, Exactly65Rejected) {
+    u8 buf[8192];
+    u32 pos = 0;
+    const char rl[] = "GET / HTTP/1.1\r\n";
+    __builtin_memcpy(buf + pos, rl, sizeof(rl) - 1);
+    pos += sizeof(rl) - 1;
+    for (u32 i = 0; i < 65; i++) {
+        buf[pos++] = 'X';
+        buf[pos++] = '-';
+        buf[pos++] = static_cast<u8>('A' + (i / 26));
+        buf[pos++] = static_cast<u8>('A' + (i % 26));
+        const char val[] = ": v\r\n";
+        __builtin_memcpy(buf + pos, val, sizeof(val) - 1);
+        pos += sizeof(val) - 1;
+    }
+    buf[pos++] = '\r';
+    buf[pos++] = '\n';
+
+    HttpParser parser;
+    ParsedRequest req;
+    auto s = parse_raw(buf, pos, &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
 int main(int argc, char** argv) {
     return rout::test::run_all(argc, argv);
 }

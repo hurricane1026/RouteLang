@@ -38,7 +38,7 @@ struct View {
 
     ~View() { restore_owner(); }
 
-    // Read: the ONLY way to access data. const — safe to pass around.
+    // Read: the only way to access data through a View (no raw pointer). const.
     u32 read(u8* dst, u32 max) const noexcept {
         if (!ptr_ || max == 0) return 0;
         u32 n = len_ < max ? len_ : max;

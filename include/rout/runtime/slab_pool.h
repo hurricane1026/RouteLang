@@ -28,8 +28,10 @@ struct SlabPool {
         objects_size = static_cast<u64>(Cap) * sizeof(T);
         void* obj_mem =
             mmap(nullptr, objects_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (obj_mem == MAP_FAILED)
+        if (obj_mem == MAP_FAILED) {
+            free_top = 0;
             return core::make_unexpected(Error::from_errno(Error::Source::SlabPool));
+        }
         objects = static_cast<T*>(obj_mem);
 
         stack_size = static_cast<u64>(Cap) * sizeof(u32);
@@ -38,6 +40,7 @@ struct SlabPool {
         if (stk_mem == MAP_FAILED) {
             munmap(objects, objects_size);
             objects = nullptr;
+            free_top = 0;
             return core::make_unexpected(Error::from_errno(Error::Source::SlabPool));
         }
         free_stack = static_cast<u32*>(stk_mem);
@@ -51,6 +54,7 @@ struct SlabPool {
             free_stack = nullptr;
             munmap(objects, objects_size);
             objects = nullptr;
+            free_top = 0;
             return core::make_unexpected(err);
         }
         in_use_map = static_cast<u8*>(map_mem);  // mmap zeroes = all free

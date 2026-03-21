@@ -85,14 +85,20 @@ struct UpstreamPool {
         c->idle = true;
     }
 
-    // Close all connections and reset.
+    // Close all connections and fully reset to initial state.
     void shutdown() {
         for (u32 i = 0; i < kMaxConns; i++) {
             if (conns[i].fd >= 0) {
                 close(conns[i].fd);
                 conns[i].fd = -1;
             }
+            conns[i].idle = false;
+            conns[i].allocated = false;
+            conns[i].upstream_id = 0;
         }
+        // Rebuild free stack (all slots available)
+        free_top = kMaxConns;
+        for (u32 i = 0; i < kMaxConns; i++) free_stack[i] = i;
     }
 
     // Create a non-blocking socket for upstream connection.

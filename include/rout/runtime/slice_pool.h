@@ -47,8 +47,11 @@ struct SlicePool {
         base_size = static_cast<u64>(n) * kSliceSize;
         void* data_mem =
             mmap(nullptr, base_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (data_mem == MAP_FAILED)
+        if (data_mem == MAP_FAILED) {
+            count = 0;
+            free_top = 0;
             return core::make_unexpected(Error::from_errno(Error::Source::SlicePool));
+        }
         base = static_cast<u8*>(data_mem);
 
         // mmap free stack
@@ -58,6 +61,8 @@ struct SlicePool {
         if (stack_mem == MAP_FAILED) {
             munmap(base, base_size);
             base = nullptr;
+            count = 0;
+            free_top = 0;
             return core::make_unexpected(Error::from_errno(Error::Source::SlicePool));
         }
         free_stack = static_cast<u32*>(stack_mem);
@@ -72,6 +77,8 @@ struct SlicePool {
             free_stack = nullptr;
             munmap(base, base_size);
             base = nullptr;
+            count = 0;
+            free_top = 0;
             return core::make_unexpected(err);
         }
         in_use_map = static_cast<u8*>(map_mem);  // mmap zeroes = all free

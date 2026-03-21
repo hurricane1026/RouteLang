@@ -110,7 +110,12 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
     // Get actual port from first shard's socket
     struct sockaddr_in bound_addr;
     socklen_t addr_len = sizeof(bound_addr);
-    getsockname(shards[0].listen_fd, reinterpret_cast<struct sockaddr*>(&bound_addr), &addr_len);
+    if (getsockname(
+            shards[0].listen_fd, reinterpret_cast<struct sockaddr*>(&bound_addr), &addr_len) < 0) {
+        write_str("Failed to get bound address\n");
+        for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
+        return 1;
+    }
     port = __builtin_bswap16(bound_addr.sin_port);
 
     write_str("Listening on port ");

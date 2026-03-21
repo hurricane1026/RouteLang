@@ -9,7 +9,11 @@ namespace rir {
 // Produces human-readable --emit-rir text output. Writes directly to
 // a file descriptor (no stdio, no stdlib).
 //
-// Output format (based on DESIGN.md §11.2.5):
+// Output format (differs from DESIGN.md §11.2.5 in two ways:
+// 1. All operands are SSA references — string/numeric literals are
+//    materialized as const.str/const.i32 instructions, not inlined.
+// 2. Header uses "route:" instead of "params:").
+//
 //   === handle_get_users_id ===
 //     route: /users/:id
 //     io_points: 0 (all sync)
@@ -19,7 +23,8 @@ namespace rir {
 //
 //     entry:
 //       %0 = req.header "Authorization"    // line 42
-//       br %0.is_nil, block_1, block_2     // line 42
+//       %1 = opt.is_nil %0                 // line 42
+//       br %1, block_reject_401, block_1   // line 42
 
 struct PrintBuf {
     char* data;

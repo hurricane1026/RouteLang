@@ -217,6 +217,13 @@ struct Builder {
         return EmitResult{inst, vid};
     }
 
+    // Roll back a previously committed emit() — used when a post-emit
+    // step (e.g., set_operands) fails, to keep the IR consistent.
+    void rollback_emit(const EmitResult& r) {
+        if (cur_block && cur_block->inst_count > 0) cur_block->inst_count--;
+        if (r.vid != kNoValue && cur_func && cur_func->value_count > 0) cur_func->value_count--;
+    }
+
     // ── Helpers for variadic operand storage ────────────────────────
 
     VoidResult set_operands(Instruction* inst, const ValueId* ops, u32 count) {
@@ -385,9 +392,12 @@ struct Builder {
 
     Result<ValueId> emit_str_interpolate(const ValueId* parts, u32 count, SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
-        auto [inst, vid] = TRY(emit(Opcode::StrInterpolate, ty, loc));
-        TRY_VOID(set_operands(inst, parts, count));
-        return vid;
+        auto r = TRY(emit(Opcode::StrInterpolate, ty, loc));
+        if (!set_operands(r.inst, parts, count)) {
+            rollback_emit(r);
+            return err(RirError::OutOfMemory);
+        }
+        return r.vid;
     }
 
     // ── Comparisons ─────────────────────────────────────────────────
@@ -486,10 +496,13 @@ struct Builder {
                                      const Type* return_type,
                                      SourceLoc loc = {}) {
         if (!return_type) return err(RirError::InvalidState);
-        auto [inst, vid] = TRY(emit(Opcode::CallExtern, return_type, loc));
-        inst->imm.extern_name = func_name;
-        TRY_VOID(set_operands(inst, args, arg_count));
-        return vid;
+        auto r = TRY(emit(Opcode::CallExtern, return_type, loc));
+        r.inst->imm.extern_name = func_name;
+        if (!set_operands(r.inst, args, arg_count)) {
+            rollback_emit(r);
+            return err(RirError::OutOfMemory);
+        }
+        return r.vid;
     }
 
     // ── Terminators ─────────────────────────────────────────────────
@@ -539,11 +552,14 @@ struct Builder {
     Result<ValueId> emit_yield_extern(
         Str name, const ValueId* args, u32 arg_count, const Type* return_type, SourceLoc loc = {}) {
         if (!return_type) return err(RirError::InvalidState);
-        auto [inst, vid] = TRY(emit(Opcode::YieldExtern, return_type, loc));
-        inst->imm.extern_name = name;
-        TRY_VOID(set_operands(inst, args, arg_count));
+        auto r = TRY(emit(Opcode::YieldExtern, return_type, loc));
+        r.inst->imm.extern_name = name;
+        if (!set_operands(r.inst, args, arg_count)) {
+            rollback_emit(r);
+            return err(RirError::OutOfMemory);
+        }
         cur_func->yield_count++;
-        return vid;
+        return r.vid;
     }
 };
 

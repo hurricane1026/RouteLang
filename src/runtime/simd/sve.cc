@@ -71,7 +71,8 @@ u32 scan_uri(const u8* buf, u32 pos, u32 end) {
         svbool_t sp_match = svcmpeq_u8(pred, chunk, ' ');
         svbool_t lt21 = svcmplt_u8(pred, chunk, 0x21);
         svbool_t is_del = svcmpeq_u8(pred, chunk, 0x7F);
-        svbool_t bad = svorr_b_z(pred, lt21, is_del);
+        svbool_t ge80 = svcmpge_u8(pred, chunk, 0x80);
+        svbool_t bad = svorr_b_z(pred, svorr_b_z(pred, lt21, is_del), ge80);
 
         if (svptest_any(pred, svorr_b_z(pred, sp_match, bad))) {
             u32 scan_end = pos + (remaining < vl ? remaining : vl);

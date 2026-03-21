@@ -76,7 +76,10 @@ u32 scan_uri(const u8* buf, u32 pos, u32 end) {
     while (pos + 64 <= end) {
         __m512i chunk = _mm512_loadu_si512(buf + pos);
         u64 sp_mask = _mm512_cmpeq_epi8_mask(chunk, vsp);
-        u64 bad_mask = _mm512_cmplt_epu8_mask(chunk, v21) | _mm512_cmpeq_epi8_mask(chunk, v7f);
+        // Reject bytes < 0x21, == 0x7F, or >= 0x80 (high bit set)
+        u64 high_mask = _mm512_movepi8_mask(chunk);  // extract sign bit = high bit
+        u64 bad_mask =
+            _mm512_cmplt_epu8_mask(chunk, v21) | _mm512_cmpeq_epi8_mask(chunk, v7f) | high_mask;
 
         if (sp_mask) {
             u32 sp_pos = static_cast<u32>(__builtin_ctzll(sp_mask));

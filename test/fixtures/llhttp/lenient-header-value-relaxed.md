@@ -2,7 +2,7 @@ Relaxed header value character parsing
 =======================================
 
 Relaxed parsing mode: accepts unusual characters (like control chars)
-but still rejects specifally dangerous ones (NULL, CR, LF) that could enable
+but still rejects specifically dangerous ones (NULL, CR, LF) that could enable
 smuggling attacks.
 
 ## Control char in header value (relaxed)

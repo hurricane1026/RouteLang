@@ -399,7 +399,7 @@ off=56 message complete
 
 ### OPTIONS request with RTSP
 
-NOTE: `OPTIONS` is a valid HTTP metho too.
+NOTE: `OPTIONS` is a valid HTTP method too.
 
 <!-- meta={"type": "request"} -->
 ```http

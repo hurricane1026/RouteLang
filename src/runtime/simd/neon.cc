@@ -73,11 +73,14 @@ u32 scan_uri(const u8* buf, u32 pos, u32 end) {
     const uint8x16_t vsp = vdupq_n_u8(' ');
     const uint8x16_t v21 = vdupq_n_u8(0x21);
     const uint8x16_t v7f = vdupq_n_u8(0x7F);
+    const uint8x16_t v80 = vdupq_n_u8(0x80);
 
     while (pos + 16 <= end) {
         uint8x16_t chunk = vld1q_u8(buf + pos);
         uint8x16_t sp_match = vceqq_u8(chunk, vsp);
-        uint8x16_t bad = vorrq_u8(vcltq_u8(chunk, v21), vceqq_u8(chunk, v7f));
+        // Reject bytes < 0x21, == 0x7F, or >= 0x80 (high bit set)
+        uint8x16_t high = vcgeq_u8(chunk, v80);
+        uint8x16_t bad = vorrq_u8(vorrq_u8(vcltq_u8(chunk, v21), vceqq_u8(chunk, v7f)), high);
 
         if (neon_any(vorrq_u8(sp_match, bad))) {
             for (u32 i = 0; i < 16 && pos + i < end; i++) {

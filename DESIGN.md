@@ -1,4 +1,4 @@
-# Dispatcher: Design Document
+# Rue: Design Document
 
 > A strongly-typed DSL and high-performance HTTP gateway runtime replacing nginx + OpenResty.
 
@@ -26,7 +26,7 @@
 
 ```
                         ┌─────────────────────────────┐
-  .dispatch source ───▶ │  Compiler (embedded in proc) │
+  .rue source ───▶ │  Compiler (embedded in proc) │
                         │  parse → type check → IR     │
                         └──────────┬──────────────────┘
                                    │
@@ -37,7 +37,7 @@
                                    │ native function pointers
                                    ▼
   ┌────────────────────────────────────────────────────────┐
-  │                    Dispatcher Runtime                   │
+  │                    Rue Runtime                   │
   │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
   │  │  Shard 0  │ │  Shard 1  │ │  Shard 2  │ │  Shard N  │  │
   │  │ io_uring  │ │ io_uring  │ │ io_uring  │ │ io_uring  │  │
@@ -64,7 +64,7 @@
 
 ---
 
-## 3. The Dispatch Language
+## 3. The Rue Language
 
 ### 3.1 Design Principles
 
@@ -78,7 +78,7 @@
 
 ### 3.2 File Extension
 
-`.dispatch`
+`.rue`
 
 ### 3.3 Type System
 
@@ -611,8 +611,8 @@ fire post http://audit-service/log {
 #### 3.4.11 Module System
 
 ```swift
-import "middleware/auth.dispatch"
-import "middleware/ratelimit.dispatch"
+import "middleware/auth.rue"
+import "middleware/ratelimit.rue"
 ```
 
 #### 3.4.12 External Functions (FFI Escape Hatch)
@@ -756,10 +756,10 @@ func auth(_ req: Request, role: string) -> User {
 ### 3.9 Complete Example
 
 ```swift
-// production.dispatch
+// production.rue
 
-import "middleware/auth.dispatch"
-import "middleware/security.dispatch"
+import "middleware/auth.rue"
+import "middleware/security.rue"
 
 listen :443, tls(cert: env("CERT"), key: env("KEY"))
 listen :80, redirect: :443
@@ -2007,7 +2007,7 @@ SNI implementation:
   - OpenSSL SNI callback (SSL_CTX_set_tlsext_servername_callback)
   - Lookup hostname from ClientHello → select SSL_CTX with matching certificate
   - Per-shard certificate cache (share-nothing)
-  - Certificate reload on hot reload (new .dispatch → new cert paths → reload certs)
+  - Certificate reload on hot reload (new .rue → new cert paths → reload certs)
 ```
 
 TLS Session Resumption — avoid full handshake on reconnect:
@@ -2114,7 +2114,7 @@ Phase 2: Inbound TLS + Outbound TLS
   - OpenSSL + BIO_s_mem + io_uring
   - SNI for multi-domain
   - Session ID cache + Session Tickets
-  - TLS config in .dispatch files
+  - TLS config in .rue files
   - Outbound HTTPS for HTTP calls
 
 Phase 3: Optimization + Advanced
@@ -2534,7 +2534,7 @@ Hot path overhead per request:
 
 ```swift
 // 1. File watch (automatic)
-//    Runtime uses inotify to watch .dispatch files
+//    Runtime uses inotify to watch .rue files
 //    Change detected → debounce → compile → swap
 
 // 2. API endpoint (manual)
@@ -2575,7 +2575,7 @@ During shutdown:
 ### 11.1 Pipeline
 
 ```
-.dispatch source
+.rue source
     │
     ▼
   Lexer / Parser (hand-written recursive descent)
@@ -2598,7 +2598,7 @@ During shutdown:
   Inline Expansion (all func calls expanded)
     │
     ▼
-  Dispatcher IR (DIR)  ◄── custom IR, backend-agnostic
+  Rue IR (RIR)  ◄── custom IR, backend-agnostic
     │
     ├── Optimization passes (on DIR)
     │   - dead code elimination
@@ -2623,7 +2623,7 @@ During shutdown:
   CompiledConfig { version, routes, handlers }
 ```
 
-### 11.2 Dispatcher IR (DIR)
+### 11.2 Rue IR (RIR)
 
 A lightweight, flat, typed IR between the AST and LLVM IR. Each route handler compiles to one DIR function — a linear sequence of blocks with explicit control flow.
 
@@ -2854,7 +2854,7 @@ Pass 5: Guard Coalescing
 #### 11.2.5 DIR Dump (--emit-dir)
 
 ```
-$ dispatcher --emit-dir gateway.dispatch
+$ rue --emit-rir gateway.rue
 
 === handle_get_users_id ===
   params: [:id]
@@ -2896,9 +2896,9 @@ Recommended: start with LLVM ORC JIT (dynamic link), consider Cranelift if LLVM 
 ### 11.3 C++ Integration API
 
 ```cpp
-class DispatcherEngine {
+class RueEngine {
 public:
-    // Compile .dispatch source, returns compile result (errors or config)
+    // Compile .rue source, returns compile result (errors or config)
     CompileResult compile(std::string_view source);
 
     // Atomically load new config to all shards (RCU swap)
@@ -2907,7 +2907,7 @@ public:
     // Current config version
     uint64_t current_version() const;
 
-    // Register C++ functions callable from .dispatch
+    // Register C++ functions callable from .rue
     template<typename Func>
     void register_native(std::string_view name, Func&& fn);
 };
@@ -3377,7 +3377,7 @@ Format: one JSON line per request
   }
 ```
 
-User-configurable in .dispatch:
+User-configurable in .rue:
 
 ```swift
 accessLog {
@@ -3488,7 +3488,7 @@ POST /internal/log-level — dynamic log level change
 Compile-time validation without starting the server:
 
 ```
-$ dispatcher --dry-run gateway.dispatch
+$ rue --dry-run gateway.rue
 
 ✓ Parsed 3 files
 ✓ Type check passed
@@ -3559,7 +3559,7 @@ Deliverable: can accept HTTP requests, proxy to upstream, return responses.
 ### Phase 2: Language + JIT
 
 ```
-├── Lexer + Parser for .dispatch (~2000 lines)
+├── Lexer + Parser for .rue (~2000 lines)
 ├── Type checker (~1500 lines)
 ├── LLVM IR codegen (~2000 lines)
 ├── JIT loading + hot reload (~1000 lines)
@@ -3567,7 +3567,7 @@ Deliverable: can accept HTTP requests, proxy to upstream, return responses.
 ├── Radix trie route compiler (~500 lines)
 └── Total: ~8000 lines
 
-Deliverable: .dispatch files compiled and loaded, hot reload works.
+Deliverable: .rue files compiled and loaded, hot reload works.
 ```
 
 ### Phase 3: Production Hardening
@@ -3621,4 +3621,4 @@ Deliverable: .dispatch files compiled and loaded, hot reload works.
 | 21 | Custom IR (DIR) between AST and LLVM IR | Direct AST → LLVM IR | Enables domain-specific optimizations, backend independence (swap LLVM for Cranelift), debuggability (--emit-dir), and clean instrumentation insertion point |
 | 22 | Security as language-level code, not runtime features | Built-in WAF/DDoS modules | WAF rules, bot detection, flood protection are all expressible in the DSL; no hardcoded security logic in runtime; users can customize everything |
 | 23 | Response middleware via parameter signature | Separate `onResponse` keyword | `func f(req, resp)` = response middleware; compiler auto-detects; no new syntax needed |
-| 24 | Connection-level protection in `listen` config | Runtime-only config | headerTimeout, maxConnsPerIP, minRecvRate, strictParsing are declared in .dispatch files; compile-time validated; visible alongside routing logic |
+| 24 | Connection-level protection in `listen` config | Runtime-only config | headerTimeout, maxConnsPerIP, minRecvRate, strictParsing are declared in .rue files; compile-time validated; visible alongside routing logic |

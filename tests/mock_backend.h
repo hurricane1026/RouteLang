@@ -1,0 +1,109 @@
+#pragma once
+
+#include "rout/common/types.h"
+#include "rout/runtime/io_event.h"
+
+namespace rout {
+
+// Mock I/O backend for unit testing.
+// Records all submitted operations, lets tests inject completions.
+// No real sockets, no syscalls, fully deterministic.
+
+struct MockOp {
+    enum Type : u8 { Accept, Recv, Send, Connect, Cancel };
+    Type type;
+    i32 fd;
+    u32 conn_id;
+    const u8* send_buf;
+    u32 send_len;
+};
+
+struct MockBackend {
+    // Recorded operations (submitted by event loop / callbacks)
+    static constexpr u32 kMaxOps = 256;
+    MockOp ops[kMaxOps];
+    u32 op_count = 0;
+
+    // Injected completions (fed back to event loop)
+    static constexpr u32 kMaxEvents = 256;
+    IoEvent pending[kMaxEvents];
+    u32 pending_count = 0;
+
+    i32 init(u32 /*shard_id*/, i32 /*listen_fd*/) {
+        op_count = 0;
+        pending_count = 0;
+        return 0;
+    }
+
+    void add_accept() {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::Accept, -1, 0, nullptr, 0};
+        }
+    }
+
+    void add_recv(i32 fd, u32 conn_id) {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::Recv, fd, conn_id, nullptr, 0};
+        }
+    }
+
+    void add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::Send, fd, conn_id, buf, len};
+        }
+    }
+
+    void add_connect(i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/) {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::Connect, fd, conn_id, nullptr, 0};
+        }
+    }
+
+    void cancel(i32 fd, u32 conn_id) {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::Cancel, fd, conn_id, nullptr, 0};
+        }
+    }
+
+    void shutdown() {}
+
+    // --- Test helpers ---
+
+    // Inject a completion event. Will be returned by next wait().
+    void inject(IoEvent ev) {
+        if (pending_count < kMaxEvents) {
+            pending[pending_count++] = ev;
+        }
+    }
+
+    // Return injected events, then clear.
+    u32 wait(IoEvent* events, u32 max) {
+        u32 n = pending_count < max ? pending_count : max;
+        for (u32 i = 0; i < n; i++) events[i] = pending[i];
+        // Shift remaining
+        for (u32 i = n; i < pending_count; i++) pending[i - n] = pending[i];
+        pending_count -= n;
+        return n;
+    }
+
+    // Find last op of given type.
+    const MockOp* last_op(MockOp::Type type) const {
+        for (i32 i = static_cast<i32>(op_count) - 1; i >= 0; i--) {
+            if (ops[i].type == type) return &ops[i];
+        }
+        return nullptr;
+    }
+
+    // Count ops of given type.
+    u32 count_ops(MockOp::Type type) const {
+        u32 n = 0;
+        for (u32 i = 0; i < op_count; i++) {
+            if (ops[i].type == type) n++;
+        }
+        return n;
+    }
+
+    void clear_ops() { op_count = 0; }
+};
+
+}  // namespace rout

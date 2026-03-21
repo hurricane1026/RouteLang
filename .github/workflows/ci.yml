@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  format:
+    name: clang-format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: |
+          find include/rout src tests -name '*.h' -o -name '*.cc' | \
+            xargs clang-format --dry-run --Werror
+
+  lint:
+    name: clang-tidy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tidy cmake ninja-build
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Lint
+        run: |
+          find src -name '*.cc' | \
+            xargs clang-tidy -p build --warnings-as-errors='bugprone-*,performance-*'
+
+  test:
+    name: Build & Test
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        compiler: [clang, gcc]
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+          fi
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          else
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          fi
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Test
+        run: |
+          ./build/tests/test_network
+          ./build/tests/test_integration
+          ./build/tests/test_arena
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm cmake ninja-build
+
+      - name: Build with coverage
+        run: |
+          CC=clang CXX=clang++ cmake -B build -G Ninja \
+            -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
+            -DCMAKE_BUILD_TYPE=Debug
+          ninja -C build
+
+      - name: Run tests
+        run: |
+          LLVM_PROFILE_FILE=build/test_network.profraw ./build/tests/test_network
+          LLVM_PROFILE_FILE=build/test_integration.profraw ./build/tests/test_integration
+          LLVM_PROFILE_FILE=build/test_arena.profraw ./build/tests/test_arena
+
+      - name: Generate coverage report
+        run: |
+          llvm-profdata merge build/*.profraw -o build/merged.profdata
+
+          # Report for runtime code (exclude test framework and unused utility headers)
+          llvm-cov report \
+            --instr-profile=build/merged.profdata \
+            --object build/tests/test_network \
+            --object build/tests/test_integration \
+            --object build/tests/test_arena \
+            --sources include/rout/runtime/ src/runtime/ | tee build/coverage.txt
+
+          cat build/coverage.txt
+
+          # Extract line coverage from TOTAL row.
+          # llvm-cov output has 4 percentage columns: Regions, Functions, Lines, Branches.
+          # We want the 3rd one (Lines Cover).
+          LINE_COV=$(grep '^TOTAL' build/coverage.txt | awk '{
+            n=0; for(i=1;i<=NF;i++) if($i ~ /%/) { n++; if(n==3) { gsub(/%/,"",$i); print $i; exit } }
+          }')
+          echo "Line coverage: ${LINE_COV}%"
+          if [ -z "$LINE_COV" ]; then
+            echo "ERROR: Could not parse line coverage"
+            exit 1
+          fi
+          # awk exit 0 = success (pass), exit 1 = fail
+          if ! awk "BEGIN { exit ($LINE_COV < 80) }"; then
+            echo "ERROR: Line coverage ${LINE_COV}% is below 80% threshold"
+            exit 1
+          fi
+          echo "Coverage OK: ${LINE_COV}% >= 80%"

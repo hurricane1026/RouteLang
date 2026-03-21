@@ -58,8 +58,9 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
     u32 shard_id;
 
 private:
-    bool running_;  // access only via is_running()/stop() with atomics
-
+    volatile bool running_;  // volatile: prevent compiler hoisting out of loop.
+                             // Single writer (stop from main thread after sigwait),
+                             // single reader (shard thread's while loop). No atomic needed.
 public:
     static constexpr u32 kMaxConns = 16384;
     Connection conns[kMaxConns];
@@ -70,7 +71,7 @@ public:
 
     core::Expected<void, Error> init(u32 id, i32 listen_fd) {
         shard_id = id;
-        __atomic_store_n(&running_, true, __ATOMIC_RELAXED);
+        running_ = true;
         keepalive_timeout = 60;  // explicit: mmap zeroes memory, skipping default member init
         free_top = kMaxConns;
         timer.init();
@@ -88,7 +89,7 @@ public:
         backend.add_accept();
         IoEvent events[kMaxEventsPerWait];
 
-        while (__atomic_load_n(&running_, __ATOMIC_RELAXED)) {
+        while (running_) {
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
             for (u32 i = 0; i < n; i++) {
                 dispatch(events[i]);
@@ -96,8 +97,8 @@ public:
         }
     }
 
-    void stop() { __atomic_store_n(&running_, false, __ATOMIC_RELAXED); }
-    bool is_running() const { return __atomic_load_n(&running_, __ATOMIC_RELAXED); }
+    void stop() { running_ = false; }
+    bool is_running() const { return running_; }
     void shutdown() { backend.shutdown(); }
 
     // --- CRTP implementations ---

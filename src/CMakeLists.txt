@@ -1,5 +1,6 @@
 # Runtime library
 add_library(rue_runtime STATIC
+    placement_new.cc
     runtime/shard.cc
     runtime/io_uring_backend.cc
     runtime/epoll_backend.cc

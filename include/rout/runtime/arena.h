@@ -5,15 +5,6 @@
 #include <errno.h>
 #include <sys/mman.h>  // mmap, munmap
 
-// Placement new without <new> header — guarded to avoid ODR conflict
-// if any TU also includes <new>.
-#ifndef RUE_PLACEMENT_NEW_DEFINED
-#define RUE_PLACEMENT_NEW_DEFINED
-inline void* operator new(decltype(sizeof(0)), void* p) noexcept {
-    return p;
-}
-#endif
-
 namespace rout {
 
 // Arena — bump allocator with block chaining. Zero stdlib, no malloc, no new.

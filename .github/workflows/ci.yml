@@ -17,7 +17,7 @@ jobs:
 
       - name: Check formatting
         run: |
-          find include/rout src tests -name '*.h' -o -name '*.cc' | \
+          find include/rout include/core src tests -name '*.h' -o -name '*.cc' | \
             xargs clang-format --dry-run --Werror
 
   lint:
@@ -71,6 +71,7 @@ jobs:
           ./build/tests/test_network
           ./build/tests/test_integration
           ./build/tests/test_arena
+          ./build/tests/test_expected
 
   coverage:
     name: Code Coverage
@@ -94,6 +95,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_network.profraw ./build/tests/test_network
           LLVM_PROFILE_FILE=build/test_integration.profraw ./build/tests/test_integration
           LLVM_PROFILE_FILE=build/test_arena.profraw ./build/tests/test_arena
+          LLVM_PROFILE_FILE=build/test_expected.profraw ./build/tests/test_expected
 
       - name: Generate coverage report
         run: |

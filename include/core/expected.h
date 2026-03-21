@@ -1,0 +1,391 @@
+#pragma once
+
+// Expected<T, E> — C++23 std::expected equivalent, no stdlib dependency.
+//
+// Usage:
+//   Expected<int, ErrorCode> parse(const char* s);
+//   auto result = parse("42");
+//   if (result) use(result.value());
+//   else handle(result.error());
+//
+// Monadic:
+//   parse("42").and_then(validate).or_else(log_error);
+
+// Placement new — no <new> header in -nostdlib++
+inline void *operator new(decltype(sizeof(0)), void *p) noexcept { return p; }
+
+namespace core {
+
+// ── Type traits (no <type_traits>) ──────────────────────────────────
+
+template <typename T> struct RemoveRef {
+  using type = T;
+};
+template <typename T> struct RemoveRef<T &> {
+  using type = T;
+};
+template <typename T> struct RemoveRef<T &&> {
+  using type = T;
+};
+template <typename T> using RemoveRef_t = typename RemoveRef<T>::type;
+
+// ── Unexpected wrapper (tags the error value) ────────────────────────
+
+template <typename E> struct Unexpected {
+  E val;
+
+  constexpr explicit Unexpected(const E &e) : val(e) {}
+  constexpr explicit Unexpected(E &&e) : val(static_cast<E &&>(e)) {}
+
+  constexpr const E &value() const & { return val; }
+  constexpr E &value() & { return val; }
+  constexpr E &&value() && { return static_cast<E &&>(val); }
+};
+
+template <typename E> Unexpected(E) -> Unexpected<E>;
+
+// ── Forward declaration ──────────────────────────────────────────────
+
+template <typename T, typename E> class Expected;
+
+// ── Storage: discriminated union via placement + aligned_storage ─────
+
+namespace detail {
+
+// alignof / sizeof max helper
+template <typename A, typename B> struct MaxAlign {
+  static constexpr auto value = alignof(A) > alignof(B) ? alignof(A)
+                                                        : alignof(B);
+};
+
+template <typename A, typename B> struct MaxSize {
+  static constexpr auto value = sizeof(A) > sizeof(B) ? sizeof(A) : sizeof(B);
+};
+
+template <typename T, typename E> struct Storage {
+  alignas(MaxAlign<T, E>::value) char buf[MaxSize<T, E>::value];
+  bool has_val;
+
+  // Construct value
+  template <typename... Args> constexpr void construct_val(Args &&...args) {
+    ::new (static_cast<void *>(buf)) T(static_cast<Args &&>(args)...);
+    has_val = true;
+  }
+
+  // Construct error
+  template <typename... Args> constexpr void construct_err(Args &&...args) {
+    ::new (static_cast<void *>(buf)) E(static_cast<Args &&>(args)...);
+    has_val = false;
+  }
+
+  constexpr T &val() { return *reinterpret_cast<T *>(buf); }
+  constexpr const T &val() const { return *reinterpret_cast<const T *>(buf); }
+  constexpr E &err() { return *reinterpret_cast<E *>(buf); }
+  constexpr const E &err() const { return *reinterpret_cast<const E *>(buf); }
+
+  constexpr void destroy() {
+    if (has_val)
+      val().~T();
+    else
+      err().~E();
+  }
+};
+
+// Void specialization — no value storage, only error
+template <typename E> struct Storage<void, E> {
+  alignas(alignof(E)) char buf[sizeof(E)];
+  bool has_val;
+
+  constexpr void construct_val() { has_val = true; }
+
+  template <typename... Args> constexpr void construct_err(Args &&...args) {
+    ::new (static_cast<void *>(buf)) E(static_cast<Args &&>(args)...);
+    has_val = false;
+  }
+
+  constexpr E &err() { return *reinterpret_cast<E *>(buf); }
+  constexpr const E &err() const { return *reinterpret_cast<const E *>(buf); }
+
+  constexpr void destroy() {
+    if (!has_val)
+      err().~E();
+  }
+};
+
+} // namespace detail
+
+// ── Expected<T, E> ──────────────────────────────────────────────────
+
+template <typename T, typename E> class Expected {
+  detail::Storage<T, E> stor_;
+
+public:
+  using value_type = T;
+  using error_type = E;
+
+  // ── Constructors ────────────────────────────────────────────────
+
+  // Implicit from T (value)
+  constexpr Expected(const T &v) { stor_.construct_val(v); }
+  constexpr Expected(T &&v) { stor_.construct_val(static_cast<T &&>(v)); }
+
+  // From Unexpected<E> (error)
+  constexpr Expected(const Unexpected<E> &u) { stor_.construct_err(u.value()); }
+  constexpr Expected(Unexpected<E> &&u) {
+    stor_.construct_err(static_cast<E &&>(u.value()));
+  }
+
+  // Copy
+  constexpr Expected(const Expected &o) {
+    if (o.stor_.has_val)
+      stor_.construct_val(o.stor_.val());
+    else
+      stor_.construct_err(o.stor_.err());
+  }
+
+  // Move
+  constexpr Expected(Expected &&o) {
+    if (o.stor_.has_val)
+      stor_.construct_val(static_cast<T &&>(o.stor_.val()));
+    else
+      stor_.construct_err(static_cast<E &&>(o.stor_.err()));
+  }
+
+  ~Expected() { stor_.destroy(); }
+
+  // ── Assignment ──────────────────────────────────────────────────
+
+  constexpr Expected &operator=(const Expected &o) {
+    if (this != &o) {
+      stor_.destroy();
+      if (o.stor_.has_val)
+        stor_.construct_val(o.stor_.val());
+      else
+        stor_.construct_err(o.stor_.err());
+    }
+    return *this;
+  }
+
+  constexpr Expected &operator=(Expected &&o) {
+    if (this != &o) {
+      stor_.destroy();
+      if (o.stor_.has_val)
+        stor_.construct_val(static_cast<T &&>(o.stor_.val()));
+      else
+        stor_.construct_err(static_cast<E &&>(o.stor_.err()));
+    }
+    return *this;
+  }
+
+  // ── Observers ───────────────────────────────────────────────────
+
+  constexpr bool has_value() const { return stor_.has_val; }
+  constexpr explicit operator bool() const { return stor_.has_val; }
+
+  constexpr T &value() & { return stor_.val(); }
+  constexpr const T &value() const & { return stor_.val(); }
+  constexpr T &&value() && { return static_cast<T &&>(stor_.val()); }
+
+  constexpr T &operator*() & { return stor_.val(); }
+  constexpr const T &operator*() const & { return stor_.val(); }
+  constexpr T *operator->() { return &stor_.val(); }
+  constexpr const T *operator->() const { return &stor_.val(); }
+
+  constexpr E &error() & { return stor_.err(); }
+  constexpr const E &error() const & { return stor_.err(); }
+  constexpr E &&error() && { return static_cast<E &&>(stor_.err()); }
+
+  // ── value_or ────────────────────────────────────────────────────
+
+  template <typename U> constexpr T value_or(U &&fallback) const & {
+    return has_value() ? value() : static_cast<T>(static_cast<U &&>(fallback));
+  }
+
+  template <typename U> constexpr T value_or(U &&fallback) && {
+    return has_value() ? static_cast<T &&>(stor_.val())
+                       : static_cast<T>(static_cast<U &&>(fallback));
+  }
+
+  // ── Monadic operations ──────────────────────────────────────────
+
+  // and_then: F(T) -> Expected<U, E>
+  // Chains operations that can fail. Short-circuits on error.
+  template <typename F> constexpr auto and_then(F &&f) & {
+    using R = decltype(f(stor_.val()));
+    if (has_value())
+      return f(stor_.val());
+    return R(Unexpected<E>(stor_.err()));
+  }
+
+  template <typename F> constexpr auto and_then(F &&f) const & {
+    using R = decltype(f(stor_.val()));
+    if (has_value())
+      return f(stor_.val());
+    return R(Unexpected<E>(stor_.err()));
+  }
+
+  template <typename F> constexpr auto and_then(F &&f) && {
+    using R = decltype(f(static_cast<T &&>(stor_.val())));
+    if (has_value())
+      return f(static_cast<T &&>(stor_.val()));
+    return R(Unexpected<E>(static_cast<E &&>(stor_.err())));
+  }
+
+  // or_else: F(E) -> Expected<T, G>
+  // Handles/recovers from errors. Passes through values.
+  template <typename F> constexpr auto or_else(F &&f) & {
+    using R = decltype(f(stor_.err()));
+    if (has_value())
+      return R(stor_.val());
+    return f(stor_.err());
+  }
+
+  template <typename F> constexpr auto or_else(F &&f) const & {
+    using R = decltype(f(stor_.err()));
+    if (has_value())
+      return R(stor_.val());
+    return f(stor_.err());
+  }
+
+  template <typename F> constexpr auto or_else(F &&f) && {
+    using R = decltype(f(static_cast<E &&>(stor_.err())));
+    if (has_value())
+      return R(static_cast<T &&>(stor_.val()));
+    return f(static_cast<E &&>(stor_.err()));
+  }
+
+  // transform: F(T) -> U (plain value, not Expected)
+  // Maps the value. Wraps result in Expected<U, E>.
+  template <typename F> constexpr auto transform(F &&f) & {
+    using U = decltype(f(stor_.val()));
+    if (has_value())
+      return Expected<U, E>(f(stor_.val()));
+    return Expected<U, E>(Unexpected<E>(stor_.err()));
+  }
+
+  template <typename F> constexpr auto transform(F &&f) const & {
+    using U = decltype(f(stor_.val()));
+    if (has_value())
+      return Expected<U, E>(f(stor_.val()));
+    return Expected<U, E>(Unexpected<E>(stor_.err()));
+  }
+
+  template <typename F> constexpr auto transform(F &&f) && {
+    using U = decltype(f(static_cast<T &&>(stor_.val())));
+    if (has_value())
+      return Expected<U, E>(f(static_cast<T &&>(stor_.val())));
+    return Expected<U, E>(Unexpected<E>(static_cast<E &&>(stor_.err())));
+  }
+};
+
+// ── Expected<void, E> specialization ────────────────────────────────
+
+template <typename E> class Expected<void, E> {
+  detail::Storage<void, E> stor_;
+
+public:
+  using value_type = void;
+  using error_type = E;
+
+  // Success
+  constexpr Expected() { stor_.construct_val(); }
+
+  // Error
+  constexpr Expected(const Unexpected<E> &u) { stor_.construct_err(u.value()); }
+  constexpr Expected(Unexpected<E> &&u) {
+    stor_.construct_err(static_cast<E &&>(u.value()));
+  }
+
+  // Copy / Move
+  constexpr Expected(const Expected &o) {
+    if (o.stor_.has_val)
+      stor_.construct_val();
+    else
+      stor_.construct_err(o.stor_.err());
+  }
+
+  constexpr Expected(Expected &&o) {
+    if (o.stor_.has_val)
+      stor_.construct_val();
+    else
+      stor_.construct_err(static_cast<E &&>(o.stor_.err()));
+  }
+
+  ~Expected() { stor_.destroy(); }
+
+  constexpr Expected &operator=(const Expected &o) {
+    if (this != &o) {
+      stor_.destroy();
+      if (o.stor_.has_val)
+        stor_.construct_val();
+      else
+        stor_.construct_err(o.stor_.err());
+    }
+    return *this;
+  }
+
+  constexpr Expected &operator=(Expected &&o) {
+    if (this != &o) {
+      stor_.destroy();
+      if (o.stor_.has_val)
+        stor_.construct_val();
+      else
+        stor_.construct_err(static_cast<E &&>(o.stor_.err()));
+    }
+    return *this;
+  }
+
+  constexpr bool has_value() const { return stor_.has_val; }
+  constexpr explicit operator bool() const { return stor_.has_val; }
+
+  constexpr E &error() & { return stor_.err(); }
+  constexpr const E &error() const & { return stor_.err(); }
+  constexpr E &&error() && { return static_cast<E &&>(stor_.err()); }
+};
+
+// ── Helper: construct Unexpected ────────────────────────────────────
+
+template <typename E>
+constexpr Unexpected<RemoveRef_t<E>> make_unexpected(E &&e) {
+  return Unexpected<RemoveRef_t<E>>(static_cast<E &&>(e));
+}
+
+} // namespace core
+
+// ── TRY macro — Rust-style ? operator ───────────────────────────────
+//
+// Usage:
+//   Expected<int, Err> foo() {
+//       auto val = TRY(bar());   // early-return Unexpected on error
+//       return val + 1;
+//   }
+//
+// Uses GCC/Clang statement expression extension ({}).
+// __COUNTER__ ensures unique variable names when TRY is used multiple
+// times on the same line (e.g. TRY(a) + TRY(b)).
+
+#define TRY_CONCAT_(a, b) a##b
+#define TRY_CONCAT(a, b) TRY_CONCAT_(a, b)
+
+// TRY: unwrap Expected<T, E> -> T, early-return on error
+#define TRY(expr)                                                              \
+  ({                                                                           \
+    auto &&TRY_CONCAT(_try_r_, __LINE__) = (expr);                             \
+    if (!TRY_CONCAT(_try_r_, __LINE__))                                        \
+      return ::core::make_unexpected(                                          \
+          static_cast<decltype(TRY_CONCAT(_try_r_, __LINE__).error()) &&>(     \
+              TRY_CONCAT(_try_r_, __LINE__).error()));                         \
+    static_cast<decltype(TRY_CONCAT(_try_r_, __LINE__)) &&>(                   \
+        TRY_CONCAT(_try_r_, __LINE__))                                         \
+        .value();                                                              \
+  })
+
+// TRY_VOID: unwrap Expected<void, E>, early-return on error, no value
+#define TRY_VOID(expr)                                                         \
+  do {                                                                         \
+    auto &&TRY_CONCAT(_try_r_, __LINE__) = (expr);                             \
+    if (!TRY_CONCAT(_try_r_, __LINE__))                                        \
+      return ::core::make_unexpected(                                          \
+          static_cast<decltype(TRY_CONCAT(_try_r_, __LINE__).error()) &&>(     \
+              TRY_CONCAT(_try_r_, __LINE__).error()));                         \
+  } while (0)

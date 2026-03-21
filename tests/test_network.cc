@@ -1857,6 +1857,173 @@ TEST(slab_pool, small_object) {
     pool.destroy();
 }
 
+// === Double-free detection ===
+
+TEST(slice_pool, double_free_rejected) {
+    SlicePool pool;
+    REQUIRE(pool.init(4));
+    u8* s = pool.alloc();
+    REQUIRE(s != nullptr);
+    CHECK_EQ(pool.available(), 3u);
+    pool.free(s);
+    CHECK_EQ(pool.available(), 4u);
+    pool.free(s);                    // double-free: should be silently rejected
+    CHECK_EQ(pool.available(), 4u);  // unchanged
+    pool.destroy();
+}
+
+TEST(slab_pool, double_free_by_ptr_rejected) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE(pool.init());
+    TestObj* a = pool.alloc();
+    REQUIRE(a != nullptr);
+    CHECK_EQ(pool.in_use(), 1u);
+    pool.free(a);
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.free(a);                 // double-free
+    CHECK_EQ(pool.in_use(), 0u);  // unchanged
+    pool.destroy();
+}
+
+TEST(slab_pool, double_free_by_idx_rejected) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE(pool.init());
+    u32 idx = 0;
+    pool.alloc_with_id(idx);
+    pool.free(idx);
+    CHECK_EQ(pool.available(), 4u);
+    pool.free(idx);                  // double-free
+    CHECK_EQ(pool.available(), 4u);  // unchanged
+    pool.destroy();
+}
+
+TEST(upstream_pool, double_free_rejected) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    u32 before = pool.free_top;
+    c->fd = -1;  // no real fd to close
+    pool.free(c);
+    CHECK_EQ(pool.free_top, before + 1);
+    pool.free(c);                         // double-free: allocated=false now
+    CHECK_EQ(pool.free_top, before + 1);  // unchanged
+}
+
+// === UpstreamPool validation ===
+
+TEST(upstream_pool, return_idle_null_safe) {
+    UpstreamPool pool;
+    pool.init();
+    pool.return_idle(nullptr);  // should not crash
+}
+
+TEST(upstream_pool, return_idle_requires_allocated) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    c->fd = -1;
+    pool.free(c);
+    // c is now free — return_idle should reject
+    pool.return_idle(c);
+    CHECK(!c->idle);  // not marked idle (allocated=false)
+}
+
+TEST(upstream_pool, shutdown_is_idempotent) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    c->fd = UpstreamPool::create_socket();
+    pool.shutdown();
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+    pool.shutdown();  // second shutdown
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+}
+
+TEST(upstream_pool, alloc_resets_upstream_id) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    c->upstream_id = 42;
+    c->fd = -1;
+    pool.free(c);
+    auto* c2 = pool.alloc();
+    CHECK_EQ(c2->upstream_id, 0u);  // reset on alloc
+    c2->fd = -1;
+    pool.free(c2);
+}
+
+// === RouteTable validation ===
+
+TEST(route, add_proxy_invalid_upstream_id) {
+    RouteConfig cfg;
+    // No upstreams added — upstream_id 0 is invalid
+    CHECK(!cfg.add_proxy("/api/", 0, 0));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_proxy_path_too_long) {
+    RouteConfig cfg;
+    cfg.add_upstream("x", 0x7F000001, 80);
+    char long_path[256];
+    for (u32 i = 0; i < 255; i++) long_path[i] = 'a';
+    long_path[255] = '\0';
+    CHECK(!cfg.add_proxy(long_path, 0, 0));  // exceeds 128-char RouteEntry::path
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_static_path_too_long) {
+    RouteConfig cfg;
+    char long_path[256];
+    for (u32 i = 0; i < 255; i++) long_path[i] = 'b';
+    long_path[255] = '\0';
+    CHECK(!cfg.add_static(long_path, 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_upstream_at_capacity) {
+    RouteConfig cfg;
+    for (u32 i = 0; i < RouteConfig::kMaxUpstreams; i++) {
+        CHECK(cfg.add_upstream("x", 0x7F000001, static_cast<u16>(8080 + i)) >= 0);
+    }
+    CHECK(cfg.add_upstream("overflow", 0x7F000001, 9999) < 0);  // full
+}
+
+TEST(route, add_route_at_capacity) {
+    RouteConfig cfg;
+    cfg.add_upstream("x", 0x7F000001, 80);
+    for (u32 i = 0; i < RouteConfig::kMaxRoutes; i++) {
+        char path[8];
+        path[0] = '/';
+        path[1] = static_cast<char>('0' + (i / 100) % 10);
+        path[2] = static_cast<char>('0' + (i / 10) % 10);
+        path[3] = static_cast<char>('0' + i % 10);
+        path[4] = '\0';
+        CHECK(cfg.add_proxy(path, 0, 0));
+    }
+    CHECK(!cfg.add_proxy("/overflow", 0, 0));  // full
+}
+
+// === Error source ===
+
+#include "rout/runtime/error.h"
+
+TEST(error, from_errno_captures_source) {
+    errno = ENOMEM;
+    Error e = Error::from_errno(Error::Source::Mmap);
+    CHECK_EQ(e.code, ENOMEM);
+    CHECK_EQ(static_cast<u8>(e.source), static_cast<u8>(Error::Source::Mmap));
+}
+
+TEST(error, make_with_code) {
+    Error e = Error::make(EINVAL, Error::Source::Socket);
+    CHECK_EQ(e.code, EINVAL);
+    CHECK_EQ(static_cast<u8>(e.source), static_cast<u8>(Error::Source::Socket));
+}
+
 int main(int argc, char** argv) {
     return rout::test::run_all(argc, argv);
 }

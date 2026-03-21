@@ -729,6 +729,43 @@ TEST(shard, detect_cpu_count) {
     CHECK(cpus <= 1024);  // sanity upper bound
 }
 
+// Two shards with ephemeral port (port=0) bind the same port
+TEST(shard, ephemeral_port_two_shards) {
+    // First shard gets ephemeral port
+    i32 lfd1 = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd1 >= 0);
+    u16 port = get_port(lfd1);
+    CHECK(port > 0);
+
+    // Second shard should bind the same port (SO_REUSEPORT)
+    i32 lfd2 = create_listen_socket(port).value_or(-1);
+    REQUIRE(lfd2 >= 0);
+    CHECK_EQ(get_port(lfd2), port);
+
+    Shard<EpollBackend> s1, s2;
+    REQUIRE(s1.init(0, lfd1).has_value());
+    REQUIRE(s2.init(1, lfd2).has_value());
+    REQUIRE(s1.spawn(-1).has_value());
+    REQUIRE(s2.spawn(-1).has_value());
+
+    usleep(50000);
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    char buf[4096];
+    CHECK(recv_timeout(c, buf, sizeof(buf), 2000) > 0);
+    close(c);
+
+    s1.stop();
+    s2.stop();
+    s1.join();
+    s2.join();
+    s1.shutdown();
+    s2.shutdown();
+    close(lfd1);
+    close(lfd2);
+}
+
 // Shard with owns_listen_fd closes it on shutdown
 TEST(shard, owns_listen_fd) {
     Shard<EpollBackend> shard;

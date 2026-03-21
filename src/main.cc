@@ -54,11 +54,11 @@ static bool detect_io_uring() {
 
 // --- Signal handling for graceful shutdown ---
 
-// Signal handler only sets a flag; main thread calls stop() outside signal context.
-static volatile sig_atomic_t g_stop_requested = 0;
-
-static void signal_handler(int /*sig*/) {
-    g_stop_requested = 1;
+static void write_error(const char* prefix, const rout::Error& err) {
+    write_str(prefix);
+    write_str(" (errno=");
+    write_u32(static_cast<u32>(err.code));
+    write_str(")\n");
 }
 
 template <typename Backend>
@@ -80,7 +80,7 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
         if (!lfd_result) {
             write_str("Failed to create listen socket for shard ");
             write_u32(i);
-            write_str("\n");
+            write_error("", lfd_result.error());
             // Cleanup already-initialized shards
             for (u32 j = 0; j < i; j++) {
                 shards[j].stop();
@@ -96,7 +96,7 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
         if (!rc) {
             write_str("Failed to init shard ");
             write_u32(i);
-            write_str("\n");
+            write_error("", rc.error());
             close(lfd);
             for (u32 j = 0; j < i; j++) {
                 shards[j].stop();
@@ -124,12 +124,13 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
     write_u32(shard_count);
     write_str(" shard(s)\n");
 
-    // Install signal handlers for graceful shutdown
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
-    sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
+    // Block SIGINT/SIGTERM so sigwait() can catch them race-free.
+    // Must block before spawning threads (threads inherit the mask).
+    sigset_t wait_set;
+    sigemptyset(&wait_set);
+    sigaddset(&wait_set, SIGINT);
+    sigaddset(&wait_set, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &wait_set, nullptr);
 
     // Spawn shard threads
     for (u32 i = 0; i < shard_count; i++) {
@@ -138,7 +139,7 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
         if (!rc) {
             write_str("Failed to spawn shard ");
             write_u32(i);
-            write_str("\n");
+            write_error("", rc.error());
             // Stop all already-spawned shards
             for (u32 j = 0; j < i; j++) shards[j].stop();
             for (u32 j = 0; j < i; j++) shards[j].join();
@@ -147,8 +148,9 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
         }
     }
 
-    // Wait for signal, then stop all shards from main thread (async-signal-safe).
-    while (!g_stop_requested) pause();
+    // Wait for SIGINT/SIGTERM — sigwait() is race-free (signal is blocked).
+    i32 sig = 0;
+    sigwait(&wait_set, &sig);
 
     // Stop all shards from main thread (not signal context)
     for (u32 i = 0; i < shard_count; i++) shards[i].stop();

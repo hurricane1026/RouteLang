@@ -338,7 +338,7 @@ TEST(loop, stop_from_outside) {
     send_all(c, HTTP_REQ, HTTP_REQ_LEN);
     char buf[4096];
     recv_timeout(c, buf, sizeof(buf), 1000);
-    srv.loop->running = false;
+    srv.loop->stop();
     close(c);
     srv.teardown();
 }

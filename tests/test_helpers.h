@@ -216,7 +216,7 @@ struct LoopThread {
         lp->backend.add_accept();
         IoEvent events[256];
         i32 iters = 0;
-        while (lp->running) {
+        while (lp->is_running()) {
             u32 n = lp->backend.wait(events, 256, lp->conns, RealLoop::kMaxConns);
             for (u32 i = 0; i < n; i++) lp->dispatch(events[i]);
             if (++iters >= lt->max_iters) break;
@@ -225,7 +225,7 @@ struct LoopThread {
     }
     void start() { pthread_create(&thread, nullptr, run, this); }
     void stop() {
-        loop->running = false;
+        loop->stop();
         pthread_join(thread, nullptr);
     }
 };

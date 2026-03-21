@@ -56,8 +56,11 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
     Backend backend;
     TimerWheel timer;
     u32 shard_id;
-    volatile bool running;
 
+private:
+    bool running_;  // access only via is_running()/stop() with atomics
+
+public:
     static constexpr u32 kMaxConns = 16384;
     Connection conns[kMaxConns];
     u32 free_stack[kMaxConns];
@@ -67,7 +70,7 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
 
     core::Expected<void, Error> init(u32 id, i32 listen_fd) {
         shard_id = id;
-        __atomic_store_n(&running, true, __ATOMIC_RELAXED);
+        __atomic_store_n(&running_, true, __ATOMIC_RELAXED);
         keepalive_timeout = 60;  // explicit: mmap zeroes memory, skipping default member init
         free_top = kMaxConns;
         timer.init();
@@ -85,7 +88,7 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
         backend.add_accept();
         IoEvent events[kMaxEventsPerWait];
 
-        while (__atomic_load_n(&running, __ATOMIC_RELAXED)) {
+        while (__atomic_load_n(&running_, __ATOMIC_RELAXED)) {
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
             for (u32 i = 0; i < n; i++) {
                 dispatch(events[i]);
@@ -93,7 +96,8 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
         }
     }
 
-    void stop() { __atomic_store_n(&running, false, __ATOMIC_RELAXED); }
+    void stop() { __atomic_store_n(&running_, false, __ATOMIC_RELAXED); }
+    bool is_running() const { return __atomic_load_n(&running_, __ATOMIC_RELAXED); }
     void shutdown() { backend.shutdown(); }
 
     // --- CRTP implementations ---

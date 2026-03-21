@@ -117,21 +117,20 @@ struct Shard {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
 
-        // Pin to CPU if requested
+        // Pin to CPU if requested. Use sched_getaffinity to check allowed CPUs
+        // (respects cpuset/cgroup restrictions). Fall back to unpinned on failure.
         if (pin_cpu >= 0) {
-            u32 ncpus = detect_cpu_count();
-            if (static_cast<u32>(pin_cpu) >= ncpus) {
-                pthread_attr_destroy(&attr);
-                return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+            cpu_set_t allowed;
+            CPU_ZERO(&allowed);
+            if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0 &&
+                CPU_ISSET(pin_cpu, &allowed)) {
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                CPU_SET(pin_cpu, &cpuset);
+                // Best-effort: if setaffinity fails, continue unpinned
+                (void)pthread_attr_setaffinity_np(&attr, sizeof(cpuset), &cpuset);
             }
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(pin_cpu, &cpuset);
-            i32 aff_rc = pthread_attr_setaffinity_np(&attr, sizeof(cpuset), &cpuset);
-            if (aff_rc != 0) {
-                pthread_attr_destroy(&attr);
-                return core::make_unexpected(Error::make(aff_rc, Error::Source::Thread));
-            }
+            // If CPU not in allowed set or getaffinity failed, spawn unpinned
         }
 
         i32 rc = pthread_create(&thread, &attr, thread_entry, this);

@@ -1,5 +1,6 @@
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
 #include "rout/runtime/arena.h"
+#include "rout/runtime/error.h"
 #include "rout/runtime/route_table.h"
 #include "rout/runtime/slab_pool.h"
 #include "rout/runtime/slice_pool.h"
@@ -2008,8 +2009,6 @@ TEST(route, add_route_at_capacity) {
 }
 
 // === Error source ===
-
-#include "rout/runtime/error.h"
 
 TEST(error, from_errno_captures_source) {
     errno = ENOMEM;

@@ -21,10 +21,10 @@
 //       b.run("llhttp_parse", [&] { ... });
 //   }
 
+#include "rout/common/types.h"
+
 #include <time.h>    // clock_gettime, CLOCK_MONOTONIC
 #include <unistd.h>  // write
-
-#include "rout/common/types.h"
 
 namespace rout::bench {
 
@@ -38,7 +38,9 @@ inline void do_not_optimize(T const* p) {
     asm volatile("" : : "r"(p) : "memory");
 }
 
-inline void clobber() { asm volatile("" : : : "memory"); }
+inline void clobber() {
+    asm volatile("" : : : "memory");
+}
 
 // ============================================================================
 // Output helpers (no stdlib)
@@ -173,7 +175,7 @@ struct Bench {
     const char* title_ = "Benchmark";
     u64 min_iters_ = 100000;
     u64 warmup_iters_ = 10000;
-    u32 epochs_ = 11;  // odd number for clean median
+    u32 epochs_ = 11;      // odd number for clean median
     u64 epoch_iters_ = 0;  // 0 = auto (min_iters / epochs)
     u64 bytes_per_op_ = 0;
 

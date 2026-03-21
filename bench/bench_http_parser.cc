@@ -3,8 +3,9 @@
 // Build:  ninja -C build bench_http_parser
 // Run:    ./build/bench/bench_http_parser
 
-#include "bench.h"
 #include "rout/runtime/http_parser.h"
+
+#include "bench.h"
 
 // llhttp (C library)
 extern "C" {
@@ -49,7 +50,8 @@ static const char kApiPost[] =
 // curl-style GET
 static const char kCurlGet[] =
     "GET /test HTTP/1.1\r\n"
-    "User-Agent: curl/7.18.0 (i486-pc-linux-gnu) libcurl/7.18.0 OpenSSL/0.9.8g zlib/1.2.3.3 libidn/1.1\r\n"
+    "User-Agent: curl/7.18.0 (i486-pc-linux-gnu) libcurl/7.18.0 OpenSSL/0.9.8g zlib/1.2.3.3 "
+    "libidn/1.1\r\n"
     "Host: 0.0.0.0=5000\r\n"
     "Accept: */*\r\n"
     "\r\n";
@@ -121,8 +123,8 @@ int main() {
 
         b.run("rue", [&] {
             rue_parser.reset();
-            auto s = rue_parser.parse(reinterpret_cast<const u8*>(payload.data), payload.len,
-                                      &rue_req);
+            auto s =
+                rue_parser.parse(reinterpret_cast<const u8*>(payload.data), payload.len, &rue_req);
             bench::do_not_optimize(&s);
             bench::do_not_optimize(&rue_req);
         });

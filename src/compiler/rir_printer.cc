@@ -8,10 +8,15 @@ namespace rir {
 // ── PrintBuf implementation ─────────────────────────────────────────
 
 void PrintBuf::flush() {
-    if (len > 0) {
-        ::write(fd, data, len);
-        len = 0;
+    if (len > 0 && fd >= 0) {
+        u32 written = 0;
+        while (written < len) {
+            auto n = ::write(fd, data + written, len - written);
+            if (n <= 0) break;  // EBADF or unrecoverable
+            written += static_cast<u32>(n);
+        }
     }
+    len = 0;
 }
 
 void PrintBuf::put(char c) {
@@ -35,7 +40,7 @@ void PrintBuf::put_u32(u32 val) {
     char tmp[10];
     i32 i = 0;
     while (val > 0) {
-        tmp[i++] = '0' + static_cast<char>(val % 10);
+        tmp[i++] = static_cast<char>('0' + val % 10);
         val /= 10;
     }
     while (i > 0) put(tmp[--i]);
@@ -63,7 +68,7 @@ void PrintBuf::put_i64(i64 val) {
         char tmp[20];
         i32 i = 0;
         while (abs > 0) {
-            tmp[i++] = '0' + static_cast<char>(abs % 10);
+            tmp[i++] = static_cast<char>('0' + abs % 10);
             abs /= 10;
         }
         while (i > 0) put(tmp[--i]);
@@ -76,7 +81,7 @@ void PrintBuf::put_i64(i64 val) {
         char tmp[20];
         i32 i = 0;
         while (v > 0) {
-            tmp[i++] = '0' + static_cast<char>(v % 10);
+            tmp[i++] = static_cast<char>('0' + v % 10);
             v /= 10;
         }
         while (i > 0) put(tmp[--i]);

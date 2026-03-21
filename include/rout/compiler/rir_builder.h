@@ -20,6 +20,9 @@ namespace rir {
 //   ...
 //   b.emit_br(cond, then_block, else_block, loc);
 
+// Sentinel for invalid block IDs (parallel to kNoValue for values).
+static constexpr BlockId kNoBlock = {0xFFFFFFFF};
+
 struct Builder {
     Module* mod;
 
@@ -35,22 +38,28 @@ struct Builder {
 
     // ── Module-level ────────────────────────────────────────────────
 
-    // Register a struct type definition.
+    // Create and register a struct type definition in the module.
     StructDef* create_struct(Str name, const FieldDef* fields, u32 count) {
         auto* arena = mod->arena;
         u64 size = sizeof(StructDef) + sizeof(FieldDef) * count;
         auto* sd = static_cast<StructDef*>(arena->alloc(size));
+        if (!sd) return nullptr;
         sd->name = name;
         sd->field_count = count;
         for (u32 i = 0; i < count; i++) {
             sd->fields()[i] = fields[i];
         }
+        // Register in module if capacity allows.
+        if (mod->struct_defs && mod->struct_count < 64) {
+            mod->struct_defs[mod->struct_count++] = sd;
+        }
         return sd;
     }
 
-    // Intern a type in the arena.
+    // Intern a type in the arena. Returns nullptr on OOM.
     const Type* make_type(TypeKind kind, const Type* inner = nullptr, StructDef* sd = nullptr) {
         auto* t = mod->arena->alloc_t<Type>();
+        if (!t) return nullptr;
         t->kind = kind;
         t->inner = inner;
         t->struct_def = sd;
@@ -63,19 +72,21 @@ struct Builder {
         auto* arena = mod->arena;
         if (mod->func_count >= mod->func_cap) return nullptr;
 
+        static constexpr u32 kInitBlocks = 32;
+        static constexpr u32 kInitValues = 256;
+        auto* blocks = arena->alloc_array<Block>(kInitBlocks);
+        auto* values = arena->alloc_array<Value>(kInitValues);
+        if (!blocks || !values) return nullptr;
+
         auto* fn = &mod->functions[mod->func_count++];
         fn->name = name;
         fn->route_pattern = route_pattern;
         fn->http_method = http_method;
         fn->yield_count = 0;
-
-        // Pre-allocate block and value arrays.
-        static constexpr u32 kInitBlocks = 32;
-        static constexpr u32 kInitValues = 256;
-        fn->blocks = arena->alloc_array<Block>(kInitBlocks);
+        fn->blocks = blocks;
         fn->block_count = 0;
         fn->block_cap = kInitBlocks;
-        fn->values = arena->alloc_array<Value>(kInitValues);
+        fn->values = values;
         fn->value_count = 0;
         fn->value_cap = kInitValues;
 
@@ -83,19 +94,21 @@ struct Builder {
     }
 
     BlockId create_block(Function* fn, Str label) {
+        // Grow block array if needed.
         if (fn->block_count >= fn->block_cap) {
-            return {0xFFFFFFFF};  // capacity exceeded
+            if (!grow_blocks(fn)) return kNoBlock;
         }
 
         auto* arena = mod->arena;
+        static constexpr u32 kInitInsts = 32;
+        auto* insts = arena->alloc_array<Instruction>(kInitInsts);
+        if (!insts) return kNoBlock;
+
         BlockId bid = {fn->block_count};
         auto* blk = &fn->blocks[fn->block_count++];
         blk->id = bid;
         blk->label = label;
-
-        // Pre-allocate instruction array.
-        static constexpr u32 kInitInsts = 32;
-        blk->insts = arena->alloc_array<Instruction>(kInitInsts);
+        blk->insts = insts;
         blk->inst_count = 0;
         blk->inst_cap = kInitInsts;
 
@@ -103,6 +116,11 @@ struct Builder {
     }
 
     void set_insert_point(Function* fn, BlockId block) {
+        if (!fn || block.id >= fn->block_count) {
+            cur_func = nullptr;
+            cur_block = nullptr;
+            return;
+        }
         cur_func = fn;
         cur_block = &fn->blocks[block.id];
     }
@@ -133,10 +151,23 @@ struct Builder {
         return true;
     }
 
+    bool grow_blocks(Function* fn) {
+        u32 new_cap = fn->block_cap * 2;
+        auto* new_blocks = mod->arena->alloc_array<Block>(new_cap);
+        if (!new_blocks) return false;
+        for (u32 i = 0; i < fn->block_count; i++) {
+            new_blocks[i] = fn->blocks[i];
+        }
+        fn->blocks = new_blocks;
+        fn->block_cap = new_cap;
+        return true;
+    }
+
     // ── Instruction emission ────────────────────────────────────────
     // Atomically reserves both a value slot (if needed) and an
-    // instruction slot. If either cannot be satisfied the builder
-    // emits nothing and returns nullptr + kNoValue.
+    // instruction slot. Refuses to emit into an already-terminated
+    // block. If capacity cannot be satisfied the builder emits
+    // nothing and returns nullptr + kNoValue.
 
     struct EmitResult {
         Instruction* inst;
@@ -144,6 +175,14 @@ struct Builder {
     };
 
     EmitResult emit(Opcode op, const Type* result_type, SourceLoc loc) {
+        if (!cur_block || !cur_func) return {nullptr, kNoValue};
+
+        // Refuse to emit into a block that already has a terminator.
+        if (cur_block->inst_count > 0) {
+            auto& last = cur_block->insts[cur_block->inst_count - 1];
+            if (last.is_terminator()) return {nullptr, kNoValue};
+        }
+
         // Grow instruction array if needed.
         if (cur_block->inst_count >= cur_block->inst_cap) {
             if (!grow_insts(cur_block)) return {nullptr, kNoValue};
@@ -175,20 +214,22 @@ struct Builder {
 
     // ── Helpers for variadic operand storage ────────────────────────
 
-    void set_operands(Instruction* inst, const ValueId* ops, u32 count) {
+    bool set_operands(Instruction* inst, const ValueId* ops, u32 count) {
         inst->operand_count = count;
         if (count <= kMaxInlineOperands) {
             for (u32 i = 0; i < count; i++) inst->operands[i] = ops[i];
-        } else {
-            for (u32 i = 0; i < kMaxInlineOperands; i++) {
-                inst->operands[i] = ops[i];
-            }
-            u32 extra = count - kMaxInlineOperands;
-            inst->extra_operands = mod->arena->alloc_array<ValueId>(extra);
-            for (u32 i = 0; i < extra; i++) {
-                inst->extra_operands[i] = ops[kMaxInlineOperands + i];
-            }
+            return true;
         }
+        for (u32 i = 0; i < kMaxInlineOperands; i++) {
+            inst->operands[i] = ops[i];
+        }
+        u32 extra = count - kMaxInlineOperands;
+        inst->extra_operands = mod->arena->alloc_array<ValueId>(extra);
+        if (!inst->extra_operands) return false;
+        for (u32 i = 0; i < extra; i++) {
+            inst->extra_operands[i] = ops[kMaxInlineOperands + i];
+        }
+        return true;
     }
 
     // ── Constants ───────────────────────────────────────────────────

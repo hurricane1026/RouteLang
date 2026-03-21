@@ -1,6 +1,7 @@
 #include "rout/compiler/rir.h"
 #include "rout/compiler/rir_builder.h"
 #include "rout/compiler/rir_printer.h"
+
 #include "test.h"
 
 using namespace rout;
@@ -28,7 +29,7 @@ struct TestContext {
         mod.functions = arena.alloc_array<Function>(kMaxFuncs);
         mod.func_count = 0;
         mod.func_cap = kMaxFuncs;
-        mod.struct_defs = nullptr;
+        mod.struct_defs = arena.alloc_array<StructDef*>(64);
         mod.struct_count = 0;
         return true;
     }
@@ -403,9 +404,8 @@ TEST(RirIntegration, AuthHandlerFromDesignDoc) {
     // ── Print the IR ──
     char print_buf[4096];
     PrintBuf pb;
-    pb.init(print_buf, sizeof(print_buf), 1);  // fd=1 (stdout)
+    pb.init(print_buf, sizeof(print_buf), -1);  // in-memory only, no stdout noise
     print_function(pb, *fn);
-    pb.flush();
 
     ctx.destroy();
 }
@@ -589,10 +589,11 @@ TEST(RirBuilder, ValueOverflow) {
     // We need to emit 260+ values across multiple blocks to exceed
     // the initial 256 value cap.
     // Use 9 blocks of 32 insts each = 288 values.
+    // Labels must have stable storage (not stack temporaries).
+    const char* labels[] = {
+        "blk_0", "blk_1", "blk_2", "blk_3", "blk_4", "blk_5", "blk_6", "blk_7", "blk_8"};
     for (u32 blk_idx = 0; blk_idx < 9; blk_idx++) {
-        char name[] = "blk_X";
-        name[4] = '0' + static_cast<char>(blk_idx);
-        auto bid = b.create_block(fn, lit(name));
+        auto bid = b.create_block(fn, lit(labels[blk_idx]));
         b.set_insert_point(fn, bid);
 
         for (u32 i = 0; i < 32; i++) {

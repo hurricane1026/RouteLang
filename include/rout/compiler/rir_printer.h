@@ -9,9 +9,9 @@ namespace rir {
 // Produces human-readable --emit-rir text output. Writes directly to
 // a file descriptor (no stdio, no stdlib).
 //
-// Output format matches DESIGN.md §11.2.5:
+// Output format (based on DESIGN.md §11.2.5):
 //   === handle_get_users_id ===
-//     params: [:id]
+//     route: /users/:id
 //     io_points: 0 (all sync)
 //     states: 1
 //     blocks: 7

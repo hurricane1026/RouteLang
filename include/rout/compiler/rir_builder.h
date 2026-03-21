@@ -34,11 +34,16 @@ struct Builder {
     BlockId cur_block_id;
     Block* cur_block;
 
+    // Interned primitive types — allocated once, reused across all emissions.
+    static constexpr u32 kTypeKindCount = static_cast<u32>(TypeKind::Array) + 1;
+    const Type* type_cache[kTypeKindCount];
+
     void init(Module* m) {
         mod = m;
         cur_func = nullptr;
         cur_block_id = kNoBlock;
         cur_block = nullptr;
+        for (u32 i = 0; i < kTypeKindCount; i++) type_cache[i] = nullptr;
     }
 
     // ── Module-level ────────────────────────────────────────────────
@@ -64,11 +69,20 @@ struct Builder {
     Result<const Type*> make_type(TypeKind kind,
                                   const Type* inner = nullptr,
                                   StructDef* sd = nullptr) {
+        // Return cached primitive type if available (no inner/struct_def).
+        auto idx = static_cast<u32>(kind);
+        if (!inner && !sd && idx < kTypeKindCount && type_cache[idx]) {
+            return type_cache[idx];
+        }
         auto* t = mod->arena->alloc_t<Type>();
         if (!t) return err(RirError::OutOfMemory);
         t->kind = kind;
         t->inner = inner;
         t->struct_def = sd;
+        // Cache primitive types for reuse.
+        if (!inner && !sd && idx < kTypeKindCount) {
+            type_cache[idx] = t;
+        }
         return static_cast<const Type*>(t);
     }
 
@@ -206,6 +220,7 @@ struct Builder {
             vid = {cur_func->value_count};
             auto* v = &cur_func->values[cur_func->value_count++];
             v->type = result_type;
+            v->def_block = cur_block_id;
             v->def_inst = cur_block->inst_count;
         }
 
@@ -524,6 +539,9 @@ struct Builder {
     // ── Terminators ─────────────────────────────────────────────────
 
     VoidResult emit_br(ValueId cond, BlockId then_blk, BlockId else_blk, SourceLoc loc = {}) {
+        if (then_blk.id >= cur_func->block_count || else_blk.id >= cur_func->block_count) {
+            return err(RirError::InvalidState);
+        }
         auto r = TRY(emit(Opcode::Br, nullptr, loc));
         r.inst->operands[0] = cond;
         r.inst->operand_count = 1;
@@ -533,6 +551,7 @@ struct Builder {
     }
 
     VoidResult emit_jmp(BlockId target, SourceLoc loc = {}) {
+        if (target.id >= cur_func->block_count) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::Jmp, nullptr, loc));
         r.inst->imm.block_targets[0] = target;
         return {};

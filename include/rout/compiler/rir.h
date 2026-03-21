@@ -103,12 +103,6 @@ struct ValueId {
 // Sentinel for "no value" (void-returning instructions).
 static constexpr ValueId kNoValue = {0xFFFFFFFF};
 
-// A produced SSA value: the result of an instruction.
-struct Value {
-    const Type* type;
-    u32 def_inst;  // index of the defining instruction in the block
-};
-
 // ── Block IDs ───────────────────────────────────────────────────────
 
 struct BlockId {
@@ -120,6 +114,13 @@ struct BlockId {
 
 // Sentinel for "no block" (invalid block ID).
 static constexpr BlockId kNoBlock = {0xFFFFFFFF};
+
+// A produced SSA value: the result of an instruction.
+struct Value {
+    const Type* type;
+    BlockId def_block;  // block containing the defining instruction
+    u32 def_inst;       // index of the defining instruction within the block
+};
 
 // ── Opcodes ─────────────────────────────────────────────────────────
 // Flat enumeration of all RIR operations. Grouped by category.

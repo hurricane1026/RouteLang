@@ -24,10 +24,10 @@ add_executable(test_expected test_expected.cc ${PROJECT_SOURCE_DIR}/src/placemen
 target_include_directories(test_expected PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
 add_custom_target(check
-    COMMAND test_network
-    COMMAND test_integration
-    COMMAND test_arena
-    COMMAND test_expected
+    COMMAND $<TARGET_FILE:test_network>
+    COMMAND $<TARGET_FILE:test_integration>
+    COMMAND $<TARGET_FILE:test_arena>
+    COMMAND $<TARGET_FILE:test_expected>
     DEPENDS test_network test_integration test_arena test_expected
     COMMENT "Running all tests..."
 )

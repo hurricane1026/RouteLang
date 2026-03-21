@@ -136,7 +136,10 @@ struct Builder {
 
     // ── Capacity growth ───────────────────────────────────────────
 
+    static constexpr u32 kMaxCap = 0x7FFFFFFFu;  // guard against u32 overflow on doubling
+
     VoidResult grow_values(Function* fn) {
+        if (fn->value_cap > kMaxCap) return err(RirError::CapacityFull);
         u32 new_cap = fn->value_cap * 2;
         auto* new_vals = mod->arena->alloc_array<Value>(new_cap);
         if (!new_vals) return err(RirError::OutOfMemory);
@@ -149,6 +152,7 @@ struct Builder {
     }
 
     VoidResult grow_insts(Block* blk) {
+        if (blk->inst_cap > kMaxCap) return err(RirError::CapacityFull);
         u32 new_cap = blk->inst_cap * 2;
         auto* new_insts = mod->arena->alloc_array<Instruction>(new_cap);
         if (!new_insts) return err(RirError::OutOfMemory);
@@ -161,6 +165,7 @@ struct Builder {
     }
 
     VoidResult grow_blocks(Function* fn) {
+        if (fn->block_cap > kMaxCap) return err(RirError::CapacityFull);
         u32 new_cap = fn->block_cap * 2;
         auto* new_blocks = mod->arena->alloc_array<Block>(new_cap);
         if (!new_blocks) return err(RirError::OutOfMemory);
@@ -353,17 +358,17 @@ struct Builder {
     // ── Request mutation ────────────────────────────────────────────
 
     VoidResult emit_req_set_header(Str name, ValueId val, SourceLoc loc = {}) {
-        auto [inst, vid] = TRY(emit(Opcode::ReqSetHeader, nullptr, loc));
-        inst->imm.str_val = name;
-        inst->operands[0] = val;
-        inst->operand_count = 1;
+        auto r = TRY(emit(Opcode::ReqSetHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
         return {};
     }
 
     VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}) {
-        auto [inst, vid] = TRY(emit(Opcode::ReqSetPath, nullptr, loc));
-        inst->operands[0] = path;
-        inst->operand_count = 1;
+        auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));
+        r.inst->operands[0] = path;
+        r.inst->operand_count = 1;
         return {};
     }
 
@@ -390,9 +395,10 @@ struct Builder {
     Result<ValueId> emit_str_interpolate(const ValueId* parts, u32 count, SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
         auto r = TRY(emit(Opcode::StrInterpolate, ty, loc));
-        if (!set_operands(r.inst, parts, count)) {
+        auto ops = set_operands(r.inst, parts, count);
+        if (!ops) {
             rollback_emit(r);
-            return err(RirError::OutOfMemory);
+            return err(ops.error());
         }
         return r.vid;
     }
@@ -495,9 +501,10 @@ struct Builder {
         if (!return_type) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::CallExtern, return_type, loc));
         r.inst->imm.extern_name = func_name;
-        if (!set_operands(r.inst, args, arg_count)) {
+        auto ops = set_operands(r.inst, args, arg_count);
+        if (!ops) {
             rollback_emit(r);
-            return err(RirError::OutOfMemory);
+            return err(ops.error());
         }
         return r.vid;
     }
@@ -505,30 +512,30 @@ struct Builder {
     // ── Terminators ─────────────────────────────────────────────────
 
     VoidResult emit_br(ValueId cond, BlockId then_blk, BlockId else_blk, SourceLoc loc = {}) {
-        auto [inst, vid] = TRY(emit(Opcode::Br, nullptr, loc));
-        inst->operands[0] = cond;
-        inst->operand_count = 1;
-        inst->imm.block_targets[0] = then_blk;
-        inst->imm.block_targets[1] = else_blk;
+        auto r = TRY(emit(Opcode::Br, nullptr, loc));
+        r.inst->operands[0] = cond;
+        r.inst->operand_count = 1;
+        r.inst->imm.block_targets[0] = then_blk;
+        r.inst->imm.block_targets[1] = else_blk;
         return {};
     }
 
     VoidResult emit_jmp(BlockId target, SourceLoc loc = {}) {
-        auto [inst, vid] = TRY(emit(Opcode::Jmp, nullptr, loc));
-        inst->imm.block_targets[0] = target;
+        auto r = TRY(emit(Opcode::Jmp, nullptr, loc));
+        r.inst->imm.block_targets[0] = target;
         return {};
     }
 
     VoidResult emit_ret_status(i32 code, SourceLoc loc = {}) {
-        auto [inst, vid] = TRY(emit(Opcode::RetStatus, nullptr, loc));
-        inst->imm.i32_val = code;
+        auto r = TRY(emit(Opcode::RetStatus, nullptr, loc));
+        r.inst->imm.i32_val = code;
         return {};
     }
 
     VoidResult emit_ret_proxy(ValueId upstream, SourceLoc loc = {}) {
-        auto [inst, vid] = TRY(emit(Opcode::RetProxy, nullptr, loc));
-        inst->operands[0] = upstream;
-        inst->operand_count = 1;
+        auto r = TRY(emit(Opcode::RetProxy, nullptr, loc));
+        r.inst->operands[0] = upstream;
+        r.inst->operand_count = 1;
         return {};
     }
 
@@ -551,9 +558,10 @@ struct Builder {
         if (!return_type) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::YieldExtern, return_type, loc));
         r.inst->imm.extern_name = name;
-        if (!set_operands(r.inst, args, arg_count)) {
+        auto ops = set_operands(r.inst, args, arg_count);
+        if (!ops) {
             rollback_emit(r);
-            return err(RirError::OutOfMemory);
+            return err(ops.error());
         }
         cur_func->yield_count++;
         return r.vid;

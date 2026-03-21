@@ -301,7 +301,11 @@ TEST(RirBuilder, VariadicStrInterpolate) {
     ctx.destroy();
 }
 
-// ── Integration Test: DESIGN.md auth example ────────────────────────
+// ── Integration Test: simplified DESIGN.md auth example ─────────────
+// Based on §11.2.3 but simplified: omits block_check_exp/
+// block_reject_401_expired, and models claims as Optional(str)
+// rather than Optional(Struct(Claims)). Tests the builder's ability
+// to construct a realistic multi-block handler, not exact fidelity.
 
 TEST(RirIntegration, AuthHandlerFromDesignDoc) {
     TestContext ctx;

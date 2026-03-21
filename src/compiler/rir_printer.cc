@@ -11,16 +11,22 @@ namespace rir {
 void PrintBuf::flush() {
     // When fd < 0 (in-memory mode), don't discard buffered data.
     if (fd < 0) return;
-    if (len > 0) {
-        u32 written = 0;
-        while (written < len) {
-            auto n = ::write(fd, data + written, len - written);
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) break;
-            written += static_cast<u32>(n);
-        }
+    if (len == 0) return;
+    u32 written = 0;
+    while (written < len) {
+        auto n = ::write(fd, data + written, len - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        written += static_cast<u32>(n);
     }
-    len = 0;
+    // Preserve unwritten tail on short write.
+    if (written < len) {
+        u32 remaining = len - written;
+        for (u32 i = 0; i < remaining; i++) data[i] = data[written + i];
+        len = remaining;
+    } else {
+        len = 0;
+    }
 }
 
 void PrintBuf::put(char c) {
@@ -357,7 +363,34 @@ static void print_value_ref(PrintBuf& buf, ValueId vid) {
 
 static void print_quoted_str(PrintBuf& buf, Str s) {
     buf.put('"');
-    buf.put_str(s);
+    for (u32 i = 0; i < s.len; i++) {
+        auto c = static_cast<unsigned char>(s.ptr[i]);
+        switch (c) {
+            case '\\':
+                buf.put_cstr("\\\\");
+                break;
+            case '"':
+                buf.put_cstr("\\\"");
+                break;
+            case '\n':
+                buf.put_cstr("\\n");
+                break;
+            case '\t':
+                buf.put_cstr("\\t");
+                break;
+            default:
+                if (c >= 0x20 && c <= 0x7e) {
+                    buf.put(static_cast<char>(c));
+                } else {
+                    const char hex[] = "0123456789ABCDEF";
+                    buf.put('\\');
+                    buf.put('x');
+                    buf.put(hex[(c >> 4) & 0x0F]);
+                    buf.put(hex[c & 0x0F]);
+                }
+                break;
+        }
+    }
     buf.put('"');
 }
 
@@ -572,10 +605,14 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
 
         default:
-            // Fallback: print all operands for opcodes without
-            // specialized formatting (StructCreate, ArrayLen, ArrayGet, etc.).
+            // Fallback: print all operands comma-separated for opcodes
+            // without specialized formatting (StructCreate, ArrayLen, etc.).
             for (u32 i = 0; i < inst.operand_count; i++) {
-                buf.put(' ');
+                if (i == 0) {
+                    buf.put(' ');
+                } else {
+                    buf.put_cstr(", ");
+                }
                 print_value_ref(buf, inst.operand(i));
             }
             break;
@@ -644,6 +681,7 @@ void print_function(PrintBuf& buf, const Function& fn) {
     for (u32 i = 0; i < fn.block_count; i++) {
         print_block(buf, fn.blocks[i], fn);
     }
+    buf.flush();
 }
 
 // ── Module printing ─────────────────────────────────────────────────

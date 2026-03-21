@@ -43,14 +43,14 @@ jobs:
 
       - name: Lint
         run: |
-          # Only lint files that compile on this platform.
-          # Exclude arch-specific SIMD backends (neon, sve, avx2, avx512)
-          # which require target-specific headers/intrinsics.
+          # Exclude all arch-specific SIMD backends — only lint scalar
+          # and main parser code (arch-independent).
           find src -name '*.cc' \
-            ! -path '*/simd/neon.cc' \
-            ! -path '*/simd/sve.cc' \
+            ! -path '*/simd/sse2.cc' \
             ! -path '*/simd/avx2.cc' \
-            ! -path '*/simd/avx512.cc' | \
+            ! -path '*/simd/avx512.cc' \
+            ! -path '*/simd/neon.cc' \
+            ! -path '*/simd/sve.cc' | \
             xargs clang-tidy -p build --warnings-as-errors='bugprone-*,performance-*'
 
   test:

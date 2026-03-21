@@ -254,8 +254,9 @@ static inline ParseStatus apply_semantic_header(
 // falls back to find_header_end() to disambiguate.
 
 ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
+    header_end = 0;  // Clear on entry so stale values are never exposed on Incomplete/Error.
+
     // Quick check: need at least 4 bytes to try method matching.
-    // (Shorter buffers can only be incomplete.)
     if (UNLIKELY(len < 4)) {
         return ParseStatus::Incomplete;
     }

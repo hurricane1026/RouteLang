@@ -81,12 +81,15 @@ coverage() {
 tidy() {
     configure
     echo "=== Running clang-tidy ==="
-    # Exclude SIMD backends that require target-specific intrinsics
+    # Exclude all arch-specific SIMD backends — they require target intrinsic
+    # headers that may not be available on the host (e.g. sse2.cc on ARM).
+    # Only lint the scalar backend and the main parser code.
     local src_cc=$(find "$PROJECT_DIR/src" -name '*.cc' \
-        ! -path '*/simd/neon.cc' \
-        ! -path '*/simd/sve.cc' \
+        ! -path '*/simd/sse2.cc' \
         ! -path '*/simd/avx2.cc' \
-        ! -path '*/simd/avx512.cc' | \
+        ! -path '*/simd/avx512.cc' \
+        ! -path '*/simd/neon.cc' \
+        ! -path '*/simd/sve.cc' | \
         grep -v third_party)
     clang-tidy -p "$BUILD_DIR" $src_cc 2>&1 | grep -E "warning:|error:" || echo "No issues found."
 }

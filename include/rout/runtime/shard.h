@@ -16,6 +16,9 @@
 
 namespace rout {
 
+// Forward declaration (defined below Shard).
+inline u32 detect_cpu_count();
+
 // Shard — per-core share-nothing runtime unit.
 //
 // Each Shard owns:
@@ -116,10 +119,19 @@ struct Shard {
 
         // Pin to CPU if requested
         if (pin_cpu >= 0) {
+            u32 ncpus = detect_cpu_count();
+            if (static_cast<u32>(pin_cpu) >= ncpus) {
+                pthread_attr_destroy(&attr);
+                return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+            }
             cpu_set_t cpuset;
             CPU_ZERO(&cpuset);
             CPU_SET(pin_cpu, &cpuset);
-            pthread_attr_setaffinity_np(&attr, sizeof(cpuset), &cpuset);
+            i32 aff_rc = pthread_attr_setaffinity_np(&attr, sizeof(cpuset), &cpuset);
+            if (aff_rc != 0) {
+                pthread_attr_destroy(&attr);
+                return core::make_unexpected(Error::make(aff_rc, Error::Source::Thread));
+            }
         }
 
         i32 rc = pthread_create(&thread, &attr, thread_entry, this);

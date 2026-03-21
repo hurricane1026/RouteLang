@@ -118,8 +118,9 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
                        ring_fd,
                        IORING_OFF_SQ_RING);
     if (sq_ring_ptr == MAP_FAILED) {
+        i32 err = errno;
         shutdown();
-        return core::make_unexpected(Error::from_errno(Error::Source::IoUring));
+        return core::make_unexpected(Error::make(err, Error::Source::IoUring));
     }
 
     auto* sq_base = static_cast<u8*>(sq_ring_ptr);
@@ -137,8 +138,9 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
                     ring_fd,
                     IORING_OFF_SQES);
     if (sqes_ptr == MAP_FAILED) {
+        i32 err = errno;
         shutdown();
-        return core::make_unexpected(Error::from_errno(Error::Source::IoUring));
+        return core::make_unexpected(Error::make(err, Error::Source::IoUring));
     }
     sq_entries = static_cast<io_uring_sqe*>(sqes_ptr);
 
@@ -151,8 +153,9 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
                        ring_fd,
                        IORING_OFF_CQ_RING);
     if (cq_ring_ptr == MAP_FAILED) {
+        i32 err = errno;
         shutdown();
-        return core::make_unexpected(Error::from_errno(Error::Source::IoUring));
+        return core::make_unexpected(Error::make(err, Error::Source::IoUring));
     }
 
     auto* cq_base = static_cast<u8*>(cq_ring_ptr);
@@ -199,8 +202,9 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
                                      -1,
                                      0));
     if (buf_base == MAP_FAILED) {
+        i32 err = errno;
         shutdown();
-        return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
 
     // Allocate the buf_ring structure itself
@@ -212,8 +216,9 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
                           -1,
                           0);
     if (ring_mem == MAP_FAILED) {
+        i32 err = errno;
         shutdown();
-        return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
     buf_ring = static_cast<io_uring_buf_ring*>(ring_mem);
 

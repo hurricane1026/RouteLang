@@ -65,8 +65,9 @@ core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
     ev.events = EPOLLIN;
     ev.data.u64 = encode_data(kTimerConnId, IoEventType::Timeout);
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &ev) < 0) {
+        i32 err = errno;
         shutdown();
-        return core::make_unexpected(Error::from_errno(Error::Source::Epoll));
+        return core::make_unexpected(Error::make(err, Error::Source::Epoll));
     }
 
     return {};

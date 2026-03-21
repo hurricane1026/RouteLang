@@ -32,6 +32,15 @@ static void write_u32(u32 val) {
     for (i32 i = n - 1; i >= 0; i--) (void)write(1, &buf[i], 1);
 }
 
+static bool str_eq(const char* a, const char* b) {
+    while (*a && *b) {
+        if (*a != *b) return false;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
 static bool detect_io_uring() {
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
@@ -47,7 +56,7 @@ static bool detect_io_uring() {
 
 // Store pointers to each shard's loop->running flag for signal handler.
 // Writing false to a bool is async-signal-safe.
-static bool* g_running_flags[kMaxShards];
+static volatile bool* g_running_flags[kMaxShards];
 static u32 g_shard_count = 0;
 
 static void signal_handler(int /*sig*/) {
@@ -137,6 +146,11 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
 
     // Wait for all shard threads to finish (blocked by signal or stop)
     for (u32 i = 0; i < shard_count; i++) shards[i].join();
+
+    // Clear signal handler state before shutdown to prevent dangling pointer access
+    g_shard_count = 0;
+    for (u32 i = 0; i < shard_count; i++) g_running_flags[i] = nullptr;
+
     for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
 
     return 0;
@@ -156,15 +170,7 @@ int main(int argc, char** argv) {
         }
         // Check --shards
         if (i + 1 < argc) {
-            bool is_shards = true;
-            const char* expect = "--shards";
-            for (int k = 0; expect[k]; k++) {
-                if (argv[i][k] != expect[k]) {
-                    is_shards = false;
-                    break;
-                }
-            }
-            if (is_shards) {
+            if (str_eq(argv[i], "--shards")) {
                 i++;
                 shard_count = 0;
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
@@ -172,15 +178,7 @@ int main(int argc, char** argv) {
             }
         }
         // Check --no-pin
-        bool is_nopin = true;
-        const char* expect_np = "--no-pin";
-        for (int k = 0; expect_np[k]; k++) {
-            if (argv[i][k] != expect_np[k]) {
-                is_nopin = false;
-                break;
-            }
-        }
-        if (is_nopin) pin_cpus = false;
+        if (str_eq(argv[i], "--no-pin")) pin_cpus = false;
     }
 
     if (shard_count == 0) shard_count = detect_cpu_count();

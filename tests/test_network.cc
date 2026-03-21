@@ -1,5 +1,9 @@
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
 #include "rout/runtime/arena.h"
+#include "rout/runtime/route_table.h"
+#include "rout/runtime/slab_pool.h"
+#include "rout/runtime/slice_pool.h"
+#include "rout/runtime/upstream_pool.h"
 
 #include "test.h"
 #include "test_helpers.h"
@@ -1369,8 +1373,6 @@ TEST(copilot6, keepalive_timeout_is_60) {
 
 // === RouteTable ===
 
-#include "rout/runtime/route_table.h"
-
 TEST(route, match_prefix) {
     RouteConfig cfg;
     i32 up = cfg.add_upstream("backend", 0x7F000001, 8080);
@@ -1439,8 +1441,6 @@ TEST(route, upstream_target_addr) {
 
 // === UpstreamPool ===
 
-#include "rout/runtime/upstream_pool.h"
-
 TEST(upstream_pool, alloc_free) {
     UpstreamPool pool;
     pool.init();
@@ -1493,8 +1493,6 @@ TEST(upstream_pool, shutdown_closes_fds) {
 }
 
 // === SlicePool ===
-
-#include "rout/runtime/slice_pool.h"
 
 TEST(slice_pool, init_destroy) {
     SlicePool pool;
@@ -1657,8 +1655,6 @@ TEST(slice_pool, large_pool) {
 }
 
 // === SlabPool ===
-
-#include "rout/runtime/slab_pool.h"
 
 struct TestObj {
     i32 value;

@@ -56,7 +56,7 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
     Backend backend;
     TimerWheel timer;
     u32 shard_id;
-    bool running;
+    volatile bool running;
 
     static constexpr u32 kMaxConns = 16384;
     Connection conns[kMaxConns];

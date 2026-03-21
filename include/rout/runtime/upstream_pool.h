@@ -50,12 +50,14 @@ struct UpstreamPool {
 
     // Free an upstream connection slot.
     void free(UpstreamConn* c) {
+        if (!c || c < conns || c >= conns + kMaxConns) return;
         if (c->fd >= 0) {
             close(c->fd);
             c->fd = -1;
         }
         c->idle = false;
         u32 idx = static_cast<u32>(c - conns);
+        if (free_top >= kMaxConns) return;
         free_stack[free_top++] = idx;
     }
 

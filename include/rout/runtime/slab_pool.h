@@ -72,11 +72,16 @@ struct SlabPool {
     }
 
     // Free an object by index.
-    void free(u32 idx) { free_stack[free_top++] = idx; }
+    void free(u32 idx) {
+        if (idx >= Cap || free_top >= Cap || !free_stack) return;
+        free_stack[free_top++] = idx;
+    }
 
     // Free an object by pointer.
     void free(T* obj) {
+        if (!obj || !objects || obj < objects || obj >= objects + Cap) return;
         u32 idx = static_cast<u32>(obj - objects);
+        if (free_top >= Cap) return;
         free_stack[free_top++] = idx;
     }
 

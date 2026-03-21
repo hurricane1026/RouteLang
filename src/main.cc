@@ -55,13 +55,15 @@ static bool detect_io_uring() {
 // --- Signal handling for graceful shutdown ---
 
 // Store pointers to each shard's loop->running flag for signal handler.
-// Writing false to a bool is async-signal-safe.
+// Use atomic store for cross-thread + signal safety.
 static volatile bool* g_running_flags[kMaxShards];
-static u32 g_shard_count = 0;
+static volatile sig_atomic_t g_shard_count = 0;
 
 static void signal_handler(int /*sig*/) {
-    for (u32 i = 0; i < g_shard_count; i++) {
-        if (g_running_flags[i]) *g_running_flags[i] = false;
+    sig_atomic_t count = g_shard_count;
+    for (sig_atomic_t i = 0; i < count && i < static_cast<sig_atomic_t>(kMaxShards); i++) {
+        volatile bool* flag = g_running_flags[i];
+        if (flag) __atomic_store_n(flag, false, __ATOMIC_RELAXED);
     }
 }
 
@@ -119,7 +121,7 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
     for (u32 i = 0; i < shard_count; i++) {
         g_running_flags[i] = &shards[i].loop->running;
     }
-    g_shard_count = shard_count;
+    g_shard_count = static_cast<sig_atomic_t>(shard_count);
 
     // Install signal handlers for graceful shutdown
     struct sigaction sa;

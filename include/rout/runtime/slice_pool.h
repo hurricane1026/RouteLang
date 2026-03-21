@@ -75,8 +75,11 @@ struct SlicePool {
 
     // Free a slice back to the pool. ptr must have been returned by alloc().
     void free(u8* ptr) {
-        if (!ptr || !base) return;
+        if (!ptr || !base || !free_stack || count == 0) return;
+        if (ptr < base || ptr >= base + base_size) return;  // out of range
         u64 offset = static_cast<u64>(ptr - base);
+        if (offset % kSliceSize != 0) return;  // not slice-aligned
+        if (free_top >= count) return;         // overflow (double-free)
         u32 idx = static_cast<u32>(offset / kSliceSize);
         free_stack[free_top++] = idx;
     }

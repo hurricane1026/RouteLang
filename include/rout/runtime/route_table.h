@@ -68,15 +68,17 @@ struct RouteConfig {
     u32 upstream_count = 0;
 
     // Add a proxy route: path prefix → upstream target.
-    // Returns true on success.
+    // Returns false if table full, upstream_id invalid, or path too long.
     bool add_proxy(const char* path, u8 method, u16 upstream_id) {
         if (route_count >= kMaxRoutes) return false;
+        if (upstream_id >= upstream_count) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
             r.path[r.path_len] = path[r.path_len];
             r.path_len++;
         }
+        if (path[r.path_len] != '\0') return false;  // path too long (truncated)
         r.path[r.path_len] = '\0';
         r.method = method;
         r.action = RouteAction::Proxy;
@@ -86,7 +88,7 @@ struct RouteConfig {
         return true;
     }
 
-    // Add a static response route.
+    // Add a static response route. Returns false if table full or path too long.
     bool add_static(const char* path, u8 method, u16 status) {
         if (route_count >= kMaxRoutes) return false;
         auto& r = routes[route_count];
@@ -95,6 +97,7 @@ struct RouteConfig {
             r.path[r.path_len] = path[r.path_len];
             r.path_len++;
         }
+        if (path[r.path_len] != '\0') return false;  // path too long
         r.path[r.path_len] = '\0';
         r.method = method;
         r.action = RouteAction::Static;

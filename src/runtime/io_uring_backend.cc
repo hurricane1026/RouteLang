@@ -1,11 +1,15 @@
 #include "rout/runtime/io_uring_backend.h"
 
+#include "rout/runtime/connection.h"
+
 #include <errno.h>
 #include <linux/io_uring.h>
 #include <string.h>  // memset
 #include <sys/mman.h>
 #include <sys/socket.h>  // SOCK_NONBLOCK, SOCK_CLOEXEC
 #include <sys/syscall.h>
+#include <sys/timerfd.h>
+#include <time.h>
 #include <unistd.h>
 
 // IORING_OP_CANCEL may not be defined on older kernel headers
@@ -18,6 +22,11 @@
 #endif
 
 namespace rout {
+
+// Sentinel conn_id for timer events (same value as epoll backend)
+static constexpr u32 kTimerConnId = 0xFFFFFE;
+// Sentinel conn_id for cancel completions (must not collide with real conn_ids or timer)
+static constexpr u32 kCancelConnId = 0xFFFFFD;
 
 // --- Syscall wrappers (no liburing) ---
 
@@ -75,6 +84,13 @@ static void sqe_advance_tail(u32* sq_tail) {
 
 i32 IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     listen_fd = lfd;
+    // Explicitly init fds to -1: mmap-zeroed memory skips default member initializers,
+    // so timer_fd/ring_fd could be 0. If init fails early and calls shutdown(), closing
+    // fd 0 (stdin) would be catastrophic.
+    ring_fd = -1;
+    timer_fd = -1;
+    timer_read_armed = false;
+    for (u32 i = 0; i < kMaxSendState; i++) send_state[i] = {nullptr, -1, 0, 0};
 
     // Setup io_uring with desired flags
     struct io_uring_params params;
@@ -145,6 +161,26 @@ i32 IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     // Setup provided buffer ring for zero-copy recv
     i32 rc = setup_buf_ring();
     if (rc < 0) return rc;
+
+    // Create timerfd for 1-second ticks (drives timer wheel)
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (timer_fd < 0) {
+        i32 err = errno;
+        shutdown();
+        return -err;
+    }
+    struct itimerspec ts;
+    memset(&ts, 0, sizeof(ts));
+    ts.it_interval.tv_sec = 1;
+    ts.it_value.tv_sec = 1;
+    if (timerfd_settime(timer_fd, 0, &ts, nullptr) < 0) {
+        i32 err = errno;
+        shutdown();
+        return -err;
+    }
+
+    // Submit initial read on timerfd
+    submit_timer_read();
 
     return 0;
 }
@@ -218,6 +254,23 @@ void IoUringBackend::return_buffer(u16 buf_id) {
     __atomic_store_n(&buf_ring->tail, static_cast<u16>(tail + 1), __ATOMIC_RELEASE);
 }
 
+void IoUringBackend::submit_timer_read() {
+    if (timer_read_armed) return;  // already in-flight
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;  // SQ full — will retry on next wait()
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_READ;
+    sqe->fd = timer_fd;
+    sqe->addr = reinterpret_cast<u64>(&timer_ticks_buf);
+    sqe->len = sizeof(timer_ticks_buf);
+    sqe->user_data = encode_user_data(kTimerConnId, IoEventType::Timeout);
+
+    sqe_advance_tail(sq_tail);
+    pending++;
+    timer_read_armed = true;
+}
+
 // --- Operations ---
 
 void IoUringBackend::add_accept() {
@@ -254,7 +307,13 @@ void IoUringBackend::add_recv(i32 fd, u32 conn_id) {
 
 void IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return;  // SQ full — don't record send_state without a submitted SQE
+
+    // Record send state only after acquiring SQE — if kernel returns partial,
+    // wait() re-submits the remainder.
+    if (conn_id < kMaxSendState) {
+        send_state[conn_id] = {buf, fd, 0, len};
+    }
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_SEND;
@@ -292,7 +351,8 @@ void IoUringBackend::cancel(i32 fd, u32 conn_id) {
     // Cancel by user_data — matches any pending SQE with this conn_id for Recv
     sqe->addr = encode_user_data(conn_id, IoEventType::Recv);
     sqe->cancel_flags = IORING_ASYNC_CANCEL_ALL;
-    sqe->user_data = 0;  // we don't care about the cancel completion
+    // Use a sentinel that won't collide with real conn_ids or Accept(conn_id=0).
+    sqe->user_data = encode_user_data(kCancelConnId, IoEventType::Accept);
 
     sqe_advance_tail(sq_tail);
     pending++;
@@ -300,7 +360,10 @@ void IoUringBackend::cancel(i32 fd, u32 conn_id) {
 
 // --- Wait (submit + harvest) ---
 
-u32 IoUringBackend::wait(IoEvent* events, u32 max_events) {
+u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns) {
+    // Retry timer read if previous submit_timer_read() failed (SQ was full)
+    if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
+
     // Submit pending SQEs and wait for at least 1 CQE
     u32 flags = IORING_ENTER_GETEVENTS;
     i32 ret;
@@ -329,18 +392,123 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events) {
         IoEventType type;
         decode_user_data(cqe->user_data, conn_id, type);
 
+        // Cancel CQEs — silently consume, don't emit event
+        if (conn_id == kCancelConnId) {
+            head++;
+            continue;
+        }
+
+        // --- #3: Timer tick handling ---
+        if (conn_id == kTimerConnId && type == IoEventType::Timeout) {
+            timer_read_armed = false;
+            if (cqe->res == static_cast<i32>(sizeof(timer_ticks_buf))) {
+                // Clamp tick count to avoid i32 overflow after long stalls
+                i32 ticks =
+                    (timer_ticks_buf > 0x7FFFFFFF) ? 0x7FFFFFFF : static_cast<i32>(timer_ticks_buf);
+                events[count].conn_id = 0;
+                events[count].type = IoEventType::Timeout;
+                events[count].result = ticks;
+                events[count].buf_id = 0;
+                events[count].has_buf = 0;
+                count++;
+            }
+            // Re-submit read on timerfd for next tick
+            submit_timer_read();
+            head++;
+            continue;
+        }
+
+        // --- #4: Provided buffer handling ---
+        // MUST return the buffer to the ring regardless of result or conn_id validity,
+        // otherwise the provided buffer ring drains and recv stalls.
+        if (cqe->flags & IORING_CQE_F_BUFFER) {
+            u16 buf_id = static_cast<u16>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+
+            // Append data into Connection::recv_buf only on success + valid conn.
+            // Buffer is NOT reset here — callback resets when it consumes data.
+            i32 buf_result = cqe->res;
+            if (cqe->res > 0 && conn_id < max_conns) {
+                u32 nbytes = static_cast<u32>(cqe->res);
+                auto& recv_buf = conns[conn_id].recv_buf;
+                const u8* src = buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
+                u32 avail = recv_buf.write_avail();
+                u32 to_copy = nbytes < avail ? nbytes : avail;
+                if (to_copy > 0) {
+                    __builtin_memcpy(recv_buf.write_ptr(), src, to_copy);
+                    recv_buf.commit(to_copy);
+                }
+                // Report actual bytes copied, not kernel bytes (may differ if buf full)
+                buf_result = (to_copy < nbytes) ? -ENOBUFS : static_cast<i32>(to_copy);
+            }
+
+            // Always return the buffer, even on error
+            return_buffer(buf_id);
+
+            // Emit event (buffer already returned, clear has_buf)
+            events[count].conn_id = conn_id;
+            events[count].type = type;
+            events[count].result = buf_result;
+            events[count].buf_id = 0;
+            events[count].has_buf = 0;
+            head++;
+            count++;
+            continue;
+        }
+
+        // --- Send completion: enforce full-send proactor semantics ---
+        // If IORING_OP_SEND returned partial, re-submit the remainder.
+        // Only emit completion when all bytes sent (or error).
+        if (type == IoEventType::Send && conn_id < kMaxSendState) {
+            auto& ss = send_state[conn_id];
+            if (cqe->res > 0 && ss.remaining > 0) {
+                u32 nw = static_cast<u32>(cqe->res);
+                ss.offset += nw;
+                ss.remaining -= nw;
+                if (ss.remaining > 0) {
+                    // Partial — re-submit remaining bytes
+                    io_uring_sqe* sqe = get_sqe();
+                    if (sqe) {
+                        memset(sqe, 0, sizeof(*sqe));
+                        sqe->opcode = IORING_OP_SEND;
+                        sqe->fd = ss.fd;
+                        sqe->addr = reinterpret_cast<u64>(ss.src + ss.offset);
+                        sqe->len = ss.remaining;
+                        sqe->user_data = encode_user_data(conn_id, IoEventType::Send);
+                        sqe_advance_tail(sq_tail);
+                        pending++;
+                        head++;
+                        continue;  // don't emit event yet
+                    }
+                    // SQ full — can't re-submit. Emit error to prevent deadlock.
+                    ss.remaining = 0;
+                    events[count].conn_id = conn_id;
+                    events[count].type = IoEventType::Send;
+                    events[count].result = -ENOSPC;
+                    events[count].buf_id = 0;
+                    events[count].has_buf = 0;
+                    head++;
+                    count++;
+                    continue;
+                }
+                // All bytes sent — emit completion with total
+                events[count].conn_id = conn_id;
+                events[count].type = IoEventType::Send;
+                events[count].result = static_cast<i32>(ss.offset);
+                events[count].buf_id = 0;
+                events[count].has_buf = 0;
+                head++;
+                count++;
+                continue;
+            }
+            // Error or no send_state — fall through to default emit
+        }
+
+        // --- Default: non-buffer events (Accept, Connect, error Send/Recv) ---
         events[count].conn_id = conn_id;
         events[count].type = type;
         events[count].result = cqe->res;
-
-        // Extract buffer ID from CQE flags (for provided buffer ring)
-        if (cqe->flags & IORING_CQE_F_BUFFER) {
-            events[count].buf_id = static_cast<u16>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
-            events[count].has_buf = 1;
-        } else {
-            events[count].buf_id = 0;
-            events[count].has_buf = 0;
-        }
+        events[count].buf_id = 0;
+        events[count].has_buf = 0;
 
         head++;
         count++;
@@ -353,6 +521,10 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events) {
 // --- Shutdown ---
 
 void IoUringBackend::shutdown() {
+    if (timer_fd >= 0) {
+        close(timer_fd);
+        timer_fd = -1;
+    }
     if (buf_base != nullptr) {
         munmap(buf_base, static_cast<u64>(kProvidedBufCount) * kProvidedBufSize);
         buf_base = nullptr;

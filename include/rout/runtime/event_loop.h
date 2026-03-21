@@ -82,7 +82,7 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
         IoEvent events[kMaxEventsPerWait];
 
         while (running) {
-            u32 n = backend.wait(events, kMaxEventsPerWait);
+            u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
             for (u32 i = 0; i < n; i++) {
                 dispatch(events[i]);
             }
@@ -142,7 +142,14 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
             return;
         }
         if (ev.type == IoEventType::Timeout) {
-            timer.tick([this](Connection* c) { this->close_conn(*c); });
+            // ev.result carries timerfd tick count — may be >1 if loop stalled.
+            // Advance timer wheel once per accumulated tick to avoid skipping expirations.
+            i32 ticks = ev.result > 0 ? ev.result : 1;
+            const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
+            if (ticks > max_ticks) ticks = max_ticks;  // clamp to wheel size
+            for (i32 t = 0; t < ticks; t++) {
+                timer.tick([this](Connection* c) { this->close_conn(*c); });
+            }
             return;
         }
         if (ev.conn_id < kMaxConns) {

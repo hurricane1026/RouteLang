@@ -5,6 +5,8 @@
 
 namespace rout {
 
+struct Connection;  // forward declaration for wait() signature
+
 // Mock I/O backend for unit testing.
 // Records all submitted operations, lets tests inject completions.
 // No real sockets, no syscalls, fully deterministic.
@@ -77,7 +79,8 @@ struct MockBackend {
     }
 
     // Return injected events, then clear.
-    u32 wait(IoEvent* events, u32 max) {
+    // conns/max_conns match backend concept but unused in mock (no real recv).
+    u32 wait(IoEvent* events, u32 max, Connection* /*conns*/ = nullptr, u32 /*max_conns*/ = 0) {
         u32 n = pending_count < max ? pending_count : max;
         for (u32 i = 0; i < n; i++) events[i] = pending[i];
         // Shift remaining

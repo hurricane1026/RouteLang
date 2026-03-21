@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rout/common/types.h"
+#include "rout/runtime/connection.h"
 #include "rout/runtime/io_backend.h"
 
 #include <sys/epoll.h>
@@ -33,6 +34,20 @@ struct EpollBackend {
     IoEvent pending_completions[64];
     u32 pending_count = 0;
 
+    // Outstanding partial-send state per connection.
+    // When add_send() can't complete immediately (partial write or EAGAIN),
+    // it records the source pointer, fd, and remaining bytes here.
+    // wait() resumes the send on EPOLLOUT using this state directly,
+    // not conns[conn_id].send_buf — because the source may be recv_buf (proxy).
+    // remaining == 0 means no outstanding send for this conn_id.
+    struct SendState {
+        const u8* src;  // original buffer pointer passed to add_send
+        i32 fd;         // fd to send on (may differ from fd_map for upstream)
+        u32 offset;
+        u32 remaining;
+    };
+    SendState send_state[kMaxFdMap];
+
     // --- Interface methods ---
 
     // Initialize epoll and timerfd for this shard.
@@ -55,7 +70,8 @@ struct EpollBackend {
     void cancel(i32 fd, u32 conn_id);
 
     // Wait for events, perform I/O, return completion events.
-    u32 wait(IoEvent* events, u32 max_events);
+    // conns + max_conns: connection table for recv into Connection::recv_buf.
+    u32 wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
 
     // Shutdown and close fds.
     void shutdown();

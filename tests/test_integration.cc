@@ -1,6 +1,7 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
-#include "rout/test.h"
+#include "rout/runtime/io_uring_backend.h"
 
+#include "test.h"
 #include "test_helpers.h"
 
 // === Socket Setup (libuv: test-tcp-bind-error, test-tcp-flags, test-tcp-reuseport) ===
@@ -339,6 +340,289 @@ TEST(loop, stop_from_outside) {
     srv.loop->running = false;
     close(c);
     srv.teardown();
+}
+
+// === Partial send (real socket) ===
+
+// Verify EpollBackend::send_state is initialized to zero.
+// After init, no connection should have outstanding send state.
+TEST(partial_send, state_initialized) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    i32 fd = create_listen_socket(0);
+    REQUIRE(fd >= 0);
+    REQUIRE_EQ(loop->init(0, fd), 0);
+    // EpollBackend send_state should be zero-initialized
+    for (u32 i = 0; i < EpollBackend::kMaxFdMap; i++) {
+        CHECK_EQ(loop->backend.send_state[i].remaining, 0u);
+    }
+    loop->shutdown();
+    close(fd);
+    destroy_real_loop(loop);
+}
+
+// Real partial send test: fill socket buffer to force EAGAIN, then drain.
+// Uses socketpair to control both ends.
+// Force actual partial send via backpressure: fill the socket send buffer
+// by not reading on the peer side, then drain and verify completion.
+TEST(partial_send, real_epollout_completion) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    // Set minimal send buffer to force partial sends / EAGAIN quickly.
+    // Linux doubles the value, so minimum effective is ~2*sndbuf.
+    i32 sndbuf = 2048;
+    REQUIRE_EQ(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
+    // Also limit recv buffer on peer to create backpressure faster
+    i32 rcvbuf = 2048;
+    REQUIRE_EQ(setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)), 0);
+
+    // Use init() so timerfd is created — gives wait() a bounded 1-second wakeup
+    // to prevent indefinite hangs if EPOLLOUT doesn't fire immediately.
+    EpollBackend backend;
+    REQUIRE_EQ(backend.init(0, -1), 0);
+    backend.fd_map[0] = fds[0];
+
+    Connection conn;
+    conn.reset();
+    conn.id = 0;
+    conn.fd = fds[0];
+
+    // Fill send_buf with 4096 bytes (larger than the tiny socket buffer)
+    u8 fill_data[4096];
+    for (u32 j = 0; j < sizeof(fill_data); j++) fill_data[j] = static_cast<u8>(j & 0xFF);
+    conn.send_buf.write(fill_data, sizeof(fill_data));
+
+    // add_send tries immediate send — may be partial or EAGAIN
+    backend.add_send(fds[0], 0, conn.send_buf.data(), conn.send_buf.len());
+
+    // Check for immediate completion via synthetic pending events (non-blocking).
+    // If add_send succeeded fully, pending_count > 0 with the completion.
+    IoEvent events[16];
+    bool got_full_send = false;
+    if (backend.pending_count > 0) {
+        u32 n = backend.wait(events, 16, &conn, 1);
+        for (u32 i = 0; i < n; i++) {
+            if (events[i].type == IoEventType::Send && events[i].result == 4096) {
+                got_full_send = true;
+            }
+        }
+    }
+
+    if (!got_full_send) {
+        // Partial send or EAGAIN path — drain peer to make socket writable,
+        // then wait for EPOLLOUT completion. Drain fully before wait() to
+        // ensure EPOLLOUT is ready (wait uses blocking epoll_wait).
+        char drain[8192];
+        for (int attempt = 0; attempt < 20; attempt++) {
+            // Drain all available data from peer
+            for (;;) {
+                ssize_t nr = recv(fds[1], drain, sizeof(drain), MSG_DONTWAIT);
+                if (nr <= 0) break;
+            }
+            usleep(1000);  // 1ms — let kernel update socket writability
+
+            u32 n = backend.wait(events, 16, &conn, 1);
+            for (u32 i = 0; i < n; i++) {
+                if (events[i].type == IoEventType::Send) {
+                    CHECK_EQ(events[i].result, 4096);
+                    got_full_send = true;
+                }
+            }
+            if (got_full_send) break;
+        }
+    }
+    CHECK(got_full_send);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+// === Partial send: real socket edge cases ===
+
+// Verify EpollBackend correctly handles immediate full send on socketpair
+TEST(partial_send, socketpair_full_send) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE_EQ(backend.init(0, -1), 0);
+    backend.fd_map[0] = fds[0];
+
+    Connection conn;
+    conn.reset();
+    conn.id = 0;
+    conn.fd = fds[0];
+
+    // Small payload — immediate full send
+    conn.send_buf.write(reinterpret_cast<const u8*>("OK"), 2);
+    backend.add_send(fds[0], 0, conn.send_buf.data(), conn.send_buf.len());
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
+    bool found = false;
+    for (u32 i = 0; i < n; i++) {
+        if (events[i].type == IoEventType::Send) {
+            CHECK_EQ(events[i].result, 2);
+            found = true;
+        }
+    }
+    CHECK(found);
+
+    // Verify receiver got the data
+    char buf[8];
+    ssize_t nr = recv(fds[1], buf, sizeof(buf), 0);
+    CHECK_EQ(nr, 2);
+    CHECK_EQ(buf[0], 'O');
+    CHECK_EQ(buf[1], 'K');
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+// Verify add_send error path: send to closed peer
+TEST(partial_send, send_to_closed_peer) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    // Close receiver immediately
+    close(fds[1]);
+
+    EpollBackend backend;
+    REQUIRE_EQ(backend.init(0, -1), 0);
+
+    Connection conn;
+    conn.reset();
+    conn.id = 0;
+    conn.fd = fds[0];
+    conn.send_buf.write(reinterpret_cast<const u8*>("data"), 4);
+
+    // send to closed peer — may succeed (kernel buffers) or fail with EPIPE/ECONNRESET
+    backend.add_send(fds[0], 0, conn.send_buf.data(), conn.send_buf.len());
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
+    // Should get a completion (either success or error)
+    bool found = false;
+    for (u32 i = 0; i < n; i++) {
+        if (events[i].type == IoEventType::Send) {
+            found = true;
+            // result is either positive (buffered) or negative (-errno)
+        }
+    }
+    CHECK(found);
+
+    close(fds[0]);
+    backend.shutdown();
+}
+
+// Verify send_state is zeroed per connection after init
+TEST(partial_send, state_zeroed_per_conn) {
+    EpollBackend backend;
+    REQUIRE_EQ(backend.init(0, -1), 0);
+    // Spot check several entries
+    CHECK_EQ(backend.send_state[0].offset, 0u);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+    CHECK_EQ(backend.send_state[100].remaining, 0u);
+    CHECK_EQ(backend.send_state[EpollBackend::kMaxFdMap - 1].remaining, 0u);
+    backend.shutdown();
+}
+
+// Verify EPOLLOUT with no pending send switches back to EPOLLIN (no busy loop).
+// After a successful immediate send, send_state.remaining == 0.
+// If a spurious EPOLLOUT fires, wait() should switch to EPOLLIN and not spin.
+TEST(partial_send, epollout_no_pending_switches_to_epollin) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE_EQ(backend.init(0, -1), 0);
+    backend.fd_map[0] = fds[0];
+
+    Connection conn;
+    conn.reset();
+    conn.id = 0;
+    conn.fd = fds[0];
+
+    // Do a small immediate send — completes fully, send_state.remaining stays 0
+    conn.send_buf.write(reinterpret_cast<const u8*>("hi"), 2);
+    backend.add_send(fds[0], 0, conn.send_buf.data(), conn.send_buf.len());
+
+    // Drain the synthetic completion
+    IoEvent events[8];
+    if (backend.pending_count > 0) {
+        backend.wait(events, 8, &conn, 1);
+    }
+
+    // send_state should have remaining == 0 after full immediate send
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    // Ensure fd is registered with epoll (add_recv registers for EPOLLIN),
+    // then switch to EPOLLOUT to simulate a spurious wakeup.
+    backend.add_recv(fds[0], 0);
+    struct epoll_event ev;
+    ev.events = EPOLLOUT;
+    ev.data.u64 = (static_cast<u64>(0) << 8) | static_cast<u64>(IoEventType::Send);
+    REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
+
+    // wait() should see EPOLLOUT with no pending send → switch to EPOLLIN, no event
+    // The timerfd will wake wait() within 1 second (bounded, no hang)
+    u32 n = backend.wait(events, 8, &conn, 1);
+    // Should get a Timeout event (from timerfd), not a Send event
+    bool got_send = false;
+    for (u32 i = 0; i < n; i++) {
+        if (events[i].type == IoEventType::Send) got_send = true;
+    }
+    CHECK(!got_send);  // no spurious Send completion
+
+    // Drain peer
+    char buf[8];
+    (void)recv(fds[1], buf, sizeof(buf), MSG_DONTWAIT);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+// === io_uring backend (TODO #3 + #4) ===
+
+// Verify IoUringBackend::init creates a timerfd
+TEST(uring, init_creates_timerfd) {
+    // io_uring requires Linux 6.0+. If init fails, skip gracefully.
+    IoUringBackend backend;
+    i32 lfd = create_listen_socket(0);
+    REQUIRE(lfd >= 0);
+    i32 rc = backend.init(0, lfd);
+    if (rc < 0) {
+        // io_uring not available — skip
+        close(lfd);
+        CHECK(true);
+        return;
+    }
+    CHECK(backend.timer_fd >= 0);
+    backend.shutdown();
+    close(lfd);
+}
+
+// Verify return_buffer doesn't crash (ring structure test)
+TEST(uring, return_buffer_no_crash) {
+    IoUringBackend backend;
+    i32 lfd = create_listen_socket(0);
+    REQUIRE(lfd >= 0);
+    i32 rc = backend.init(0, lfd);
+    if (rc < 0) {
+        close(lfd);
+        CHECK(true);
+        return;
+    }
+    // Return buffer 0 — should not crash
+    backend.return_buffer(0);
+    // Return buffer at boundary
+    backend.return_buffer(static_cast<u16>(kProvidedBufCount - 1));
+    backend.shutdown();
+    close(lfd);
 }
 
 // === Copilot-found: epoll add_recv EEXIST after send ===

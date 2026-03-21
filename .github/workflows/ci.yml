@@ -12,13 +12,21 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format
+      - name: Install clang-format (LLVM snapshot, v20)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble main" | \
+            sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y clang-format-20 || sudo apt-get install -y clang-format-19
+          CF=$(command -v clang-format-20 || command -v clang-format-19)
+          echo "CF=$CF" >> "$GITHUB_ENV"
+          $CF --version
 
       - name: Check formatting
         run: |
-          find include/rout include/core src tests -name '*.h' -o -name '*.cc' | \
-            xargs clang-format --dry-run --Werror
+          find include src testing tests bench -name '*.h' -o -name '*.cc' | \
+            xargs $CF --dry-run --Werror
 
   lint:
     name: clang-tidy
@@ -35,7 +43,14 @@ jobs:
 
       - name: Lint
         run: |
-          find src -name '*.cc' | \
+          # Exclude all arch-specific SIMD backends — only lint scalar
+          # and main parser code (arch-independent).
+          find src -name '*.cc' \
+            ! -path '*/simd/sse2.cc' \
+            ! -path '*/simd/avx2.cc' \
+            ! -path '*/simd/avx512.cc' \
+            ! -path '*/simd/neon.cc' \
+            ! -path '*/simd/sve.cc' | \
             xargs clang-tidy -p build --warnings-as-errors='bugprone-*,performance-*'
 
   test:
@@ -67,11 +82,7 @@ jobs:
         run: ninja -C build
 
       - name: Test
-        run: |
-          ./build/tests/test_network
-          ./build/tests/test_integration
-          ./build/tests/test_arena
-          ./build/tests/test_expected
+        run: ninja -C build check
 
   coverage:
     name: Code Coverage
@@ -92,22 +103,32 @@ jobs:
 
       - name: Run tests
         run: |
+          LLVM_PROFILE_FILE=build/test_buffer.profraw ./build/tests/test_buffer
+          LLVM_PROFILE_FILE=build/test_types.profraw ./build/tests/test_types
           LLVM_PROFILE_FILE=build/test_network.profraw ./build/tests/test_network
           LLVM_PROFILE_FILE=build/test_integration.profraw ./build/tests/test_integration
           LLVM_PROFILE_FILE=build/test_arena.profraw ./build/tests/test_arena
           LLVM_PROFILE_FILE=build/test_expected.profraw ./build/tests/test_expected
+          LLVM_PROFILE_FILE=build/test_http_parser.profraw ./build/tests/test_http_parser
 
       - name: Generate coverage report
         run: |
           llvm-profdata merge build/*.profraw -o build/merged.profdata
 
-          # Report for runtime code (exclude test framework and unused utility headers)
+          # Report for runtime code (exclude test framework and unused utility headers).
+          # io_uring_backend is excluded: requires kernel 6.0+ and io_uring permissions,
+          # which are unreliable in CI. It is tested via conditional integration tests.
           llvm-cov report \
             --instr-profile=build/merged.profdata \
+            --object build/tests/test_buffer \
+            --object build/tests/test_types \
             --object build/tests/test_network \
             --object build/tests/test_integration \
             --object build/tests/test_arena \
-            --sources include/rout/runtime/ src/runtime/ | tee build/coverage.txt
+            --object build/tests/test_http_parser \
+            --object build/tests/test_expected \
+            --sources include/rout/common/ include/rout/runtime/ src/runtime/ \
+            --ignore-filename-regex='io_uring_backend' | tee build/coverage.txt
 
           cat build/coverage.txt
 

@@ -38,13 +38,16 @@ struct View {
 
     ~View() { restore_owner(); }
 
-    // Read: the only way to access data through a View (no raw pointer). const.
+    // Read: copy data out of the View. const.
     u32 read(u8* dst, u32 max) const noexcept {
         if (!ptr_ || max == 0) return 0;
         u32 n = len_ < max ? len_ : max;
         if (n > 0) __builtin_memmove(dst, ptr_, n);
         return n;
     }
+
+    // Read-only data pointer — for kernel send() on a View.
+    const u8* data() const noexcept { return ptr_; }
 
     u32 len() const noexcept { return len_; }
     bool valid() const noexcept { return ptr_ != nullptr; }
@@ -134,6 +137,46 @@ struct Buffer {
     void reset() noexcept {
         if (released_) __builtin_trap();
         len_ = 0;
+    }
+
+    // --- I/O boundary: direct access for kernel syscalls ---
+    // These bypass the copy-based read()/write() interface.
+    // Use only at system boundaries (recv/send), not in application logic.
+
+    // Writable region for direct I/O (e.g. recv() target).
+    // Returns pointer past current data; write_avail() bytes available.
+    u8* write_ptr() noexcept {
+        if (released_) __builtin_trap();
+        return ptr_ ? ptr_ + len_ : nullptr;
+    }
+
+    u32 write_avail() const noexcept {
+        if (released_) __builtin_trap();
+        return ptr_ ? cap_ - len_ : 0;
+    }
+
+    // Commit n bytes written directly via write_ptr().
+    // Call after recv() returns — advances len_ without copying.
+    void commit(u32 n) noexcept {
+        if (released_) __builtin_trap();
+        if (!ptr_ || len_ + n > cap_) __builtin_trap();
+        len_ += n;
+    }
+
+    // Read-only data pointer for kernel send() / zero-copy forwarding.
+    // Traps if released — use View::data() for the released case.
+    const u8* data() const noexcept {
+        if (released_) __builtin_trap();
+        return ptr_;
+    }
+
+    // Forceful reinit — only for connection reset (all Views must be dead).
+    // Caller guarantees no live Views reference this Buffer.
+    void bind(u8* ptr, u32 cap) noexcept {
+        ptr_ = ptr;
+        len_ = 0;
+        cap_ = cap;
+        released_ = false;
     }
 
     u32 len() const noexcept { return len_; }

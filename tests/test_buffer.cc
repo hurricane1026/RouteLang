@@ -1,6 +1,7 @@
 // Buffer/View typestate tests
 #include "rout/common/buffer.h"
-#include "rout/test.h"
+
+#include "test.h"
 
 using namespace rout;
 
@@ -470,6 +471,204 @@ TEST(copilot4, write_overlapping_src_safe) {
     buf.read(out, sizeof(out));
     CHECK_EQ(out[0], 'a');
     CHECK_EQ(out[4], 'a');
+}
+
+// === I/O boundary methods ===
+
+TEST(io_boundary, write_ptr_and_commit) {
+    u8 storage[64];
+    Buffer buf(storage, sizeof(storage));
+    u8* wp = buf.write_ptr();
+    CHECK_EQ(wp, storage);
+    CHECK_EQ(buf.write_avail(), 64u);
+    // Simulate recv: write directly, then commit
+    wp[0] = 'G';
+    wp[1] = 'E';
+    wp[2] = 'T';
+    buf.commit(3);
+    CHECK_EQ(buf.len(), 3u);
+    CHECK_EQ(buf.data()[0], 'G');
+    // write_ptr advances past committed data
+    CHECK_EQ(buf.write_ptr(), storage + 3);
+    CHECK_EQ(buf.write_avail(), 61u);
+}
+
+TEST(io_boundary, commit_after_write) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("AB"), 2);
+    CHECK_EQ(buf.write_ptr(), storage + 2);
+    buf.write_ptr()[0] = 'C';
+    buf.commit(1);
+    CHECK_EQ(buf.len(), 3u);
+    CHECK_EQ(buf.data()[2], 'C');
+}
+
+TEST(io_boundary, data_read_only) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("hello"), 5);
+    const u8* d = buf.data();
+    CHECK_EQ(d, storage);
+    CHECK_EQ(d[0], 'h');
+    CHECK_EQ(d[4], 'o');
+}
+
+TEST(io_boundary, view_data_ptr) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("test"), 4);
+    View view = buf.release();
+    CHECK_EQ(view.data(), storage);
+    CHECK_EQ(view.data()[0], 't');
+    CHECK_EQ(view.len(), 4u);
+}
+
+TEST(io_boundary, bind_resets_buffer) {
+    u8 storage[32];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("data"), 4);
+    CHECK_EQ(buf.len(), 4u);
+    u8 new_storage[64];
+    buf.bind(new_storage, sizeof(new_storage));
+    CHECK_EQ(buf.len(), 0u);
+    CHECK_EQ(buf.capacity(), 64u);
+    CHECK(buf.valid());
+    CHECK(!buf.is_released());
+}
+
+TEST(io_boundary, bind_clears_released_state) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("x"), 1);
+    View view = buf.release();
+    CHECK(buf.is_released());
+    // Normally this would be a bug, but bind() is for connection reset
+    // where all Views are guaranteed dead. Simulate by scoping the moved View.
+    {
+        View moved = static_cast<View&&>(view);
+        (void)moved;
+    }
+    // After moved View is destroyed, original is invalidated. Now bind.
+    buf.bind(storage, sizeof(storage));
+    CHECK(!buf.is_released());
+    CHECK_EQ(buf.len(), 0u);
+}
+
+TEST(io_boundary, write_ptr_null_buffer) {
+    Buffer buf;
+    CHECK(buf.write_ptr() == nullptr);
+    CHECK_EQ(buf.write_avail(), 0u);
+    CHECK(buf.data() == nullptr);
+}
+
+TEST(io_boundary, commit_fills_to_capacity) {
+    u8 storage[8];
+    Buffer buf(storage, sizeof(storage));
+    buf.commit(8);
+    CHECK_EQ(buf.len(), 8u);
+    CHECK_EQ(buf.write_avail(), 0u);
+}
+
+// === Coverage: edge cases for I/O boundary methods ===
+
+// write_ptr returns past-the-end (non-null) when buffer is full
+TEST(io_coverage, write_ptr_when_full) {
+    u8 storage[8];
+    Buffer buf(storage, sizeof(storage));
+    buf.commit(8);
+    CHECK_EQ(buf.write_avail(), 0u);
+    // write_ptr() returns ptr_ + len_ (past-the-end), not nullptr.
+    // Callers must check write_avail() before writing.
+    u8* wp = buf.write_ptr();
+    CHECK(wp != nullptr);
+    CHECK_EQ(wp, storage + 8);  // past-the-end
+    CHECK_EQ(buf.write_avail(), 0u);
+}
+
+// write() when buffer is already full returns 0
+TEST(io_coverage, write_when_full) {
+    u8 storage[4];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("ABCD"), 4);
+    CHECK_EQ(buf.len(), 4u);
+    u32 written = buf.write(reinterpret_cast<const u8*>("E"), 1);
+    CHECK_EQ(written, 0u);  // no space
+    CHECK_EQ(buf.len(), 4u);
+}
+
+// commit(0) is a no-op
+TEST(io_coverage, commit_zero) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.commit(0);
+    CHECK_EQ(buf.len(), 0u);
+}
+
+// data() returns nullptr for default-constructed buffer
+TEST(io_coverage, data_on_default) {
+    Buffer buf;
+    CHECK(buf.data() == nullptr);
+    View view;
+    CHECK(view.data() == nullptr);
+}
+
+// bind() to same storage is idempotent
+TEST(io_coverage, bind_same_storage) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("hello"), 5);
+    buf.bind(storage, sizeof(storage));
+    CHECK_EQ(buf.len(), 0u);
+    CHECK_EQ(buf.capacity(), 16u);
+    CHECK_EQ(buf.data(), storage);
+}
+
+// Sequential write + commit interleaving
+TEST(io_coverage, write_then_commit_interleaved) {
+    u8 storage[32];
+    Buffer buf(storage, sizeof(storage));
+    // write 3 bytes
+    buf.write(reinterpret_cast<const u8*>("ABC"), 3);
+    CHECK_EQ(buf.len(), 3u);
+    // commit 2 bytes (e.g., recv directly wrote to buf)
+    buf.write_ptr()[0] = 'D';
+    buf.write_ptr()[1] = 'E';
+    buf.commit(2);
+    CHECK_EQ(buf.len(), 5u);
+    // read all
+    u8 out[8];
+    u32 n = buf.read(out, sizeof(out));
+    CHECK_EQ(n, 5u);
+    CHECK_EQ(out[0], 'A');
+    CHECK_EQ(out[3], 'D');
+    CHECK_EQ(out[4], 'E');
+}
+
+// View data() matches buffer content
+TEST(io_coverage, view_data_matches_buffer) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("test123"), 7);
+    View view = buf.release();
+    CHECK_EQ(view.data(), storage);
+    CHECK_EQ(view.len(), 7u);
+    CHECK_EQ(view.data()[0], 't');
+    CHECK_EQ(view.data()[6], '3');
+}
+
+// reset() after partial write clears len but preserves storage
+TEST(io_coverage, reset_preserves_storage) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("data"), 4);
+    buf.reset();
+    CHECK_EQ(buf.len(), 0u);
+    CHECK_EQ(buf.capacity(), 16u);
+    CHECK_EQ(buf.data(), storage);
+    // Can write again
+    buf.write(reinterpret_cast<const u8*>("new"), 3);
+    CHECK_EQ(buf.len(), 3u);
 }
 
 int main(int argc, char** argv) {

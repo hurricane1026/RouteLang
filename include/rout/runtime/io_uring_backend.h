@@ -10,6 +10,8 @@
 
 namespace rout {
 
+struct Connection;  // forward declaration for wait() signature
+
 // Direct io_uring backend — no liburing dependency.
 // Uses raw syscalls for full control (~300 lines per DESIGN.md).
 //
@@ -56,6 +58,23 @@ struct IoUringBackend {
     // Listen socket
     i32 listen_fd = -1;
 
+    // Timer fd for 1-second ticks (drives timer wheel, same as epoll backend)
+    i32 timer_fd = -1;
+    u64 timer_ticks_buf = 0;        // read target for IORING_OP_READ on timer_fd
+    bool timer_read_armed = false;  // true if a timer read SQE is in-flight
+
+    // Outstanding partial-send state per connection.
+    // When IORING_OP_SEND completes partially, wait() re-submits the remainder.
+    // Only emits Send completion when all bytes are sent (or error).
+    static constexpr u32 kMaxSendState = 16384;
+    struct SendState {
+        const u8* src;
+        i32 fd;
+        u32 offset;
+        u32 remaining;
+    };
+    SendState send_state[kMaxSendState];
+
     // Pending SQE count (for submission)
     u32 pending = 0;
 
@@ -83,7 +102,9 @@ struct IoUringBackend {
 
     // Wait for completions. Returns number of events filled.
     // Calls io_uring_enter to submit pending SQEs and wait for CQEs.
-    u32 wait(IoEvent* events, u32 max_events);
+    // conns: connection table — recv completions using provided buffers are
+    // copied into conns[conn_id].recv_buf. max_conns: table size for bounds checking.
+    u32 wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
 
     // Shutdown and unmap all resources.
     void shutdown();
@@ -103,6 +124,9 @@ private:
 
     // Setup provided buffer ring via io_uring_register.
     i32 setup_buf_ring();
+
+    // Submit IORING_OP_READ on timer_fd to receive next tick.
+    void submit_timer_read();
 };
 
 }  // namespace rout

@@ -5,12 +5,12 @@ Outstanding work items, tracked from code TODOs and Copilot review findings.
 ## Phase 1 (current)
 
 ### epoll backend
-- [ ] **Partial send proactor semantics** — `add_send()` on EAGAIN/partial registers EPOLLOUT but `wait()` emits `result=0` (readiness). Callbacks treat non-negative as success → truncated responses under backpressure. Fix: track per-connection send state (buf/offset/remaining), complete the send inside `wait()`, emit real byte count. (`src/runtime/epoll_backend.cc:118`)
-- [ ] **recv into Connection buffer** — `wait()` recv's into stack `tmp_buf` and discards data. Callbacks (especially proxy) need data in `Connection::recv_buf`. Fix: pass connection table to `wait()`, or extend IoEvent with buffer pointer. (`src/runtime/epoll_backend.cc:223`)
+- [x] **Partial send proactor semantics** — `add_send()` tracks offset/remaining in `SendState` per conn_id. `wait()` completes the send on EPOLLOUT via loop, emits real byte count. send_buf converted to Buffer.
+- [x] **recv into Connection buffer** — `wait()` now recv's into `Connection::recv_buf` (Buffer) via `write_ptr()`/`commit()`. Connection table passed to `wait()`. Callbacks use `recv_buf.data()`/`recv_buf.len()`.
 
 ### io_uring backend
-- [ ] **Timeout events** — io_uring backend does not emit `IoEventType::Timeout`. Timer wheel only driven by epoll's timerfd. Fix: add timerfd + `IORING_OP_READ` or `IORING_OP_TIMEOUT` for periodic ticks. (`include/rout/runtime/event_loop.h:135`)
-- [ ] **Provided buffer return** — recv completions transfer buffer ownership to userspace but `EventLoop::dispatch` never calls `return_buffer()`. Will exhaust the ring after ~2048 recvs. Fix: return buffer after callback processes data (copy out, then return).
+- [x] **Timeout events** — timerfd created in `init()`, `IORING_OP_READ` submitted for 1-second ticks. `wait()` emits `Timeout` events and re-submits the read.
+- [x] **Provided buffer return** — `wait()` copies recv data from provided buffer into `Connection::recv_buf` via `write_ptr()`/`commit()`, then immediately calls `return_buffer(buf_id)`. Events reach dispatch with `has_buf=0`.
 
 ## Phase 2 (shard integration)
 - [ ] **Shard: memory pools** — Arena, SlabPool, SlicePool per shard (`include/rout/runtime/shard.h:14`)

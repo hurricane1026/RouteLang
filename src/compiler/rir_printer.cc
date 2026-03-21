@@ -1,0 +1,642 @@
+#include "rout/compiler/rir_printer.h"
+
+#include <unistd.h>
+
+namespace rout {
+namespace rir {
+
+// ── PrintBuf implementation ─────────────────────────────────────────
+
+void PrintBuf::flush() {
+    if (len > 0) {
+        ::write(fd, data, len);
+        len = 0;
+    }
+}
+
+void PrintBuf::put(char c) {
+    if (len >= cap) flush();
+    data[len++] = c;
+}
+
+void PrintBuf::put_str(const char* s, u32 n) {
+    for (u32 i = 0; i < n; i++) put(s[i]);
+}
+
+void PrintBuf::put_cstr(const char* s) {
+    while (*s) put(*s++);
+}
+
+void PrintBuf::put_u32(u32 val) {
+    if (val == 0) {
+        put('0');
+        return;
+    }
+    char tmp[10];
+    i32 i = 0;
+    while (val > 0) {
+        tmp[i++] = '0' + static_cast<char>(val % 10);
+        val /= 10;
+    }
+    while (i > 0) put(tmp[--i]);
+}
+
+void PrintBuf::put_i32(i32 val) {
+    if (val < 0) {
+        put('-');
+        // Handle INT_MIN safely.
+        put_u32(static_cast<u32>(-(val + 1)) + 1);
+    } else {
+        put_u32(static_cast<u32>(val));
+    }
+}
+
+void PrintBuf::put_i64(i64 val) {
+    if (val < 0) {
+        put('-');
+        u64 abs = static_cast<u64>(-(val + 1)) + 1;
+        // Recursively print u64.
+        if (abs == 0) {
+            put('0');
+            return;
+        }
+        char tmp[20];
+        i32 i = 0;
+        while (abs > 0) {
+            tmp[i++] = '0' + static_cast<char>(abs % 10);
+            abs /= 10;
+        }
+        while (i > 0) put(tmp[--i]);
+    } else {
+        u64 v = static_cast<u64>(val);
+        if (v == 0) {
+            put('0');
+            return;
+        }
+        char tmp[20];
+        i32 i = 0;
+        while (v > 0) {
+            tmp[i++] = '0' + static_cast<char>(v % 10);
+            v /= 10;
+        }
+        while (i > 0) put(tmp[--i]);
+    }
+}
+
+void PrintBuf::indent(u32 level) {
+    for (u32 i = 0; i < level * 2; i++) put(' ');
+}
+
+// ── Opcode names ────────────────────────────────────────────────────
+
+void print_opcode(PrintBuf& buf, Opcode op) {
+    switch (op) {
+        case Opcode::ConstStr:
+            buf.put_cstr("const.str");
+            break;
+        case Opcode::ConstI32:
+            buf.put_cstr("const.i32");
+            break;
+        case Opcode::ConstI64:
+            buf.put_cstr("const.i64");
+            break;
+        case Opcode::ConstBool:
+            buf.put_cstr("const.bool");
+            break;
+        case Opcode::ConstDuration:
+            buf.put_cstr("const.duration");
+            break;
+        case Opcode::ConstByteSize:
+            buf.put_cstr("const.bytesize");
+            break;
+        case Opcode::ConstMethod:
+            buf.put_cstr("const.method");
+            break;
+        case Opcode::ConstStatus:
+            buf.put_cstr("const.status");
+            break;
+        case Opcode::ReqHeader:
+            buf.put_cstr("req.header");
+            break;
+        case Opcode::ReqParam:
+            buf.put_cstr("req.param");
+            break;
+        case Opcode::ReqMethod:
+            buf.put_cstr("req.method");
+            break;
+        case Opcode::ReqPath:
+            buf.put_cstr("req.path");
+            break;
+        case Opcode::ReqRemoteAddr:
+            buf.put_cstr("req.remote_addr");
+            break;
+        case Opcode::ReqContentLength:
+            buf.put_cstr("req.content_length");
+            break;
+        case Opcode::ReqCookie:
+            buf.put_cstr("req.cookie");
+            break;
+        case Opcode::ReqSetHeader:
+            buf.put_cstr("req.set_header");
+            break;
+        case Opcode::ReqSetPath:
+            buf.put_cstr("req.set_path");
+            break;
+        case Opcode::StrHasPrefix:
+            buf.put_cstr("str.has_prefix");
+            break;
+        case Opcode::StrTrimPrefix:
+            buf.put_cstr("str.trim_prefix");
+            break;
+        case Opcode::StrInterpolate:
+            buf.put_cstr("str.interpolate");
+            break;
+        case Opcode::CmpEq:
+            buf.put_cstr("cmp.eq");
+            break;
+        case Opcode::CmpNe:
+            buf.put_cstr("cmp.ne");
+            break;
+        case Opcode::CmpLt:
+            buf.put_cstr("cmp.lt");
+            break;
+        case Opcode::CmpGt:
+            buf.put_cstr("cmp.gt");
+            break;
+        case Opcode::CmpLe:
+            buf.put_cstr("cmp.le");
+            break;
+        case Opcode::CmpGe:
+            buf.put_cstr("cmp.ge");
+            break;
+        case Opcode::TimeNow:
+            buf.put_cstr("time.now");
+            break;
+        case Opcode::TimeDiff:
+            buf.put_cstr("time.diff");
+            break;
+        case Opcode::IpInCidr:
+            buf.put_cstr("ip.in_cidr");
+            break;
+        case Opcode::HashHmacSha256:
+            buf.put_cstr("hash.hmac_sha256");
+            break;
+        case Opcode::BytesHex:
+            buf.put_cstr("bytes.hex");
+            break;
+        case Opcode::CallExtern:
+            buf.put_cstr("call");
+            break;
+        case Opcode::CounterIncr:
+            buf.put_cstr("counter.incr");
+            break;
+        case Opcode::StructField:
+            buf.put_cstr("struct.field");
+            break;
+        case Opcode::StructCreate:
+            buf.put_cstr("struct.create");
+            break;
+        case Opcode::BodyParse:
+            buf.put_cstr("body.parse");
+            break;
+        case Opcode::ArrayLen:
+            buf.put_cstr("array.len");
+            break;
+        case Opcode::ArrayGet:
+            buf.put_cstr("array.get");
+            break;
+        case Opcode::OptIsNil:
+            buf.put_cstr("opt.is_nil");
+            break;
+        case Opcode::OptUnwrap:
+            buf.put_cstr("opt.unwrap");
+            break;
+        case Opcode::TraceFuncEnter:
+            buf.put_cstr("trace.func_enter");
+            break;
+        case Opcode::TraceFuncExit:
+            buf.put_cstr("trace.func_exit");
+            break;
+        case Opcode::TraceIoStart:
+            buf.put_cstr("trace.io_start");
+            break;
+        case Opcode::TraceIoEnd:
+            buf.put_cstr("trace.io_end");
+            break;
+        case Opcode::MetricHistRecord:
+            buf.put_cstr("metric.histogram_record");
+            break;
+        case Opcode::MetricCounterIncr:
+            buf.put_cstr("metric.counter_incr");
+            break;
+        case Opcode::AccessLogWrite:
+            buf.put_cstr("accesslog.write");
+            break;
+        case Opcode::Br:
+            buf.put_cstr("br");
+            break;
+        case Opcode::Jmp:
+            buf.put_cstr("jmp");
+            break;
+        case Opcode::RetStatus:
+            buf.put_cstr("ret.status");
+            break;
+        case Opcode::RetProxy:
+            buf.put_cstr("ret.proxy");
+            break;
+        case Opcode::YieldHttpGet:
+            buf.put_cstr("yield.http_get");
+            break;
+        case Opcode::YieldHttpPost:
+            buf.put_cstr("yield.http_post");
+            break;
+        case Opcode::YieldProxy:
+            buf.put_cstr("yield.proxy");
+            break;
+        case Opcode::YieldExtern:
+            buf.put_cstr("yield.extern");
+            break;
+    }
+}
+
+// ── Type printing ───────────────────────────────────────────────────
+
+void print_type(PrintBuf& buf, const Type* type) {
+    if (!type) {
+        buf.put_cstr("void");
+        return;
+    }
+    switch (type->kind) {
+        case TypeKind::Void:
+            buf.put_cstr("void");
+            break;
+        case TypeKind::Bool:
+            buf.put_cstr("bool");
+            break;
+        case TypeKind::I32:
+            buf.put_cstr("i32");
+            break;
+        case TypeKind::I64:
+            buf.put_cstr("i64");
+            break;
+        case TypeKind::U32:
+            buf.put_cstr("u32");
+            break;
+        case TypeKind::U64:
+            buf.put_cstr("u64");
+            break;
+        case TypeKind::F64:
+            buf.put_cstr("f64");
+            break;
+        case TypeKind::Str:
+            buf.put_cstr("str");
+            break;
+        case TypeKind::ByteSize:
+            buf.put_cstr("ByteSize");
+            break;
+        case TypeKind::Duration:
+            buf.put_cstr("Duration");
+            break;
+        case TypeKind::Time:
+            buf.put_cstr("Time");
+            break;
+        case TypeKind::IP:
+            buf.put_cstr("IP");
+            break;
+        case TypeKind::CIDR:
+            buf.put_cstr("CIDR");
+            break;
+        case TypeKind::MediaType:
+            buf.put_cstr("MediaType");
+            break;
+        case TypeKind::StatusCode:
+            buf.put_cstr("StatusCode");
+            break;
+        case TypeKind::Method:
+            buf.put_cstr("Method");
+            break;
+        case TypeKind::Bytes:
+            buf.put_cstr("Bytes");
+            break;
+        case TypeKind::Optional:
+            buf.put_cstr("Optional(");
+            print_type(buf, type->inner);
+            buf.put(')');
+            break;
+        case TypeKind::Struct:
+            buf.put_cstr("Struct(");
+            if (type->struct_def) buf.put_str(type->struct_def->name);
+            buf.put(')');
+            break;
+        case TypeKind::Array:
+            buf.put_cstr("Array(");
+            print_type(buf, type->inner);
+            buf.put(')');
+            break;
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+static void print_value_ref(PrintBuf& buf, ValueId vid) {
+    buf.put('%');
+    buf.put_u32(vid.id);
+}
+
+static void print_quoted_str(PrintBuf& buf, Str s) {
+    buf.put('"');
+    buf.put_str(s);
+    buf.put('"');
+}
+
+static void print_block_ref(PrintBuf& buf, BlockId bid, const Function& fn) {
+    if (bid.id < fn.block_count) {
+        buf.put_str(fn.blocks[bid.id].label);
+    } else {
+        buf.put_cstr("block_?");
+    }
+}
+
+static void print_source_loc(PrintBuf& buf, SourceLoc loc) {
+    if (loc.line > 0) {
+        buf.put_cstr("  // line ");
+        buf.put_u32(loc.line);
+    }
+}
+
+// ── Instruction printing ────────────────────────────────────────────
+
+void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& fn) {
+    buf.indent(2);
+
+    // Result assignment.
+    if (inst.result != kNoValue) {
+        print_value_ref(buf, inst.result);
+        buf.put_cstr(" = ");
+    }
+
+    print_opcode(buf, inst.op);
+
+    // Operands and immediates (opcode-specific formatting).
+    switch (inst.op) {
+        case Opcode::ConstStr:
+            buf.put(' ');
+            print_quoted_str(buf, inst.imm.str_val);
+            break;
+        case Opcode::ConstI32:
+        case Opcode::ConstStatus:
+            buf.put(' ');
+            buf.put_i32(inst.imm.i32_val);
+            break;
+        case Opcode::ConstI64:
+        case Opcode::ConstDuration:
+        case Opcode::ConstByteSize:
+            buf.put(' ');
+            buf.put_i64(inst.imm.i64_val);
+            break;
+        case Opcode::ConstBool:
+            buf.put(' ');
+            buf.put_cstr(inst.imm.bool_val ? "true" : "false");
+            break;
+        case Opcode::ConstMethod:
+            buf.put(' ');
+            buf.put_u32(inst.imm.method_val);
+            break;
+        case Opcode::ReqHeader:
+        case Opcode::ReqParam:
+        case Opcode::ReqCookie:
+            buf.put(' ');
+            print_quoted_str(buf, inst.imm.str_val);
+            break;
+        case Opcode::ReqMethod:
+        case Opcode::ReqPath:
+        case Opcode::ReqRemoteAddr:
+        case Opcode::ReqContentLength:
+        case Opcode::TimeNow:
+            // No operands.
+            break;
+        case Opcode::ReqSetHeader:
+            buf.put(' ');
+            print_quoted_str(buf, inst.imm.str_val);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::ReqSetPath:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::StrHasPrefix:
+        case Opcode::StrTrimPrefix:
+        case Opcode::CmpEq:
+        case Opcode::CmpNe:
+        case Opcode::CmpLt:
+        case Opcode::CmpGt:
+        case Opcode::CmpLe:
+        case Opcode::CmpGe:
+        case Opcode::TimeDiff:
+            // Binary: %a, %b
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[1]);
+            break;
+        case Opcode::StrInterpolate:
+            buf.put_cstr(" [");
+            for (u32 i = 0; i < inst.operand_count; i++) {
+                if (i > 0) buf.put_cstr(", ");
+                print_value_ref(buf, inst.operand(i));
+            }
+            buf.put(']');
+            break;
+        case Opcode::IpInCidr:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            buf.put_str(inst.imm.str_val);
+            break;
+        case Opcode::OptIsNil:
+        case Opcode::OptUnwrap:
+        case Opcode::BytesHex:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::StructField:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_quoted_str(buf, inst.imm.struct_ref.name);
+            break;
+        case Opcode::BodyParse:
+            buf.put(' ');
+            print_type(buf, inst.imm.struct_ref.type);
+            break;
+        case Opcode::CounterIncr:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            buf.put_i64(inst.imm.i64_val);
+            buf.put('s');
+            break;
+        case Opcode::CallExtern:
+            buf.put('.');
+            buf.put_str(inst.imm.extern_name);
+            buf.put(' ');
+            for (u32 i = 0; i < inst.operand_count; i++) {
+                if (i > 0) buf.put_cstr(", ");
+                print_value_ref(buf, inst.operand(i));
+            }
+            break;
+        case Opcode::HashHmacSha256:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[1]);
+            break;
+
+        // Terminators
+        case Opcode::Br:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_block_ref(buf, inst.imm.block_targets[0], fn);
+            buf.put_cstr(", ");
+            print_block_ref(buf, inst.imm.block_targets[1], fn);
+            break;
+        case Opcode::Jmp:
+            buf.put(' ');
+            print_block_ref(buf, inst.imm.block_targets[0], fn);
+            break;
+        case Opcode::RetStatus:
+            buf.put(' ');
+            buf.put_i32(inst.imm.i32_val);
+            break;
+        case Opcode::RetProxy:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            break;
+
+        // Yields
+        case Opcode::YieldHttpGet:
+            buf.put(' ');
+            print_quoted_str(buf, inst.imm.str_val);
+            if (inst.operand_count > 0) {
+                buf.put_cstr(", ");
+                print_value_ref(buf, inst.operands[0]);
+            }
+            break;
+        case Opcode::YieldHttpPost:
+            buf.put(' ');
+            print_quoted_str(buf, inst.imm.str_val);
+            for (u32 i = 0; i < inst.operand_count; i++) {
+                buf.put_cstr(", ");
+                print_value_ref(buf, inst.operand(i));
+            }
+            break;
+        case Opcode::YieldProxy:
+            buf.put(' ');
+            if (inst.operand_count > 0) print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::YieldExtern:
+            buf.put(' ');
+            print_quoted_str(buf, inst.imm.extern_name);
+            for (u32 i = 0; i < inst.operand_count; i++) {
+                buf.put_cstr(", ");
+                print_value_ref(buf, inst.operand(i));
+            }
+            break;
+
+        // Instrumentation
+        case Opcode::TraceFuncEnter:
+        case Opcode::TraceFuncExit:
+        case Opcode::TraceIoStart:
+        case Opcode::TraceIoEnd:
+        case Opcode::MetricHistRecord:
+        case Opcode::MetricCounterIncr:
+        case Opcode::AccessLogWrite:
+            for (u32 i = 0; i < inst.operand_count; i++) {
+                buf.put(' ');
+                print_value_ref(buf, inst.operand(i));
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    print_source_loc(buf, inst.loc);
+    buf.newline();
+}
+
+// ── Block printing ──────────────────────────────────────────────────
+
+void print_block(PrintBuf& buf, const Block& block, const Function& fn) {
+    buf.indent(1);
+    buf.put_str(block.label);
+    buf.put(':');
+    buf.newline();
+
+    for (u32 i = 0; i < block.inst_count; i++) {
+        print_instruction(buf, block.insts[i], fn);
+    }
+}
+
+// ── Function printing ───────────────────────────────────────────────
+
+void print_function(PrintBuf& buf, const Function& fn) {
+    // Header.
+    buf.put_cstr("=== ");
+    buf.put_str(fn.name);
+    buf.put_cstr(" ===");
+    buf.newline();
+
+    // Summary.
+    buf.indent(1);
+    buf.put_cstr("route: ");
+    buf.put_str(fn.route_pattern);
+    buf.newline();
+
+    buf.indent(1);
+    buf.put_cstr("io_points: ");
+    buf.put_u32(fn.yield_count);
+    if (fn.yield_count == 0) buf.put_cstr(" (all sync)");
+    buf.newline();
+
+    buf.indent(1);
+    buf.put_cstr("states: ");
+    buf.put_u32(fn.yield_count + 1);
+    buf.newline();
+
+    buf.indent(1);
+    buf.put_cstr("blocks: ");
+    buf.put_u32(fn.block_count);
+    buf.newline();
+
+    // Count total instructions.
+    u32 total_insts = 0;
+    for (u32 i = 0; i < fn.block_count; i++) {
+        total_insts += fn.blocks[i].inst_count;
+    }
+    buf.indent(1);
+    buf.put_cstr("instructions: ");
+    buf.put_u32(total_insts);
+    buf.newline();
+    buf.newline();
+
+    // Blocks.
+    for (u32 i = 0; i < fn.block_count; i++) {
+        print_block(buf, fn.blocks[i], fn);
+    }
+}
+
+// ── Module printing ─────────────────────────────────────────────────
+
+void print_module(PrintBuf& buf, const Module& mod) {
+    for (u32 i = 0; i < mod.func_count; i++) {
+        if (i > 0) buf.newline();
+        print_function(buf, mod.functions[i]);
+    }
+    buf.flush();
+}
+
+}  // namespace rir
+}  // namespace rout

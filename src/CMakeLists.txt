@@ -68,6 +68,7 @@ endif()
 # Compiler library
 add_library(rue_compiler STATIC
     compiler/lexer.cc
+    compiler/rir_printer.cc
 )
 
 target_include_directories(rue_compiler PUBLIC

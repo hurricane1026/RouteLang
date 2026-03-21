@@ -54,6 +54,13 @@ target_include_directories(test_types PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 
+add_executable(test_rir test_rir.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_link_libraries(test_rir rue_compiler)
+target_include_directories(test_rir PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+
 add_custom_target(check
     COMMAND $<TARGET_FILE:test_network>
     COMMAND $<TARGET_FILE:test_integration>
@@ -62,6 +69,7 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_http_parser>
     COMMAND $<TARGET_FILE:test_buffer>
     COMMAND $<TARGET_FILE:test_types>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_buffer test_types
+    COMMAND $<TARGET_FILE:test_rir>
+    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_buffer test_types test_rir
     COMMENT "Running all tests..."
 )

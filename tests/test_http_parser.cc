@@ -1858,6 +1858,216 @@ TEST(NginxHeaders, ContentLengthAndTransferEncodingConflict) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
 }
 
+// --- Duplicate Content-Length: more edge cases ---
+
+TEST(NginxHeaders, DuplicateContentLengthZeroZero) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Two CL: 0 headers — same value, should be accepted
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Content-Length: 0\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, 0u);
+}
+
+TEST(NginxHeaders, DuplicateContentLengthZeroNonzero) {
+    HttpParser parser;
+    ParsedRequest req;
+    // CL: 0 then CL: 5 — different values, must reject
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Content-Length: 0\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(NginxHeaders, TripleDuplicateContentLength) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Three identical CL headers — allowed
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Content-Length: 42\r\n"
+        "Content-Length: 42\r\n"
+        "Content-Length: 42\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, 42u);
+}
+
+TEST(NginxHeaders, TripleDuplicateContentLengthMismatch) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Two same, one different — must reject
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Content-Length: 42\r\n"
+        "Content-Length: 42\r\n"
+        "Content-Length: 43\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(NginxHeaders, ContentLengthAfterOtherHeaders) {
+    HttpParser parser;
+    ParsedRequest req;
+    // CL after other headers, duplicate with mismatch
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Content-Length: 10\r\n"
+        "Accept: */*\r\n"
+        "Content-Length: 20\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+// --- Content-Length + Transfer-Encoding conflict: more cases ---
+
+TEST(NginxHeaders, TransferEncodingThenContentLength) {
+    HttpParser parser;
+    ParsedRequest req;
+    // TE first, CL second — also rejected
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Content-Length: 10\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(NginxHeaders, ContentLengthZeroWithChunked) {
+    HttpParser parser;
+    ParsedRequest req;
+    // CL: 0 + chunked — still a conflict per RFC
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Content-Length: 0\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(NginxHeaders, TransferEncodingNonChunkedWithCL) {
+    HttpParser parser;
+    ParsedRequest req;
+    // TE: gzip (not chunked) + CL — no conflict (chunked flag not set)
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Transfer-Encoding: gzip\r\n"
+        "Content-Length: 10\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.chunked);
+    CHECK_EQ(req.content_length, 10u);
+}
+
+TEST(NginxHeaders, ChunkedInTokenList) {
+    HttpParser parser;
+    ParsedRequest req;
+    // TE: gzip, chunked — chunked is in the token list
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Transfer-Encoding: gzip, chunked\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.chunked);
+}
+
+TEST(NginxHeaders, ChunkedInTokenListWithCL) {
+    HttpParser parser;
+    ParsedRequest req;
+    // TE with chunked in list + CL — conflict
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Transfer-Encoding: gzip, chunked\r\n"
+        "Content-Length: 10\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+// --- Connection header token parsing edge cases ---
+
+TEST(NginxHeaders, ConnectionCloseUpgrade) {
+    HttpParser parser;
+    ParsedRequest req;
+    // "close, upgrade" — close takes precedence
+    auto s = parse_one(
+        "GET / HTTP/1.1\r\n"
+        "Connection: close, upgrade\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.keep_alive);
+}
+
+TEST(NginxHeaders, ConnectionKeepAliveUpgrade) {
+    HttpParser parser;
+    ParsedRequest req;
+    // "keep-alive, upgrade"
+    auto s = parse_one(
+        "GET / HTTP/1.1\r\n"
+        "Connection: keep-alive, upgrade\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.keep_alive);
+}
+
+TEST(NginxHeaders, ConnectionTokenWithSpaces) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Extra spaces around tokens
+    auto s = parse_one(
+        "GET / HTTP/1.1\r\n"
+        "Connection:  close , upgrade \r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.keep_alive);
+}
+
+TEST(NginxHeaders, ConnectionEmptyTokens) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Empty tokens between commas should be skipped
+    auto s = parse_one(
+        "GET / HTTP/1.1\r\n"
+        "Connection: ,,close,,\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.keep_alive);
+}
+
 TEST(NginxHeaders, DuplicateHost) {
     HttpParser parser;
     ParsedRequest req;

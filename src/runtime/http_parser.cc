@@ -377,7 +377,7 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
 
     // Reject requests with both Content-Length and Transfer-Encoding: chunked
     // to prevent request-smuggling attacks (RFC 7230 §3.3.3).
-    if (UNLIKELY(req->chunked && req->content_length > 0)) return ParseStatus::Error;
+    if (UNLIKELY(req->chunked && req->has_content_length)) return ParseStatus::Error;
 
     return ParseStatus::Complete;
 

@@ -235,10 +235,14 @@ struct Instruction {
         return extra_operands[i - kMaxInlineOperands];
     }
 
-    // Is this instruction a terminator?
+    // Is this a block-ending instruction? Includes both control flow
+    // terminators (br, jmp, ret) and yields (I/O suspend points that
+    // become state machine boundaries). No instructions may follow
+    // a block-ender within the same block.
     bool is_terminator() const { return op >= Opcode::Br && op <= Opcode::YieldExtern; }
 
-    // Is this a yield (I/O suspend point)?
+    // Is this a yield (I/O suspend point → state machine boundary)?
+    // Yields are a subset of terminators.
     bool is_yield() const { return op >= Opcode::YieldHttpGet && op <= Opcode::YieldExtern; }
 };
 
@@ -299,6 +303,7 @@ struct Module {
     // Struct type definitions (shared across functions).
     StructDef** struct_defs;
     u32 struct_count;
+    u32 struct_cap;
 
     // Functions (one per route handler).
     Function* functions;

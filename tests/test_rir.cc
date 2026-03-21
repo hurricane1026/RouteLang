@@ -29,8 +29,10 @@ struct TestContext {
         mod.functions = arena.alloc_array<Function>(kMaxFuncs);
         mod.func_count = 0;
         mod.func_cap = kMaxFuncs;
-        mod.struct_defs = arena.alloc_array<StructDef*>(64);
+        static constexpr u32 kMaxStructs = 64;
+        mod.struct_defs = arena.alloc_array<StructDef*>(kMaxStructs);
         mod.struct_count = 0;
+        mod.struct_cap = kMaxStructs;
         return true;
     }
 

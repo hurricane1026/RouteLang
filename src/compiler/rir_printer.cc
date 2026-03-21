@@ -1,5 +1,6 @@
 #include "rout/compiler/rir_printer.h"
 
+#include <errno.h>
 #include <unistd.h>
 
 namespace rout {
@@ -12,6 +13,7 @@ void PrintBuf::flush() {
         u32 written = 0;
         while (written < len) {
             auto n = ::write(fd, data + written, len - written);
+            if (n < 0 && errno == EINTR) continue;
             if (n <= 0) break;  // EBADF or unrecoverable
             written += static_cast<u32>(n);
         }
@@ -565,6 +567,12 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
 
         default:
+            // Fallback: print all operands for opcodes without
+            // specialized formatting (StructCreate, ArrayLen, ArrayGet, etc.).
+            for (u32 i = 0; i < inst.operand_count; i++) {
+                buf.put(' ');
+                print_value_ref(buf, inst.operand(i));
+            }
             break;
     }
 

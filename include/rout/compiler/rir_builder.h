@@ -26,13 +26,15 @@ static constexpr BlockId kNoBlock = {0xFFFFFFFF};
 struct Builder {
     Module* mod;
 
-    // Current insert point.
+    // Current insert point — stored as index to survive grow_blocks().
     Function* cur_func;
+    BlockId cur_block_id;
     Block* cur_block;
 
     void init(Module* m) {
         mod = m;
         cur_func = nullptr;
+        cur_block_id = kNoBlock;
         cur_block = nullptr;
     }
 
@@ -50,7 +52,7 @@ struct Builder {
             sd->fields()[i] = fields[i];
         }
         // Register in module if capacity allows.
-        if (mod->struct_defs && mod->struct_count < 64) {
+        if (mod->struct_defs && mod->struct_count < mod->struct_cap) {
             mod->struct_defs[mod->struct_count++] = sd;
         }
         return sd;
@@ -118,10 +120,12 @@ struct Builder {
     void set_insert_point(Function* fn, BlockId block) {
         if (!fn || block.id >= fn->block_count) {
             cur_func = nullptr;
+            cur_block_id = kNoBlock;
             cur_block = nullptr;
             return;
         }
         cur_func = fn;
+        cur_block_id = block;
         cur_block = &fn->blocks[block.id];
     }
 
@@ -160,6 +164,10 @@ struct Builder {
         }
         fn->blocks = new_blocks;
         fn->block_cap = new_cap;
+        // Rebase cur_block if it pointed into the old array.
+        if (cur_func == fn && cur_block_id.id < fn->block_count) {
+            cur_block = &fn->blocks[cur_block_id.id];
+        }
         return true;
     }
 
@@ -213,71 +221,92 @@ struct Builder {
     }
 
     // ── Helpers for variadic operand storage ────────────────────────
+    // Transactional: operand_count is only updated after all storage
+    // (including overflow allocation) succeeds.
 
     bool set_operands(Instruction* inst, const ValueId* ops, u32 count) {
-        inst->operand_count = count;
         if (count <= kMaxInlineOperands) {
             for (u32 i = 0; i < count; i++) inst->operands[i] = ops[i];
+            inst->operand_count = count;
             return true;
         }
+        // Allocate overflow before committing any state.
+        u32 extra = count - kMaxInlineOperands;
+        auto* extra_ops = mod->arena->alloc_array<ValueId>(extra);
+        if (!extra_ops) return false;
         for (u32 i = 0; i < kMaxInlineOperands; i++) {
             inst->operands[i] = ops[i];
         }
-        u32 extra = count - kMaxInlineOperands;
-        inst->extra_operands = mod->arena->alloc_array<ValueId>(extra);
-        if (!inst->extra_operands) return false;
         for (u32 i = 0; i < extra; i++) {
-            inst->extra_operands[i] = ops[kMaxInlineOperands + i];
+            extra_ops[i] = ops[kMaxInlineOperands + i];
         }
+        inst->extra_operands = extra_ops;
+        inst->operand_count = count;
         return true;
     }
 
     // ── Constants ───────────────────────────────────────────────────
 
     ValueId emit_const_str(Str val, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::ConstStr, make_type(TypeKind::Str), loc);
+        const Type* ty = make_type(TypeKind::Str);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ConstStr, ty, loc);
         if (inst) inst->imm.str_val = val;
         return vid;
     }
 
     ValueId emit_const_i32(i32 val, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::ConstI32, make_type(TypeKind::I32), loc);
+        const Type* ty = make_type(TypeKind::I32);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ConstI32, ty, loc);
         if (inst) inst->imm.i32_val = val;
         return vid;
     }
 
     ValueId emit_const_i64(i64 val, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::ConstI64, make_type(TypeKind::I64), loc);
+        const Type* ty = make_type(TypeKind::I64);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ConstI64, ty, loc);
         if (inst) inst->imm.i64_val = val;
         return vid;
     }
 
     ValueId emit_const_bool(bool val, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::ConstBool, make_type(TypeKind::Bool), loc);
+        const Type* ty = make_type(TypeKind::Bool);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ConstBool, ty, loc);
         if (inst) inst->imm.bool_val = val;
         return vid;
     }
 
     ValueId emit_const_duration(i64 seconds, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::ConstDuration, make_type(TypeKind::Duration), loc);
+        const Type* ty = make_type(TypeKind::Duration);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ConstDuration, ty, loc);
         if (inst) inst->imm.i64_val = seconds;
         return vid;
     }
 
     ValueId emit_const_bytesize(i64 bytes, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::ConstByteSize, make_type(TypeKind::ByteSize), loc);
+        const Type* ty = make_type(TypeKind::ByteSize);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ConstByteSize, ty, loc);
         if (inst) inst->imm.i64_val = bytes;
         return vid;
     }
 
     ValueId emit_const_method(u8 method, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::ConstMethod, make_type(TypeKind::Method), loc);
+        const Type* ty = make_type(TypeKind::Method);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ConstMethod, ty, loc);
         if (inst) inst->imm.method_val = method;
         return vid;
     }
 
     ValueId emit_const_status(i32 code, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::ConstStatus, make_type(TypeKind::StatusCode), loc);
+        const Type* ty = make_type(TypeKind::StatusCode);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ConstStatus, ty, loc);
         if (inst) inst->imm.i32_val = code;
         return vid;
     }
@@ -285,37 +314,51 @@ struct Builder {
     // ── Request access ──────────────────────────────────────────────
 
     ValueId emit_req_header(Str name, SourceLoc loc = {}) {
-        auto* opt_str = make_type(TypeKind::Optional, make_type(TypeKind::Str));
-        auto [inst, vid] = emit(Opcode::ReqHeader, opt_str, loc);
+        auto* inner = make_type(TypeKind::Str);
+        auto* ty = inner ? make_type(TypeKind::Optional, inner) : nullptr;
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ReqHeader, ty, loc);
         if (inst) inst->imm.str_val = name;
         return vid;
     }
 
     ValueId emit_req_param(Str name, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::ReqParam, make_type(TypeKind::Str), loc);
+        const Type* ty = make_type(TypeKind::Str);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ReqParam, ty, loc);
         if (inst) inst->imm.str_val = name;
         return vid;
     }
 
     ValueId emit_req_method(SourceLoc loc = {}) {
-        return emit(Opcode::ReqMethod, make_type(TypeKind::Method), loc).vid;
+        const Type* ty = make_type(TypeKind::Method);
+        if (!ty) return kNoValue;
+        return emit(Opcode::ReqMethod, ty, loc).vid;
     }
 
     ValueId emit_req_path(SourceLoc loc = {}) {
-        return emit(Opcode::ReqPath, make_type(TypeKind::Str), loc).vid;
+        const Type* ty = make_type(TypeKind::Str);
+        if (!ty) return kNoValue;
+        return emit(Opcode::ReqPath, ty, loc).vid;
     }
 
     ValueId emit_req_remote_addr(SourceLoc loc = {}) {
-        return emit(Opcode::ReqRemoteAddr, make_type(TypeKind::IP), loc).vid;
+        const Type* ty = make_type(TypeKind::IP);
+        if (!ty) return kNoValue;
+        return emit(Opcode::ReqRemoteAddr, ty, loc).vid;
     }
 
     ValueId emit_req_content_length(SourceLoc loc = {}) {
-        return emit(Opcode::ReqContentLength, make_type(TypeKind::ByteSize), loc).vid;
+        const Type* ty = make_type(TypeKind::ByteSize);
+        if (!ty) return kNoValue;
+        return emit(Opcode::ReqContentLength, ty, loc).vid;
     }
 
     ValueId emit_req_cookie(Str name, SourceLoc loc = {}) {
-        auto* opt_str = make_type(TypeKind::Optional, make_type(TypeKind::Str));
-        auto [inst, vid] = emit(Opcode::ReqCookie, opt_str, loc);
+        auto* inner = make_type(TypeKind::Str);
+        auto* ty = inner ? make_type(TypeKind::Optional, inner) : nullptr;
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::ReqCookie, ty, loc);
         if (inst) inst->imm.str_val = name;
         return vid;
     }
@@ -342,7 +385,9 @@ struct Builder {
     // ── String operations ───────────────────────────────────────────
 
     ValueId emit_str_has_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::StrHasPrefix, make_type(TypeKind::Bool), loc);
+        const Type* ty = make_type(TypeKind::Bool);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::StrHasPrefix, ty, loc);
         if (inst) {
             inst->operands[0] = str;
             inst->operands[1] = prefix;
@@ -352,7 +397,9 @@ struct Builder {
     }
 
     ValueId emit_str_trim_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::StrTrimPrefix, make_type(TypeKind::Str), loc);
+        const Type* ty = make_type(TypeKind::Str);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::StrTrimPrefix, ty, loc);
         if (inst) {
             inst->operands[0] = str;
             inst->operands[1] = prefix;
@@ -362,15 +409,19 @@ struct Builder {
     }
 
     ValueId emit_str_interpolate(const ValueId* parts, u32 count, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::StrInterpolate, make_type(TypeKind::Str), loc);
-        if (inst) set_operands(inst, parts, count);
+        const Type* ty = make_type(TypeKind::Str);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::StrInterpolate, ty, loc);
+        if (inst && !set_operands(inst, parts, count)) return kNoValue;
         return vid;
     }
 
     // ── Comparisons ─────────────────────────────────────────────────
 
     ValueId emit_cmp(Opcode cmp_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(cmp_op, make_type(TypeKind::Bool), loc);
+        const Type* ty = make_type(TypeKind::Bool);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(cmp_op, ty, loc);
         if (inst) {
             inst->operands[0] = lhs;
             inst->operands[1] = rhs;
@@ -382,11 +433,15 @@ struct Builder {
     // ── Domain operations ───────────────────────────────────────────
 
     ValueId emit_time_now(SourceLoc loc = {}) {
-        return emit(Opcode::TimeNow, make_type(TypeKind::Time), loc).vid;
+        const Type* ty = make_type(TypeKind::Time);
+        if (!ty) return kNoValue;
+        return emit(Opcode::TimeNow, ty, loc).vid;
     }
 
     ValueId emit_time_diff(ValueId a, ValueId b, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::TimeDiff, make_type(TypeKind::Duration), loc);
+        const Type* ty = make_type(TypeKind::Duration);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::TimeDiff, ty, loc);
         if (inst) {
             inst->operands[0] = a;
             inst->operands[1] = b;
@@ -396,7 +451,9 @@ struct Builder {
     }
 
     ValueId emit_ip_in_cidr(ValueId ip, Str cidr_lit, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::IpInCidr, make_type(TypeKind::Bool), loc);
+        const Type* ty = make_type(TypeKind::Bool);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::IpInCidr, ty, loc);
         if (inst) {
             inst->operands[0] = ip;
             inst->operand_count = 1;
@@ -408,7 +465,9 @@ struct Builder {
     // ── Optional operations ─────────────────────────────────────────
 
     ValueId emit_opt_is_nil(ValueId opt, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::OptIsNil, make_type(TypeKind::Bool), loc);
+        const Type* ty = make_type(TypeKind::Bool);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::OptIsNil, ty, loc);
         if (inst) {
             inst->operands[0] = opt;
             inst->operand_count = 1;
@@ -417,6 +476,7 @@ struct Builder {
     }
 
     ValueId emit_opt_unwrap(ValueId opt, const Type* inner_type, SourceLoc loc = {}) {
+        if (!inner_type) return kNoValue;
         auto [inst, vid] = emit(Opcode::OptUnwrap, inner_type, loc);
         if (inst) {
             inst->operands[0] = opt;
@@ -431,6 +491,7 @@ struct Builder {
                               Str field_name,
                               const Type* field_type,
                               SourceLoc loc = {}) {
+        if (!field_type) return kNoValue;
         auto [inst, vid] = emit(Opcode::StructField, field_type, loc);
         if (inst) {
             inst->operands[0] = s;
@@ -442,6 +503,7 @@ struct Builder {
     }
 
     ValueId emit_body_parse(const Type* target_type, SourceLoc loc = {}) {
+        if (!target_type) return kNoValue;
         auto [inst, vid] = emit(Opcode::BodyParse, target_type, loc);
         if (inst) inst->imm.struct_ref.type = target_type;
         return vid;
@@ -450,7 +512,9 @@ struct Builder {
     // ── Counter ─────────────────────────────────────────────────────
 
     ValueId emit_counter_incr(ValueId key, i64 window_seconds, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::CounterIncr, make_type(TypeKind::I32), loc);
+        const Type* ty = make_type(TypeKind::I32);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::CounterIncr, ty, loc);
         if (inst) {
             inst->operands[0] = key;
             inst->operand_count = 1;
@@ -466,10 +530,11 @@ struct Builder {
                              u32 arg_count,
                              const Type* return_type,
                              SourceLoc loc = {}) {
+        if (!return_type) return kNoValue;
         auto [inst, vid] = emit(Opcode::CallExtern, return_type, loc);
         if (!inst) return vid;
         inst->imm.extern_name = func_name;
-        set_operands(inst, args, arg_count);
+        if (!set_operands(inst, args, arg_count)) return kNoValue;
         return vid;
     }
 
@@ -506,10 +571,11 @@ struct Builder {
     // ── Yields (I/O suspend points) ────────────────────────────────
 
     ValueId emit_yield_http_get(Str url, ValueId headers, SourceLoc loc = {}) {
-        auto [inst, vid] = emit(Opcode::YieldHttpGet, make_type(TypeKind::Str), loc);
+        const Type* ty = make_type(TypeKind::Str);
+        if (!ty) return kNoValue;
+        auto [inst, vid] = emit(Opcode::YieldHttpGet, ty, loc);
         if (inst) {
             inst->imm.str_val = url;
-            // Only store headers operand when actually provided.
             if (headers != kNoValue) {
                 inst->operands[0] = headers;
                 inst->operand_count = 1;
@@ -521,10 +587,11 @@ struct Builder {
 
     ValueId emit_yield_extern(
         Str name, const ValueId* args, u32 arg_count, const Type* return_type, SourceLoc loc = {}) {
+        if (!return_type) return kNoValue;
         auto [inst, vid] = emit(Opcode::YieldExtern, return_type, loc);
         if (!inst) return vid;
         inst->imm.extern_name = name;
-        set_operands(inst, args, arg_count);
+        if (!set_operands(inst, args, arg_count)) return kNoValue;
         cur_func->yield_count++;
         return vid;
     }

@@ -8,8 +8,8 @@ using core::Unexpected;
 
 // ── Minimal test harness (no stdlib) ────────────────────────────────
 
-extern "C" void _exit(int);
-extern "C" int write(int, const void*, unsigned long);
+#include <stdint.h>
+#include <unistd.h>
 
 static int g_total = 0;
 static int g_passed = 0;
@@ -539,7 +539,7 @@ static void test_alignment() {
     check(r.has_value(), "aligned value");
     check(r.value().v == 42, "aligned == 42");
     // Verify alignment (address should be 64-byte aligned within struct)
-    auto addr = reinterpret_cast<unsigned long>(&r.value().v);
+    auto addr = reinterpret_cast<uintptr_t>(&r.value().v);
     check((addr % 64) == 0, "aligned 64-byte");
 }
 

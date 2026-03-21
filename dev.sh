@@ -134,7 +134,7 @@ all() {
 # ---- Main ----
 case "${1:-test}" in
     build)       build ;;
-    test)        build && test ;;
+    test)        test ;;
     tidy)        tidy ;;
     format)      format_check ;;
     format-fix)  format_fix ;;

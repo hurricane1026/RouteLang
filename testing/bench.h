@@ -185,7 +185,10 @@ struct Bench {
     void title(const char* t) { title_ = t; }
     void min_iterations(u64 n) { min_iters_ = n; }
     void warmup(u64 n) { warmup_iters_ = n; }
-    void epochs(u32 n) { epochs_ = n > kMaxEpochs ? kMaxEpochs : n; }
+    void epochs(u32 n) {
+        epochs_ = n < 1 ? 1 : (n > kMaxEpochs ? kMaxEpochs : n);
+        if (epochs_ % 2 == 0) epochs_++;  // keep odd for clean median
+    }
     void bytes_per_op(u64 n) { bytes_per_op_ = n; }
 
     template <typename Fn>

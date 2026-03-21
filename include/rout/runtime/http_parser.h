@@ -4,7 +4,7 @@
 
 namespace rout {
 
-// --- HTTP method enum (sequential values) ---
+// --- HTTP method enum (0..8 for known methods, 255 for unknown) ---
 enum class HttpMethod : u8 {
     GET = 0,
     POST = 1,

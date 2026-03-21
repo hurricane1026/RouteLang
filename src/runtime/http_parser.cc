@@ -1,6 +1,5 @@
 #include "rout/runtime/http_parser.h"
 
-#include "runtime/simd/char_tables.h"
 #include "runtime/simd/simd.h"
 
 namespace rout {
@@ -168,24 +167,10 @@ static constexpr u16 kCRLF = static_cast<u16>('\r') | (static_cast<u16>('\n') <<
 // Fall through to SIMD for long data.
 // ============================================================================
 
-// Scan for ':' validating token chars. Handles first 32 bytes inline.
+// Header name: go straight to SIMD. Even for short names (~10 bytes),
+// one vector load + compare + movemask is faster than 10 scalar table lookups.
 static inline u32 fast_scan_header_name(const u8* buf, u32 pos, u32 end) {
-    // Fast scalar path: most header names are < 24 bytes
-    u32 fast_end = end - pos > 24 ? pos + 24 : end;
-    while (pos < fast_end) {
-        u8 c = buf[pos];
-        if (c == ':') return pos;
-        if (UNLIKELY(!kTokenTable[c])) return static_cast<u32>(-1);
-        pos++;
-    }
-    // Long name — fall into SIMD
     return simd::scan_header_name(buf, pos, end);
-}
-
-// Header value: go straight to SIMD. Values are often long (User-Agent, Cookie, etc.)
-// Scalar prefix would slow down the common case.
-static inline u32 fast_scan_header_value(const u8* buf, u32 pos, u32 end) {
-    return simd::scan_header_value(buf, pos, end);
 }
 
 // ============================================================================
@@ -328,15 +313,12 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
         u32 name_len = colon_pos - name_start;
         pos = colon_pos + 1;
 
-        // Skip OWS
+        // Skip OWS — hot path: single space after colon
         if (UNLIKELY(pos >= len)) goto maybe_incomplete;
-        if (buf[pos] == ' ') {
-            pos++;
-        } else if (UNLIKELY(buf[pos] == '\t')) {
+        if (LIKELY(buf[pos] == ' ')) {
             pos++;
         }
-        while (UNLIKELY(pos < len && (buf[pos] == ' ' || buf[pos] == '\t'))) pos++;
-        if (UNLIKELY(pos >= len)) goto maybe_incomplete;
+        while (UNLIKELY(buf[pos] == ' ' || buf[pos] == '\t')) pos++;
 
         {
             // Header value — SIMD scan for \r

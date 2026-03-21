@@ -46,6 +46,7 @@ struct UpstreamPool {
         if (free_top == 0) return nullptr;
         u32 idx = free_stack[--free_top];
         conns[idx].fd = -1;
+        conns[idx].upstream_id = 0;
         conns[idx].idle = false;
         conns[idx].allocated = true;
         return &conns[idx];

@@ -271,6 +271,7 @@ struct Bench {
         out("\n  --- Comparison ---\n");
         // Use first result as baseline
         u64 base_ns = results_[0].median_ns;
+        if (base_ns == 0) base_ns = 1;  // guard against div-by-zero
         const char* base_name = results_[0].name;
 
         for (u32 i = 0; i < result_count_; i++) {
@@ -283,8 +284,10 @@ struct Bench {
             if (i == 0) {
                 out("  baseline\n");
             } else {
-                if (results_[i].median_ns <= base_ns) {
-                    u64 ratio = (base_ns * 100) / results_[i].median_ns;
+                u64 other_ns = results_[i].median_ns;
+                if (other_ns == 0) other_ns = 1;  // guard against div-by-zero
+                if (other_ns <= base_ns) {
+                    u64 ratio = (base_ns * 100) / other_ns;
                     out("  ");
                     out_u64(ratio / 100);
                     out(".");
@@ -293,7 +296,7 @@ struct Bench {
                     out_u64(frac);
                     out("x faster than ");
                 } else {
-                    u64 ratio = (results_[i].median_ns * 100) / base_ns;
+                    u64 ratio = (other_ns * 100) / base_ns;
                     out("  ");
                     out_u64(ratio / 100);
                     out(".");

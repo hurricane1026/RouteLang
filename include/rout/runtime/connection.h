@@ -50,6 +50,7 @@ struct Connection {
         fd = -1;
         id = 0;
         state = ConnState::Idle;
+        shard_id = 0;
         flags = 0;
         timer_slot = 0;
         timer_node.init();

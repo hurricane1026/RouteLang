@@ -36,7 +36,6 @@ inline void out_int(int v) {
         (void)::write(1, "0", 1);
         return;
     }
-    // Use unsigned to avoid INT_MIN overflow on negation
     unsigned uv;
     if (v < 0) {
         (void)::write(1, "-", 1);

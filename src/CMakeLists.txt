@@ -10,6 +10,7 @@ add_library(rue_runtime STATIC
 
 target_include_directories(rue_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include
+
 )
 
 # Compiler library
@@ -19,6 +20,7 @@ add_library(rue_compiler STATIC
 
 target_include_directories(rue_compiler PUBLIC
     ${PROJECT_SOURCE_DIR}/include
+
 )
 
 # Main executable

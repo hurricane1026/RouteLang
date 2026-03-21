@@ -8,7 +8,8 @@ struct Connection;  // forward decl
 
 // Timer wheel — O(1) add, refresh, tick.
 // 64 slots (power of 2 for fast modulo), 1-second resolution, driven by single timerfd per shard.
-// Note: timeouts > 63s wrap via modulo. For keepalive <= 60s this is fine.
+// Note: timeouts > 63s wrap via modulo (e.g., 1000s → slot 40). For keepalive timeouts <= 60s
+// this is fine. For longer timeouts, use a hierarchical wheel (not implemented).
 //
 // Usage:
 //   wheel.add(&conn, 60);      // timeout in 60 seconds

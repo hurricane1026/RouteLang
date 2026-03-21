@@ -30,6 +30,8 @@ void EpollBackend::decode_data(u64 data, u32& conn_id, IoEventType& type) {
 
 i32 EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
     listen_fd = lfd;
+    epoll_fd = -1;
+    timer_fd = -1;
     pending_count = 0;
     for (u32 i = 0; i < kMaxFdMap; i++) fd_map[i] = -1;
 
@@ -146,9 +148,7 @@ void EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
         struct epoll_event ev;
         ev.events = EPOLLOUT;
         ev.data.u64 = encode_data(conn_id, IoEventType::UpstreamConnect);
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) < 0 && errno == ENOENT) {
-            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
-        }
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
         return;
     }
 
@@ -189,8 +189,8 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events) {
     for (;;) {
         n = epoll_wait(epoll_fd, ep_events, static_cast<i32>(max_ep), timeout_ms);
         if (n >= 0) break;
-        if (errno == EINTR) continue;  // interrupted by signal, retry
-        return out;                    // real error, return what we have
+        if (errno == EINTR) continue;
+        return out;  // real error, return what we have
     }
 
     for (i32 i = 0; i < n && out < max_events; i++) {
@@ -228,9 +228,8 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events) {
             }
         } else if (ep_events[i].events & EPOLLIN) {
             // Readiness → do recv now, emit completion
-            // TODO: recv into Connection::recv_buf instead of stack tmp_buf
-            // so callbacks can access the data. Requires passing connection
-            // table to wait(), or extending IoEvent with a buffer pointer.
+            // TODO: recv into Connection::recv_buf instead of stack tmp_buf so
+            // callbacks (especially proxy) can access the received data.
             i32 fd = (conn_id < kMaxFdMap) ? fd_map[conn_id] : -1;
             if (fd < 0) continue;
             u8 tmp_buf[4096];

@@ -12,9 +12,6 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
       - name: Install clang-format
         run: sudo apt-get update && sudo apt-get install -y clang-format
 
@@ -28,9 +25,6 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
       - name: Install tools
         run: |
           sudo apt-get update
@@ -53,9 +47,6 @@ jobs:
         build_type: [Debug, Release]
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
       - name: Install tools
         run: |
           sudo apt-get update
@@ -79,3 +70,49 @@ jobs:
         run: |
           ./build/tests/test_network
           ./build/tests/test_integration
+          ./build/tests/test_arena
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm cmake ninja-build
+
+      - name: Build with coverage
+        run: |
+          CC=clang CXX=clang++ cmake -B build -G Ninja \
+            -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
+            -DCMAKE_BUILD_TYPE=Debug
+          ninja -C build
+
+      - name: Run tests
+        run: |
+          LLVM_PROFILE_FILE=build/test_network.profraw ./build/tests/test_network
+          LLVM_PROFILE_FILE=build/test_integration.profraw ./build/tests/test_integration
+          LLVM_PROFILE_FILE=build/test_arena.profraw ./build/tests/test_arena
+
+      - name: Generate coverage report
+        run: |
+          llvm-profdata merge build/*.profraw -o build/merged.profdata
+
+          # Report for runtime code (exclude test framework and unused utility headers)
+          llvm-cov report \
+            --instr-profile=build/merged.profdata \
+            --object build/tests/test_network \
+            --object build/tests/test_integration \
+            --object build/tests/test_arena \
+            --sources include/rout/runtime/ src/runtime/ | tee build/coverage.txt
+
+          cat build/coverage.txt
+
+          # Extract line coverage from TOTAL row and enforce >= 95%
+          LINE_COV=$(grep '^TOTAL' build/coverage.txt | awk '{print $(NF-2)}' | tr -d '%')
+          echo "Line coverage: ${LINE_COV}%"
+          if awk "BEGIN { exit ($LINE_COV >= 95) }"; then
+            echo "ERROR: Line coverage ${LINE_COV}% is below 95% threshold"
+            exit 1
+          fi

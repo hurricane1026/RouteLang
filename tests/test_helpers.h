@@ -68,6 +68,10 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     void submit_send_impl(Connection& c, const u8* buf, u32 len) {
         backend.add_send(c.fd, c.id, buf, len);
     }
+    void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+        backend.add_send(c.upstream_fd, c.id, buf, len);
+    }
+    void submit_recv_upstream_impl(Connection& c) { backend.add_recv(c.upstream_fd, c.id); }
     void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
     }
@@ -118,26 +122,15 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     }
 };
 
-inline IoEvent make_ev(u32 conn_id, IoEventType type, i32 result, u16 buf_id = 0) {
-    return {conn_id, result, buf_id, 0, type};
+inline IoEvent make_ev(u32 conn_id, IoEventType type, i32 result, u16 buf_id = 0, u8 has_buf = 0) {
+    return {conn_id, result, buf_id, has_buf, type};
 }
 
 // ---- Real socket helpers ----
 
 using RealLoop = EventLoop<EpollBackend>;
 
-// Placement new without <new> header (may already be defined in arena.h)
-#ifndef RUE_PLACEMENT_NEW_DEFINED
-#define RUE_PLACEMENT_NEW_DEFINED
-inline void* operator new(decltype(sizeof(0)), void* p) noexcept {
-    return p;
-}
-#endif
-
 inline RealLoop* create_real_loop() {
-    // mmap gives zeroed memory; init() sets all fields properly.
-    // No placement-new needed — RealLoop is a trivial aggregate with no
-    // non-trivial constructors. All members are initialized by init().
     void* p =
         mmap(nullptr, sizeof(RealLoop), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return p == MAP_FAILED ? nullptr : static_cast<RealLoop*>(p);

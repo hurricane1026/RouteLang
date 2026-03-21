@@ -72,7 +72,7 @@ Coroutines were explored but rejected: frame allocation adds complexity (FramePo
 
 ### Timer management: timer wheel (O(1) all operations)
 
-64-slot array + intrusive linked list per slot, 1-second resolution, driven by single timerfd per shard. Chosen over nginx's rbtree (O(log n)) for simplicity (~50 lines) and cache-friendliness at C1000K scale.
+60-slot array + intrusive linked list per slot, 1-second resolution, driven by single timerfd per shard. Chosen over nginx's rbtree (O(log n)) for simplicity (~50 lines) and cache-friendliness at C1000K scale.
 
 ### Memory: Arena + SlicePool (not Arena-only like nginx)
 

@@ -23,7 +23,6 @@ set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
 
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
 
-
 # Project include paths
 include_directories(include)
 

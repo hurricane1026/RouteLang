@@ -4,7 +4,6 @@
 #include "rout/runtime/socket.h"
 
 #include <linux/io_uring.h>
-#include <netinet/in.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -18,11 +17,8 @@ static void write_str(const char* s) {
 }
 
 static bool detect_io_uring() {
-    // Test with the same flags IoUringBackend::init() uses.
-    // Kernels may support basic io_uring but not these specific features.
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
-    params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER;
     i32 fd = static_cast<i32>(syscall(__NR_io_uring_setup, 1, &params));
     if (fd >= 0) {
         close(fd);
@@ -45,12 +41,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Get actual port (kernel may have assigned an ephemeral port if port==0)
-    struct sockaddr_in bound_addr;
-    socklen_t addr_len = sizeof(bound_addr);
-    getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&bound_addr), &addr_len);
-    port = __builtin_bswap16(bound_addr.sin_port);
-
     write_str("Listening on port ");
     char buf[8];
     i32 n = 0;
@@ -64,33 +54,56 @@ int main(int argc, char** argv) {
     }
     write_str("\n");
 
-    bool use_epoll = true;
+    // EventLoop contains large arrays (Connection[16384] × ~8KB each ≈ 130MB).
+    // Must be mmap'd, not stack-allocated.
     if (detect_io_uring()) {
         write_str("Backend: io_uring\n");
-        EventLoop<IoUringBackend> loop;
-        if (loop.init(0, listen_fd) < 0) {
-            // io_uring detection passed but init failed (e.g., PBUF_RING
-            // not supported). Fall back to epoll.
-            write_str("io_uring init failed, falling back to epoll\n");
-        } else {
-            use_epoll = false;
-            loop.run();
-            loop.shutdown();
-        }
-    }
-    if (use_epoll) {
-        write_str("Backend: epoll\n");
-        EventLoop<EpollBackend> loop;
-        if (loop.init(0, listen_fd) < 0) {
-            write_str("Failed to init epoll\n");
+        auto* loop = static_cast<EventLoop<IoUringBackend>*>(mmap(nullptr,
+                                                                  sizeof(EventLoop<IoUringBackend>),
+                                                                  PROT_READ | PROT_WRITE,
+                                                                  MAP_PRIVATE | MAP_ANONYMOUS,
+                                                                  -1,
+                                                                  0));
+        if (loop == MAP_FAILED) {
+            write_str("Failed to mmap io_uring loop\n");
             close(listen_fd);
             return 1;
         }
-        loop.run();
-        loop.shutdown();
+        if (loop->init(0, listen_fd) < 0) {
+            write_str("Failed to init io_uring\n");
+            loop->shutdown();
+            munmap(loop, sizeof(EventLoop<IoUringBackend>));
+            close(listen_fd);
+            return 1;
+        }
+        loop->run();
+        loop->shutdown();
+        munmap(loop, sizeof(EventLoop<IoUringBackend>));
+    } else {
+        write_str("Backend: epoll\n");
+        auto* loop = static_cast<EventLoop<EpollBackend>*>(mmap(nullptr,
+                                                                sizeof(EventLoop<EpollBackend>),
+                                                                PROT_READ | PROT_WRITE,
+                                                                MAP_PRIVATE | MAP_ANONYMOUS,
+                                                                -1,
+                                                                0));
+        if (loop == MAP_FAILED) {
+            write_str("Failed to mmap epoll loop\n");
+            close(listen_fd);
+            return 1;
+        }
+        if (loop->init(0, listen_fd) < 0) {
+            write_str("Failed to init epoll\n");
+            loop->shutdown();
+            munmap(loop, sizeof(EventLoop<EpollBackend>));
+            close(listen_fd);
+            return 1;
+        }
+        loop->run();
+        loop->shutdown();
+        munmap(loop, sizeof(EventLoop<EpollBackend>));
     }
 
     close(listen_fd);
-
     return 0;
 }

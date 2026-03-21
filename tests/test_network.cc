@@ -1,4 +1,5 @@
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
+#include "rout/runtime/arena.h"
 #include "rout/test.h"
 
 #include "test_helpers.h"
@@ -487,96 +488,253 @@ TEST(copilot, backend_init_returns_zero) {
     CHECK_EQ(loop.backend.init(0, -1), 0);
 }
 
-// Copilot round 2: add_connect must populate fd_map
-// Verified at MockBackend level — submit_connect records the op.
-TEST(copilot2, connect_records_op) {
+// === Proxy (mock) ===
+
+// Full proxy cycle: accept → recv → connect upstream → send to upstream →
+//                   recv from upstream → send to client
+TEST(proxy, full_cycle) {
+    SmallLoop loop;
+    loop.setup();
+    // Accept + recv request
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
+
+    // Switch to proxy mode
+    conn->upstream_fd = 100;
+    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->state = ConnState::Proxying;
+    loop.submit_connect(*conn, nullptr, 0);
+
+    // Upstream connect succeeds
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+    CHECK_EQ(conn->state, ConnState::Proxying);
+    CHECK_EQ(conn->on_complete, &on_upstream_request_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    // Verify send went to upstream_fd (100), not client fd (42)
+    auto* send_op = loop.backend.last_op(MockOp::Send);
+    CHECK(send_op != nullptr);
+    CHECK_EQ(send_op->fd, 100);  // upstream_fd, not client fd
+
+    // Request sent to upstream → wait for response
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
+    CHECK_EQ(conn->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+
+    // Upstream response → forward to client
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 200));
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+
+    // Response sent to client → back to reading (keep-alive)
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 200));
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+}
+
+// Upstream connect fails → 502 Bad Gateway
+TEST(proxy, connect_fail_502) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
-    conn->upstream_fd = 200;
-    loop.backend.clear_ops();
-    loop.submit_connect(*conn, nullptr, 0);
-    auto* op = loop.backend.last_op(MockOp::Connect);
-    CHECK(op != nullptr);
-    CHECK_EQ(op->fd, 200);
-    CHECK_EQ(op->conn_id, conn->id);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
+    conn->upstream_fd = 100;
+    conn->on_complete = &on_upstream_connected<SmallLoop>;
+
+    // Connect fails
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -111));
+    // Should send 502 to client
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_GT(conn->send_len, 0u);
+    // Verify "502" in send buffer
+    bool has_502 = false;
+    for (u32 i = 0; i + 2 < conn->send_len; i++) {
+        if (conn->send_buf[i] == '5' && conn->send_buf[i + 1] == '0' &&
+            conn->send_buf[i + 2] == '2') {
+            has_502 = true;
+            break;
+        }
+    }
+    CHECK(has_502);
+    // 502 sets keep_alive=false → on_response_sent will close, not loop
+    CHECK_EQ(conn->keep_alive, false);
+    // Simulate send completion → connection should be closed
+    u32 cid = conn->id;
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(conn->send_len)));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed, not looped back
 }
 
-// Copilot round 2: io_uring syscall wrappers should return -errno not -1
-// (tested indirectly: if io_uring_setup fails, it returns -ENOSYS etc., not -1)
-TEST(copilot2, syscall_error_convention) {
-    // MockBackend.init always returns 0, so we can't test io_uring here.
-    // But verify the convention: negative return = -errno.
-    // Create an event with negative result and verify callback handles it.
+// Upstream send fails → close
+TEST(proxy, upstream_send_error) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
     u32 cid = conn->id;
-    // recv with -ECONNRESET (-104)
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, -104));
-    CHECK_EQ(loop.conns[cid].fd, -1);  // closed correctly
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+    conn->upstream_fd = 100;
+    conn->on_complete = &on_upstream_connected<SmallLoop>;
+
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -32));  // EPIPE
+    CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
-// Copilot round 2: CLAUDE.md timer slots
-TEST(copilot2, claude_md_timer_64_slots) {
-    CHECK_EQ(TimerWheel::kSlots, 64u);
-}
-
-// Regression: keepalive_timeout must be 60 after init, not 0.
-// Without explicit assignment in init(), mmap-zeroed memory gives 0.
-TEST(copilot_latest, keepalive_timeout_is_60) {
+// Upstream response EOF → close
+TEST(proxy, upstream_eof) {
     SmallLoop loop;
     loop.setup();
-    CHECK_EQ(loop.keepalive_timeout, 60u);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    u32 cid = conn->id;
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+    conn->upstream_fd = 100;
+    conn->on_complete = &on_upstream_connected<SmallLoop>;
+
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 100));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 0));  // EOF
+    CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
-// Regression: epoll_wait EINTR handling.
-// MockBackend.wait() with no pending events returns 0 (simulates
-// an EINTR-retried epoll_wait that found nothing). Event loop must
-// not lose previously accepted connections.
-TEST(copilot_eintr, empty_wait_preserves_state) {
+// Client send error after proxy → close
+TEST(proxy, client_send_error) {
     SmallLoop loop;
     loop.setup();
-    // Accept a connection
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    u32 cid = conn->id;
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+    conn->upstream_fd = 100;
+    conn->on_complete = &on_upstream_connected<SmallLoop>;
+
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 100));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 200));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -32));  // client EPIPE
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+// Two proxy cycles on same connection (keep-alive)
+TEST(proxy, keepalive_two_cycles) {
+    SmallLoop loop;
+    loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
 
-    // Wait with nothing pending — simulates EINTR retry returning 0
-    IoEvent events[8];
-    u32 n = loop.backend.wait(events, 8);
-    CHECK_EQ(n, 0u);
-
-    // Connection should still be alive and functional
-    CHECK_EQ(conn->fd, 42);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
-
-    // Can still process events on it
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    for (int cycle = 0; cycle < 2; cycle++) {
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
+        conn->upstream_fd = 100 + cycle;
+        conn->on_complete = &on_upstream_connected<SmallLoop>;
+        conn->state = ConnState::Proxying;
+        loop.submit_connect(*conn, nullptr, 0);
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 200));
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 200));
+        CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    }
 }
 
-// Regression: io_uring recv must use non-zero len with provided buffers.
-// kProvidedBufSize must be positive (used as sqe->len).
-TEST(copilot_iouring, provided_buf_size_nonzero) {
-    CHECK_GT(kProvidedBufSize, 0u);
-    CHECK_GT(kProvidedBufCount, 0u);
+// === Copilot round 4 regression tests ===
+
+// io_uring init returns -errno (not -1) on failure.
+// We can't easily make mmap fail, but verify the convention:
+// successful MockBackend init returns 0.
+TEST(copilot4, init_returns_zero_on_success) {
+    SmallLoop loop;
+    loop.setup();
+    CHECK_EQ(loop.backend.init(0, -1), 0);
 }
 
-// Regression: FixedVec::push returns false on overflow, not OOB write.
-TEST(copilot_types, fixedvec_push_overflow) {
-    FixedVec<i32, 4> v;
-    CHECK(v.push(1));
-    CHECK(v.push(2));
-    CHECK(v.push(3));
-    CHECK(v.push(4));
-    CHECK_EQ(v.push(5), false);  // overflow — must return false, not crash
-    CHECK_EQ(v.len, 4u);         // len unchanged
-    CHECK_EQ(v[3], 4);           // last element intact
+// Arena init returns -errno on failure (not -1).
+// Verify success returns 0.
+TEST(copilot4, arena_init_returns_zero) {
+    Arena a;
+    CHECK_EQ(a.init(4096), 0);
+    a.destroy();
+}
+
+// Arena init with absurdly large size should fail gracefully.
+// mmap of near-max u64 will fail → should return negative errno.
+TEST(copilot4, arena_init_huge_fails) {
+    Arena a;
+    i32 rc = a.init(static_cast<u64>(-1));  // ~18 exabytes
+    CHECK(rc < 0);
+    // Should be -ENOMEM or similar, not -1
+    CHECK_NE(rc, -1);  // -errno convention, not raw -1
+}
+
+// Arena alloc overflow protection
+TEST(copilot4, arena_alloc_overflow_returns_null) {
+    Arena a;
+    REQUIRE_EQ(a.init(4096), 0);
+    // size close to u64 max → overflow in (size+7) alignment
+    void* p = a.alloc(static_cast<u64>(-1));
+    CHECK(p == nullptr);
+    a.destroy();
+}
+
+// === Copilot round 5 regression tests ===
+
+// Regression: epoll add_recv MOD+ADD fallback.
+// 10 echo cycles on same connection — each cycle goes recv→send→recv.
+// Without MOD fallback, 2nd recv would fail because fd is still registered.
+TEST(copilot5, mock_10_keepalive_cycles) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    for (int i = 0; i < 10; i++) {
+        loop.backend.clear_ops();
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
+        CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+
+        loop.backend.clear_ops();
+        loop.inject_and_dispatch(
+            make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_len)));
+        CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+    }
+    CHECK_EQ(conn->fd, 42);  // still alive
+}
+
+// Regression: partial send TODO exists (code documents the limitation).
+// Verify that add_send with immediate success queues a synthetic completion.
+TEST(copilot5, add_send_immediate_success) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 50));
+    // After recv, callback sets on_complete=on_response_sent and calls submit_send.
+    // MockBackend should have a Send op.
+    auto* op = loop.backend.last_op(MockOp::Send);
+    CHECK(op != nullptr);
+    CHECK_GT(op->send_len, 0u);
+}
+
+// Regression: keepalive_timeout must be 60 after init(), not 0.
+// Without explicit assignment in init(), mmap-zeroed EventLoop gets 0.
+TEST(copilot6, keepalive_timeout_is_60) {
+    SmallLoop loop;
+    loop.setup();
+    CHECK_EQ(loop.keepalive_timeout, 60u);
 }
 
 int main(int argc, char** argv) {

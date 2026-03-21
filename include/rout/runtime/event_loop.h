@@ -40,6 +40,12 @@ public:
     void close_conn(Connection& c) { self().close_conn_impl(c); }
     Connection* alloc_conn() { return self().alloc_conn_impl(); }
     void free_conn(Connection& c) { self().free_conn_impl(c); }
+
+    // Upstream I/O: send/recv on upstream_fd instead of fd.
+    void submit_send_upstream(Connection& c, const u8* buf, u32 len) {
+        self().submit_send_upstream_impl(c, buf, len);
+    }
+    void submit_recv_upstream(Connection& c) { self().submit_recv_upstream_impl(c); }
 };
 
 template <typename Backend>
@@ -111,6 +117,10 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
     void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
     }
+    void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+        backend.add_send(c.upstream_fd, c.id, buf, len);
+    }
+    void submit_recv_upstream_impl(Connection& c) { backend.add_recv(c.upstream_fd, c.id); }
 
     void close_conn_impl(Connection& c) {
         if (c.fd >= 0) {
@@ -132,9 +142,6 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
             return;
         }
         if (ev.type == IoEventType::Timeout) {
-            // TODO: io_uring backend does not emit Timeout events yet.
-            // Need timerfd + IORING_OP_READ or IORING_OP_TIMEOUT for periodic ticks.
-            // Currently only epoll backend drives the timer wheel.
             timer.tick([this](Connection* c) { this->close_conn(*c); });
             return;
         }

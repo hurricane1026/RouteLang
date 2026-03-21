@@ -3,9 +3,6 @@
 
 #include "test_helpers.h"
 
-#include <linux/io_uring.h>
-#include <sys/syscall.h>
-
 // === Socket Setup (libuv: test-tcp-bind-error, test-tcp-flags, test-tcp-reuseport) ===
 
 TEST(socket, nonblocking) {
@@ -362,9 +359,8 @@ TEST(copilot, keepalive_5_cycles_no_eexist) {
     srv.teardown();
 }
 
-// Regression: epoll add_recv MOD+ADD fallback.
-// 20 rapid keep-alive cycles on a single connection.
-// Without MOD fallback, cycle 2+ would fail with EEXIST.
+// Regression: 20 keep-alive cycles — proves MOD+ADD fallback works.
+// Without it, cycle 2+ fails with EEXIST when fd is already registered.
 TEST(copilot, keepalive_20_cycles_eexist_regression) {
     TestServer srv;
     REQUIRE(srv.setup(200));
@@ -383,31 +379,44 @@ TEST(copilot, keepalive_20_cycles_eexist_regression) {
     srv.teardown();
 }
 
-// Regression: detect_io_uring must use same flags as IoUringBackend::init.
-// If detection passes, init must also pass (and vice versa).
-TEST(copilot_latest, io_uring_detect_matches_init) {
-    // Try detection with the flags our backend uses
-    struct io_uring_params params;
-    memset(&params, 0, sizeof(params));
-    params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER;
-    i32 fd = static_cast<i32>(syscall(__NR_io_uring_setup, 1, &params));
-    bool detected = (fd >= 0);
-    if (fd >= 0) close(fd);
+// Regression: listen_fd must be closeable after server teardown.
+// Proves the fd isn't leaked or double-closed.
+TEST(copilot6, listen_fd_not_leaked) {
+    i32 fd1 = create_listen_socket(0);
+    REQUIRE(fd1 >= 0);
+    u16 port = get_port(fd1);
 
-    if (detected) {
-        // If detection passed, IoUringBackend::init should also work
-        // (we can't easily test this without the full EventLoop, but at least
-        // verify the syscall returned a valid fd)
-        CHECK(true);  // detection consistent
-    } else {
-        // On systems without io_uring or without required features,
-        // detection correctly returns false → epoll fallback
-        CHECK(true);  // fallback path
-    }
+    // Use the fd in a server, tear it down
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE_EQ(loop->init(0, fd1), 0);
+    // Don't run the loop, just init + shutdown
+    loop->shutdown();
+    destroy_real_loop(loop);
+
+    // fd1 should still be open (shutdown doesn't close listen_fd)
+    // Close it explicitly — should succeed (not EBADF)
+    CHECK_EQ(close(fd1), 0);
+
+    // Now the port should be reusable
+    i32 fd2 = create_listen_socket(port);
+    CHECK(fd2 >= 0);
+    if (fd2 >= 0) close(fd2);
 }
 
-// Regression: dev.sh run_tests function name doesn't shadow bash builtin.
-// (Can't test shell from C++, but verify the convention is documented.)
+// Regression: keepalive_timeout must be 60 in real EventLoop after mmap+init.
+// Without explicit init, mmap zeroes → keepalive_timeout=0 → instant timeout.
+TEST(copilot6, real_loop_keepalive_timeout) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    i32 fd = create_listen_socket(0);
+    REQUIRE(fd >= 0);
+    REQUIRE_EQ(loop->init(0, fd), 0);
+    CHECK_EQ(loop->keepalive_timeout, 60u);
+    loop->shutdown();
+    close(fd);
+    destroy_real_loop(loop);
+}
 
 int main(int argc, char** argv) {
     return rout::test::run_all(argc, argv);

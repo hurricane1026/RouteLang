@@ -8,7 +8,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-// IORING_OP_ASYNC_CANCEL: cancel outstanding operations on older kernel headers
+// IORING_OP_CANCEL may not be defined on older kernel headers
 #ifndef IORING_OP_ASYNC_CANCEL
 #define IORING_OP_ASYNC_CANCEL 14
 #endif
@@ -38,8 +38,8 @@ static i32 io_uring_register(i32 fd, u32 opcode, const void* arg, u32 nr_args) {
 }
 
 // --- user_data encoding ---
-// Layout: [63:8] = conn_id (stored as u32 on decode), [7:0] = IoEventType
-// Supports up to 2^32 conn_ids (limited by u32 on decode).
+// Layout: [63:8] = conn_id (up to 56 bits used, stored in u32 on decode), [7:0] = IoEventType
+// Enough for 16M connections per shard.
 
 u64 IoUringBackend::encode_user_data(u32 conn_id, IoEventType type) {
     return (static_cast<u64>(conn_id) << 8) | static_cast<u64>(type);
@@ -300,17 +300,11 @@ void IoUringBackend::cancel(i32 fd, u32 conn_id) {
 u32 IoUringBackend::wait(IoEvent* events, u32 max_events) {
     // Submit pending SQEs and wait for at least 1 CQE
     u32 flags = IORING_ENTER_GETEVENTS;
-    i32 ret;
-    for (;;) {
-        if (pending > 0) {
-            ret = io_uring_enter(ring_fd, pending, 1, flags);
-            if (ret >= 0) pending = 0;
-        } else {
-            ret = io_uring_enter(ring_fd, 0, 1, flags);
-        }
-        if (ret >= 0) break;
-        if (ret == -EINTR) continue;  // interrupted by signal, retry
-        return 0;                     // real error, return no events
+    if (pending > 0) {
+        io_uring_enter(ring_fd, pending, 1, flags);
+        pending = 0;
+    } else {
+        io_uring_enter(ring_fd, 0, 1, flags);
     }
 
     // Harvest CQEs

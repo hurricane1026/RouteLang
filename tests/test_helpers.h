@@ -239,13 +239,14 @@ struct TestServer {
     bool setup(i32 iters) {
         loop = create_real_loop();
         if (!loop) return false;
-        listen_fd = create_listen_socket(0);
-        if (listen_fd < 0) {
+        auto lfd_result = create_listen_socket(0);
+        if (!lfd_result) {
             destroy_real_loop(loop);
             return false;
         }
+        listen_fd = lfd_result.value();
         port = get_port(listen_fd);
-        if (loop->init(0, listen_fd) < 0) {
+        if (!loop->init(0, listen_fd)) {
             close(listen_fd);
             destroy_real_loop(loop);
             return false;

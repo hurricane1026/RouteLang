@@ -1,15 +1,18 @@
 #pragma once
 
 #include "rout/common/types.h"
+#include "rout/runtime/error.h"
+
+#include "core/expected.h"
 
 namespace rout {
 
 // Create a non-blocking, reusable listen socket.
-// Returns fd on success, -errno on failure.
+// Returns fd on success, Error on failure.
 // Uses SO_REUSEPORT so each shard can bind the same port.
-i32 create_listen_socket(u16 port);
+core::Expected<i32, Error> create_listen_socket(u16 port);
 
-// Set fd to non-blocking mode.
+// Set fd to non-blocking mode. (kept as i32 — internal helper, error is rare)
 i32 set_nonblocking(i32 fd);
 
 }  // namespace rout

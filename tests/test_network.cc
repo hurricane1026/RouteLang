@@ -490,11 +490,11 @@ TEST(copilot, timer_wheel_has_64_slots) {
 
 // Copilot #4: io_backend.h documented init as void, but it returns i32.
 // Verify MockBackend.init returns 0 on success.
-TEST(copilot, backend_init_returns_zero) {
+TEST(copilot, backend_init_returns_success) {
     SmallLoop loop;
     loop.setup();
-    // setup() calls backend.init which returns i32
-    CHECK_EQ(loop.backend.init(0, -1), 0);
+    // setup() calls backend.init which returns Expected<void, Error>
+    CHECK(loop.backend.init(0, -1).has_value());
 }
 
 // === Proxy (mock) ===
@@ -1090,35 +1090,35 @@ TEST(timer_clamp, zero_tick_coerced_to_one) {
 
 // io_uring init returns -errno (not -1) on failure.
 // We can't easily make mmap fail, but verify the convention:
-// successful MockBackend init returns 0.
-TEST(copilot4, init_returns_zero_on_success) {
+// successful MockBackend init returns success.
+TEST(copilot4, init_returns_success) {
     SmallLoop loop;
     loop.setup();
-    CHECK_EQ(loop.backend.init(0, -1), 0);
+    CHECK(loop.backend.init(0, -1).has_value());
 }
 
-// Arena init returns -errno on failure (not -1).
-// Verify success returns 0.
-TEST(copilot4, arena_init_returns_zero) {
+// Arena init returns Expected on failure.
+// Verify success returns has_value().
+TEST(copilot4, arena_init_returns_success) {
     Arena a;
-    CHECK_EQ(a.init(4096), 0);
+    CHECK(a.init(4096).has_value());
     a.destroy();
 }
 
 // Arena init with absurdly large size should fail gracefully.
-// mmap of near-max u64 will fail → should return negative errno.
+// mmap of near-max u64 will fail → should return error.
 TEST(copilot4, arena_init_huge_fails) {
     Arena a;
-    i32 rc = a.init(static_cast<u64>(-1));  // ~18 exabytes
-    CHECK(rc < 0);
-    // Should be -ENOMEM or similar, not -1
-    CHECK_NE(rc, -1);  // -errno convention, not raw -1
+    auto rc = a.init(static_cast<u64>(-1));  // ~18 exabytes
+    CHECK(!rc);
+    // Should carry a real errno code
+    CHECK(rc.error().code > 0);
 }
 
 // Arena alloc overflow protection
 TEST(copilot4, arena_alloc_overflow_returns_null) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     // size close to u64 max → overflow in (size+7) alignment
     void* p = a.alloc(static_cast<u64>(-1));
     CHECK(p == nullptr);
@@ -1498,7 +1498,7 @@ TEST(upstream_pool, shutdown_closes_fds) {
 
 TEST(slice_pool, init_destroy) {
     SlicePool pool;
-    REQUIRE_EQ(pool.init(64), 0);
+    REQUIRE(pool.init(64).has_value());
     CHECK_EQ(pool.count, 64u);
     CHECK_EQ(pool.available(), 64u);
     CHECK_EQ(pool.in_use(), 0u);
@@ -1507,7 +1507,7 @@ TEST(slice_pool, init_destroy) {
 
 TEST(slice_pool, alloc_free) {
     SlicePool pool;
-    REQUIRE_EQ(pool.init(4), 0);
+    REQUIRE(pool.init(4).has_value());
 
     u8* s1 = pool.alloc();
     u8* s2 = pool.alloc();
@@ -1534,7 +1534,7 @@ TEST(slice_pool, alloc_free) {
 
 TEST(slice_pool, exhaust_and_recover) {
     SlicePool pool;
-    REQUIRE_EQ(pool.init(2), 0);
+    REQUIRE(pool.init(2).has_value());
 
     u8* s1 = pool.alloc();
     u8* s2 = pool.alloc();
@@ -1555,7 +1555,7 @@ TEST(slice_pool, exhaust_and_recover) {
 
 TEST(slice_pool, slice_size) {
     SlicePool pool;
-    REQUIRE_EQ(pool.init(1), 0);
+    REQUIRE(pool.init(1).has_value());
     CHECK_EQ(SlicePool::kSliceSize, 16384u);
     u8* s = pool.alloc();
     REQUIRE(s != nullptr);
@@ -1570,7 +1570,7 @@ TEST(slice_pool, slice_size) {
 
 TEST(slice_pool, free_null_safe) {
     SlicePool pool;
-    REQUIRE_EQ(pool.init(2), 0);
+    REQUIRE(pool.init(2).has_value());
     pool.free(nullptr);              // should not crash
     CHECK_EQ(pool.available(), 2u);  // unchanged
     pool.destroy();
@@ -1579,7 +1579,7 @@ TEST(slice_pool, free_null_safe) {
 // SlicePool: out-of-order free
 TEST(slice_pool, out_of_order_free) {
     SlicePool pool;
-    REQUIRE_EQ(pool.init(4), 0);
+    REQUIRE(pool.init(4).has_value());
     u8* s1 = pool.alloc();
     u8* s2 = pool.alloc();
     u8* s3 = pool.alloc();
@@ -1604,7 +1604,7 @@ TEST(slice_pool, out_of_order_free) {
 // SlicePool: multiple alloc-free cycles don't corrupt free-stack
 TEST(slice_pool, stress_cycles) {
     SlicePool pool;
-    REQUIRE_EQ(pool.init(8), 0);
+    REQUIRE(pool.init(8).has_value());
     for (int cycle = 0; cycle < 100; cycle++) {
         u8* ptrs[8];
         for (int j = 0; j < 8; j++) {
@@ -1621,7 +1621,7 @@ TEST(slice_pool, stress_cycles) {
 // SlicePool: destroy is idempotent
 TEST(slice_pool, destroy_idempotent) {
     SlicePool pool;
-    REQUIRE_EQ(pool.init(4), 0);
+    REQUIRE(pool.init(4).has_value());
     pool.destroy();
     pool.destroy();  // second destroy should not crash
     CHECK(pool.base == nullptr);
@@ -1631,7 +1631,7 @@ TEST(slice_pool, destroy_idempotent) {
 // SlicePool: alloc after destroy returns nullptr
 TEST(slice_pool, alloc_after_destroy) {
     SlicePool pool;
-    REQUIRE_EQ(pool.init(4), 0);
+    REQUIRE(pool.init(4).has_value());
     pool.destroy();
     CHECK(pool.alloc() == nullptr);
 }
@@ -1639,7 +1639,7 @@ TEST(slice_pool, alloc_after_destroy) {
 // SlicePool: large pool (verify mmap works at scale)
 TEST(slice_pool, large_pool) {
     SlicePool pool;
-    REQUIRE_EQ(pool.init(1024), 0);  // 1024 * 16KB = 16MB
+    REQUIRE(pool.init(1024).has_value());  // 1024 * 16KB = 16MB
     CHECK_EQ(pool.available(), 1024u);
 
     // Alloc a few, verify they don't overlap
@@ -1667,7 +1667,7 @@ struct TestObj {
 
 TEST(slab_pool, init_destroy) {
     SlabPool<TestObj, 128> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
     CHECK_EQ(pool.capacity(), 128u);
     CHECK_EQ(pool.available(), 128u);
     CHECK_EQ(pool.in_use(), 0u);
@@ -1676,7 +1676,7 @@ TEST(slab_pool, init_destroy) {
 
 TEST(slab_pool, alloc_free_by_ptr) {
     SlabPool<TestObj, 4> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
 
     TestObj* a = pool.alloc();
     TestObj* b = pool.alloc();
@@ -1698,7 +1698,7 @@ TEST(slab_pool, alloc_free_by_ptr) {
 
 TEST(slab_pool, alloc_with_id) {
     SlabPool<TestObj, 8> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
 
     u32 idx = 0;
     TestObj* obj = pool.alloc_with_id(idx);
@@ -1714,7 +1714,7 @@ TEST(slab_pool, alloc_with_id) {
 
 TEST(slab_pool, exhaust) {
     SlabPool<TestObj, 2> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
 
     TestObj* a = pool.alloc();
     TestObj* b = pool.alloc();
@@ -1733,7 +1733,7 @@ TEST(slab_pool, exhaust) {
 
 TEST(slab_pool, index_of) {
     SlabPool<TestObj, 16> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
 
     TestObj* a = pool.alloc();
     TestObj* b = pool.alloc();
@@ -1751,7 +1751,7 @@ TEST(slab_pool, index_of) {
 // SlabPool: capacity 1
 TEST(slab_pool, capacity_one) {
     SlabPool<TestObj, 1> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
     CHECK_EQ(pool.capacity(), 1u);
 
     TestObj* a = pool.alloc();
@@ -1772,7 +1772,7 @@ TEST(slab_pool, capacity_one) {
 // SlabPool: free by index vs free by pointer consistency
 TEST(slab_pool, free_by_index_vs_ptr) {
     SlabPool<TestObj, 4> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
 
     u32 idx1 = 0;
     TestObj* a = pool.alloc_with_id(idx1);
@@ -1799,7 +1799,7 @@ TEST(slab_pool, free_by_index_vs_ptr) {
 // SlabPool: alloc_with_id when empty returns nullptr
 TEST(slab_pool, alloc_with_id_empty) {
     SlabPool<TestObj, 1> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
 
     u32 idx = 999;
     pool.alloc();  // take the only slot
@@ -1816,7 +1816,7 @@ TEST(slab_pool, alloc_with_id_empty) {
 // SlabPool: destroy idempotent
 TEST(slab_pool, destroy_idempotent) {
     SlabPool<TestObj, 4> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
     pool.destroy();
     pool.destroy();  // second destroy should not crash
     CHECK(pool.objects == nullptr);
@@ -1826,7 +1826,7 @@ TEST(slab_pool, destroy_idempotent) {
 // SlabPool: stress alloc-free cycles
 TEST(slab_pool, stress_cycles) {
     SlabPool<TestObj, 16> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
     for (int cycle = 0; cycle < 50; cycle++) {
         TestObj* ptrs[16];
         for (int j = 0; j < 16; j++) {
@@ -1851,7 +1851,7 @@ struct SmallObj {
 
 TEST(slab_pool, small_object) {
     SlabPool<SmallObj, 32> pool;
-    REQUIRE_EQ(pool.init(), 0);
+    REQUIRE(pool.init().has_value());
     SmallObj* a = pool.alloc();
     REQUIRE(a != nullptr);
     a->tag = 0xAB;

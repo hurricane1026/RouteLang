@@ -1,8 +1,10 @@
 #pragma once
 
 #include "rout/common/types.h"
+#include "rout/runtime/error.h"
 
-#include <errno.h>
+#include "core/expected.h"
+
 #include <sys/mman.h>
 
 namespace rout {
@@ -18,11 +20,11 @@ namespace rout {
 //
 // Usage:
 //   SlicePool pool;
-//   pool.init(1024);       // 1024 × 16KB = 16MB
-//   u8* buf = pool.alloc();  // get a 16KB slice
-//   // ... use buf for recv/send ...
-//   pool.free(buf);          // return to pool
-//   pool.destroy();          // unmap everything
+//   auto rc = pool.init(1024);  // 1024 × 16KB = 16MB
+//   if (!rc) handle(rc.error());
+//   u8* buf = pool.alloc();
+//   pool.free(buf);
+//   pool.destroy();
 
 struct SlicePool {
     static constexpr u32 kSliceSize = 16384;  // 16KB per slice
@@ -35,8 +37,7 @@ struct SlicePool {
     u64 stack_size = 0;  // size of mmap'd free_stack region
 
     // Initialize pool with `n` slices. Total memory: n * 16KB + n * 4 bytes.
-    // Returns 0 on success, -errno on failure.
-    i32 init(u32 n) {
+    core::Expected<void, Error> init(u32 n) {
         count = n;
         free_top = n;
 
@@ -44,7 +45,8 @@ struct SlicePool {
         base_size = static_cast<u64>(n) * kSliceSize;
         void* data_mem =
             mmap(nullptr, base_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (data_mem == MAP_FAILED) return -errno;
+        if (data_mem == MAP_FAILED)
+            return core::make_unexpected(Error::from_errno(Error::Source::SlicePool));
         base = static_cast<u8*>(data_mem);
 
         // mmap free stack
@@ -54,14 +56,14 @@ struct SlicePool {
         if (stack_mem == MAP_FAILED) {
             munmap(base, base_size);
             base = nullptr;
-            return -errno;
+            return core::make_unexpected(Error::from_errno(Error::Source::SlicePool));
         }
         free_stack = static_cast<u32*>(stack_mem);
 
         // Fill free stack: all slices available
         for (u32 i = 0; i < n; i++) free_stack[i] = i;
 
-        return 0;
+        return {};
     }
 
     // Allocate one 16KB slice. Returns pointer to slice, or nullptr if exhausted.

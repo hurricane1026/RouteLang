@@ -1,8 +1,10 @@
 #pragma once
 
 #include "rout/common/types.h"
+#include "rout/runtime/error.h"
 
-#include <errno.h>
+#include "core/expected.h"
+
 #include <sys/mman.h>
 
 namespace rout {
@@ -12,19 +14,8 @@ namespace rout {
 // All objects are pre-allocated in a single mmap'd region. Free-stack
 // tracks available slots. No malloc, no fragmentation, cache-friendly.
 //
-// This is the generalized version of EventLoop's Connection[16384]+free_stack
-// and UpstreamPool's UpstreamConn[4096]+free_stack.
-//
 // T must be trivially constructible (mmap zeroes memory).
 // Caller is responsible for initializing objects after alloc.
-//
-// Usage:
-//   SlabPool<Connection, 16384> pool;
-//   pool.init();
-//   auto [obj, idx] = pool.alloc();
-//   // ... use obj ...
-//   pool.free(idx);
-//   pool.destroy();
 
 template <typename T, u32 Cap>
 struct SlabPool {
@@ -35,15 +26,15 @@ struct SlabPool {
     u64 stack_size = 0;
 
     // Initialize pool. mmap's objects + free stack.
-    // Returns 0 on success, -errno on failure.
-    i32 init() {
+    core::Expected<void, Error> init() {
         free_top = Cap;
 
         // mmap objects
         objects_size = static_cast<u64>(Cap) * sizeof(T);
         void* obj_mem =
             mmap(nullptr, objects_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (obj_mem == MAP_FAILED) return -errno;
+        if (obj_mem == MAP_FAILED)
+            return core::make_unexpected(Error::from_errno(Error::Source::SlabPool));
         objects = static_cast<T*>(obj_mem);
 
         // mmap free stack
@@ -53,17 +44,17 @@ struct SlabPool {
         if (stk_mem == MAP_FAILED) {
             munmap(objects, objects_size);
             objects = nullptr;
-            return -errno;
+            return core::make_unexpected(Error::from_errno(Error::Source::SlabPool));
         }
         free_stack = static_cast<u32*>(stk_mem);
 
         // Fill free stack
         for (u32 i = 0; i < Cap; i++) free_stack[i] = i;
 
-        return 0;
+        return {};
     }
 
-    // Allocate an object. Returns pointer + index, or {nullptr, 0} if full.
+    // Allocate an object. Returns pointer, or nullptr if full.
     T* alloc() {
         if (free_top == 0) return nullptr;
         u32 idx = free_stack[--free_top];

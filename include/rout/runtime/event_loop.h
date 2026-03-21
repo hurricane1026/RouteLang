@@ -3,9 +3,12 @@
 #include "rout/common/types.h"
 #include "rout/runtime/callbacks.h"
 #include "rout/runtime/connection.h"
+#include "rout/runtime/error.h"
 #include "rout/runtime/io_backend.h"
 #include "rout/runtime/io_event.h"
 #include "rout/runtime/timer_wheel.h"
+
+#include "core/expected.h"
 
 #include <unistd.h>  // close()
 
@@ -62,7 +65,7 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
 
     u32 keepalive_timeout = 60;
 
-    i32 init(u32 id, i32 listen_fd) {
+    core::Expected<void, Error> init(u32 id, i32 listen_fd) {
         shard_id = id;
         running = true;
         keepalive_timeout = 60;  // explicit: mmap zeroes memory, skipping default member init
@@ -74,7 +77,8 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
         }
-        return backend.init(id, listen_fd);
+        TRY_VOID(backend.init(id, listen_fd));
+        return {};
     }
 
     void run() {

@@ -2,7 +2,10 @@
 
 #include "rout/common/types.h"
 #include "rout/runtime/connection.h"
+#include "rout/runtime/error.h"
 #include "rout/runtime/io_backend.h"
+
+#include "core/expected.h"
 
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
@@ -51,8 +54,7 @@ struct EpollBackend {
     // --- Interface methods ---
 
     // Initialize epoll and timerfd for this shard.
-    // Returns 0 on success, -errno on failure.
-    i32 init(u32 shard_id, i32 listen_fd);
+    core::Expected<void, Error> init(u32 shard_id, i32 listen_fd);
 
     // Register listen socket for accept events.
     void add_accept();

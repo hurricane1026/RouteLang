@@ -13,7 +13,7 @@ using namespace rout;
 
 TEST(block, data_starts_after_header) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     auto* b = a.current;
     u64 hdr = (sizeof(Arena::Block) + 15) & ~u64(15);
     u8* expected = reinterpret_cast<u8*>(b) + hdr;
@@ -23,7 +23,7 @@ TEST(block, data_starts_after_header) {
 
 TEST(block, capacity_equals_size_minus_header) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     auto* b = a.current;
     u64 hdr = (sizeof(Arena::Block) + 15) & ~u64(15);
     CHECK_EQ(b->capacity(), b->size - hdr);
@@ -32,7 +32,7 @@ TEST(block, capacity_equals_size_minus_header) {
 
 TEST(block, remaining_decreases_after_alloc) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     u64 r0 = a.current->remaining();
     a.alloc(100);
     u64 r1 = a.current->remaining();
@@ -42,7 +42,7 @@ TEST(block, remaining_decreases_after_alloc) {
 
 TEST(block, chain_integrity) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     Arena::Block* first = a.current;
     CHECK(first->prev == nullptr);
 
@@ -59,7 +59,7 @@ TEST(block, chain_integrity) {
 
 TEST(block, three_block_chain) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     Arena::Block* b0 = a.current;
 
     // Force 3 blocks by allocating more than one block can hold each time
@@ -84,7 +84,7 @@ TEST(block, three_block_chain) {
 
 TEST(arena, init_succeeds) {
     Arena a;
-    CHECK_EQ(a.init(4096), 0);
+    CHECK(a.init(4096).has_value());
     CHECK(a.current != nullptr);
     CHECK_GT(a.space_allocated(), 0u);
     a.destroy();
@@ -92,14 +92,14 @@ TEST(arena, init_succeeds) {
 
 TEST(arena, init_min_256) {
     Arena a;
-    REQUIRE_EQ(a.init(1), 0);
+    REQUIRE(a.init(1).has_value());
     CHECK_GE(a.current->size, 256u);
     a.destroy();
 }
 
 TEST(arena, small_alloc) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     void* p = a.alloc(64);
     CHECK(p != nullptr);
     CHECK_EQ(a.space_used(), 64u);
@@ -108,7 +108,7 @@ TEST(arena, small_alloc) {
 
 TEST(arena, alloc_returns_sequential_addresses) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     u8* p1 = static_cast<u8*>(a.alloc(16));
     u8* p2 = static_cast<u8*>(a.alloc(32));
     u8* p3 = static_cast<u8*>(a.alloc(8));
@@ -119,7 +119,7 @@ TEST(arena, alloc_returns_sequential_addresses) {
 
 TEST(arena, multiple_allocs_in_one_block) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     void* p1 = a.alloc(100);
     void* p2 = a.alloc(200);
     void* p3 = a.alloc(300);
@@ -137,7 +137,7 @@ TEST(arena, multiple_allocs_in_one_block) {
 
 TEST(arena, alignment_8byte) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     void* p1 = a.alloc(1);
     void* p2 = a.alloc(1);
     CHECK_EQ(reinterpret_cast<u64>(p1) % 8, 0u);
@@ -148,7 +148,7 @@ TEST(arena, alignment_8byte) {
 
 TEST(arena, alignment_various_sizes) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     for (u64 sz = 1; sz <= 64; sz++) {
         void* p = a.alloc(sz);
         CHECK_EQ(reinterpret_cast<u64>(p) % 8, 0u);
@@ -158,7 +158,7 @@ TEST(arena, alignment_various_sizes) {
 
 TEST(arena, zero_size_alloc) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     void* p = a.alloc(0);
     CHECK(p != nullptr);
     a.destroy();
@@ -170,7 +170,7 @@ TEST(arena, zero_size_alloc) {
 
 TEST(arena, overflow_to_new_block) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     u64 cap = a.current->capacity();
     a.alloc(cap);
     a.alloc(64);
@@ -181,7 +181,7 @@ TEST(arena, overflow_to_new_block) {
 
 TEST(arena, large_alloc_gets_own_block) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     void* p = a.alloc(1024);
     CHECK(p != nullptr);
     CHECK_GE(a.current->size, 1024u + sizeof(Arena::Block));
@@ -190,7 +190,7 @@ TEST(arena, large_alloc_gets_own_block) {
 
 TEST(arena, many_blocks) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     for (int i = 0; i < 100; i++) CHECK(a.alloc(200) != nullptr);
     int blocks = 0;
     for (Arena::Block* b = a.current; b; b = b->prev) blocks++;
@@ -200,7 +200,7 @@ TEST(arena, many_blocks) {
 
 TEST(arena, alloc_exact_block_capacity) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     u64 cap = a.current->capacity();
     u64 aligned_cap = cap & ~static_cast<u64>(7);
     void* p = a.alloc(aligned_cap);
@@ -215,7 +215,7 @@ TEST(arena, alloc_exact_block_capacity) {
 
 TEST(arena, reset_single_block_only) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     Arena::Block* first = a.current;
     a.alloc(100);
     a.alloc(200);
@@ -229,7 +229,7 @@ TEST(arena, reset_single_block_only) {
 
 TEST(arena, reset_reuses_first_block) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     Arena::Block* first = a.current;
     a.alloc(100);
     a.reset();
@@ -242,7 +242,7 @@ TEST(arena, reset_reuses_first_block) {
 
 TEST(arena, reset_frees_extra_blocks) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     u64 initial = a.space_allocated();
     for (int i = 0; i < 10; i++) a.alloc(4000);
     CHECK_GT(a.space_allocated(), initial);
@@ -254,7 +254,7 @@ TEST(arena, reset_frees_extra_blocks) {
 
 TEST(arena, reset_total_allocated_tracking) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     u64 initial = a.space_allocated();
     // Create 3 extra blocks
     for (int i = 0; i < 3; i++) {
@@ -270,7 +270,7 @@ TEST(arena, reset_total_allocated_tracking) {
 
 TEST(arena, reset_then_alloc_10_cycles) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     for (int cycle = 0; cycle < 10; cycle++) {
         for (int i = 0; i < 20; i++) CHECK(a.alloc(100) != nullptr);
         a.reset();
@@ -289,7 +289,7 @@ struct Point {
 
 TEST(arena, alloc_t_pod) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     auto* p = a.alloc_t<Point>(10, 20);
     CHECK(p != nullptr);
     CHECK_EQ(p->x, 10);
@@ -304,7 +304,7 @@ struct Counter {
 
 TEST(arena, alloc_t_with_constructor) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     auto* c = a.alloc_t<Counter>();
     CHECK(c != nullptr);
     CHECK_EQ(c->value, 42);
@@ -317,7 +317,7 @@ struct Large {
 
 TEST(arena, alloc_t_large_struct) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     auto* l = a.alloc_t<Large>();
     CHECK(l != nullptr);
     // Write pattern and verify
@@ -328,7 +328,7 @@ TEST(arena, alloc_t_large_struct) {
 
 TEST(arena, alloc_t_multiple_types) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     auto* p = a.alloc_t<Point>(1, 2);
     auto* c = a.alloc_t<Counter>();
     auto* l = a.alloc_t<Large>();
@@ -340,7 +340,7 @@ TEST(arena, alloc_t_multiple_types) {
 
 TEST(arena, alloc_array_int) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     auto* arr = a.alloc_array<i32>(10);
     CHECK(arr != nullptr);
     for (int i = 0; i < 10; i++) CHECK_EQ(arr[i], 0);
@@ -351,7 +351,7 @@ TEST(arena, alloc_array_int) {
 
 TEST(arena, alloc_array_struct) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     auto* arr = a.alloc_array<Point>(5);
     CHECK(arr != nullptr);
     for (int i = 0; i < 5; i++) {
@@ -363,7 +363,7 @@ TEST(arena, alloc_array_struct) {
 
 TEST(arena, alloc_array_zero_count) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     auto* arr = a.alloc_array<i32>(0);
     CHECK(arr != nullptr);  // zero-count returns valid pointer
     a.destroy();
@@ -375,7 +375,7 @@ TEST(arena, alloc_array_zero_count) {
 
 TEST(arena, destroy_frees_all) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     for (int i = 0; i < 20; i++) a.alloc(200);
     a.destroy();
     CHECK(a.current == nullptr);
@@ -384,7 +384,7 @@ TEST(arena, destroy_frees_all) {
 
 TEST(arena, double_destroy_safe) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     a.alloc(100);
     a.destroy();
     a.destroy();
@@ -393,7 +393,7 @@ TEST(arena, double_destroy_safe) {
 
 TEST(arena, destroy_single_block) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     a.alloc(64);
     a.destroy();
     CHECK(a.current == nullptr);
@@ -406,7 +406,7 @@ TEST(arena, destroy_single_block) {
 
 TEST(arena, space_used_single_block) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     a.alloc(100);  // → 104
     a.alloc(8);
     CHECK_EQ(a.space_used(), 104u + 8u);
@@ -415,7 +415,7 @@ TEST(arena, space_used_single_block) {
 
 TEST(arena, space_used_across_blocks) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     u64 cap = a.current->capacity();
     a.alloc(cap);  // fill first block
     a.alloc(64);   // second block
@@ -426,7 +426,7 @@ TEST(arena, space_used_across_blocks) {
 
 TEST(arena, space_allocated_grows_with_blocks) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     u64 a0 = a.space_allocated();
     a.alloc(a.current->capacity());
     a.alloc(64);
@@ -437,7 +437,7 @@ TEST(arena, space_allocated_grows_with_blocks) {
 
 TEST(arena, space_used_zero_after_reset) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     a.alloc(500);
     CHECK_GT(a.space_used(), 0u);
     a.reset();
@@ -451,7 +451,7 @@ TEST(arena, space_used_zero_after_reset) {
 
 TEST(arena, stress_10k_small_allocs) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     for (int i = 0; i < 10000; i++) CHECK(a.alloc(8) != nullptr);
     CHECK_EQ(a.space_used(), 80000u);
     a.destroy();
@@ -459,7 +459,7 @@ TEST(arena, stress_10k_small_allocs) {
 
 TEST(arena, stress_mixed_sizes) {
     Arena a;
-    REQUIRE_EQ(a.init(1024), 0);
+    REQUIRE(a.init(1024).has_value());
     for (int i = 0; i < 1000; i++) {
         u64 sz = static_cast<u64>((i % 7 + 1) * 8);  // 8,16,24,32,40,48,56
         CHECK(a.alloc(sz) != nullptr);
@@ -469,7 +469,7 @@ TEST(arena, stress_mixed_sizes) {
 
 TEST(arena, stress_alloc_reset_1000_cycles) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     for (int cycle = 0; cycle < 1000; cycle++) {
         a.alloc(128);
         a.alloc(256);
@@ -482,7 +482,7 @@ TEST(arena, stress_alloc_reset_1000_cycles) {
 
 TEST(arena, stress_large_allocs_across_blocks) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     // Each alloc forces a new block
     for (int i = 0; i < 50; i++) CHECK(a.alloc(4000) != nullptr);
     int blocks = 0;
@@ -493,7 +493,7 @@ TEST(arena, stress_large_allocs_across_blocks) {
 
 TEST(arena, stress_reset_preserves_first_block_across_cycles) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     Arena::Block* first = a.current;
     for (int cycle = 0; cycle < 100; cycle++) {
         for (int i = 0; i < 10; i++) a.alloc(100);
@@ -509,7 +509,7 @@ TEST(arena, stress_reset_preserves_first_block_across_cycles) {
 
 TEST(arena, data_integrity_after_alloc) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     auto* buf = static_cast<u8*>(a.alloc(256));
     REQUIRE(buf != nullptr);
     for (int i = 0; i < 256; i++) buf[i] = static_cast<u8>(i);
@@ -519,7 +519,7 @@ TEST(arena, data_integrity_after_alloc) {
 
 TEST(arena, data_integrity_across_blocks) {
     Arena a;
-    REQUIRE_EQ(a.init(256), 0);
+    REQUIRE(a.init(256).has_value());
     // Fill first block, force second
     u64 cap = a.current->capacity();
     auto* buf1 = static_cast<u8*>(a.alloc(cap));
@@ -548,7 +548,7 @@ TEST(arena, alloc_before_init_returns_null) {
 // alloc() after destroy (current==nullptr) must return nullptr.
 TEST(arena, alloc_after_destroy_returns_null) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     a.destroy();
     CHECK(a.alloc(64) == nullptr);
 }
@@ -556,7 +556,7 @@ TEST(arena, alloc_after_destroy_returns_null) {
 // reset() after destroy (current==nullptr) must not crash.
 TEST(arena, reset_after_destroy_no_crash) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     a.destroy();
     a.reset();  // must be a no-op, not a crash
     CHECK(a.current == nullptr);

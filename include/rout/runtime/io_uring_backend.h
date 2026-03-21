@@ -1,7 +1,10 @@
 #pragma once
 
 #include "rout/common/types.h"
+#include "rout/runtime/error.h"
 #include "rout/runtime/io_backend.h"
+
+#include "core/expected.h"
 
 #include <linux/io_uring.h>
 #include <sys/mman.h>
@@ -81,8 +84,7 @@ struct IoUringBackend {
     // --- Interface methods ---
 
     // Initialize the io_uring instance for this shard.
-    // Returns 0 on success, -errno on failure.
-    i32 init(u32 shard_id, i32 listen_fd);
+    core::Expected<void, Error> init(u32 shard_id, i32 listen_fd);
 
     // Submit a multishot accept on the listen socket.
     void add_accept();
@@ -123,7 +125,7 @@ private:
     static void decode_user_data(u64 data, u32& conn_id, IoEventType& type);
 
     // Setup provided buffer ring via io_uring_register.
-    i32 setup_buf_ring();
+    core::Expected<void, Error> setup_buf_ring();
 
     // Submit IORING_OP_READ on timer_fd to receive next tick.
     void submit_timer_read();

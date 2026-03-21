@@ -63,8 +63,8 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
     // Create one SO_REUSEPORT listen socket per shard.
     // Kernel distributes incoming connections across sockets.
     for (u32 i = 0; i < shard_count; i++) {
-        i32 lfd = create_listen_socket(port);
-        if (lfd < 0) {
+        auto lfd_result = create_listen_socket(port);
+        if (!lfd_result) {
             write_str("Failed to create listen socket for shard ");
             write_u32(i);
             write_str("\n");
@@ -76,10 +76,11 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
             }
             return 1;
         }
+        i32 lfd = lfd_result.value();
         shards[i].owns_listen_fd = true;
 
-        i32 rc = shards[i].init(i, lfd);
-        if (rc < 0) {
+        auto rc = shards[i].init(i, lfd);
+        if (!rc) {
             write_str("Failed to init shard ");
             write_u32(i);
             write_str("\n");
@@ -121,8 +122,8 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
     // Spawn shard threads
     for (u32 i = 0; i < shard_count; i++) {
         i32 pin = pin_cpus ? static_cast<i32>(i) : -1;
-        i32 rc = shards[i].spawn(pin);
-        if (rc < 0) {
+        auto rc = shards[i].spawn(pin);
+        if (!rc) {
             write_str("Failed to spawn shard ");
             write_u32(i);
             write_str("\n");

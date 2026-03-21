@@ -2,9 +2,12 @@
 
 #include "rout/common/types.h"
 #include "rout/runtime/arena.h"
+#include "rout/runtime/error.h"
 #include "rout/runtime/event_loop.h"
 #include "rout/runtime/route_table.h"
 #include "rout/runtime/upstream_pool.h"
+
+#include "core/expected.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -53,8 +56,7 @@ struct Shard {
 
     // Initialize shard: mmap EventLoop, init backend + arena.
     // listen_fd must already be created with SO_REUSEPORT.
-    // Returns 0 on success, -errno on failure.
-    i32 init(u32 shard_id, i32 lfd) {
+    core::Expected<void, Error> init(u32 shard_id, i32 lfd) {
         id = shard_id;
         listen_fd = lfd;
 
@@ -65,23 +67,23 @@ struct Shard {
                          MAP_PRIVATE | MAP_ANONYMOUS,
                          -1,
                          0);
-        if (mem == MAP_FAILED) return -errno;
+        if (mem == MAP_FAILED) return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
         loop = static_cast<EventLoop<Backend>*>(mem);
 
-        i32 rc = loop->init(shard_id, listen_fd);
-        if (rc < 0) {
+        auto loop_result = loop->init(shard_id, listen_fd);
+        if (!loop_result) {
             munmap(loop, sizeof(EventLoop<Backend>));
             loop = nullptr;
-            return rc;
+            return loop_result;
         }
 
         // Init scratch arena (64KB initial block, grows on demand)
-        rc = scratch.init(65536);
-        if (rc < 0) {
+        auto arena_result = scratch.init(65536);
+        if (!arena_result) {
             loop->shutdown();
             munmap(loop, sizeof(EventLoop<Backend>));
             loop = nullptr;
-            return rc;
+            return arena_result;
         }
 
         // mmap upstream pool (UpstreamConn[4096] is ~50KB)
@@ -96,19 +98,18 @@ struct Shard {
             loop->shutdown();
             munmap(loop, sizeof(EventLoop<Backend>));
             loop = nullptr;
-            return -errno;
+            return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
         }
         upstream = static_cast<UpstreamPool*>(up_mem);
         upstream->init();
 
-        return 0;
+        return {};
     }
 
     // Spawn the shard's thread. Optionally pin to CPU core.
     // pin_cpu: -1 = no pinning, >=0 = pin to that core.
-    // Returns 0 on success, -errno on failure.
-    i32 spawn(i32 pin_cpu = -1) {
-        if (!loop) return -EINVAL;
+    core::Expected<void, Error> spawn(i32 pin_cpu = -1) {
+        if (!loop) return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);
@@ -123,9 +124,9 @@ struct Shard {
 
         i32 rc = pthread_create(&thread, &attr, thread_entry, this);
         pthread_attr_destroy(&attr);
-        if (rc != 0) return -rc;
+        if (rc != 0) return core::make_unexpected(Error::make(rc, Error::Source::Thread));
         thread_spawned = true;
-        return 0;
+        return {};
     }
 
     // Signal the shard to stop (safe to call from any thread).

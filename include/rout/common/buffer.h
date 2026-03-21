@@ -7,7 +7,8 @@ namespace rout {
 struct Buffer;
 
 // View — read-only, move-only. Created by Buffer::release().
-// On destruction, automatically restores Buffer's write permission.
+// On destruction, restores Buffer's write permission and resets Buffer's len to 0
+// (data is considered consumed; Buffer starts fresh for the next write cycle).
 struct View {
     View() noexcept : ptr_(nullptr), len_(0), owner_(nullptr) {}
 
@@ -79,7 +80,8 @@ struct Buffer {
     }
 
     Buffer& operator=(Buffer&& o) noexcept {
-        if (o.released_) __builtin_trap();  // move while View alive = dangling owner_
+        if (o.released_) __builtin_trap();  // source has View alive = dangling owner_
+        if (released_) __builtin_trap();    // dest has View alive = View would corrupt new state
         if (this != &o) {
             ptr_ = o.ptr_;
             len_ = o.len_;

@@ -56,9 +56,10 @@ struct Builder {
         for (u32 i = 0; i < count; i++) {
             sd->fields()[i] = fields[i];
         }
-        if (mod->struct_defs && mod->struct_count < mod->struct_cap) {
-            mod->struct_defs[mod->struct_count++] = sd;
+        if (!mod->struct_defs || mod->struct_count >= mod->struct_cap) {
+            return err(RirError::CapacityFull);
         }
+        mod->struct_defs[mod->struct_count++] = sd;
         return sd;
     }
 
@@ -323,26 +324,22 @@ struct Builder {
 
     Result<ValueId> emit_req_method(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Method));
-        auto [inst, vid] = TRY(emit(Opcode::ReqMethod, ty, loc));
-        return vid;
+        return TRY(emit(Opcode::ReqMethod, ty, loc)).vid;
     }
 
     Result<ValueId> emit_req_path(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
-        auto [inst, vid] = TRY(emit(Opcode::ReqPath, ty, loc));
-        return vid;
+        return TRY(emit(Opcode::ReqPath, ty, loc)).vid;
     }
 
     Result<ValueId> emit_req_remote_addr(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::IP));
-        auto [inst, vid] = TRY(emit(Opcode::ReqRemoteAddr, ty, loc));
-        return vid;
+        return TRY(emit(Opcode::ReqRemoteAddr, ty, loc)).vid;
     }
 
     Result<ValueId> emit_req_content_length(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::ByteSize));
-        auto [inst, vid] = TRY(emit(Opcode::ReqContentLength, ty, loc));
-        return vid;
+        return TRY(emit(Opcode::ReqContentLength, ty, loc)).vid;
     }
 
     Result<ValueId> emit_req_cookie(Str name, SourceLoc loc = {}) {
@@ -403,6 +400,7 @@ struct Builder {
     // ── Comparisons ─────────────────────────────────────────────────
 
     Result<ValueId> emit_cmp(Opcode cmp_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
+        if (cmp_op < Opcode::CmpEq || cmp_op > Opcode::CmpGe) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(cmp_op, ty, loc));
         inst->operands[0] = lhs;
@@ -415,8 +413,7 @@ struct Builder {
 
     Result<ValueId> emit_time_now(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Time));
-        auto [inst, vid] = TRY(emit(Opcode::TimeNow, ty, loc));
-        return vid;
+        return TRY(emit(Opcode::TimeNow, ty, loc)).vid;
     }
 
     Result<ValueId> emit_time_diff(ValueId a, ValueId b, SourceLoc loc = {}) {

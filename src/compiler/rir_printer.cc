@@ -9,12 +9,14 @@ namespace rir {
 // ── PrintBuf implementation ─────────────────────────────────────────
 
 void PrintBuf::flush() {
-    if (len > 0 && fd >= 0) {
+    // When fd < 0 (in-memory mode), don't discard buffered data.
+    if (fd < 0) return;
+    if (len > 0) {
         u32 written = 0;
         while (written < len) {
             auto n = ::write(fd, data + written, len - written);
             if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) break;  // EBADF or unrecoverable
+            if (n <= 0) break;
             written += static_cast<u32>(n);
         }
     }
@@ -22,7 +24,10 @@ void PrintBuf::flush() {
 }
 
 void PrintBuf::put(char c) {
-    if (len >= cap) flush();
+    if (len >= cap) {
+        if (fd < 0) return;  // in-memory: silently stop on overflow
+        flush();
+    }
     data[len++] = c;
 }
 

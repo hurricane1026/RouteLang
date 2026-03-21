@@ -12,7 +12,7 @@ namespace rir {
 // Output format (differs from DESIGN.md §11.2.5 in two ways:
 // 1. All operands are SSA references — string/numeric literals are
 //    materialized as const.str/const.i32 instructions, not inlined.
-// 2. Header uses "route:" instead of "params:").
+// 2. Header uses "route:" instead of "params:".
 //
 //   === handle_get_users_id ===
 //     route: /users/:id

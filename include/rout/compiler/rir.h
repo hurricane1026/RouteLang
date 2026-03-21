@@ -246,15 +246,35 @@ struct Instruction {
         return extra_operands[i - kMaxInlineOperands];
     }
 
-    // Is this a block-ending instruction? Includes both control flow
-    // terminators (br, jmp, ret) and yields (I/O suspend points that
-    // become state machine boundaries). No instructions may follow
-    // a block-ender within the same block.
-    bool is_terminator() const { return op >= Opcode::Br && op <= Opcode::YieldExtern; }
-
     // Is this a yield (I/O suspend point → state machine boundary)?
     // Yields are a subset of terminators.
-    bool is_yield() const { return op >= Opcode::YieldHttpGet && op <= Opcode::YieldExtern; }
+    // Note: DESIGN.md shows nil checks as `%v.is_nil` (sugar), but this
+    // IR uses an explicit `OptIsNil` opcode for uniformity.
+    bool is_yield() const {
+        switch (op) {
+            case Opcode::YieldHttpGet:
+            case Opcode::YieldHttpPost:
+            case Opcode::YieldProxy:
+            case Opcode::YieldExtern:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Is this a block-ending instruction? Uses explicit switch rather
+    // than range check so opcode reordering can't silently break semantics.
+    bool is_terminator() const {
+        switch (op) {
+            case Opcode::Br:
+            case Opcode::Jmp:
+            case Opcode::RetStatus:
+            case Opcode::RetProxy:
+                return true;
+            default:
+                return is_yield();
+        }
+    }
 };
 
 // ── Block ───────────────────────────────────────────────────────────

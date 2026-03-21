@@ -16,9 +16,9 @@ static Str lit(const char* s) {
 }
 
 // Unwrap Expected in tests: check success then extract value.
-// Uses statement-expression extension (supported by gcc/clang).
+// __extension__ suppresses -Wgnu-statement-expression-from-macro-expansion.
 #define V(expr)                                                \
-    ({                                                         \
+    __extension__({                                            \
         auto&& _v_result = (expr);                             \
         REQUIRE(static_cast<bool>(_v_result));                 \
         static_cast<decltype(_v_result)&&>(_v_result).value(); \
@@ -39,10 +39,12 @@ struct TestContext {
 
         static constexpr u32 kMaxFuncs = 8;
         mod.functions = arena.alloc_array<Function>(kMaxFuncs);
+        if (!mod.functions) return false;
         mod.func_count = 0;
         mod.func_cap = kMaxFuncs;
         static constexpr u32 kMaxStructs = 64;
         mod.struct_defs = arena.alloc_array<StructDef*>(kMaxStructs);
+        if (!mod.struct_defs) return false;
         mod.struct_count = 0;
         mod.struct_cap = kMaxStructs;
         return true;

@@ -14,7 +14,8 @@ TEST(block, data_starts_after_header) {
     Arena a;
     REQUIRE_EQ(a.init(4096), 0);
     auto* b = a.current;
-    u8* expected = reinterpret_cast<u8*>(b) + sizeof(Arena::Block);
+    u64 hdr = (sizeof(Arena::Block) + 15) & ~u64(15);
+    u8* expected = reinterpret_cast<u8*>(b) + hdr;
     CHECK_EQ(b->data(), expected);
     a.destroy();
 }
@@ -23,7 +24,8 @@ TEST(block, capacity_equals_size_minus_header) {
     Arena a;
     REQUIRE_EQ(a.init(4096), 0);
     auto* b = a.current;
-    CHECK_EQ(b->capacity(), b->size - sizeof(Arena::Block));
+    u64 hdr = (sizeof(Arena::Block) + 15) & ~u64(15);
+    CHECK_EQ(b->capacity(), b->size - hdr);
     a.destroy();
 }
 
@@ -60,11 +62,11 @@ TEST(block, three_block_chain) {
     Arena::Block* b0 = a.current;
 
     // Force 3 blocks by allocating more than one block can hold each time
-    a.alloc(b0->capacity() + 8);  // overflow → b1
+    a.alloc(b0->capacity() + 64);  // overflow → b1
     Arena::Block* b1 = a.current;
     CHECK_NE(b1, b0);
 
-    a.alloc(b1->capacity() + 8);  // overflow → b2
+    a.alloc(b1->capacity() + 64);  // overflow → b2
     Arena::Block* b2 = a.current;
     CHECK_NE(b2, b1);
 

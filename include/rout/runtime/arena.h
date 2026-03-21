@@ -38,8 +38,8 @@ struct Arena {
         u64 size;  // total mmap'd size (including this header)
         u64 used;  // bytes allocated after header
 
-        u8* data() { return reinterpret_cast<u8*>(this) + sizeof(Block); }
-        u64 capacity() const { return size - sizeof(Block); }
+        u8* data() { return reinterpret_cast<u8*>(this) + ((sizeof(Block) + 15) & ~u64(15)); }
+        u64 capacity() const { return size - ((sizeof(Block) + 15) & ~u64(15)); }
         u64 remaining() const { return capacity() - used; }
     };
 
@@ -65,6 +65,7 @@ struct Arena {
             current->used += size;
             return p;
         }
+        if (size > static_cast<u64>(-1) - sizeof(Block)) return nullptr;
         u64 needed = size + sizeof(Block);
         u64 new_size = block_size > needed ? block_size : needed;
         Block* b = alloc_block(new_size, current);
@@ -131,12 +132,16 @@ struct Arena {
 
 private:
     static u64 page_align(u64 size) {
-        // Round up to page size (typically 4096)
+        if (size > static_cast<u64>(-1) - 4095) return 0;  // overflow guard
         return (size + 4095) & ~static_cast<u64>(4095);
     }
 
     Block* alloc_block(u64 size, Block* prev) {
         size = page_align(size);
+        if (size == 0) {
+            errno = ENOMEM;  // overflow in page_align
+            return nullptr;
+        }
         void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return nullptr;
         auto* b = static_cast<Block*>(p);

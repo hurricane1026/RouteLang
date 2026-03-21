@@ -131,7 +131,11 @@ void EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
     // Initiate non-blocking connect
     i32 rc = connect(fd, static_cast<const struct sockaddr*>(addr), addr_len);
     if (rc == 0) {
-        // Immediate connect (loopback)
+        // Immediate connect (loopback) — register fd for future I/O
+        struct epoll_event reg_ev;
+        reg_ev.events = EPOLLIN;
+        reg_ev.data.u64 = encode_data(conn_id, IoEventType::Recv);
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &reg_ev);
         if (pending_count < 64) {
             pending_completions[pending_count].conn_id = conn_id;
             pending_completions[pending_count].type = IoEventType::UpstreamConnect;

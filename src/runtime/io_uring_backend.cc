@@ -187,7 +187,10 @@ i32 IoUringBackend::setup_buf_ring() {
     reg.bgid = kBufGroupId;
 
     i32 rc = io_uring_register(ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1);
-    if (rc < 0) return rc;
+    if (rc < 0) {
+        shutdown();
+        return rc;
+    }
 
     // Fill the ring with buffer entries
     for (u32 i = 0; i < kProvidedBufCount; i++) {
@@ -300,11 +303,17 @@ void IoUringBackend::cancel(i32 fd, u32 conn_id) {
 u32 IoUringBackend::wait(IoEvent* events, u32 max_events) {
     // Submit pending SQEs and wait for at least 1 CQE
     u32 flags = IORING_ENTER_GETEVENTS;
-    if (pending > 0) {
-        io_uring_enter(ring_fd, pending, 1, flags);
-        pending = 0;
-    } else {
-        io_uring_enter(ring_fd, 0, 1, flags);
+    i32 ret;
+    for (;;) {
+        if (pending > 0) {
+            ret = io_uring_enter(ring_fd, pending, 1, flags);
+            if (ret >= 0) pending = 0;
+        } else {
+            ret = io_uring_enter(ring_fd, 0, 1, flags);
+        }
+        if (ret >= 0) break;
+        if (ret == -EINTR) continue;
+        return 0;  // real error
     }
 
     // Harvest CQEs

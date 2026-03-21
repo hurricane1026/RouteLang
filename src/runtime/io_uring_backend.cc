@@ -120,7 +120,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     if (sq_ring_ptr == MAP_FAILED) {
         i32 err = errno;
         shutdown();
-        return core::make_unexpected(Error::make(err, Error::Source::IoUring));
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
 
     auto* sq_base = static_cast<u8*>(sq_ring_ptr);
@@ -140,7 +140,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     if (sqes_ptr == MAP_FAILED) {
         i32 err = errno;
         shutdown();
-        return core::make_unexpected(Error::make(err, Error::Source::IoUring));
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
     sq_entries = static_cast<io_uring_sqe*>(sqes_ptr);
 
@@ -155,7 +155,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     if (cq_ring_ptr == MAP_FAILED) {
         i32 err = errno;
         shutdown();
-        return core::make_unexpected(Error::make(err, Error::Source::IoUring));
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
 
     auto* cq_base = static_cast<u8*>(cq_ring_ptr);

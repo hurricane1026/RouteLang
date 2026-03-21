@@ -23,11 +23,15 @@ target_include_directories(test_arena PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_executable(test_expected test_expected.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_include_directories(test_expected PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
+add_executable(test_buffer test_buffer.cc)
+target_include_directories(test_buffer PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
 add_custom_target(check
     COMMAND $<TARGET_FILE:test_network>
     COMMAND $<TARGET_FILE:test_integration>
     COMMAND $<TARGET_FILE:test_arena>
     COMMAND $<TARGET_FILE:test_expected>
-    DEPENDS test_network test_integration test_arena test_expected
+    COMMAND $<TARGET_FILE:test_buffer>
+    DEPENDS test_network test_integration test_arena test_expected test_buffer
     COMMENT "Running all tests..."
 )

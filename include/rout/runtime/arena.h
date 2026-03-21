@@ -65,8 +65,11 @@ struct Arena {
             current->used += size;
             return p;
         }
-        if (size > static_cast<u64>(-1) - sizeof(Block)) return nullptr;
-        u64 needed = size + sizeof(Block);
+        // Use aligned header size, matching Block::data() offset
+        // Use aligned header size, matching Block::data() offset
+        constexpr u64 kHdr = (sizeof(Block) + 15) & ~static_cast<u64>(15);
+        if (size > static_cast<u64>(-1) - kHdr) return nullptr;
+        u64 needed = size + kHdr;
         u64 new_size = block_size > needed ? block_size : needed;
         Block* b = alloc_block(new_size, current);
         if (!b) return nullptr;

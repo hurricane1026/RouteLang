@@ -4,7 +4,9 @@
 #include "rout/runtime/socket.h"
 
 #include <linux/io_uring.h>
+#include <netinet/in.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -40,6 +42,12 @@ int main(int argc, char** argv) {
         write_str("Failed to create listen socket\n");
         return 1;
     }
+
+    // Get actual port (kernel may assign ephemeral if port==0)
+    struct sockaddr_in bound_addr;
+    socklen_t addr_len = sizeof(bound_addr);
+    getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&bound_addr), &addr_len);
+    port = __builtin_bswap16(bound_addr.sin_port);
 
     write_str("Listening on port ");
     char buf[8];

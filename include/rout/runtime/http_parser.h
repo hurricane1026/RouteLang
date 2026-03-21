@@ -78,22 +78,16 @@ struct ParsedRequest {
 //   if (s == ParseStatus::Incomplete) { /* wait for more data */ }
 //   if (s == ParseStatus::Error) { /* 400, close connection */ }
 //
-// Design: single-pass always starts from pos=0. `parsed_offset` is only
-// used on the Incomplete cold path to record how far we scanned.
-// On Complete, `header_end` is the offset past the final \r\n\r\n.
+// Design: single-pass, always starts from buf[0]. Each call is a full
+// reparse of the provided buffer. On Complete, `header_end` is the offset
+// past the final \r\n\r\n (first body byte).
 struct HttpParser {
-    u32 parsed_offset;  // Set to `len` on Incomplete return. Used internally by the cold-path
-                        // Error/Incomplete disambiguation.
-    u32 header_end;     // Set on Complete: offset of first body byte.
+    u32 header_end;  // Set on Complete: offset of first body byte.
 
-    void reset() {
-        parsed_offset = 0;
-        header_end = 0;
-    }
+    void reset() { header_end = 0; }
 
     // Parse request-line + headers from buf[0..len).
     // On Complete, populates `req` and sets `header_end`.
-    // On Incomplete, preserves `parsed_offset` for next call.
     ParseStatus parse(const u8* buf, u32 len, ParsedRequest* req);
 };
 

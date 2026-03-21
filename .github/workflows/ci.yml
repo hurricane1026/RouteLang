@@ -12,15 +12,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang-format (LLVM snapshot, matches local v21)
+      - name: Install clang-format (LLVM snapshot, v20)
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble main" | \
             sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
-          # LLVM snapshot publishes as clang-format-20 (dev version)
           sudo apt-get install -y clang-format-20 || sudo apt-get install -y clang-format-19
-          # Use whichever was installed
           CF=$(command -v clang-format-20 || command -v clang-format-19)
           echo "CF=$CF" >> "$GITHUB_ENV"
           $CF --version

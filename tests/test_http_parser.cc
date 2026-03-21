@@ -488,7 +488,7 @@ static const ValidRequestVec kValidRequests[] = {
      HttpVersion::Http11,
      1,
      0,
-     true,
+     false,  // close is sticky — overrides subsequent keep-alive
      false},
 
     // --- Realistic requests ---
@@ -769,7 +769,7 @@ TEST(Incremental, ValidByteByByte) {
 
 // ============================================================================
 // TEST SUITE 4: Split at every position for valid vectors
-// (Feed first N bytes, then full buffer — tests the parsed_offset optimization)
+// (Feed first N bytes, then full buffer — tests incremental reparse)
 // ============================================================================
 
 TEST(Split, ValidSplitAtEveryPosition) {
@@ -2111,6 +2111,34 @@ TEST(NginxHeaders, ConnectionEmptyTokens) {
     auto s = parse_one(
         "GET / HTTP/1.1\r\n"
         "Connection: ,,close,,\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.keep_alive);
+}
+
+TEST(NginxHeaders, ConnectionCloseThenKeepAlive) {
+    HttpParser parser;
+    ParsedRequest req;
+    // "close" then "keep-alive" — close is sticky per RFC 7230
+    auto s = parse_one(
+        "GET / HTTP/1.1\r\n"
+        "Connection: close, keep-alive\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.keep_alive);  // close overrides keep-alive
+}
+
+TEST(NginxHeaders, ConnectionKeepAliveThenClose) {
+    HttpParser parser;
+    ParsedRequest req;
+    // "keep-alive" then "close" — close wins
+    auto s = parse_one(
+        "GET / HTTP/1.1\r\n"
+        "Connection: keep-alive, close\r\n"
         "\r\n",
         &req,
         &parser);

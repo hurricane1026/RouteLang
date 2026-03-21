@@ -192,6 +192,7 @@ static inline void match_connection(const u8* val, u32 vlen, ParsedRequest* req)
 
         if (tok_len == 5 && str_ci_eq(val + tok_start, "close", 5)) {
             req->keep_alive = false;
+            return;  // close is sticky — overrides any keep-alive (RFC 7230)
         } else if (tok_len == 10 && str_ci_eq(val + tok_start, "keep-alive", 10)) {
             req->keep_alive = true;
         }
@@ -256,7 +257,6 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
     // Quick check: need at least 4 bytes to try method matching.
     // (Shorter buffers can only be incomplete.)
     if (UNLIKELY(len < 4)) {
-        parsed_offset = len;
         return ParseStatus::Incomplete;
     }
 
@@ -308,7 +308,6 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
     for (;;) {
         // Need at least 2 bytes to check for end-of-headers or start of a header
         if (UNLIKELY(pos + 2 > len)) {
-            parsed_offset = len;
             return ParseStatus::Incomplete;
         }
 
@@ -388,7 +387,6 @@ maybe_incomplete:
     if (simd::find_header_end(buf, len, 0) > 0) {
         return ParseStatus::Error;
     }
-    parsed_offset = len;
     return ParseStatus::Incomplete;
 }
 

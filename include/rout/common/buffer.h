@@ -42,7 +42,7 @@ struct View {
     u32 read(u8* dst, u32 max) const noexcept {
         if (!ptr_ || max == 0) return 0;
         u32 n = len_ < max ? len_ : max;
-        __builtin_memcpy(dst, ptr_, n);
+        if (n > 0) __builtin_memcpy(dst, ptr_, n);
         return n;
     }
 
@@ -65,6 +65,11 @@ private:
 struct Buffer {
     Buffer() noexcept : ptr_(nullptr), len_(0), cap_(0), released_(false) {}
     Buffer(u8* ptr, u32 cap) noexcept : ptr_(ptr), len_(0), cap_(cap), released_(false) {}
+
+    // Destructor: traps if View still alive (View would dangle)
+    ~Buffer() {
+        if (released_) __builtin_trap();
+    }
 
     // No copy
     Buffer(const Buffer&) = delete;
@@ -112,7 +117,7 @@ struct Buffer {
     u32 read(u8* dst, u32 max) const noexcept {
         if (!ptr_ || max == 0) return 0;
         u32 n = len_ < max ? len_ : max;
-        __builtin_memcpy(dst, ptr_, n);
+        if (n > 0) __builtin_memcpy(dst, ptr_, n);
         return n;
     }
 

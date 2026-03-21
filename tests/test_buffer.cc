@@ -416,6 +416,30 @@ TEST(copilot2, restore_resets_len_documented) {
     CHECK(!buf.is_released());
 }
 
+// === Copilot round 3 regression tests ===
+
+// #1: Buffer destructor traps if View alive.
+// Can't test trap, but verify View must die before Buffer goes out of scope.
+// The full_cycle test already proves correct usage (View scoped inside {}).
+
+// #2-3: read with empty buffer doesn't call memcpy with n==0
+TEST(copilot3, read_empty_buffer_no_memcpy_crash) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    // len_==0, so n will be 0 — must not call memcpy
+    u8 out[4];
+    CHECK_EQ(buf.read(out, sizeof(out)), 0u);
+}
+
+TEST(copilot3, read_empty_view_no_memcpy_crash) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    // Don't write anything — len==0
+    View view = buf.release();
+    u8 out[4];
+    CHECK_EQ(view.read(out, sizeof(out)), 0u);
+}
+
 // #5: test_buffer is in check target (verified by CMakeLists.txt)
 // This test itself running proves it.
 

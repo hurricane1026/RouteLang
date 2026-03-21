@@ -136,7 +136,7 @@ struct Builder {
 
     // ── Capacity growth ───────────────────────────────────────────
 
-    static constexpr u32 kMaxCap = 0x7FFFFFFFu;  // guard against u32 overflow on doubling
+    static constexpr u32 kMaxCap = 0x3FFFFFFFu;  // cap * 2 must not overflow u32
 
     VoidResult grow_values(Function* fn) {
         if (fn->value_cap > kMaxCap) return err(RirError::CapacityFull);

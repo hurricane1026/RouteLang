@@ -33,6 +33,7 @@ void PrintBuf::put(char c) {
     if (len >= cap) {
         if (fd < 0) return;  // in-memory: silently stop on overflow
         flush();
+        if (len >= cap) return;  // still full after flush (write error)
     }
     data[len++] = c;
 }
@@ -497,7 +498,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
             buf.put_cstr(", ");
-            buf.put_str(inst.imm.str_val);
+            print_quoted_str(buf, inst.imm.str_val);
             break;
         case Opcode::OptIsNil:
         case Opcode::OptUnwrap:

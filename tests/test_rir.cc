@@ -343,9 +343,13 @@ TEST(RirIntegration, AuthHandlerFromDesignDoc) {
     auto raw = V(b.emit_str_trim_prefix(token, bearer, {44, 0}));
     auto secret = V(b.emit_const_str(lit("env(JWT_SECRET)"), {44, 0}));
     auto* t_str = V(b.make_type(TypeKind::Str));
-    auto* t_opt = V(b.make_type(TypeKind::Optional, t_str));
+    // Model Claims as a proper struct with role/sub/exp fields.
+    FieldDef claims_fields[3] = {{lit("role"), t_str}, {lit("sub"), t_str}, {lit("exp"), t_str}};
+    auto* claims_sd = V(b.create_struct(lit("Claims"), claims_fields, 3));
+    auto* t_claims = V(b.make_type(TypeKind::Struct, nullptr, claims_sd));
+    auto* t_opt_claims = V(b.make_type(TypeKind::Optional, t_claims));
     ValueId jwt_args[2] = {raw, secret};
-    auto claims = V(b.emit_call_extern(lit("jwt_decode"), jwt_args, 2, t_opt, {45, 0}));
+    auto claims = V(b.emit_call_extern(lit("jwt_decode"), jwt_args, 2, t_opt_claims, {45, 0}));
     auto claims_nil = V(b.emit_opt_is_nil(claims, {45, 0}));
     VOK(b.emit_br(claims_nil, blk_reject_401, blk_check_role, {45, 0}));
 

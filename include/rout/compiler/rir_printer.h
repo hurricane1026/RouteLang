@@ -21,10 +21,10 @@ namespace rir {
 //     blocks: 7
 //     instructions: 18
 //
-//     entry:
-//       %0 = req.header "Authorization"    // line 42
-//       %1 = opt.is_nil %0                 // line 42
-//       br %1, block_reject_401, block_1   // line 42
+//   entry:
+//     %0 = req.header "Authorization"    // line 42
+//     %1 = opt.is_nil %0                 // line 42
+//     br %1, block_reject_401, block_1   // line 42
 
 struct PrintBuf {
     char* data;

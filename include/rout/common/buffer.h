@@ -35,11 +35,10 @@ struct View {
         return *this;
     }
 
-    // Destructor: auto-restore Buffer write permission
     ~View() { restore_owner(); }
 
-    // Read: the ONLY way to access data
-    u32 read(u8* dst, u32 max) noexcept {
+    // Read: the ONLY way to access data. const — safe to pass around.
+    u32 read(u8* dst, u32 max) const noexcept {
         if (!ptr_ || max == 0) return 0;
         u32 n = len_ < max ? len_ : max;
         __builtin_memcpy(dst, ptr_, n);
@@ -61,6 +60,7 @@ private:
 };
 
 // Buffer — read + write, move-only (exclusive owner).
+// Cannot be moved while released (View alive) — traps.
 struct Buffer {
     Buffer() noexcept : ptr_(nullptr), len_(0), cap_(0), released_(false) {}
     Buffer(u8* ptr, u32 cap) noexcept : ptr_(ptr), len_(0), cap_(cap), released_(false) {}
@@ -69,8 +69,9 @@ struct Buffer {
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 
-    // Move: source invalidated
+    // Move: traps if released (View holds pointer to us — moving would dangle)
     Buffer(Buffer&& o) noexcept : ptr_(o.ptr_), len_(o.len_), cap_(o.cap_), released_(o.released_) {
+        if (released_) __builtin_trap();  // move while View alive = dangling owner_
         o.ptr_ = nullptr;
         o.len_ = 0;
         o.cap_ = 0;
@@ -78,6 +79,7 @@ struct Buffer {
     }
 
     Buffer& operator=(Buffer&& o) noexcept {
+        if (o.released_) __builtin_trap();  // move while View alive = dangling owner_
         if (this != &o) {
             ptr_ = o.ptr_;
             len_ = o.len_;
@@ -104,8 +106,8 @@ struct Buffer {
         return to_write;
     }
 
-    // Read: Buffer owner can also read
-    u32 read(u8* dst, u32 max) noexcept {
+    // Read: const — Buffer owner can also read
+    u32 read(u8* dst, u32 max) const noexcept {
         if (!ptr_ || max == 0) return 0;
         u32 n = len_ < max ? len_ : max;
         __builtin_memcpy(dst, ptr_, n);
@@ -113,7 +115,11 @@ struct Buffer {
     }
 
     // Release: create View, lock writes. View destructor auto-unlocks.
+    // Traps if already released (double release = two Views = bug).
+    // Returns empty View if buffer is invalid (ptr_==nullptr).
     View release() noexcept {
+        if (released_) __builtin_trap();  // double release = bug
+        if (!ptr_) return View();         // invalid buffer → empty View, no lock
         released_ = true;
         return View(ptr_, len_, this);
     }
@@ -136,7 +142,6 @@ private:
     bool released_;
 };
 
-// View destructor restores Buffer write permission
 inline void View::restore_owner() noexcept {
     if (owner_) {
         owner_->released_ = false;

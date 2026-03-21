@@ -333,6 +333,60 @@ TEST(buffer, write_appends) {
     CHECK_EQ(out[4], 'o');
 }
 
+// === Copilot review regression tests ===
+
+// #1: release on null buffer → empty View, no lock
+// Without fix: null buffer would set released_=true, trapping on next write
+TEST(copilot, release_null_buffer_no_lock) {
+    Buffer buf;  // null, invalid
+    CHECK(!buf.valid());
+    View view = buf.release();
+    CHECK(!view.valid());
+    CHECK(!buf.is_released());  // not locked — null buffer skips lock
+}
+
+// #2: double release traps (programming error)
+// Without fix: two Views alive, first destructor unlocks while second still reads
+// Can't test trap directly, but verify the flag prevents it
+TEST(copilot, release_flag_prevents_double) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("hi"), 2);
+    View view = buf.release();
+    CHECK(buf.is_released());
+    // Double release would trap — verified by is_released() check
+    // buf.release();  // would __builtin_trap()
+    (void)view;
+}
+
+// #4: read is const — can pass const View& and const Buffer&
+TEST(copilot, read_is_const) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("test"), 4);
+    View view = buf.release();
+
+    // const ref read
+    const View& cv = view;
+    u8 out[16];
+    CHECK_EQ(cv.read(out, sizeof(out)), 4u);
+    CHECK_EQ(out[0], 't');
+}
+
+TEST(copilot, buffer_read_is_const) {
+    u8 storage[16];
+    Buffer buf(storage, sizeof(storage));
+    buf.write(reinterpret_cast<const u8*>("abc"), 3);
+
+    const Buffer& cb = buf;
+    u8 out[16];
+    CHECK_EQ(cb.read(out, sizeof(out)), 3u);
+    CHECK_EQ(out[0], 'a');
+}
+
+// #5: test_buffer is in check target (verified by CMakeLists.txt)
+// This test itself running proves it.
+
 int main(int argc, char** argv) {
     return rout::test::run_all(argc, argv);
 }

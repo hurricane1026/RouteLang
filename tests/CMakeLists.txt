@@ -42,12 +42,19 @@ target_include_directories(test_http_parser PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+add_executable(test_buffer test_buffer.cc)
+target_include_directories(test_buffer PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+
 add_custom_target(check
     COMMAND $<TARGET_FILE:test_network>
     COMMAND $<TARGET_FILE:test_integration>
     COMMAND $<TARGET_FILE:test_arena>
     COMMAND $<TARGET_FILE:test_expected>
     COMMAND $<TARGET_FILE:test_http_parser>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser
+    COMMAND $<TARGET_FILE:test_buffer>
+    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_buffer
     COMMENT "Running all tests..."
 )

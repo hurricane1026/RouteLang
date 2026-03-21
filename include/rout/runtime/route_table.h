@@ -1,0 +1,139 @@
+#pragma once
+
+#include "rout/common/types.h"
+
+#include <netinet/in.h>
+#include <string.h>
+
+namespace rout {
+
+// Action for a matched route.
+enum class RouteAction : u8 {
+    Static,  // respond with fixed status (e.g., 200 OK, 404)
+    Proxy,   // forward to upstream target
+};
+
+// Upstream target — address:port for a backend server.
+struct UpstreamTarget {
+    struct sockaddr_in addr;
+    // Short name for logging/debugging (e.g., "api-v1")
+    char name[32];
+    u32 name_len;
+
+    void set_name(const char* n) {
+        name_len = 0;
+        while (n[name_len] && name_len < sizeof(name) - 1) {
+            name[name_len] = n[name_len];
+            name_len++;
+        }
+        name[name_len] = '\0';
+    }
+
+    // Helper: set address from IP (host order) + port (host order)
+    void set_addr(u32 ip, u16 port) {
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = __builtin_bswap32(ip);
+        addr.sin_port = __builtin_bswap16(port);
+    }
+};
+
+// Single route entry: matches method + path prefix → action.
+struct RouteEntry {
+    // Match criteria
+    char path[128];  // path prefix (e.g., "/api/v1/")
+    u32 path_len;
+    u8 method;  // 0 = any, 'G' = GET, 'P' = POST, etc. (first char)
+
+    // Action
+    RouteAction action;
+    u16 upstream_id;  // index into RouteConfig::upstreams (if action == Proxy)
+    u16 status_code;  // status code (if action == Static, e.g., 200, 404)
+};
+
+// RouteConfig — immutable after construction, atomically swappable.
+// Contains route entries + upstream targets. The entire config is replaced
+// on hot reload (RCU pattern: new config built, atomic swap, old reclaimed).
+//
+// Phase 2: simple linear scan (adequate for <100 routes).
+// Phase 3: radix trie from Rue compiler (O(path_length) lookup).
+struct RouteConfig {
+    static constexpr u32 kMaxRoutes = 128;
+    static constexpr u32 kMaxUpstreams = 64;
+
+    RouteEntry routes[kMaxRoutes];
+    u32 route_count = 0;
+
+    UpstreamTarget upstreams[kMaxUpstreams];
+    u32 upstream_count = 0;
+
+    // Add a proxy route: path prefix → upstream target.
+    // Returns true on success.
+    bool add_proxy(const char* path, u8 method, u16 upstream_id) {
+        if (route_count >= kMaxRoutes) return false;
+        auto& r = routes[route_count];
+        r.path_len = 0;
+        while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
+            r.path[r.path_len] = path[r.path_len];
+            r.path_len++;
+        }
+        r.path[r.path_len] = '\0';
+        r.method = method;
+        r.action = RouteAction::Proxy;
+        r.upstream_id = upstream_id;
+        r.status_code = 0;
+        route_count++;
+        return true;
+    }
+
+    // Add a static response route.
+    bool add_static(const char* path, u8 method, u16 status) {
+        if (route_count >= kMaxRoutes) return false;
+        auto& r = routes[route_count];
+        r.path_len = 0;
+        while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
+            r.path[r.path_len] = path[r.path_len];
+            r.path_len++;
+        }
+        r.path[r.path_len] = '\0';
+        r.method = method;
+        r.action = RouteAction::Static;
+        r.upstream_id = 0;
+        r.status_code = status;
+        route_count++;
+        return true;
+    }
+
+    // Add an upstream target. Returns its index.
+    i32 add_upstream(const char* name, u32 ip, u16 port) {
+        if (upstream_count >= kMaxUpstreams) return -1;
+        u32 idx = upstream_count++;
+        upstreams[idx].set_name(name);
+        upstreams[idx].set_addr(ip, port);
+        return static_cast<i32>(idx);
+    }
+
+    // Match a request path (prefix match, first match wins).
+    // method_char: first char of HTTP method ('G'=GET, 'P'=POST, etc.), 0=any.
+    // Returns pointer to matching entry, or nullptr for no match (→ default 200 OK).
+    const RouteEntry* match(const u8* path_data, u32 path_len, u8 method_char) const {
+        for (u32 i = 0; i < route_count; i++) {
+            auto& r = routes[i];
+            // Method filter: 0 = any
+            if (r.method != 0 && r.method != method_char) continue;
+            // Prefix match
+            if (path_len < r.path_len) continue;
+            bool matched = true;
+            for (u32 j = 0; j < r.path_len; j++) {
+                if (path_data[j] != static_cast<u8>(r.path[j])) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) return &r;
+        }
+        return nullptr;  // no match → default handler
+    }
+};
+
+}  // namespace rout

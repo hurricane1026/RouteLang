@@ -1,5 +1,6 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
 #include "rout/runtime/io_uring_backend.h"
+#include "rout/runtime/shard.h"
 
 #include "test.h"
 #include "test_helpers.h"
@@ -622,6 +623,155 @@ TEST(uring, return_buffer_no_crash) {
     // Return buffer at boundary
     backend.return_buffer(static_cast<u16>(kProvidedBufCount - 1));
     backend.shutdown();
+    close(lfd);
+}
+
+// === Shard lifecycle ===
+
+// Shard init + shutdown without spawning a thread
+TEST(shard, init_shutdown) {
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0);
+    REQUIRE(lfd >= 0);
+    REQUIRE_EQ(shard.init(0, lfd), 0);
+    CHECK(shard.loop != nullptr);
+    CHECK_EQ(shard.id, 0u);
+    CHECK_EQ(shard.listen_fd, lfd);
+    shard.shutdown();
+    CHECK(shard.loop == nullptr);
+    close(lfd);
+}
+
+// Shard spawn + stop + join
+TEST(shard, spawn_stop_join) {
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0);
+    REQUIRE(lfd >= 0);
+    REQUIRE_EQ(shard.init(0, lfd), 0);
+    REQUIRE_EQ(shard.spawn(-1), 0);  // no CPU pinning
+    CHECK(shard.thread_spawned);
+
+    // Let the shard run briefly, then stop
+    usleep(50000);  // 50ms
+    shard.stop();
+    shard.join();
+    CHECK(!shard.thread_spawned);
+    shard.shutdown();
+    close(lfd);
+}
+
+// Shard handles requests while running
+TEST(shard, serves_requests) {
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE_EQ(shard.init(0, lfd), 0);
+    REQUIRE_EQ(shard.spawn(-1), 0);
+
+    usleep(50000);  // let shard start
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    char buf[4096];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(n > 0);
+    CHECK(has_200(buf, n));
+    close(c);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// Two shards on same port (SO_REUSEPORT)
+TEST(shard, two_shards_same_port) {
+    i32 lfd1 = create_listen_socket(0);
+    REQUIRE(lfd1 >= 0);
+    u16 port = get_port(lfd1);
+    i32 lfd2 = create_listen_socket(port);
+    REQUIRE(lfd2 >= 0);
+
+    Shard<EpollBackend> s1, s2;
+    REQUIRE_EQ(s1.init(0, lfd1), 0);
+    REQUIRE_EQ(s2.init(1, lfd2), 0);
+    REQUIRE_EQ(s1.spawn(-1), 0);
+    REQUIRE_EQ(s2.spawn(-1), 0);
+
+    usleep(50000);
+
+    // Send requests — kernel distributes across shards
+    for (int i = 0; i < 5; i++) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+        char buf[4096];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK(n > 0);
+        close(c);
+    }
+
+    s1.stop();
+    s2.stop();
+    s1.join();
+    s2.join();
+    s1.shutdown();
+    s2.shutdown();
+    close(lfd1);
+    close(lfd2);
+}
+
+// detect_cpu_count returns > 0
+TEST(shard, detect_cpu_count) {
+    u32 cpus = detect_cpu_count();
+    CHECK(cpus > 0);
+    CHECK(cpus <= 1024);  // sanity upper bound
+}
+
+// Shard with owns_listen_fd closes it on shutdown
+TEST(shard, owns_listen_fd) {
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0);
+    REQUIRE(lfd >= 0);
+    REQUIRE_EQ(shard.init(0, lfd), 0);
+    shard.owns_listen_fd = true;
+    shard.shutdown();
+    // lfd should be closed now — verify by trying to close again
+    CHECK(close(lfd) < 0);
+}
+
+// Shard has upstream pool after init
+TEST(shard, upstream_pool_initialized) {
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0);
+    REQUIRE(lfd >= 0);
+    REQUIRE_EQ(shard.init(0, lfd), 0);
+    CHECK(shard.upstream != nullptr);
+    // Pool should be fresh (all free)
+    auto* c = shard.upstream->alloc();
+    CHECK(c != nullptr);
+    shard.upstream->free(c);
+    shard.shutdown();
+    close(lfd);
+}
+
+// Shard can hold a route config
+TEST(shard, route_config_attached) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 200);
+    cfg.add_upstream("api", 0x7F000001, 8080);
+    cfg.add_proxy("/api/", 0, 0);
+
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0);
+    REQUIRE(lfd >= 0);
+    REQUIRE_EQ(shard.init(0, lfd), 0);
+    shard.route_config = &cfg;
+    CHECK(shard.route_config != nullptr);
+    CHECK_EQ(shard.route_config->route_count, 2u);
+    CHECK_EQ(shard.route_config->upstream_count, 1u);
+    shard.shutdown();
     close(lfd);
 }
 

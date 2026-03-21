@@ -1367,6 +1367,500 @@ TEST(copilot6, keepalive_timeout_is_60) {
     CHECK_EQ(loop.keepalive_timeout, 60u);
 }
 
+// === RouteTable ===
+
+#include "rout/runtime/route_table.h"
+
+TEST(route, match_prefix) {
+    RouteConfig cfg;
+    i32 up = cfg.add_upstream("backend", 0x7F000001, 8080);
+    REQUIRE(up >= 0);
+    cfg.add_proxy("/api/", 0, static_cast<u16>(up));
+
+    const u8 path1[] = "/api/users";
+    auto* r = cfg.match(path1, sizeof(path1) - 1, 0);
+    REQUIRE(r != nullptr);
+    CHECK_EQ(r->action, RouteAction::Proxy);
+    CHECK_EQ(r->upstream_id, static_cast<u16>(up));
+
+    const u8 path2[] = "/health";
+    CHECK(cfg.match(path2, sizeof(path2) - 1, 0) == nullptr);
+}
+
+TEST(route, method_filter) {
+    RouteConfig cfg;
+    cfg.add_static("/status", 'G', 200);
+
+    const u8 path[] = "/status";
+    CHECK(cfg.match(path, sizeof(path) - 1, 'G') != nullptr);
+    CHECK(cfg.match(path, sizeof(path) - 1, 'P') == nullptr);
+}
+
+TEST(route, first_match_wins) {
+    RouteConfig cfg;
+    i32 up1 = cfg.add_upstream("v1", 0x7F000001, 8081);
+    i32 up2 = cfg.add_upstream("v2", 0x7F000001, 8082);
+    cfg.add_proxy("/api/v1/", 0, static_cast<u16>(up1));
+    cfg.add_proxy("/api/", 0, static_cast<u16>(up2));
+
+    const u8 path[] = "/api/v1/users";
+    auto* r = cfg.match(path, sizeof(path) - 1, 0);
+    REQUIRE(r != nullptr);
+    CHECK_EQ(r->upstream_id, static_cast<u16>(up1));
+}
+
+TEST(route, static_response) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 200);
+
+    const u8 path[] = "/health";
+    auto* r = cfg.match(path, sizeof(path) - 1, 0);
+    REQUIRE(r != nullptr);
+    CHECK_EQ(r->action, RouteAction::Static);
+    CHECK_EQ(r->status_code, 200u);
+}
+
+TEST(route, empty_config_no_match) {
+    RouteConfig cfg;
+    const u8 path[] = "/anything";
+    CHECK(cfg.match(path, sizeof(path) - 1, 0) == nullptr);
+}
+
+TEST(route, upstream_target_addr) {
+    RouteConfig cfg;
+    i32 idx = cfg.add_upstream("api", 0x0A000101, 9090);
+    REQUIRE(idx >= 0);
+    auto& t = cfg.upstreams[idx];
+    CHECK_EQ(t.addr.sin_family, AF_INET);
+    CHECK_EQ(__builtin_bswap16(t.addr.sin_port), 9090u);
+    CHECK_EQ(__builtin_bswap32(t.addr.sin_addr.s_addr), 0x0A000101u);
+    CHECK_EQ(t.name[0], 'a');
+}
+
+// === UpstreamPool ===
+
+#include "rout/runtime/upstream_pool.h"
+
+TEST(upstream_pool, alloc_free) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    CHECK_EQ(c->fd, -1);
+    CHECK(!c->idle);
+    pool.free(c);
+}
+
+TEST(upstream_pool, find_idle) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    c->upstream_id = 5;
+
+    CHECK(pool.find_idle(5) == nullptr);
+    pool.return_idle(c);
+    CHECK(c->idle);
+
+    auto* found = pool.find_idle(5);
+    CHECK_EQ(found, c);
+    CHECK(!found->idle);
+
+    pool.return_idle(c);
+    CHECK(pool.find_idle(99) == nullptr);
+
+    c->fd = -1;
+    pool.free(c);
+}
+
+TEST(upstream_pool, create_socket) {
+    i32 fd = UpstreamPool::create_socket();
+    CHECK(fd >= 0);
+    if (fd >= 0) close(fd);
+}
+
+TEST(upstream_pool, shutdown_closes_fds) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    c->fd = UpstreamPool::create_socket();
+    REQUIRE(c->fd >= 0);
+    i32 saved_fd = c->fd;
+    pool.shutdown();
+    CHECK(close(saved_fd) < 0);
+}
+
+// === SlicePool ===
+
+#include "rout/runtime/slice_pool.h"
+
+TEST(slice_pool, init_destroy) {
+    SlicePool pool;
+    REQUIRE_EQ(pool.init(64), 0);
+    CHECK_EQ(pool.count, 64u);
+    CHECK_EQ(pool.available(), 64u);
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
+
+TEST(slice_pool, alloc_free) {
+    SlicePool pool;
+    REQUIRE_EQ(pool.init(4), 0);
+
+    u8* s1 = pool.alloc();
+    u8* s2 = pool.alloc();
+    REQUIRE(s1 != nullptr);
+    REQUIRE(s2 != nullptr);
+    CHECK_NE(s1, s2);
+    CHECK_EQ(pool.available(), 2u);
+    CHECK_EQ(pool.in_use(), 2u);
+
+    // Write to slices — verify no overlap (16KB apart)
+    s1[0] = 'A';
+    s1[SlicePool::kSliceSize - 1] = 'Z';
+    s2[0] = 'B';
+    CHECK_EQ(s1[0], 'A');
+    CHECK_EQ(s1[SlicePool::kSliceSize - 1], 'Z');
+    CHECK_EQ(s2[0], 'B');
+
+    pool.free(s1);
+    CHECK_EQ(pool.available(), 3u);
+    pool.free(s2);
+    CHECK_EQ(pool.available(), 4u);
+    pool.destroy();
+}
+
+TEST(slice_pool, exhaust_and_recover) {
+    SlicePool pool;
+    REQUIRE_EQ(pool.init(2), 0);
+
+    u8* s1 = pool.alloc();
+    u8* s2 = pool.alloc();
+    REQUIRE(s1 != nullptr);
+    REQUIRE(s2 != nullptr);
+    CHECK(pool.alloc() == nullptr);  // exhausted
+    CHECK_EQ(pool.available(), 0u);
+
+    pool.free(s1);
+    u8* s3 = pool.alloc();
+    CHECK(s3 != nullptr);  // recovered
+    CHECK_EQ(s3, s1);      // reuses same slice
+
+    pool.free(s2);
+    pool.free(s3);
+    pool.destroy();
+}
+
+TEST(slice_pool, slice_size) {
+    SlicePool pool;
+    REQUIRE_EQ(pool.init(1), 0);
+    CHECK_EQ(SlicePool::kSliceSize, 16384u);
+    u8* s = pool.alloc();
+    REQUIRE(s != nullptr);
+    // Verify we can write to the full 16KB without crash
+    for (u32 i = 0; i < SlicePool::kSliceSize; i++) s[i] = static_cast<u8>(i & 0xFF);
+    CHECK_EQ(s[0], 0u);
+    CHECK_EQ(s[255], 255u);
+    CHECK_EQ(s[16383], static_cast<u8>(16383 & 0xFF));
+    pool.free(s);
+    pool.destroy();
+}
+
+TEST(slice_pool, free_null_safe) {
+    SlicePool pool;
+    REQUIRE_EQ(pool.init(2), 0);
+    pool.free(nullptr);              // should not crash
+    CHECK_EQ(pool.available(), 2u);  // unchanged
+    pool.destroy();
+}
+
+// SlicePool: out-of-order free
+TEST(slice_pool, out_of_order_free) {
+    SlicePool pool;
+    REQUIRE_EQ(pool.init(4), 0);
+    u8* s1 = pool.alloc();
+    u8* s2 = pool.alloc();
+    u8* s3 = pool.alloc();
+    REQUIRE(s1 && s2 && s3);
+
+    // Free in non-LIFO order
+    pool.free(s2);
+    pool.free(s1);
+    pool.free(s3);
+    CHECK_EQ(pool.available(), 4u);
+
+    // Re-alloc should still work
+    u8* r1 = pool.alloc();
+    u8* r2 = pool.alloc();
+    CHECK(r1 != nullptr);
+    CHECK(r2 != nullptr);
+    pool.free(r1);
+    pool.free(r2);
+    pool.destroy();
+}
+
+// SlicePool: multiple alloc-free cycles don't corrupt free-stack
+TEST(slice_pool, stress_cycles) {
+    SlicePool pool;
+    REQUIRE_EQ(pool.init(8), 0);
+    for (int cycle = 0; cycle < 100; cycle++) {
+        u8* ptrs[8];
+        for (int j = 0; j < 8; j++) {
+            ptrs[j] = pool.alloc();
+            REQUIRE(ptrs[j] != nullptr);
+        }
+        CHECK(pool.alloc() == nullptr);  // exhausted each cycle
+        for (int j = 7; j >= 0; j--) pool.free(ptrs[j]);
+        CHECK_EQ(pool.available(), 8u);
+    }
+    pool.destroy();
+}
+
+// SlicePool: destroy is idempotent
+TEST(slice_pool, destroy_idempotent) {
+    SlicePool pool;
+    REQUIRE_EQ(pool.init(4), 0);
+    pool.destroy();
+    pool.destroy();  // second destroy should not crash
+    CHECK(pool.base == nullptr);
+    CHECK(pool.free_stack == nullptr);
+}
+
+// SlicePool: alloc after destroy returns nullptr
+TEST(slice_pool, alloc_after_destroy) {
+    SlicePool pool;
+    REQUIRE_EQ(pool.init(4), 0);
+    pool.destroy();
+    CHECK(pool.alloc() == nullptr);
+}
+
+// SlicePool: large pool (verify mmap works at scale)
+TEST(slice_pool, large_pool) {
+    SlicePool pool;
+    REQUIRE_EQ(pool.init(1024), 0);  // 1024 * 16KB = 16MB
+    CHECK_EQ(pool.available(), 1024u);
+
+    // Alloc a few, verify they don't overlap
+    u8* first = pool.alloc();
+    u8* last = pool.alloc();
+    REQUIRE(first != nullptr);
+    REQUIRE(last != nullptr);
+    // Must be at least 16KB apart
+    u64 dist = (first > last) ? static_cast<u64>(first - last) : static_cast<u64>(last - first);
+    CHECK(dist >= SlicePool::kSliceSize);
+
+    pool.free(first);
+    pool.free(last);
+    pool.destroy();
+}
+
+// === SlabPool ===
+
+#include "rout/runtime/slab_pool.h"
+
+struct TestObj {
+    i32 value;
+    u8 data[60];  // pad to 64 bytes
+};
+
+TEST(slab_pool, init_destroy) {
+    SlabPool<TestObj, 128> pool;
+    REQUIRE_EQ(pool.init(), 0);
+    CHECK_EQ(pool.capacity(), 128u);
+    CHECK_EQ(pool.available(), 128u);
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
+
+TEST(slab_pool, alloc_free_by_ptr) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE_EQ(pool.init(), 0);
+
+    TestObj* a = pool.alloc();
+    TestObj* b = pool.alloc();
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK_NE(a, b);
+    CHECK_EQ(pool.in_use(), 2u);
+
+    a->value = 42;
+    b->value = 99;
+    CHECK_EQ(a->value, 42);
+    CHECK_EQ(b->value, 99);
+
+    pool.free(a);
+    pool.free(b);
+    CHECK_EQ(pool.available(), 4u);
+    pool.destroy();
+}
+
+TEST(slab_pool, alloc_with_id) {
+    SlabPool<TestObj, 8> pool;
+    REQUIRE_EQ(pool.init(), 0);
+
+    u32 idx = 0;
+    TestObj* obj = pool.alloc_with_id(idx);
+    REQUIRE(obj != nullptr);
+    obj->value = 7;
+    CHECK_EQ(pool[idx].value, 7);
+    CHECK_EQ(pool.index_of(obj), idx);
+
+    pool.free(idx);
+    CHECK_EQ(pool.available(), 8u);
+    pool.destroy();
+}
+
+TEST(slab_pool, exhaust) {
+    SlabPool<TestObj, 2> pool;
+    REQUIRE_EQ(pool.init(), 0);
+
+    TestObj* a = pool.alloc();
+    TestObj* b = pool.alloc();
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK(pool.alloc() == nullptr);
+
+    pool.free(a);
+    TestObj* c = pool.alloc();
+    CHECK_EQ(c, a);
+
+    pool.free(b);
+    pool.free(c);
+    pool.destroy();
+}
+
+TEST(slab_pool, index_of) {
+    SlabPool<TestObj, 16> pool;
+    REQUIRE_EQ(pool.init(), 0);
+
+    TestObj* a = pool.alloc();
+    TestObj* b = pool.alloc();
+    u32 ia = pool.index_of(a);
+    u32 ib = pool.index_of(b);
+    CHECK_NE(ia, ib);
+    CHECK_EQ(&pool[ia], a);
+    CHECK_EQ(&pool[ib], b);
+
+    pool.free(a);
+    pool.free(b);
+    pool.destroy();
+}
+
+// SlabPool: capacity 1
+TEST(slab_pool, capacity_one) {
+    SlabPool<TestObj, 1> pool;
+    REQUIRE_EQ(pool.init(), 0);
+    CHECK_EQ(pool.capacity(), 1u);
+
+    TestObj* a = pool.alloc();
+    REQUIRE(a != nullptr);
+    CHECK(pool.alloc() == nullptr);  // full
+
+    a->value = 77;
+    CHECK_EQ(pool[0].value, 77);
+
+    pool.free(a);
+    TestObj* b = pool.alloc();
+    CHECK_EQ(b, a);  // reused
+
+    pool.free(b);
+    pool.destroy();
+}
+
+// SlabPool: free by index vs free by pointer consistency
+TEST(slab_pool, free_by_index_vs_ptr) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE_EQ(pool.init(), 0);
+
+    u32 idx1 = 0;
+    TestObj* a = pool.alloc_with_id(idx1);
+    u32 idx2 = 0;
+    TestObj* b = pool.alloc_with_id(idx2);
+    REQUIRE(a && b);
+
+    // Free a by index, b by pointer
+    pool.free(idx1);
+    pool.free(b);
+    CHECK_EQ(pool.available(), 4u);
+
+    // Both slots reusable
+    TestObj* c = pool.alloc();
+    TestObj* d = pool.alloc();
+    CHECK(c != nullptr);
+    CHECK(d != nullptr);
+
+    pool.free(c);
+    pool.free(d);
+    pool.destroy();
+}
+
+// SlabPool: alloc_with_id when empty returns nullptr
+TEST(slab_pool, alloc_with_id_empty) {
+    SlabPool<TestObj, 1> pool;
+    REQUIRE_EQ(pool.init(), 0);
+
+    u32 idx = 999;
+    pool.alloc();  // take the only slot
+
+    TestObj* obj = pool.alloc_with_id(idx);
+    CHECK(obj == nullptr);
+    CHECK_EQ(idx, 0u);  // idx set to 0 on failure
+
+    // Cleanup
+    pool.free(static_cast<u32>(0));
+    pool.destroy();
+}
+
+// SlabPool: destroy idempotent
+TEST(slab_pool, destroy_idempotent) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE_EQ(pool.init(), 0);
+    pool.destroy();
+    pool.destroy();  // second destroy should not crash
+    CHECK(pool.objects == nullptr);
+    CHECK(pool.free_stack == nullptr);
+}
+
+// SlabPool: stress alloc-free cycles
+TEST(slab_pool, stress_cycles) {
+    SlabPool<TestObj, 16> pool;
+    REQUIRE_EQ(pool.init(), 0);
+    for (int cycle = 0; cycle < 50; cycle++) {
+        TestObj* ptrs[16];
+        for (int j = 0; j < 16; j++) {
+            ptrs[j] = pool.alloc();
+            REQUIRE(ptrs[j] != nullptr);
+            ptrs[j]->value = cycle * 16 + j;
+        }
+        CHECK(pool.alloc() == nullptr);
+        // Verify values
+        for (int j = 0; j < 16; j++) CHECK_EQ(ptrs[j]->value, cycle * 16 + j);
+        // Free all
+        for (int j = 0; j < 16; j++) pool.free(ptrs[j]);
+        CHECK_EQ(pool.available(), 16u);
+    }
+    pool.destroy();
+}
+
+// SlabPool: different object type (small)
+struct SmallObj {
+    u8 tag;
+};
+
+TEST(slab_pool, small_object) {
+    SlabPool<SmallObj, 32> pool;
+    REQUIRE_EQ(pool.init(), 0);
+    SmallObj* a = pool.alloc();
+    REQUIRE(a != nullptr);
+    a->tag = 0xAB;
+    CHECK_EQ(pool.index_of(a), pool.index_of(a));  // consistent
+    CHECK_EQ(a->tag, 0xABu);
+    pool.free(a);
+    pool.destroy();
+}
+
 int main(int argc, char** argv) {
     return rout::test::run_all(argc, argv);
 }

@@ -586,6 +586,50 @@ static void test_const_monadic() {
     check(r3.value() == 0, "const or_else");
 }
 
+// ── 16. Default constructor ──────────────────────────────────────────
+
+static void test_default_constructor() {
+    Expected<int, Err> r;
+    check(r.has_value(), "default ctor has_value");
+    check(r.value() == 0, "default ctor int == 0");
+
+    Expected<Point, Err> p;
+    check(p.has_value(), "default ctor Point has_value");
+}
+
+// ── 17. TRY on same line (__COUNTER__ uniqueness) ───────────────────
+
+static Expected<int, Err> try_same_line(const char* a, const char* b) {
+    return TRY(parse(a)) + TRY(parse(b));
+}
+
+static void test_try_same_line() {
+    auto r = try_same_line("ab", "cd");
+    check(r.has_value(), "TRY same line has_value");
+    check(r.value() == 4, "TRY same line == 4");  // 2 + 2
+
+    auto r2 = try_same_line(nullptr, "cd");
+    check(!r2.has_value(), "TRY same line first error");
+
+    auto r3 = try_same_line("ab", nullptr);
+    check(!r3.has_value(), "TRY same line second error");
+}
+
+// ── 18. const Expected through TRY (RemoveCvRef) ────────────────────
+
+static Expected<int, Err> try_from_const() {
+    const Expected<int, Err> ce = Unexpected(Err::NotFound);
+    // make_unexpected must strip const from error type
+    if (!ce) return ::core::make_unexpected(ce.error());
+    return ce.value();
+}
+
+static void test_try_const_expected() {
+    auto r = try_from_const();
+    check(!r.has_value(), "const expected error propagation");
+    check(r.error() == Err::NotFound, "const expected error == NotFound");
+}
+
 // ═══════════════════════════════════════════════════════════════════
 
 int main() {
@@ -666,6 +710,15 @@ int main() {
     // 15. Const correctness
     test_const_access();
     test_const_monadic();
+
+    // 16. Default constructor
+    test_default_constructor();
+
+    // 17. TRY same line (__COUNTER__)
+    test_try_same_line();
+
+    // 18. const Expected through TRY
+    test_try_const_expected();
 
     // Summary
     write(1, "ALL PASSED: ", 12);

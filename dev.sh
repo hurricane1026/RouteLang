@@ -40,13 +40,15 @@ build() {
 test() {
     configure
     echo "=== Building tests ==="
-    ninja -C "$BUILD_DIR" test_network test_integration test_arena
+    ninja -C "$BUILD_DIR" test_network test_integration test_arena test_expected
     echo "=== Running mock tests ==="
     "$BUILD_DIR/tests/test_network"
     echo "=== Running integration tests ==="
     "$BUILD_DIR/tests/test_integration"
     echo "=== Running arena tests ==="
     "$BUILD_DIR/tests/test_arena"
+    echo "=== Running expected tests ==="
+    "$BUILD_DIR/tests/test_expected"
 }
 
 # ---- Coverage ----
@@ -64,6 +66,7 @@ coverage() {
     LLVM_PROFILE_FILE="$BUILD_DIR-cov/test_network.profraw" "$BUILD_DIR-cov/tests/test_network"
     LLVM_PROFILE_FILE="$BUILD_DIR-cov/test_integration.profraw" "$BUILD_DIR-cov/tests/test_integration"
     LLVM_PROFILE_FILE="$BUILD_DIR-cov/test_arena.profraw" "$BUILD_DIR-cov/tests/test_arena"
+    LLVM_PROFILE_FILE="$BUILD_DIR-cov/test_expected.profraw" "$BUILD_DIR-cov/tests/test_expected"
 
     echo "=== Coverage report ==="
     llvm-profdata merge "$BUILD_DIR-cov"/*.profraw -o "$BUILD_DIR-cov/merged.profdata"

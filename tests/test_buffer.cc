@@ -354,7 +354,7 @@ TEST(copilot, release_flag_prevents_double) {
     buf.write(reinterpret_cast<const u8*>("hi"), 2);
     View view = buf.release();
     CHECK(buf.is_released());
-    // Double release would trap — verified by is_released() check
+    // Double release would trap; only verify precondition state here
     // buf.release();  // would __builtin_trap()
     (void)view;
 }
@@ -396,7 +396,7 @@ TEST(copilot2, dest_released_move_assign_guarded) {
     View view = b2.release();
     CHECK(b2.is_released());
     // b2 = static_cast<Buffer&&>(b1);  // would trap — dest is released
-    // Can't test trap, but verify the guard exists via is_released()
+    // Can't exercise the trap directly; verify the precondition flag only
     CHECK(b2.is_released());
     (void)view;
 }

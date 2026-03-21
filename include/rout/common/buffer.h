@@ -124,7 +124,7 @@ struct Buffer {
     // Release: create View, lock writes. View destructor auto-unlocks.
     // Traps if already released (double release = two Views = bug).
     // Returns empty View if buffer is invalid (ptr_==nullptr).
-    View release() noexcept {
+    [[nodiscard]] View release() noexcept {
         if (released_) __builtin_trap();  // double release = bug
         if (!ptr_) return View();         // invalid buffer → empty View, no lock
         released_ = true;

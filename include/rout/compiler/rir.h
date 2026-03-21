@@ -3,8 +3,19 @@
 #include "rout/common/types.h"
 #include "rout/runtime/arena.h"
 
+#include "core/expected.h"
+
 namespace rout {
 namespace rir {
+
+// ── Builder Error ───────────────────────────────────────────────────
+// Returned by builder operations that can fail.
+
+enum class RirError : u8 {
+    OutOfMemory,   // Arena allocation failed
+    InvalidState,  // e.g., emit after terminator, invalid block ID
+    CapacityFull,  // Module/function capacity exceeded
+};
 
 // ── Source Location ─────────────────────────────────────────────────
 // Every instruction maps back to source for --emit-rir and diagnostics.

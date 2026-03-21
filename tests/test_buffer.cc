@@ -1,5 +1,6 @@
 // Buffer/View typestate tests
 #include "rout/common/buffer.h"
+
 #include "test.h"
 
 using namespace rout;

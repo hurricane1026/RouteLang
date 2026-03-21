@@ -49,15 +49,19 @@ u32 find_header_end(const u8* buf, u32 len, u32 from) {
 
 u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
     const __m256i vcr = _mm256_set1_epi8('\r');
-    const __m256i v20 = _mm256_set1_epi8(0x20);
     const __m256i vht = _mm256_set1_epi8(0x09);
     const __m256i vdel = _mm256_set1_epi8(0x7F);
+    // Unsigned comparison via xor-0x80 trick: (x ^ 0x80) <s (0x20 ^ 0x80)
+    // This correctly handles obs-text bytes 0x80-0xFF as valid.
+    const __m256i v80 = _mm256_set1_epi8(static_cast<char>(0x80));
+    const __m256i v20_biased = _mm256_set1_epi8(static_cast<char>(0x20 ^ 0x80));
 
     while (pos + 32 <= end) {
         __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + pos));
         u32 cr_mask = static_cast<u32>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vcr)));
-        // bad: (< 0x20 && != HT) || == DEL
-        __m256i lt20 = _mm256_cmpgt_epi8(v20, chunk);  // v20 > chunk ≡ chunk < v20 (signed)
+        // bad: (< 0x20 unsigned && != HT) || == DEL
+        __m256i biased = _mm256_xor_si256(chunk, v80);
+        __m256i lt20 = _mm256_cmpgt_epi8(v20_biased, biased);  // unsigned chunk < 0x20
         __m256i bad = _mm256_or_si256(_mm256_andnot_si256(_mm256_cmpeq_epi8(chunk, vht), lt20),
                                       _mm256_cmpeq_epi8(chunk, vdel));
         u32 bad_mask = static_cast<u32>(_mm256_movemask_epi8(bad));

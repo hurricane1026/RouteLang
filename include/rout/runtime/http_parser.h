@@ -4,7 +4,7 @@
 
 namespace rout {
 
-// --- HTTP method enum (bit flags for fast matching in routing) ---
+// --- HTTP method enum (sequential values) ---
 enum class HttpMethod : u8 {
     GET = 0,
     POST = 1,
@@ -76,7 +76,8 @@ struct ParsedRequest {
 //   if (s == ParseStatus::Incomplete) { /* wait for more data */ }
 //   if (s == ParseStatus::Error) { /* 400, close connection */ }
 //
-// Design: scans from `parsed_offset` (where we left off) each call.
+// Design: single-pass always starts from pos=0. `parsed_offset` is only
+// used on the Incomplete cold path to record how far we scanned.
 // On Complete, `header_end` is the offset past the final \r\n\r\n.
 struct HttpParser {
     u32 parsed_offset;  // How far we've scanned so far.

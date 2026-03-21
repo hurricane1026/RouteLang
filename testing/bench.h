@@ -4,7 +4,7 @@
 // Inspired by nanobench. Uses clock_gettime(CLOCK_MONOTONIC).
 //
 // Usage:
-//   #include "rout/bench.h"
+//   #include "bench.h"
 //
 //   int main() {
 //       rout::bench::Bench b;

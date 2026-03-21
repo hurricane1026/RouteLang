@@ -34,16 +34,20 @@ u32 find_header_end(const u8* buf, u32 len, u32 from) {
 
 u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
     const __m128i vcr = _mm_set1_epi8('\r');
-    const __m128i v20 = _mm_set1_epi8(0x20);
     const __m128i vht = _mm_set1_epi8(0x09);
     const __m128i vdel = _mm_set1_epi8(0x7F);
+    // Unsigned comparison via xor-0x80 trick: (x ^ 0x80) <s (0x20 ^ 0x80)
+    // This correctly handles obs-text bytes 0x80-0xFF as valid.
+    const __m128i v80 = _mm_set1_epi8(static_cast<char>(0x80));
+    const __m128i v20_biased = _mm_set1_epi8(static_cast<char>(0x20 ^ 0x80));
 
     while (pos + 16 <= end) {
         __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + pos));
         int cr_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, vcr));
-        __m128i bad =
-            _mm_or_si128(_mm_andnot_si128(_mm_cmpeq_epi8(chunk, vht), _mm_cmplt_epi8(chunk, v20)),
-                         _mm_cmpeq_epi8(chunk, vdel));
+        __m128i biased = _mm_xor_si128(chunk, v80);
+        __m128i bad = _mm_or_si128(
+            _mm_andnot_si128(_mm_cmpeq_epi8(chunk, vht), _mm_cmplt_epi8(biased, v20_biased)),
+            _mm_cmpeq_epi8(chunk, vdel));
         int bad_mask = _mm_movemask_epi8(bad);
 
         if (cr_mask | bad_mask) {

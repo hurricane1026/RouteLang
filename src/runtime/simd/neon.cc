@@ -5,41 +5,8 @@
 
 namespace rout::simd {
 
-// NEON has no movemask. Extract per-byte bitmask via narrowing shift.
-static inline u64 neon_movemask(uint8x16_t v) {
-    // Narrow 16x8 → 8x8 with shift, packing each byte's high bit into 4-bit nibbles.
-    uint8x8_t narrowed = vshrn_n_u16(vreinterpretq_u16_u8(v), 4);
-    return vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
-    // Each matching byte produces 0xF nibble, non-matching produces 0x0.
-    // Use ctzll / 4 to find byte index.
-}
-
 static inline bool neon_any(uint8x16_t v) {
     return vmaxvq_u8(v) != 0;
-}
-
-static inline u32 neon_first_set(u64 mask) {
-    return static_cast<u32>(__builtin_ctzll(mask)) >> 2;
-}
-
-// Build a 16-bit bitmask (one bit per byte) from NEON comparison result.
-// More precise than nibble approach when we need mask arithmetic.
-static inline u32 neon_bitmask16(uint8x16_t v) {
-    // Pack each byte's MSB into a 16-bit integer.
-    // Use pairwise add to reduce: 16 bytes → 8 shorts → extract.
-    static const uint8x16_t kBitSelect = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
-    uint8x16_t masked = vandq_u8(v, kBitSelect);
-    // Add pairs: byte[0]+byte[1], byte[2]+byte[3], ...
-    uint8x8_t lo = vget_low_u8(masked);
-    uint8x8_t hi = vget_high_u8(masked);
-    uint8x8_t sum_lo = vpadd_u8(lo, lo);  // 4 values
-    uint8x8_t sum_hi = vpadd_u8(hi, hi);
-    sum_lo = vpadd_u8(sum_lo, sum_lo);  // 2 values
-    sum_hi = vpadd_u8(sum_hi, sum_hi);
-    sum_lo = vpadd_u8(sum_lo, sum_lo);  // 1 value
-    sum_hi = vpadd_u8(sum_hi, sum_hi);
-    return static_cast<u32>(vget_lane_u8(sum_lo, 0)) |
-           (static_cast<u32>(vget_lane_u8(sum_hi, 0)) << 8);
 }
 
 u32 find_header_end(const u8* buf, u32 len, u32 from) {

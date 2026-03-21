@@ -178,18 +178,22 @@ static inline u32 fast_scan_header_name(const u8* buf, u32 pos, u32 end) {
 // Avoids str_ci_eq call for most headers.
 // ============================================================================
 
-// Connection: close / keep-alive
+// Connection: comma-separated token parsing (handles "close, upgrade" etc.)
 static inline void match_connection(const u8* val, u32 vlen, ParsedRequest* req) {
-    if (vlen == 5) {
-        // "close" — check as u32 + 1 byte
-        u32 lo = load_u32(val) | 0x20202020U;
-        if (lo == u32_lit('c', 'l', 'o', 's') && (val[4] | 0x20) == 'e') {
+    u32 i = 0;
+    while (i < vlen) {
+        // Skip leading OWS and commas
+        while (i < vlen && (val[i] == ' ' || val[i] == '\t' || val[i] == ',')) i++;
+        if (i >= vlen) break;
+
+        // Find end of token
+        u32 tok_start = i;
+        while (i < vlen && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
+        u32 tok_len = i - tok_start;
+
+        if (tok_len == 5 && str_ci_eq(val + tok_start, "close", 5)) {
             req->keep_alive = false;
-        }
-    } else if (vlen == 10) {
-        // "keep-alive"
-        u64 v = load_u64(val) | 0x2020202020202020ULL;
-        if (v == u64_lit("keep-ali") && (val[8] | 0x20) == 'v' && (val[9] | 0x20) == 'e') {
+        } else if (tok_len == 10 && str_ci_eq(val + tok_start, "keep-alive", 10)) {
             req->keep_alive = true;
         }
     }
@@ -215,8 +219,18 @@ static inline ParseStatus apply_semantic_header(
         }
     } else if (first == 't') {
         if (name_len == 17 && str_ci_eq(name + 1, "ransfer-encoding", 16)) {
-            if (vlen >= 7 && str_ci_eq(val + vlen - 7, "chunked", 7)) {
-                req->chunked = true;
+            // Parse as comma-separated token list, match full "chunked" token
+            u32 ti = 0;
+            while (ti < vlen) {
+                while (ti < vlen && (val[ti] == ' ' || val[ti] == '\t' || val[ti] == ',')) ti++;
+                if (ti >= vlen) break;
+                u32 tok_start = ti;
+                while (ti < vlen && val[ti] != ',' && val[ti] != ' ' && val[ti] != '\t') ti++;
+                u32 tok_len = ti - tok_start;
+                if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
+                    req->chunked = true;
+                    break;
+                }
             }
             return ParseStatus::Complete;
         }
@@ -318,7 +332,8 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
         if (LIKELY(buf[pos] == ' ')) {
             pos++;
         }
-        while (UNLIKELY(buf[pos] == ' ' || buf[pos] == '\t')) pos++;
+        while (UNLIKELY(pos < len && (buf[pos] == ' ' || buf[pos] == '\t'))) pos++;
+        if (UNLIKELY(pos >= len)) goto maybe_incomplete;
 
         {
             // Header value — SIMD scan for \r

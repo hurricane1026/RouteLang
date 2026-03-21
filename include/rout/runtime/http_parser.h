@@ -50,9 +50,10 @@ struct ParsedRequest {
     Header headers[kMaxHeaders];
     u32 header_count;
 
-    u32 content_length;  // From Content-Length header, 0 if absent.
-    bool keep_alive;     // Derived from Connection header + HTTP version.
-    bool chunked;        // Transfer-Encoding: chunked
+    u32 content_length;       // From Content-Length header, 0 if absent.
+    bool keep_alive;          // Derived from Connection header + HTTP version.
+    bool chunked;             // Transfer-Encoding: chunked
+    bool has_content_length;  // True if Content-Length header was seen.
 
     void reset() {
         method = HttpMethod::Unknown;
@@ -62,6 +63,7 @@ struct ParsedRequest {
         content_length = 0;
         keep_alive = false;
         chunked = false;
+        has_content_length = false;
     }
 };
 
@@ -80,7 +82,8 @@ struct ParsedRequest {
 // used on the Incomplete cold path to record how far we scanned.
 // On Complete, `header_end` is the offset past the final \r\n\r\n.
 struct HttpParser {
-    u32 parsed_offset;  // How far we've scanned so far.
+    u32 parsed_offset;  // Set to `len` on Incomplete return. Used internally by the cold-path
+                        // Error/Incomplete disambiguation.
     u32 header_end;     // Set on Complete: offset of first body byte.
 
     void reset() {

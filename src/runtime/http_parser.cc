@@ -210,7 +210,13 @@ static inline ParseStatus apply_semantic_header(
         if (name_len == 14 && str_ci_eq(name + 1, "ontent-length", 13)) {
             i64 cl = parse_uint(val, vlen);
             if (UNLIKELY(cl < 0)) return ParseStatus::Error;
+            if (UNLIKELY(req->has_content_length)) {
+                // Duplicate Content-Length with different value → reject
+                if (req->content_length != static_cast<u32>(cl)) return ParseStatus::Error;
+                return ParseStatus::Complete;
+            }
             req->content_length = static_cast<u32>(cl);
+            req->has_content_length = true;
             return ParseStatus::Complete;
         }
         if (name_len == 10 && str_ci_eq(name + 1, "onnection", 9)) {
@@ -242,13 +248,10 @@ static inline ParseStatus apply_semantic_header(
 // Core parser — single-pass, no find_header_end pre-scan
 // ============================================================================
 
-// In two-pass mode (used when parsed_offset indicates we haven't scanned yet
-// or the fast single-pass fails to find enough data), we fall back to
-// find_header_end + full re-parse.
-//
-// In single-pass mode, we parse directly and return Incomplete if we run
-// out of buffer before finding the end of headers. This eliminates the
-// pre-scan for the common case where the full request arrives in one recv.
+// Single-pass parser: parses method, URI, version, and headers directly
+// from the buffer. Returns Incomplete if the buffer does not contain
+// enough data. On ambiguous cases (could be incomplete or malformed),
+// falls back to find_header_end() to disambiguate.
 
 ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
     // Quick check: need at least 4 bytes to try method matching.
@@ -371,6 +374,11 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
 
     req->header_count = hdr_count;
     header_end = pos;
+
+    // Reject requests with both Content-Length and Transfer-Encoding: chunked
+    // to prevent request-smuggling attacks (RFC 7230 §3.3.3).
+    if (UNLIKELY(req->chunked && req->content_length > 0)) return ParseStatus::Error;
+
     return ParseStatus::Complete;
 
 maybe_incomplete:

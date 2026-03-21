@@ -49,12 +49,13 @@ target_include_directories(test_buffer PRIVATE
 )
 
 add_custom_target(check
+    COMMAND $<TARGET_FILE:test_framework> || true
     COMMAND $<TARGET_FILE:test_network>
     COMMAND $<TARGET_FILE:test_integration>
     COMMAND $<TARGET_FILE:test_arena>
     COMMAND $<TARGET_FILE:test_expected>
     COMMAND $<TARGET_FILE:test_http_parser>
     COMMAND $<TARGET_FILE:test_buffer>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_buffer
+    DEPENDS test_framework test_network test_integration test_arena test_expected test_http_parser test_buffer
     COMMENT "Running all tests..."
 )

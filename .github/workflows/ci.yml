@@ -123,6 +123,8 @@ jobs:
             --object build/tests/test_integration \
             --object build/tests/test_arena \
             --object build/tests/test_http_parser \
+            --object build/tests/test_expected \
+            --object build/tests/test_buffer \
             --sources include/rout/runtime/ src/runtime/ | tee build/coverage.txt
 
           cat build/coverage.txt

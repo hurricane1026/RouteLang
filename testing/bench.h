@@ -82,7 +82,7 @@ inline void out_u64_comma(u64 v) {
     for (int i = n - 1; i >= 0; i--) (void)::write(1, &buf[i], 1);
 }
 
-// Print fixed-point: val is in nanoseconds, print as "X.YYY ns" or "X.YYY us" or "X.YYY ms"
+// Print fixed-point: val is in nanoseconds, print as "X ns" or "X.YY us" or "X.YY ms"
 inline void out_duration_ns(u64 ns) {
     if (ns < 1000) {
         out_u64(ns);

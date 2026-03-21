@@ -1816,8 +1816,8 @@ TEST(NginxURI, DELCharInvalid) {
 TEST(NginxHeaders, DuplicateContentLength) {
     HttpParser parser;
     ParsedRequest req;
-    // nginx rejects duplicate Content-Length. Our parser currently accepts
-    // the last value (we test current behavior, may add rejection later).
+    // Duplicate Content-Length with different values must be rejected
+    // to prevent request-smuggling (RFC 7230 §3.3.3).
     auto s = parse_one(
         "PUT /url HTTP/1.1\r\n"
         "Content-Length: 1\r\n"
@@ -1825,9 +1825,37 @@ TEST(NginxHeaders, DuplicateContentLength) {
         "\r\n",
         &req,
         &parser);
-    // Current behavior: parses successfully, takes last value
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(NginxHeaders, DuplicateContentLengthSameValue) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Duplicate Content-Length with the same value is allowed.
+    auto s = parse_one(
+        "PUT /url HTTP/1.1\r\n"
+        "Content-Length: 5\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n",
+        &req,
+        &parser);
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
-    CHECK_EQ(req.content_length, 2u);
+    CHECK_EQ(req.content_length, 5u);
+}
+
+TEST(NginxHeaders, ContentLengthAndTransferEncodingConflict) {
+    HttpParser parser;
+    ParsedRequest req;
+    // Both Content-Length and Transfer-Encoding: chunked is rejected
+    // to prevent request-smuggling (RFC 7230 §3.3.3).
+    auto s = parse_one(
+        "POST /url HTTP/1.1\r\n"
+        "Content-Length: 10\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n",
+        &req,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
 }
 
 TEST(NginxHeaders, DuplicateHost) {

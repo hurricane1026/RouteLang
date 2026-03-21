@@ -292,8 +292,8 @@ public:
         return R(Unexpected<E>(static_cast<E&&>(stor_.err())));
     }
 
-    // or_else: F(E) -> Expected<T, G>
-    // Handles/recovers from errors. Passes through values.
+    // or_else: F(E) -> R, where R = decltype(f(error)) and R is constructible from T.
+    // Handles/recovers from errors. If *this has a value, returns R(value()).
     template <typename F>
     constexpr auto or_else(F&& f) & {
         using R = decltype(static_cast<F&&>(f)(stor_.err()));

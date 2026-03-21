@@ -1,49 +1,12 @@
-// Compile: clang++ -std=c++23 -fno-exceptions -fno-rtti -I../include
-// test_expected.cc -o test_expected
+#include "rout/test.h"
+
 #include "core/expected.h"
+
+#include <stdint.h>
 
 using core::Expected;
 using core::make_unexpected;
 using core::Unexpected;
-
-// ── Minimal test harness (no stdlib) ────────────────────────────────
-
-#include <stdint.h>
-#include <unistd.h>
-
-static int g_total = 0;
-static int g_passed = 0;
-
-static void check(bool cond, const char* msg) {
-    ++g_total;
-    if (!cond) {
-        write(2, "FAIL: ", 6);
-        int len = 0;
-        while (msg[len]) ++len;
-        write(2, msg, len);
-        write(2, "\n", 1);
-        _exit(1);
-    }
-    ++g_passed;
-}
-
-// ── Helper: int to decimal string (no snprintf) ────────────────────
-
-static void write_int(int fd, int v) {
-    char buf[16];
-    int i = 15;
-    buf[i--] = '\n';
-    if (v == 0) {
-        buf[i--] = '0';
-    } else {
-        while (v > 0) {
-            buf[i--] = '0' + (v % 10);
-            v /= 10;
-        }
-    }
-    ++i;
-    write(fd, buf + i, 16 - i);
-}
 
 // ── Error type ──────────────────────────────────────────────────────
 
@@ -104,113 +67,116 @@ static Expected<int, Err> checked_add_ten(int v) {
 
 // ── 1. Basic construction and observers ─────────────────────────────
 
-static void test_basic_value() {
+TEST(basic, value) {
     Expected<int, Err> r = 42;
-    check(r.has_value(), "basic value has_value");
-    check(static_cast<bool>(r), "basic value bool");
-    check(r.value() == 42, "basic value == 42");
-    check(*r == 42, "basic deref == 42");
+    CHECK(r.has_value());
+    CHECK(static_cast<bool>(r));
+    CHECK_EQ(r.value(), 42);
+    CHECK_EQ(*r, 42);
 }
 
-static void test_basic_error() {
+TEST(basic, error) {
     Expected<int, Err> r = Unexpected(Err::NotFound);
-    check(!r.has_value(), "basic error !has_value");
-    check(!static_cast<bool>(r), "basic error !bool");
-    check(r.error() == Err::NotFound, "basic error == NotFound");
+    CHECK(!r.has_value());
+    CHECK(!static_cast<bool>(r));
+    CHECK(r.error() == Err::NotFound);
 }
 
 // ── 2. Copy and move ────────────────────────────────────────────────
 
-static void test_copy_value() {
+TEST(copy, value) {
     Expected<int, Err> a = 10;
-    Expected<int, Err> b = a;  // copy
-    check(b.has_value(), "copy value has_value");
-    check(b.value() == 10, "copy value == 10");
-    check(a.value() == 10, "original unchanged");
+    Expected<int, Err> b = a;
+    CHECK(b.has_value());
+    CHECK_EQ(b.value(), 10);
+    CHECK_EQ(a.value(), 10);
 }
 
-static void test_copy_error() {
+TEST(copy, error) {
     Expected<int, Err> a = Unexpected(Err::Timeout);
-    Expected<int, Err> b = a;  // copy
-    check(!b.has_value(), "copy error !has_value");
-    check(b.error() == Err::Timeout, "copy error == Timeout");
+    Expected<int, Err> b = a;
+    CHECK(!b.has_value());
+    CHECK(b.error() == Err::Timeout);
 }
 
-static void test_move_value() {
+TEST(move, value) {
     reset_counters();
     {
         Expected<Tracked, Err> a = Tracked(7);
         Expected<Tracked, Err> b = static_cast<Expected<Tracked, Err>&&>(a);
-        check(b.has_value(), "move value has_value");
-        check(b.value().val == 7, "move value == 7");
-        check(a.value().val == -1, "moved-from value == -1");
+        CHECK(b.has_value());
+        CHECK_EQ(b.value().val, 7);
+        CHECK_EQ(a.value().val, -1);
     }
-    check(g_dtor_count > 0, "move value: dtors called");
+    CHECK_GT(g_dtor_count, 0);
 }
 
-static void test_move_error() {
+TEST(move, error) {
     Expected<int, ErrInfo> a = Unexpected(ErrInfo{Err::Overflow, 999});
     Expected<int, ErrInfo> b = static_cast<Expected<int, ErrInfo>&&>(a);
-    check(!b.has_value(), "move error !has_value");
-    check(b.error().code == Err::Overflow, "move error code");
-    check(b.error().detail == 999, "move error detail");
+    CHECK(!b.has_value());
+    CHECK(b.error().code == Err::Overflow);
+    CHECK_EQ(b.error().detail, 999);
 }
 
 // ── 3. Assignment ───────────────────────────────────────────────────
 
-static void test_assign_value_to_value() {
+TEST(assign, value_to_value) {
     Expected<int, Err> a = 10;
     Expected<int, Err> b = 20;
     a = b;
-    check(a.value() == 20, "assign v->v == 20");
+    CHECK_EQ(a.value(), 20);
 }
 
-static void test_assign_error_to_value() {
+TEST(assign, error_to_value) {
     Expected<int, Err> a = 10;
     Expected<int, Err> b = Unexpected(Err::NotFound);
     a = b;
-    check(!a.has_value(), "assign e->v !has_value");
-    check(a.error() == Err::NotFound, "assign e->v error");
+    CHECK(!a.has_value());
+    CHECK(a.error() == Err::NotFound);
 }
 
-static void test_assign_value_to_error() {
+TEST(assign, value_to_error) {
     Expected<int, Err> a = Unexpected(Err::BadInput);
     Expected<int, Err> b = 99;
     a = b;
-    check(a.has_value(), "assign v->e has_value");
-    check(a.value() == 99, "assign v->e == 99");
+    CHECK(a.has_value());
+    CHECK_EQ(a.value(), 99);
 }
 
-static void test_assign_error_to_error() {
+TEST(assign, error_to_error) {
     Expected<int, Err> a = Unexpected(Err::BadInput);
     Expected<int, Err> b = Unexpected(Err::Timeout);
     a = b;
-    check(!a.has_value(), "assign e->e !has_value");
-    check(a.error() == Err::Timeout, "assign e->e == Timeout");
+    CHECK(!a.has_value());
+    CHECK(a.error() == Err::Timeout);
 }
 
-static void test_self_assign() {
+TEST(assign, self_assign) {
     Expected<int, Err> a = 42;
     a = a;
-    check(a.has_value(), "self assign has_value");
-    check(a.value() == 42, "self assign == 42");
+    CHECK(a.has_value());
+    CHECK_EQ(a.value(), 42);
 }
 
-static void test_move_assign() {
+TEST(assign, move_assign) {
     Expected<int, Err> a = 10;
     Expected<int, Err> b = 20;
     a = static_cast<Expected<int, Err>&&>(b);
-    check(a.value() == 20, "move assign == 20");
+    CHECK_EQ(a.value(), 20);
 }
 
 // ── 4. value_or ─────────────────────────────────────────────────────
 
-static void test_value_or() {
+TEST(value_or, pass_through) {
     Expected<int, Err> v = 5;
+    CHECK_EQ(v.value_or(42), 5);
+}
+
+TEST(value_or, fallback) {
     Expected<int, Err> e = Unexpected(Err::BadInput);
-    check(v.value_or(42) == 5, "value_or pass-through");
-    check(e.value_or(42) == 42, "value_or fallback");
-    check(e.value_or(0) == 0, "value_or fallback 0");
+    CHECK_EQ(e.value_or(42), 42);
+    CHECK_EQ(e.value_or(0), 0);
 }
 
 // ── 5. operator-> ───────────────────────────────────────────────────
@@ -220,12 +186,12 @@ struct Point {
     int y;
 };
 
-static void test_arrow_operator() {
+TEST(arrow, access_and_mutate) {
     Expected<Point, Err> r = Point{3, 7};
-    check(r->x == 3, "arrow x == 3");
-    check(r->y == 7, "arrow y == 7");
+    CHECK_EQ(r->x, 3);
+    CHECK_EQ(r->y, 7);
     r->x = 99;
-    check(r->x == 99, "arrow mutation x == 99");
+    CHECK_EQ(r->x, 99);
 }
 
 // ── 6. TRY macro ────────────────────────────────────────────────────
@@ -236,29 +202,27 @@ static Expected<int, Err> try_pipeline(const char* s) {
     return doubled + 1;
 }
 
-static void test_try_success() {
+TEST(try_macro, success) {
     auto r = try_pipeline("hi");
-    check(r.has_value(), "TRY success has_value");
-    check(r.value() == 5, "TRY success == 5");  // len=2, *2=4, +1=5
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 5);  // len=2, *2=4, +1=5
 }
 
-static void test_try_first_error() {
+TEST(try_macro, first_error) {
     auto r = try_pipeline(nullptr);
-    check(!r.has_value(), "TRY first error");
-    check(r.error() == Err::BadInput, "TRY first error == BadInput");
+    CHECK(!r.has_value());
+    CHECK(r.error() == Err::BadInput);
 }
 
-static void test_try_second_error() {
-    // Build a string > 1000 chars so checked_double overflows
+TEST(try_macro, second_error) {
     char big[1024];
     for (int i = 0; i < 1023; ++i) big[i] = 'x';
     big[1023] = '\0';
     auto r = try_pipeline(big);
-    check(!r.has_value(), "TRY second error");
-    check(r.error() == Err::Overflow, "TRY second error == Overflow");
+    CHECK(!r.has_value());
+    CHECK(r.error() == Err::Overflow);
 }
 
-// TRY with three chained calls
 static Expected<int, Err> try_three_step(const char* s) {
     auto a = TRY(parse(s));
     auto b = TRY(checked_double(a));
@@ -266,13 +230,12 @@ static Expected<int, Err> try_three_step(const char* s) {
     return c;
 }
 
-static void test_try_three_steps() {
+TEST(try_macro, three_steps) {
     auto r = try_three_step("abc");  // len=3, *2=6, +10=16
-    check(r.has_value(), "TRY 3-step has_value");
-    check(r.value() == 16, "TRY 3-step == 16");
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 16);
 }
 
-// TRY with non-trivial error type
 static Expected<int, ErrInfo> parse_detailed(const char* s) {
     if (s == nullptr) return Unexpected(ErrInfo{Err::BadInput, 42});
     int len = 0;
@@ -285,14 +248,13 @@ static Expected<int, ErrInfo> try_detailed(const char* s) {
     return v * 3;
 }
 
-static void test_try_non_trivial_error() {
+TEST(try_macro, non_trivial_error) {
     auto r = try_detailed(nullptr);
-    check(!r.has_value(), "TRY non-trivial error");
-    check(r.error().code == Err::BadInput, "TRY non-trivial code");
-    check(r.error().detail == 42, "TRY non-trivial detail");
+    CHECK(!r.has_value());
+    CHECK(r.error().code == Err::BadInput);
+    CHECK_EQ(r.error().detail, 42);
 }
 
-// TRY with Expected<void, E>
 static Expected<void, Err> validate(int v) {
     if (v < 0) return Unexpected(Err::BadInput);
     if (v > 100) return Unexpected(Err::Overflow);
@@ -304,122 +266,122 @@ static Expected<int, Err> try_with_void(int v) {
     return v * 2;
 }
 
-static void test_try_void() {
-    auto r1 = try_with_void(10);
-    check(r1.has_value(), "TRY void success");
-    check(r1.value() == 20, "TRY void == 20");
+TEST(try_macro, void_success) {
+    auto r = try_with_void(10);
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 20);
+}
 
+TEST(try_macro, void_error) {
     auto r2 = try_with_void(-5);
-    check(!r2.has_value(), "TRY void error neg");
-    check(r2.error() == Err::BadInput, "TRY void BadInput");
+    CHECK(!r2.has_value());
+    CHECK(r2.error() == Err::BadInput);
 
     auto r3 = try_with_void(200);
-    check(!r3.has_value(), "TRY void error big");
-    check(r3.error() == Err::Overflow, "TRY void Overflow");
+    CHECK(!r3.has_value());
+    CHECK(r3.error() == Err::Overflow);
 }
 
 // ── 7. Monadic: and_then ────────────────────────────────────────────
 
-static void test_and_then_success() {
+TEST(and_then, success) {
     auto r = parse("abc").and_then(checked_double);
-    check(r.has_value(), "and_then success");
-    check(r.value() == 6, "and_then == 6");
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 6);
 }
 
-static void test_and_then_first_error() {
+TEST(and_then, first_error) {
     auto r = parse(nullptr).and_then(checked_double);
-    check(!r.has_value(), "and_then short-circuit");
-    check(r.error() == Err::BadInput, "and_then keeps error");
+    CHECK(!r.has_value());
+    CHECK(r.error() == Err::BadInput);
 }
 
-static void test_and_then_second_error() {
+TEST(and_then, second_error) {
     char big[1024];
     for (int i = 0; i < 1023; ++i) big[i] = 'x';
     big[1023] = '\0';
     auto r = parse(big).and_then(checked_double);
-    check(!r.has_value(), "and_then second error");
-    check(r.error() == Err::Overflow, "and_then second Overflow");
+    CHECK(!r.has_value());
+    CHECK(r.error() == Err::Overflow);
 }
 
-static void test_and_then_chain() {
+TEST(and_then, chain) {
     auto r = parse("ab").and_then(checked_double).and_then(checked_add_ten);
-    check(r.has_value(), "and_then chain");
-    check(r.value() == 14, "and_then chain == 14");  // len=2, *2=4, +10=14
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 14);  // len=2, *2=4, +10=14
 }
 
-static void test_and_then_lambda() {
+TEST(and_then, lambda) {
     auto r = parse("test").and_then([](int v) -> Expected<int, Err> {
         if (v == 0) return Unexpected(Err::BadInput);
         return v * v;
     });
-    check(r.has_value(), "and_then lambda");
-    check(r.value() == 16, "and_then lambda == 16");
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 16);
 }
 
 // ── 8. Monadic: transform ───────────────────────────────────────────
 
-static void test_transform_success() {
+TEST(transform, success) {
     auto r = parse("hi").transform([](int v) { return v * 10; });
-    check(r.has_value(), "transform success");
-    check(r.value() == 20, "transform == 20");
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 20);
 }
 
-static void test_transform_error() {
+TEST(transform, error_propagation) {
     auto r = parse(nullptr).transform([](int v) { return v * 10; });
-    check(!r.has_value(), "transform propagates error");
-    check(r.error() == Err::BadInput, "transform error == BadInput");
+    CHECK(!r.has_value());
+    CHECK(r.error() == Err::BadInput);
 }
 
-static void test_transform_type_change() {
-    // int -> bool
+TEST(transform, type_change) {
     auto r = parse("abc").transform([](int v) { return v > 2; });
-    check(r.has_value(), "transform type change");
-    check(r.value() == true, "transform bool == true");
+    CHECK(r.has_value());
+    CHECK(r.value() == true);
 }
 
-static void test_transform_chain() {
+TEST(transform, chain) {
     auto r =
         parse("ab").transform([](int v) { return v + 100; }).transform([](int v) { return v * 2; });
-    check(r.has_value(), "transform chain");
-    check(r.value() == 204, "transform chain == 204");  // (2+100)*2
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 204);  // (2+100)*2
 }
 
 // ── 9. Monadic: or_else ─────────────────────────────────────────────
 
-static void test_or_else_with_value() {
+TEST(or_else, pass_through) {
     auto r = parse("ok").or_else([](Err) -> Expected<int, Err> { return 0; });
-    check(r.has_value(), "or_else pass-through value");
-    check(r.value() == 2, "or_else pass-through == 2");
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 2);
 }
 
-static void test_or_else_recover() {
+TEST(or_else, recover) {
     auto r = parse(nullptr).or_else([](Err) -> Expected<int, Err> { return 0; });
-    check(r.has_value(), "or_else recover");
-    check(r.value() == 0, "or_else recover == 0");
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 0);
 }
 
-static void test_or_else_remap_error() {
-    // Convert Err -> ErrInfo
+TEST(or_else, remap_error) {
     auto r = parse(nullptr).or_else([](Err e) -> Expected<int, Err> {
-        if (e == Err::BadInput) return Unexpected(Err::NotFound);  // remap
+        if (e == Err::BadInput) return Unexpected(Err::NotFound);
         return Unexpected(e);
     });
-    check(!r.has_value(), "or_else remap error");
-    check(r.error() == Err::NotFound, "or_else remap == NotFound");
+    CHECK(!r.has_value());
+    CHECK(r.error() == Err::NotFound);
 }
 
 // ── 10. Mixed monadic chains ────────────────────────────────────────
 
-static void test_mixed_chain() {
+TEST(mixed, chain_success) {
     auto r = parse("hi")
                  .and_then(checked_double)                // 2 -> 4
                  .transform([](int v) { return v + 1; })  // 4 -> 5
                  .and_then(checked_add_ten);              // 5 -> 15
-    check(r.has_value(), "mixed chain has_value");
-    check(r.value() == 15, "mixed chain == 15");
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 15);
 }
 
-static void test_mixed_chain_error_midway() {
+TEST(mixed, chain_error_midway) {
     char big[1024];
     for (int i = 0; i < 1023; ++i) big[i] = 'x';
     big[1023] = '\0';
@@ -427,87 +389,85 @@ static void test_mixed_chain_error_midway() {
                  .and_then(checked_double)                // 1023 > 1000, error
                  .transform([](int v) { return v + 1; })  // skipped
                  .and_then(checked_add_ten);              // skipped
-    check(!r.has_value(), "mixed chain error midway");
-    check(r.error() == Err::Overflow, "mixed chain midway == Overflow");
+    CHECK(!r.has_value());
+    CHECK(r.error() == Err::Overflow);
 }
 
 // ── 11. Expected<void, E> ───────────────────────────────────────────
 
-static void test_void_success() {
+TEST(void_expected, success) {
     Expected<void, Err> r = {};
-    check(r.has_value(), "void success");
+    CHECK(r.has_value());
 }
 
-static void test_void_error() {
+TEST(void_expected, error) {
     Expected<void, Err> r = Unexpected(Err::Timeout);
-    check(!r.has_value(), "void error");
-    check(r.error() == Err::Timeout, "void error == Timeout");
+    CHECK(!r.has_value());
+    CHECK(r.error() == Err::Timeout);
 }
 
-static void test_void_copy() {
+TEST(void_expected, copy) {
     Expected<void, Err> a = {};
     Expected<void, Err> b = a;
-    check(b.has_value(), "void copy success");
+    CHECK(b.has_value());
 
     Expected<void, Err> c = Unexpected(Err::BadInput);
     Expected<void, Err> d = c;
-    check(!d.has_value(), "void copy error");
-    check(d.error() == Err::BadInput, "void copy error == BadInput");
+    CHECK(!d.has_value());
+    CHECK(d.error() == Err::BadInput);
 }
 
-static void test_void_move() {
+TEST(void_expected, move) {
     Expected<void, ErrInfo> a = Unexpected(ErrInfo{Err::Overflow, 7});
     Expected<void, ErrInfo> b = static_cast<Expected<void, ErrInfo>&&>(a);
-    check(!b.has_value(), "void move error");
-    check(b.error().detail == 7, "void move detail");
+    CHECK(!b.has_value());
+    CHECK_EQ(b.error().detail, 7);
 }
 
-static void test_void_assign() {
+TEST(void_expected, assign) {
     Expected<void, Err> a = {};
     Expected<void, Err> b = Unexpected(Err::NotFound);
     a = b;
-    check(!a.has_value(), "void assign e->v");
-    check(a.error() == Err::NotFound, "void assign error");
+    CHECK(!a.has_value());
+    CHECK(a.error() == Err::NotFound);
 
     Expected<void, Err> c = {};
     a = c;
-    check(a.has_value(), "void assign v->e");
+    CHECK(a.has_value());
 }
 
 // ── 12. Non-trivial types: construction/destruction tracking ────────
 
-static void test_tracked_value_lifecycle() {
+TEST(lifecycle, tracked_value) {
     reset_counters();
     {
         Expected<Tracked, Err> r = Tracked(42);
-        check(r.has_value(), "tracked value");
-        check(r.value().val == 42, "tracked value == 42");
+        CHECK(r.has_value());
+        CHECK_EQ(r.value().val, 42);
     }
-    // 1 ctor (Tracked(42)) + 1 move (into Expected) = ctor=1, move=1, dtor=2
-    check(g_ctor_count == 1, "tracked ctor count");
-    check(g_move_count == 1, "tracked move count");
-    check(g_dtor_count == 2, "tracked dtor count");  // temp + stored
+    CHECK_EQ(g_ctor_count, 1);
+    CHECK_EQ(g_move_count, 1);
+    CHECK_EQ(g_dtor_count, 2);
 }
 
-static void test_tracked_error_no_value_dtor() {
+TEST(lifecycle, tracked_error_no_value_dtor) {
     reset_counters();
     {
         Expected<Tracked, Err> r = Unexpected(Err::BadInput);
-        check(!r.has_value(), "tracked error path");
+        CHECK(!r.has_value());
     }
-    // No Tracked constructed or destroyed
-    check(g_ctor_count == 0, "tracked error: no ctor");
-    check(g_dtor_count == 0, "tracked error: no dtor");
+    CHECK_EQ(g_ctor_count, 0);
+    CHECK_EQ(g_dtor_count, 0);
 }
 
-static void test_tracked_copy() {
+TEST(lifecycle, tracked_copy) {
     reset_counters();
     {
         Expected<Tracked, Err> a = Tracked(10);
-        Expected<Tracked, Err> b = a;  // copy
-        check(b.value().val == 10, "tracked copy == 10");
+        Expected<Tracked, Err> b = a;
+        CHECK_EQ(b.value().val, 10);
     }
-    check(g_copy_count == 1, "tracked copy count");
+    CHECK_EQ(g_copy_count, 1);
 }
 
 // ── 13. Different T and E sizes / alignments ────────────────────────
@@ -520,81 +480,82 @@ struct Small {
     char c;
 };
 
-static void test_size_mismatch() {
+TEST(size, mismatch) {
     Expected<Big, Small> r1 = Big{{}, 99};
-    check(r1.has_value(), "big value");
-    check(r1->tag == 99, "big tag == 99");
+    CHECK(r1.has_value());
+    CHECK_EQ(r1->tag, 99);
 
     Expected<Small, Big> r2 = Unexpected(Big{{}, 77});
-    check(!r2.has_value(), "big error");
-    check(r2.error().tag == 77, "big error tag == 77");
+    CHECK(!r2.has_value());
+    CHECK_EQ(r2.error().tag, 77);
 }
 
 struct Aligned {
     alignas(64) int v;
 };
 
-static void test_alignment() {
+TEST(size, alignment) {
     Expected<Aligned, Err> r = Aligned{42};
-    check(r.has_value(), "aligned value");
-    check(r.value().v == 42, "aligned == 42");
-    // Verify alignment (address should be 64-byte aligned within struct)
+    CHECK(r.has_value());
+    CHECK_EQ(r.value().v, 42);
     auto addr = reinterpret_cast<uintptr_t>(&r.value().v);
-    check((addr % 64) == 0, "aligned 64-byte");
+    CHECK_EQ(addr % 64, 0u);
 }
 
 // ── 14. make_unexpected ─────────────────────────────────────────────
 
-static void test_make_unexpected() {
+TEST(make_unexpected, rvalue) {
     auto u = make_unexpected(Err::Timeout);
     Expected<int, Err> r = u;
-    check(!r.has_value(), "make_unexpected");
-    check(r.error() == Err::Timeout, "make_unexpected == Timeout");
+    CHECK(!r.has_value());
+    CHECK(r.error() == Err::Timeout);
 }
 
-static void test_make_unexpected_lvalue() {
+TEST(make_unexpected, lvalue) {
     Err e = Err::NotFound;
-    auto u = make_unexpected(e);  // lvalue — RemoveRef strips &
+    auto u = make_unexpected(e);
     Expected<int, Err> r = u;
-    check(r.error() == Err::NotFound, "make_unexpected lvalue");
+    CHECK(r.error() == Err::NotFound);
 }
 
 // ── 15. Const correctness ───────────────────────────────────────────
 
-static void test_const_access() {
+TEST(const_access, value_and_error) {
     const Expected<int, Err> v = 42;
-    check(v.has_value(), "const has_value");
-    check(v.value() == 42, "const value");
-    check(*v == 42, "const deref");
-    check(v.value_or(0) == 42, "const value_or");
+    CHECK(v.has_value());
+    CHECK_EQ(v.value(), 42);
+    CHECK_EQ(*v, 42);
+    CHECK_EQ(v.value_or(0), 42);
 
     const Expected<int, Err> e = Unexpected(Err::BadInput);
-    check(!e.has_value(), "const error has_value");
-    check(e.error() == Err::BadInput, "const error");
+    CHECK(!e.has_value());
+    CHECK(e.error() == Err::BadInput);
 }
 
-static void test_const_monadic() {
+TEST(const_access, monadic) {
     const Expected<int, Err> v = 5;
     auto r = v.and_then(checked_double);
-    check(r.value() == 10, "const and_then");
+    CHECK_EQ(r.value(), 10);
 
     auto r2 = v.transform([](int x) { return x + 1; });
-    check(r2.value() == 6, "const transform");
+    CHECK_EQ(r2.value(), 6);
 
     const Expected<int, Err> e = Unexpected(Err::BadInput);
     auto r3 = e.or_else([](Err) -> Expected<int, Err> { return 0; });
-    check(r3.value() == 0, "const or_else");
+    CHECK_EQ(r3.value(), 0);
 }
 
 // ── 16. Default constructor ──────────────────────────────────────────
 
-static void test_default_constructor() {
+TEST(default_ctor, int) {
     Expected<int, Err> r;
-    check(r.has_value(), "default ctor has_value");
-    check(r.value() == 0, "default ctor int == 0");
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 0);
+}
 
+TEST(default_ctor, point) {
     Expected<Point, Err> p;
-    check(p.has_value(), "default ctor Point has_value");
+    CHECK(p.has_value());
 }
 
 // ── 17. TRY on same line (__COUNTER__ uniqueness) ───────────────────
@@ -603,126 +564,38 @@ static Expected<int, Err> try_same_line(const char* a, const char* b) {
     return TRY(parse(a)) + TRY(parse(b));
 }
 
-static void test_try_same_line() {
+TEST(try_macro, same_line_success) {
     auto r = try_same_line("ab", "cd");
-    check(r.has_value(), "TRY same line has_value");
-    check(r.value() == 4, "TRY same line == 4");  // 2 + 2
+    CHECK(r.has_value());
+    CHECK_EQ(r.value(), 4);  // 2 + 2
+}
 
-    auto r2 = try_same_line(nullptr, "cd");
-    check(!r2.has_value(), "TRY same line first error");
+TEST(try_macro, same_line_first_error) {
+    auto r = try_same_line(nullptr, "cd");
+    CHECK(!r.has_value());
+}
 
-    auto r3 = try_same_line("ab", nullptr);
-    check(!r3.has_value(), "TRY same line second error");
+TEST(try_macro, same_line_second_error) {
+    auto r = try_same_line("ab", nullptr);
+    CHECK(!r.has_value());
 }
 
 // ── 18. const Expected through TRY (RemoveCvRef) ────────────────────
 
 static Expected<int, Err> try_from_const() {
     const Expected<int, Err> ce = Unexpected(Err::NotFound);
-    // make_unexpected must strip const from error type
     if (!ce) return ::core::make_unexpected(ce.error());
     return ce.value();
 }
 
-static void test_try_const_expected() {
+TEST(try_macro, const_expected) {
     auto r = try_from_const();
-    check(!r.has_value(), "const expected error propagation");
-    check(r.error() == Err::NotFound, "const expected error == NotFound");
+    CHECK(!r.has_value());
+    CHECK(r.error() == Err::NotFound);
 }
 
 // ═══════════════════════════════════════════════════════════════════
 
-int main() {
-    // 1. Basic
-    test_basic_value();
-    test_basic_error();
-
-    // 2. Copy / Move
-    test_copy_value();
-    test_copy_error();
-    test_move_value();
-    test_move_error();
-
-    // 3. Assignment
-    test_assign_value_to_value();
-    test_assign_error_to_value();
-    test_assign_value_to_error();
-    test_assign_error_to_error();
-    test_self_assign();
-    test_move_assign();
-
-    // 4. value_or
-    test_value_or();
-
-    // 5. operator->
-    test_arrow_operator();
-
-    // 6. TRY macro
-    test_try_success();
-    test_try_first_error();
-    test_try_second_error();
-    test_try_three_steps();
-    test_try_non_trivial_error();
-    test_try_void();
-
-    // 7. and_then
-    test_and_then_success();
-    test_and_then_first_error();
-    test_and_then_second_error();
-    test_and_then_chain();
-    test_and_then_lambda();
-
-    // 8. transform
-    test_transform_success();
-    test_transform_error();
-    test_transform_type_change();
-    test_transform_chain();
-
-    // 9. or_else
-    test_or_else_with_value();
-    test_or_else_recover();
-    test_or_else_remap_error();
-
-    // 10. Mixed chains
-    test_mixed_chain();
-    test_mixed_chain_error_midway();
-
-    // 11. Expected<void, E>
-    test_void_success();
-    test_void_error();
-    test_void_copy();
-    test_void_move();
-    test_void_assign();
-
-    // 12. Non-trivial lifecycle
-    test_tracked_value_lifecycle();
-    test_tracked_error_no_value_dtor();
-    test_tracked_copy();
-
-    // 13. Size / alignment
-    test_size_mismatch();
-    test_alignment();
-
-    // 14. make_unexpected
-    test_make_unexpected();
-    test_make_unexpected_lvalue();
-
-    // 15. Const correctness
-    test_const_access();
-    test_const_monadic();
-
-    // 16. Default constructor
-    test_default_constructor();
-
-    // 17. TRY same line (__COUNTER__)
-    test_try_same_line();
-
-    // 18. const Expected through TRY
-    test_try_const_expected();
-
-    // Summary
-    write(1, "ALL PASSED: ", 12);
-    write_int(1, g_passed);
-
-    return 0;
+int main(int argc, char** argv) {
+    return rout::test::run_all(argc, argv);
 }

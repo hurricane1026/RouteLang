@@ -321,8 +321,8 @@ struct Function {
     // Yield point count (determines state machine states).
     u32 yield_count;
 
-    Block* entry() { return &blocks[0]; }
-    const Block* entry() const { return &blocks[0]; }
+    Block* entry() { return block_count > 0 ? &blocks[0] : nullptr; }
+    const Block* entry() const { return block_count > 0 ? &blocks[0] : nullptr; }
 };
 
 // ── Module ──────────────────────────────────────────────────────────

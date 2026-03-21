@@ -47,6 +47,10 @@ struct Builder {
     // ── Module-level ────────────────────────────────────────────────
 
     Result<StructDef*> create_struct(Str name, const FieldDef* fields, u32 count) {
+        // Check capacity before allocating to avoid wasting arena space.
+        if (!mod->struct_defs || mod->struct_count >= mod->struct_cap) {
+            return err(RirError::CapacityFull);
+        }
         auto* arena = mod->arena;
         u64 size = sizeof(StructDef) + sizeof(FieldDef) * count;
         auto* sd = static_cast<StructDef*>(arena->alloc(size));
@@ -55,9 +59,6 @@ struct Builder {
         sd->field_count = count;
         for (u32 i = 0; i < count; i++) {
             sd->fields()[i] = fields[i];
-        }
-        if (!mod->struct_defs || mod->struct_count >= mod->struct_cap) {
-            return err(RirError::CapacityFull);
         }
         mod->struct_defs[mod->struct_count++] = sd;
         return sd;

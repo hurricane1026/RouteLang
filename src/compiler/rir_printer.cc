@@ -526,10 +526,12 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::CallExtern:
             buf.put('.');
             buf.put_str(inst.imm.extern_name);
-            buf.put(' ');
-            for (u32 i = 0; i < inst.operand_count; i++) {
-                if (i > 0) buf.put_cstr(", ");
-                print_value_ref(buf, inst.operand(i));
+            if (inst.operand_count > 0) {
+                buf.put(' ');
+                for (u32 i = 0; i < inst.operand_count; i++) {
+                    if (i > 0) buf.put_cstr(", ");
+                    print_value_ref(buf, inst.operand(i));
+                }
             }
             break;
         case Opcode::HashHmacSha256:

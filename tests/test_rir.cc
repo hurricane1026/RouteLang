@@ -524,10 +524,6 @@ TEST(RirBuilder, DomainOps) {
     ctx.destroy();
 }
 
-int main(int argc, char** argv) {
-    return rout::test::run_all(argc, argv);
-}
-
 // ── Overflow tests ──────────────────────────────────────────────────
 
 TEST(RirBuilder, InstructionOverflow) {
@@ -665,4 +661,8 @@ TEST(RirModule, MultipleFunctions) {
     CHECK_EQ(e2.id, 0u);
 
     ctx.destroy();
+}
+
+int main(int argc, char** argv) {
+    return rout::test::run_all(argc, argv);
 }

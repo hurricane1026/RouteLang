@@ -17,9 +17,6 @@ namespace rir {
 //   b.set_insert_point(fn, entry);
 //   auto v0 = TRY(b.emit_const_str("Bearer "));
 
-// Sentinel for invalid block IDs (parallel to kNoValue for values).
-static constexpr BlockId kNoBlock = {0xFFFFFFFF};
-
 // Convenience aliases.
 template <typename T>
 using Result = core::Expected<T, RirError>;
@@ -406,8 +403,22 @@ struct Builder {
 
     // ── Comparisons ─────────────────────────────────────────────────
 
+    static bool is_cmp_opcode(Opcode op) {
+        switch (op) {
+            case Opcode::CmpEq:
+            case Opcode::CmpNe:
+            case Opcode::CmpLt:
+            case Opcode::CmpGt:
+            case Opcode::CmpLe:
+            case Opcode::CmpGe:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     Result<ValueId> emit_cmp(Opcode cmp_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
-        if (cmp_op < Opcode::CmpEq || cmp_op > Opcode::CmpGe) return err(RirError::InvalidState);
+        if (!is_cmp_opcode(cmp_op)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(cmp_op, ty, loc));
         inst->operands[0] = lhs;

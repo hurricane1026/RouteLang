@@ -31,9 +31,15 @@ void PrintBuf::flush() {
 
 void PrintBuf::put(char c) {
     if (len >= cap) {
-        if (fd < 0) return;  // in-memory: silently stop on overflow
+        if (fd < 0) {
+            overflow = true;
+            return;
+        }
         flush();
-        if (len >= cap) return;  // still full after flush (write error)
+        if (len >= cap) {
+            overflow = true;
+            return;
+        }
     }
     data[len++] = c;
 }
@@ -601,12 +607,6 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::MetricHistRecord:
         case Opcode::MetricCounterIncr:
         case Opcode::AccessLogWrite:
-            for (u32 i = 0; i < inst.operand_count; i++) {
-                buf.put(' ');
-                print_value_ref(buf, inst.operand(i));
-            }
-            break;
-
         default:
             // Fallback: print all operands comma-separated for opcodes
             // without specialized formatting (StructCreate, ArrayLen, etc.).

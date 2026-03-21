@@ -118,6 +118,9 @@ struct BlockId {
     bool operator!=(BlockId other) const { return id != other.id; }
 };
 
+// Sentinel for "no block" (invalid block ID).
+static constexpr BlockId kNoBlock = {0xFFFFFFFF};
+
 // ── Opcodes ─────────────────────────────────────────────────────────
 // Flat enumeration of all RIR operations. Grouped by category.
 // The opcode determines operand layout (see Instruction).
@@ -290,10 +293,11 @@ struct Block {
     u32 inst_count;
     u32 inst_cap;
 
-    // The last instruction must be a terminator.
+    // Returns the terminator if the block is properly terminated, nullptr otherwise.
     const Instruction* terminator() const {
         if (inst_count == 0) return nullptr;
-        return &insts[inst_count - 1];
+        const Instruction* last = &insts[inst_count - 1];
+        return last->is_terminator() ? last : nullptr;
     }
 };
 

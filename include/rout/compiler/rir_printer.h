@@ -30,13 +30,15 @@ struct PrintBuf {
     char* data;
     u32 len;
     u32 cap;
-    i32 fd;  // output file descriptor
+    i32 fd;         // output file descriptor (-1 for in-memory)
+    bool overflow;  // true if put() dropped data due to full buffer
 
     void init(char* buf, u32 buf_cap, i32 out_fd) {
         data = buf;
         len = 0;
         cap = buf_cap;
         fd = out_fd;
+        overflow = false;
     }
 
     void flush();

@@ -31,10 +31,12 @@ struct SlicePool {
 
     u8* base = nullptr;         // mmap'd region: count * kSliceSize bytes
     u32* free_stack = nullptr;  // mmap'd: free slice indices
+    u8* in_use_map = nullptr;   // mmap'd: 1 byte per slice (0=free, 1=in-use)
     u32 free_top = 0;
     u32 count = 0;       // total number of slices
     u64 base_size = 0;   // size of mmap'd base region
     u64 stack_size = 0;  // size of mmap'd free_stack region
+    u64 map_size = 0;    // size of mmap'd in_use_map
 
     // Initialize pool with `n` slices. Total memory: n * 16KB + n * 4 bytes.
     core::Expected<void, Error> init(u32 n) {
@@ -60,6 +62,20 @@ struct SlicePool {
         }
         free_stack = static_cast<u32*>(stack_mem);
 
+        // mmap in-use tracking map (1 byte per slice, 0=free)
+        map_size = static_cast<u64>(n);
+        void* map_mem =
+            mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (map_mem == MAP_FAILED) {
+            auto err = Error::from_errno(Error::Source::SlicePool);
+            munmap(free_stack, stack_size);
+            free_stack = nullptr;
+            munmap(base, base_size);
+            base = nullptr;
+            return core::make_unexpected(err);
+        }
+        in_use_map = static_cast<u8*>(map_mem);  // mmap zeroes = all free
+
         // Fill free stack: all slices available
         for (u32 i = 0; i < n; i++) free_stack[i] = i;
 
@@ -70,6 +86,7 @@ struct SlicePool {
     u8* alloc() {
         if (free_top == 0) return nullptr;
         u32 idx = free_stack[--free_top];
+        if (in_use_map) in_use_map[idx] = 1;
         return base + static_cast<u64>(idx) * kSliceSize;
     }
 
@@ -79,8 +96,10 @@ struct SlicePool {
         if (ptr < base || ptr >= base + base_size) return;  // out of range
         u64 offset = static_cast<u64>(ptr - base);
         if (offset % kSliceSize != 0) return;  // not slice-aligned
-        if (free_top >= count) return;         // overflow (double-free)
+        if (free_top >= count) return;         // overflow guard
         u32 idx = static_cast<u32>(offset / kSliceSize);
+        if (in_use_map && !in_use_map[idx]) return;  // double-free detection
+        if (in_use_map) in_use_map[idx] = 0;
         free_stack[free_top++] = idx;
     }
 
@@ -92,6 +111,10 @@ struct SlicePool {
 
     // Release all mmap'd memory.
     void destroy() {
+        if (in_use_map) {
+            munmap(in_use_map, map_size);
+            in_use_map = nullptr;
+        }
         if (free_stack) {
             munmap(free_stack, stack_size);
             free_stack = nullptr;

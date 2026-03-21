@@ -17,8 +17,9 @@ namespace rout {
 
 struct UpstreamConn {
     i32 fd = -1;
-    u16 upstream_id = 0;  // which upstream target this connects to
-    bool idle = false;    // true = available for reuse
+    u16 upstream_id = 0;     // which upstream target this connects to
+    bool idle = false;       // true = available for reuse
+    bool allocated = false;  // true = slot in use (guards double-free)
 };
 
 struct UpstreamPool {
@@ -34,6 +35,7 @@ struct UpstreamPool {
             conns[i].fd = -1;
             conns[i].upstream_id = 0;
             conns[i].idle = false;
+            conns[i].allocated = false;
             free_stack[i] = i;
         }
     }
@@ -45,17 +47,20 @@ struct UpstreamPool {
         u32 idx = free_stack[--free_top];
         conns[idx].fd = -1;
         conns[idx].idle = false;
+        conns[idx].allocated = true;
         return &conns[idx];
     }
 
     // Free an upstream connection slot.
     void free(UpstreamConn* c) {
         if (!c || c < conns || c >= conns + kMaxConns) return;
+        if (!c->allocated) return;  // double-free detection
         if (c->fd >= 0) {
             close(c->fd);
             c->fd = -1;
         }
         c->idle = false;
+        c->allocated = false;
         u32 idx = static_cast<u32>(c - conns);
         if (free_top >= kMaxConns) return;
         free_stack[free_top++] = idx;
@@ -74,7 +79,11 @@ struct UpstreamPool {
     }
 
     // Return a connection to the idle pool for reuse.
-    void return_idle(UpstreamConn* c) { c->idle = true; }
+    void return_idle(UpstreamConn* c) {
+        if (!c || c < conns || c >= conns + kMaxConns) return;
+        if (!c->allocated || c->fd < 0) return;
+        c->idle = true;
+    }
 
     // Close all connections and reset.
     void shutdown() {

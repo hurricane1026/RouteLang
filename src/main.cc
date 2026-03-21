@@ -54,17 +54,11 @@ static bool detect_io_uring() {
 
 // --- Signal handling for graceful shutdown ---
 
-// Store pointers to each shard's loop->running flag for signal handler.
-// Use atomic store for cross-thread + signal safety.
-static volatile bool* g_running_flags[kMaxShards];
-static volatile sig_atomic_t g_shard_count = 0;
+// Signal handler only sets a flag; main thread calls stop() outside signal context.
+static volatile sig_atomic_t g_stop_requested = 0;
 
 static void signal_handler(int /*sig*/) {
-    sig_atomic_t count = g_shard_count;
-    for (sig_atomic_t i = 0; i < count && i < static_cast<sig_atomic_t>(kMaxShards); i++) {
-        volatile bool* flag = g_running_flags[i];
-        if (flag) __atomic_store_n(flag, false, __ATOMIC_RELAXED);
-    }
+    g_stop_requested = 1;
 }
 
 template <typename Backend>
@@ -72,9 +66,17 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
     Shard<Backend> shards[kMaxShards];
 
     // Create one SO_REUSEPORT listen socket per shard.
-    // Kernel distributes incoming connections across sockets.
+    // If port==0 (ephemeral), create shard 0 first to get the assigned port,
+    // then create remaining sockets on that concrete port.
     for (u32 i = 0; i < shard_count; i++) {
         auto lfd_result = create_listen_socket(port);
+        // After shard 0, resolve ephemeral port so remaining shards bind the same port.
+        if (i == 0 && port == 0 && lfd_result) {
+            struct sockaddr_in a;
+            socklen_t al = sizeof(a);
+            getsockname(lfd_result.value(), reinterpret_cast<struct sockaddr*>(&a), &al);
+            port = __builtin_bswap16(a.sin_port);
+        }
         if (!lfd_result) {
             write_str("Failed to create listen socket for shard ");
             write_u32(i);
@@ -117,12 +119,6 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
     write_u32(shard_count);
     write_str(" shard(s)\n");
 
-    // Register running flags for signal handler (before spawning threads)
-    for (u32 i = 0; i < shard_count; i++) {
-        g_running_flags[i] = &shards[i].loop->running;
-    }
-    g_shard_count = static_cast<sig_atomic_t>(shard_count);
-
     // Install signal handlers for graceful shutdown
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -146,13 +142,12 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
         }
     }
 
-    // Wait for all shard threads to finish (blocked by signal or stop)
+    // Wait for signal, then stop all shards from main thread (async-signal-safe).
+    while (!g_stop_requested) pause();
+
+    // Stop all shards from main thread (not signal context)
+    for (u32 i = 0; i < shard_count; i++) shards[i].stop();
     for (u32 i = 0; i < shard_count; i++) shards[i].join();
-
-    // Clear signal handler state before shutdown to prevent dangling pointer access
-    g_shard_count = 0;
-    for (u32 i = 0; i < shard_count; i++) g_running_flags[i] = nullptr;
-
     for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
 
     return 0;

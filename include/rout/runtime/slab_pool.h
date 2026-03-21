@@ -10,26 +10,21 @@
 namespace rout {
 
 // SlabPool<T, Cap> — fixed-size object pool, O(1) alloc/free.
-//
-// All objects are pre-allocated in a single mmap'd region. Free-stack
-// tracks available slots. No malloc, no fragmentation, cache-friendly.
-//
-// T must be trivially constructible (mmap zeroes memory).
-// Caller is responsible for initializing objects after alloc.
+// Double-free detected via per-slot in_use tracking.
 
 template <typename T, u32 Cap>
 struct SlabPool {
-    T* objects = nullptr;       // mmap'd: Cap * sizeof(T)
-    u32* free_stack = nullptr;  // mmap'd: Cap * sizeof(u32)
+    T* objects = nullptr;
+    u32* free_stack = nullptr;
+    u8* in_use_map = nullptr;  // 1 byte per slot: 0=free, 1=allocated
     u32 free_top = 0;
     u64 objects_size = 0;
     u64 stack_size = 0;
+    u64 map_size = 0;
 
-    // Initialize pool. mmap's objects + free stack.
     core::Expected<void, Error> init() {
         free_top = Cap;
 
-        // mmap objects
         objects_size = static_cast<u64>(Cap) * sizeof(T);
         void* obj_mem =
             mmap(nullptr, objects_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -37,7 +32,6 @@ struct SlabPool {
             return core::make_unexpected(Error::from_errno(Error::Source::SlabPool));
         objects = static_cast<T*>(obj_mem);
 
-        // mmap free stack
         stack_size = static_cast<u64>(Cap) * sizeof(u32);
         void* stk_mem =
             mmap(nullptr, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -48,57 +42,69 @@ struct SlabPool {
         }
         free_stack = static_cast<u32*>(stk_mem);
 
-        // Fill free stack
-        for (u32 i = 0; i < Cap; i++) free_stack[i] = i;
+        map_size = static_cast<u64>(Cap);
+        void* map_mem =
+            mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (map_mem == MAP_FAILED) {
+            auto err = Error::from_errno(Error::Source::SlabPool);
+            munmap(free_stack, stack_size);
+            free_stack = nullptr;
+            munmap(objects, objects_size);
+            objects = nullptr;
+            return core::make_unexpected(err);
+        }
+        in_use_map = static_cast<u8*>(map_mem);  // mmap zeroes = all free
 
+        for (u32 i = 0; i < Cap; i++) free_stack[i] = i;
         return {};
     }
 
-    // Allocate an object. Returns pointer, or nullptr if full.
     T* alloc() {
         if (free_top == 0) return nullptr;
         u32 idx = free_stack[--free_top];
+        if (in_use_map) in_use_map[idx] = 1;
         return &objects[idx];
     }
 
-    // Allocate and return index as well.
     T* alloc_with_id(u32& out_idx) {
         if (free_top == 0) {
             out_idx = 0;
             return nullptr;
         }
         out_idx = free_stack[--free_top];
+        if (in_use_map) in_use_map[out_idx] = 1;
         return &objects[out_idx];
     }
 
-    // Free an object by index.
     void free(u32 idx) {
         if (idx >= Cap || free_top >= Cap || !free_stack) return;
+        if (in_use_map && !in_use_map[idx]) return;  // double-free
+        if (in_use_map) in_use_map[idx] = 0;
         free_stack[free_top++] = idx;
     }
 
-    // Free an object by pointer.
     void free(T* obj) {
         if (!obj || !objects || obj < objects || obj >= objects + Cap) return;
         u32 idx = static_cast<u32>(obj - objects);
         if (free_top >= Cap) return;
+        if (in_use_map && !in_use_map[idx]) return;  // double-free
+        if (in_use_map) in_use_map[idx] = 0;
         free_stack[free_top++] = idx;
     }
 
-    // Get object by index.
     T& operator[](u32 idx) { return objects[idx]; }
     const T& operator[](u32 idx) const { return objects[idx]; }
-
-    // Get index from pointer.
     u32 index_of(const T* obj) const { return static_cast<u32>(obj - objects); }
 
-    // Stats.
     u32 capacity() const { return Cap; }
     u32 available() const { return free_top; }
     u32 in_use() const { return Cap - free_top; }
 
-    // Release all mmap'd memory.
     void destroy() {
+        if (in_use_map) {
+            munmap(in_use_map, map_size);
+            in_use_map = nullptr;
+        }
         if (free_stack) {
             munmap(free_stack, stack_size);
             free_stack = nullptr;

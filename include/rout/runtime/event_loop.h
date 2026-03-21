@@ -67,7 +67,7 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
 
     core::Expected<void, Error> init(u32 id, i32 listen_fd) {
         shard_id = id;
-        running = true;
+        __atomic_store_n(&running, true, __ATOMIC_RELAXED);
         keepalive_timeout = 60;  // explicit: mmap zeroes memory, skipping default member init
         free_top = kMaxConns;
         timer.init();
@@ -85,7 +85,7 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
         backend.add_accept();
         IoEvent events[kMaxEventsPerWait];
 
-        while (running) {
+        while (__atomic_load_n(&running, __ATOMIC_RELAXED)) {
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
             for (u32 i = 0; i < n; i++) {
                 dispatch(events[i]);
@@ -93,7 +93,7 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
         }
     }
 
-    void stop() { running = false; }
+    void stop() { __atomic_store_n(&running, false, __ATOMIC_RELAXED); }
     void shutdown() { backend.shutdown(); }
 
     // --- CRTP implementations ---

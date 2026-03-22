@@ -75,6 +75,7 @@ struct Shard {
 
         auto loop_result = loop->init(shard_id, listen_fd);
         if (!loop_result) {
+            loop->~EventLoop();
             munmap(loop, sizeof(EventLoop<Backend>));
             loop = nullptr;
             return loop_result;
@@ -84,6 +85,7 @@ struct Shard {
         auto arena_result = scratch.init(65536);
         if (!arena_result) {
             loop->shutdown();
+            loop->~EventLoop();
             munmap(loop, sizeof(EventLoop<Backend>));
             loop = nullptr;
             return arena_result;
@@ -99,6 +101,7 @@ struct Shard {
         if (up_mem == MAP_FAILED) {
             scratch.destroy();
             loop->shutdown();
+            loop->~EventLoop();
             munmap(loop, sizeof(EventLoop<Backend>));
             loop = nullptr;
             return core::make_unexpected(Error::from_errno(Error::Source::Mmap));

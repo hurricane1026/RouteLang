@@ -72,7 +72,7 @@ public:
     core::Expected<void, Error> init(u32 id, i32 listen_fd) {
         shard_id = id;
         running_ = true;
-        keepalive_timeout = 60;  // explicit: mmap zeroes memory, skipping default member init
+        keepalive_timeout = 60;
         free_top = kMaxConns;
         timer.init();
         for (u32 i = 0; i < kMaxConns; i++) {

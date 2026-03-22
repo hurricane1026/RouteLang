@@ -39,7 +39,6 @@ build() {
 
 # ---- Test ----
 test() {
-    configure
     build
     echo "=== Running all tests ==="
     ninja -C "$BUILD_DIR" check

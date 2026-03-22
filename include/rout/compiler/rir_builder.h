@@ -466,6 +466,9 @@ struct Builder {
     Result<ValueId> emit_cmp(Opcode cmp_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
         if (!is_cmp_opcode(cmp_op) || !valid_val(lhs) || !valid_val(rhs))
             return err(RirError::InvalidState);
+        // Operands must have matching types.
+        if (cur_func->values[lhs.id].type != cur_func->values[rhs.id].type)
+            return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(cmp_op, ty, loc));
         inst->operands[0] = lhs;
@@ -482,7 +485,8 @@ struct Builder {
     }
 
     Result<ValueId> emit_time_diff(ValueId a, ValueId b, SourceLoc loc = {}) {
-        if (!valid_val(a) || !valid_val(b)) return err(RirError::InvalidState);
+        if (!val_has_type(a, TypeKind::Time) || !val_has_type(b, TypeKind::Time))
+            return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Duration));
         auto [inst, vid] = TRY(emit(Opcode::TimeDiff, ty, loc));
         inst->operands[0] = a;
@@ -492,7 +496,7 @@ struct Builder {
     }
 
     Result<ValueId> emit_ip_in_cidr(ValueId ip, Str cidr_lit, SourceLoc loc = {}) {
-        if (!valid_val(ip)) return err(RirError::InvalidState);
+        if (!val_has_type(ip, TypeKind::IP)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(Opcode::IpInCidr, ty, loc));
         inst->operands[0] = ip;

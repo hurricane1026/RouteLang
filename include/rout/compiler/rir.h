@@ -257,7 +257,11 @@ struct Instruction {
     }
 
     // Is this a yield (I/O suspend point → state machine boundary)?
-    // Yields are a subset of terminators.
+    // Yields are a subset of terminators — no instructions may follow
+    // within the same block. Yield instructions produce SSA values
+    // (the I/O result); the state machine construction pass (Pass 3)
+    // splits the function at yield boundaries and wires the result
+    // value into the continuation block's live-in set.
     // Note: DESIGN.md shows nil checks as `%v.is_nil` (sugar), but this
     // IR uses an explicit `OptIsNil` opcode for uniformity.
     bool is_yield() const {

@@ -600,11 +600,12 @@ struct Builder {
     // ── Yields (I/O suspend points) ────────────────────────────────
 
     Result<ValueId> emit_yield_http_get(Str url, ValueId headers, SourceLoc loc = {}) {
+        // Validate headers before emit() to avoid phantom instructions.
+        if (headers != kNoValue && !valid_val(headers)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Str));
         auto [inst, vid] = TRY(emit(Opcode::YieldHttpGet, ty, loc));
         inst->imm.str_val = url;
         if (headers != kNoValue) {
-            if (!valid_val(headers)) return err(RirError::InvalidState);
             inst->operands[0] = headers;
             inst->operand_count = 1;
         }

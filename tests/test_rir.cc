@@ -39,12 +39,18 @@ struct TestContext {
 
         static constexpr u32 kMaxFuncs = 8;
         mod.functions = arena.alloc_array<Function>(kMaxFuncs);
-        if (!mod.functions) return false;
+        if (!mod.functions) {
+            arena.destroy();
+            return false;
+        }
         mod.func_count = 0;
         mod.func_cap = kMaxFuncs;
         static constexpr u32 kMaxStructs = 64;
         mod.struct_defs = arena.alloc_array<StructDef*>(kMaxStructs);
-        if (!mod.struct_defs) return false;
+        if (!mod.struct_defs) {
+            arena.destroy();
+            return false;
+        }
         mod.struct_count = 0;
         mod.struct_cap = kMaxStructs;
         return true;

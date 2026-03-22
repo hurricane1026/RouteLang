@@ -71,7 +71,7 @@ struct Shard {
                          -1,
                          0);
         if (mem == MAP_FAILED) return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
-        loop = static_cast<EventLoop<Backend>*>(mem);
+        loop = new (mem) EventLoop<Backend>();
 
         auto loop_result = loop->init(shard_id, listen_fd);
         if (!loop_result) {
@@ -103,7 +103,7 @@ struct Shard {
             loop = nullptr;
             return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
         }
-        upstream = static_cast<UpstreamPool*>(up_mem);
+        upstream = new (up_mem) UpstreamPool();
         upstream->init();
 
         return {};
@@ -161,11 +161,13 @@ struct Shard {
         join();
         if (upstream) {
             upstream->shutdown();
+            upstream->~UpstreamPool();
             munmap(upstream, sizeof(UpstreamPool));
             upstream = nullptr;
         }
         if (loop) {
             loop->shutdown();
+            loop->~EventLoop();
             munmap(loop, sizeof(EventLoop<Backend>));
             loop = nullptr;
         }

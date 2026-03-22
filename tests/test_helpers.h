@@ -152,11 +152,15 @@ using RealLoop = EventLoop<EpollBackend>;
 inline RealLoop* create_real_loop() {
     void* p =
         mmap(nullptr, sizeof(RealLoop), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return p == MAP_FAILED ? nullptr : static_cast<RealLoop*>(p);
+    if (p == MAP_FAILED) return nullptr;
+    return new (p) RealLoop();
 }
 
 inline void destroy_real_loop(RealLoop* l) {
-    if (l) munmap(l, sizeof(RealLoop));
+    if (l) {
+        l->~RealLoop();
+        munmap(l, sizeof(RealLoop));
+    }
 }
 
 inline u16 get_port(i32 fd) {

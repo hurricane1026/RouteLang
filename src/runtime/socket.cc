@@ -17,9 +17,9 @@ i32 set_nonblocking(i32 fd) {
     return 0;
 }
 
-i32 create_listen_socket(u16 port) {
+core::Expected<i32, Error> create_listen_socket(u16 port) {
     i32 fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -errno;
+    if (fd < 0) return core::make_unexpected(Error::from_errno(Error::Source::Socket));
 
     i32 one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -33,15 +33,15 @@ i32 create_listen_socket(u16 port) {
     addr.sin_addr.s_addr = 0;                 // INADDR_ANY
 
     if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        i32 err = errno;
+        auto err = Error::from_errno(Error::Source::Socket);
         close(fd);
-        return -err;
+        return core::make_unexpected(err);
     }
 
     if (listen(fd, 4096) < 0) {
-        i32 err = errno;
+        auto err = Error::from_errno(Error::Source::Socket);
         close(fd);
-        return -err;
+        return core::make_unexpected(err);
     }
 
     return fd;

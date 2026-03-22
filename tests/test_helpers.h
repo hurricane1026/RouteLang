@@ -152,11 +152,15 @@ using RealLoop = EventLoop<EpollBackend>;
 inline RealLoop* create_real_loop() {
     void* p =
         mmap(nullptr, sizeof(RealLoop), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return p == MAP_FAILED ? nullptr : static_cast<RealLoop*>(p);
+    if (p == MAP_FAILED) return nullptr;
+    return new (p) RealLoop();
 }
 
 inline void destroy_real_loop(RealLoop* l) {
-    if (l) munmap(l, sizeof(RealLoop));
+    if (l) {
+        l->~RealLoop();
+        munmap(l, sizeof(RealLoop));
+    }
 }
 
 inline u16 get_port(i32 fd) {
@@ -216,7 +220,7 @@ struct LoopThread {
         lp->backend.add_accept();
         IoEvent events[256];
         i32 iters = 0;
-        while (lp->running) {
+        while (lp->is_running()) {
             u32 n = lp->backend.wait(events, 256, lp->conns, RealLoop::kMaxConns);
             for (u32 i = 0; i < n; i++) lp->dispatch(events[i]);
             if (++iters >= lt->max_iters) break;
@@ -225,7 +229,7 @@ struct LoopThread {
     }
     void start() { pthread_create(&thread, nullptr, run, this); }
     void stop() {
-        loop->running = false;
+        loop->stop();
         pthread_join(thread, nullptr);
     }
 };
@@ -239,13 +243,14 @@ struct TestServer {
     bool setup(i32 iters) {
         loop = create_real_loop();
         if (!loop) return false;
-        listen_fd = create_listen_socket(0);
-        if (listen_fd < 0) {
+        auto lfd_result = create_listen_socket(0);
+        if (!lfd_result) {
             destroy_real_loop(loop);
             return false;
         }
+        listen_fd = lfd_result.value();
         port = get_port(listen_fd);
-        if (loop->init(0, listen_fd) < 0) {
+        if (!loop->init(0, listen_fd)) {
             close(listen_fd);
             destroy_real_loop(loop);
             return false;

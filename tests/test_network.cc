@@ -1,5 +1,10 @@
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
 #include "rout/runtime/arena.h"
+#include "rout/runtime/error.h"
+#include "rout/runtime/route_table.h"
+#include "rout/runtime/slab_pool.h"
+#include "rout/runtime/slice_pool.h"
+#include "rout/runtime/upstream_pool.h"
 
 #include "test.h"
 #include "test_helpers.h"
@@ -490,11 +495,11 @@ TEST(copilot, timer_wheel_has_64_slots) {
 
 // Copilot #4: io_backend.h documented init as void, but it returns i32.
 // Verify MockBackend.init returns 0 on success.
-TEST(copilot, backend_init_returns_zero) {
+TEST(copilot, backend_init_returns_success) {
     SmallLoop loop;
     loop.setup();
-    // setup() calls backend.init which returns i32
-    CHECK_EQ(loop.backend.init(0, -1), 0);
+    // setup() calls backend.init which returns Expected<void, Error>
+    CHECK(loop.backend.init(0, -1).has_value());
 }
 
 // === Proxy (mock) ===
@@ -1090,35 +1095,35 @@ TEST(timer_clamp, zero_tick_coerced_to_one) {
 
 // io_uring init returns -errno (not -1) on failure.
 // We can't easily make mmap fail, but verify the convention:
-// successful MockBackend init returns 0.
-TEST(copilot4, init_returns_zero_on_success) {
+// successful MockBackend init returns success.
+TEST(copilot4, init_returns_success) {
     SmallLoop loop;
     loop.setup();
-    CHECK_EQ(loop.backend.init(0, -1), 0);
+    CHECK(loop.backend.init(0, -1).has_value());
 }
 
-// Arena init returns -errno on failure (not -1).
-// Verify success returns 0.
-TEST(copilot4, arena_init_returns_zero) {
+// Arena init returns Expected on failure.
+// Verify success returns has_value().
+TEST(copilot4, arena_init_returns_success) {
     Arena a;
-    CHECK_EQ(a.init(4096), 0);
+    CHECK(a.init(4096).has_value());
     a.destroy();
 }
 
 // Arena init with absurdly large size should fail gracefully.
-// mmap of near-max u64 will fail → should return negative errno.
+// mmap of near-max u64 will fail → should return error.
 TEST(copilot4, arena_init_huge_fails) {
     Arena a;
-    i32 rc = a.init(static_cast<u64>(-1));  // ~18 exabytes
-    CHECK(rc < 0);
-    // Should be -ENOMEM or similar, not -1
-    CHECK_NE(rc, -1);  // -errno convention, not raw -1
+    auto rc = a.init(static_cast<u64>(-1));  // ~18 exabytes
+    CHECK(!rc);
+    // Should carry a real errno code
+    CHECK(rc.error().code > 0);
 }
 
 // Arena alloc overflow protection
 TEST(copilot4, arena_alloc_overflow_returns_null) {
     Arena a;
-    REQUIRE_EQ(a.init(4096), 0);
+    REQUIRE(a.init(4096).has_value());
     // size close to u64 max → overflow in (size+7) alignment
     void* p = a.alloc(static_cast<u64>(-1));
     CHECK(p == nullptr);
@@ -1365,6 +1370,657 @@ TEST(copilot6, keepalive_timeout_is_60) {
     SmallLoop loop;
     loop.setup();
     CHECK_EQ(loop.keepalive_timeout, 60u);
+}
+
+// === RouteTable ===
+
+TEST(route, match_prefix) {
+    RouteConfig cfg;
+    i32 up = cfg.add_upstream("backend", 0x7F000001, 8080);
+    REQUIRE(up >= 0);
+    cfg.add_proxy("/api/", 0, static_cast<u16>(up));
+
+    const u8 path1[] = "/api/users";
+    auto* r = cfg.match(path1, sizeof(path1) - 1, 0);
+    REQUIRE(r != nullptr);
+    CHECK_EQ(r->action, RouteAction::Proxy);
+    CHECK_EQ(r->upstream_id, static_cast<u16>(up));
+
+    const u8 path2[] = "/health";
+    CHECK(cfg.match(path2, sizeof(path2) - 1, 0) == nullptr);
+}
+
+TEST(route, method_filter) {
+    RouteConfig cfg;
+    cfg.add_static("/status", 'G', 200);
+
+    const u8 path[] = "/status";
+    CHECK(cfg.match(path, sizeof(path) - 1, 'G') != nullptr);
+    CHECK(cfg.match(path, sizeof(path) - 1, 'P') == nullptr);
+}
+
+TEST(route, first_match_wins) {
+    RouteConfig cfg;
+    i32 up1 = cfg.add_upstream("v1", 0x7F000001, 8081);
+    i32 up2 = cfg.add_upstream("v2", 0x7F000001, 8082);
+    cfg.add_proxy("/api/v1/", 0, static_cast<u16>(up1));
+    cfg.add_proxy("/api/", 0, static_cast<u16>(up2));
+
+    const u8 path[] = "/api/v1/users";
+    auto* r = cfg.match(path, sizeof(path) - 1, 0);
+    REQUIRE(r != nullptr);
+    CHECK_EQ(r->upstream_id, static_cast<u16>(up1));
+}
+
+TEST(route, static_response) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 200);
+
+    const u8 path[] = "/health";
+    auto* r = cfg.match(path, sizeof(path) - 1, 0);
+    REQUIRE(r != nullptr);
+    CHECK_EQ(r->action, RouteAction::Static);
+    CHECK_EQ(r->status_code, 200u);
+}
+
+TEST(route, empty_config_no_match) {
+    RouteConfig cfg;
+    const u8 path[] = "/anything";
+    CHECK(cfg.match(path, sizeof(path) - 1, 0) == nullptr);
+}
+
+TEST(route, upstream_target_addr) {
+    RouteConfig cfg;
+    i32 idx = cfg.add_upstream("api", 0x0A000101, 9090);
+    REQUIRE(idx >= 0);
+    auto& t = cfg.upstreams[idx];
+    CHECK_EQ(t.addr.sin_family, AF_INET);
+    CHECK_EQ(__builtin_bswap16(t.addr.sin_port), 9090u);
+    CHECK_EQ(__builtin_bswap32(t.addr.sin_addr.s_addr), 0x0A000101u);
+    CHECK_EQ(t.name[0], 'a');
+}
+
+// === UpstreamPool ===
+
+TEST(upstream_pool, alloc_free) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    CHECK_EQ(c->fd, -1);
+    CHECK(!c->idle);
+    pool.free(c);
+}
+
+TEST(upstream_pool, find_idle) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    c->upstream_id = 5;
+
+    CHECK(pool.find_idle(5) == nullptr);
+    pool.return_idle(c);
+    CHECK(c->idle);
+
+    auto* found = pool.find_idle(5);
+    CHECK_EQ(found, c);
+    CHECK(!found->idle);
+
+    pool.return_idle(c);
+    CHECK(pool.find_idle(99) == nullptr);
+
+    c->fd = -1;
+    pool.free(c);
+}
+
+TEST(upstream_pool, create_socket) {
+    i32 fd = UpstreamPool::create_socket();
+    CHECK(fd >= 0);
+    if (fd >= 0) close(fd);
+}
+
+TEST(upstream_pool, shutdown_closes_fds) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    c->fd = UpstreamPool::create_socket();
+    REQUIRE(c->fd >= 0);
+    i32 saved_fd = c->fd;
+    pool.shutdown();
+    CHECK(close(saved_fd) < 0);
+}
+
+// === SlicePool ===
+
+TEST(slice_pool, init_destroy) {
+    SlicePool pool;
+    REQUIRE(pool.init(64).has_value());
+    CHECK_EQ(pool.count, 64u);
+    CHECK_EQ(pool.available(), 64u);
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
+
+TEST(slice_pool, alloc_free) {
+    SlicePool pool;
+    REQUIRE(pool.init(4).has_value());
+
+    u8* s1 = pool.alloc();
+    u8* s2 = pool.alloc();
+    REQUIRE(s1 != nullptr);
+    REQUIRE(s2 != nullptr);
+    CHECK_NE(s1, s2);
+    CHECK_EQ(pool.available(), 2u);
+    CHECK_EQ(pool.in_use(), 2u);
+
+    // Write to slices — verify no overlap (16KB apart)
+    s1[0] = 'A';
+    s1[SlicePool::kSliceSize - 1] = 'Z';
+    s2[0] = 'B';
+    CHECK_EQ(s1[0], 'A');
+    CHECK_EQ(s1[SlicePool::kSliceSize - 1], 'Z');
+    CHECK_EQ(s2[0], 'B');
+
+    pool.free(s1);
+    CHECK_EQ(pool.available(), 3u);
+    pool.free(s2);
+    CHECK_EQ(pool.available(), 4u);
+    pool.destroy();
+}
+
+TEST(slice_pool, exhaust_and_recover) {
+    SlicePool pool;
+    REQUIRE(pool.init(2).has_value());
+
+    u8* s1 = pool.alloc();
+    u8* s2 = pool.alloc();
+    REQUIRE(s1 != nullptr);
+    REQUIRE(s2 != nullptr);
+    CHECK(pool.alloc() == nullptr);  // exhausted
+    CHECK_EQ(pool.available(), 0u);
+
+    pool.free(s1);
+    u8* s3 = pool.alloc();
+    CHECK(s3 != nullptr);  // recovered
+    CHECK_EQ(s3, s1);      // reuses same slice
+
+    pool.free(s2);
+    pool.free(s3);
+    pool.destroy();
+}
+
+TEST(slice_pool, slice_size) {
+    SlicePool pool;
+    REQUIRE(pool.init(1).has_value());
+    CHECK_EQ(SlicePool::kSliceSize, 16384u);
+    u8* s = pool.alloc();
+    REQUIRE(s != nullptr);
+    // Verify we can write to the full 16KB without crash
+    for (u32 i = 0; i < SlicePool::kSliceSize; i++) s[i] = static_cast<u8>(i & 0xFF);
+    CHECK_EQ(s[0], 0u);
+    CHECK_EQ(s[255], 255u);
+    CHECK_EQ(s[16383], static_cast<u8>(16383 & 0xFF));
+    pool.free(s);
+    pool.destroy();
+}
+
+TEST(slice_pool, free_null_safe) {
+    SlicePool pool;
+    REQUIRE(pool.init(2).has_value());
+    pool.free(nullptr);              // should not crash
+    CHECK_EQ(pool.available(), 2u);  // unchanged
+    pool.destroy();
+}
+
+// SlicePool: out-of-order free
+TEST(slice_pool, out_of_order_free) {
+    SlicePool pool;
+    REQUIRE(pool.init(4).has_value());
+    u8* s1 = pool.alloc();
+    u8* s2 = pool.alloc();
+    u8* s3 = pool.alloc();
+    REQUIRE(s1 && s2 && s3);
+
+    // Free in non-LIFO order
+    pool.free(s2);
+    pool.free(s1);
+    pool.free(s3);
+    CHECK_EQ(pool.available(), 4u);
+
+    // Re-alloc should still work
+    u8* r1 = pool.alloc();
+    u8* r2 = pool.alloc();
+    CHECK(r1 != nullptr);
+    CHECK(r2 != nullptr);
+    pool.free(r1);
+    pool.free(r2);
+    pool.destroy();
+}
+
+// SlicePool: multiple alloc-free cycles don't corrupt free-stack
+TEST(slice_pool, stress_cycles) {
+    SlicePool pool;
+    REQUIRE(pool.init(8).has_value());
+    for (int cycle = 0; cycle < 100; cycle++) {
+        u8* ptrs[8];
+        for (int j = 0; j < 8; j++) {
+            ptrs[j] = pool.alloc();
+            REQUIRE(ptrs[j] != nullptr);
+        }
+        CHECK(pool.alloc() == nullptr);  // exhausted each cycle
+        for (int j = 7; j >= 0; j--) pool.free(ptrs[j]);
+        CHECK_EQ(pool.available(), 8u);
+    }
+    pool.destroy();
+}
+
+// SlicePool: destroy is idempotent
+TEST(slice_pool, destroy_idempotent) {
+    SlicePool pool;
+    REQUIRE(pool.init(4).has_value());
+    pool.destroy();
+    pool.destroy();  // second destroy should not crash
+    CHECK(pool.base == nullptr);
+    CHECK(pool.free_stack == nullptr);
+}
+
+// SlicePool: alloc after destroy returns nullptr
+TEST(slice_pool, alloc_after_destroy) {
+    SlicePool pool;
+    REQUIRE(pool.init(4).has_value());
+    pool.destroy();
+    CHECK(pool.alloc() == nullptr);
+}
+
+// SlicePool: large pool (verify mmap works at scale)
+TEST(slice_pool, large_pool) {
+    SlicePool pool;
+    REQUIRE(pool.init(1024).has_value());  // 1024 * 16KB = 16MB
+    CHECK_EQ(pool.available(), 1024u);
+
+    // Alloc a few, verify they don't overlap
+    u8* first = pool.alloc();
+    u8* last = pool.alloc();
+    REQUIRE(first != nullptr);
+    REQUIRE(last != nullptr);
+    // Must be at least 16KB apart
+    u64 dist = (first > last) ? static_cast<u64>(first - last) : static_cast<u64>(last - first);
+    CHECK(dist >= SlicePool::kSliceSize);
+
+    pool.free(first);
+    pool.free(last);
+    pool.destroy();
+}
+
+// === SlabPool ===
+
+struct TestObj {
+    i32 value;
+    u8 data[60];  // pad to 64 bytes
+};
+
+TEST(slab_pool, init_destroy) {
+    SlabPool<TestObj, 128> pool;
+    REQUIRE(pool.init().has_value());
+    CHECK_EQ(pool.capacity(), 128u);
+    CHECK_EQ(pool.available(), 128u);
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
+
+TEST(slab_pool, alloc_free_by_ptr) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE(pool.init().has_value());
+
+    TestObj* a = pool.alloc();
+    TestObj* b = pool.alloc();
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK_NE(a, b);
+    CHECK_EQ(pool.in_use(), 2u);
+
+    a->value = 42;
+    b->value = 99;
+    CHECK_EQ(a->value, 42);
+    CHECK_EQ(b->value, 99);
+
+    pool.free(a);
+    pool.free(b);
+    CHECK_EQ(pool.available(), 4u);
+    pool.destroy();
+}
+
+TEST(slab_pool, alloc_with_id) {
+    SlabPool<TestObj, 8> pool;
+    REQUIRE(pool.init().has_value());
+
+    u32 idx = 0;
+    TestObj* obj = pool.alloc_with_id(idx);
+    REQUIRE(obj != nullptr);
+    obj->value = 7;
+    CHECK_EQ(pool[idx].value, 7);
+    CHECK_EQ(pool.index_of(obj), idx);
+
+    pool.free(idx);
+    CHECK_EQ(pool.available(), 8u);
+    pool.destroy();
+}
+
+TEST(slab_pool, exhaust) {
+    SlabPool<TestObj, 2> pool;
+    REQUIRE(pool.init().has_value());
+
+    TestObj* a = pool.alloc();
+    TestObj* b = pool.alloc();
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK(pool.alloc() == nullptr);
+
+    pool.free(a);
+    TestObj* c = pool.alloc();
+    CHECK_EQ(c, a);
+
+    pool.free(b);
+    pool.free(c);
+    pool.destroy();
+}
+
+TEST(slab_pool, index_of) {
+    SlabPool<TestObj, 16> pool;
+    REQUIRE(pool.init().has_value());
+
+    TestObj* a = pool.alloc();
+    TestObj* b = pool.alloc();
+    u32 ia = pool.index_of(a);
+    u32 ib = pool.index_of(b);
+    CHECK_NE(ia, ib);
+    CHECK_EQ(&pool[ia], a);
+    CHECK_EQ(&pool[ib], b);
+
+    pool.free(a);
+    pool.free(b);
+    pool.destroy();
+}
+
+// SlabPool: capacity 1
+TEST(slab_pool, capacity_one) {
+    SlabPool<TestObj, 1> pool;
+    REQUIRE(pool.init().has_value());
+    CHECK_EQ(pool.capacity(), 1u);
+
+    TestObj* a = pool.alloc();
+    REQUIRE(a != nullptr);
+    CHECK(pool.alloc() == nullptr);  // full
+
+    a->value = 77;
+    CHECK_EQ(pool[0].value, 77);
+
+    pool.free(a);
+    TestObj* b = pool.alloc();
+    CHECK_EQ(b, a);  // reused
+
+    pool.free(b);
+    pool.destroy();
+}
+
+// SlabPool: free by index vs free by pointer consistency
+TEST(slab_pool, free_by_index_vs_ptr) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE(pool.init().has_value());
+
+    u32 idx1 = 0;
+    TestObj* a = pool.alloc_with_id(idx1);
+    u32 idx2 = 0;
+    TestObj* b = pool.alloc_with_id(idx2);
+    REQUIRE(a && b);
+
+    // Free a by index, b by pointer
+    pool.free(idx1);
+    pool.free(b);
+    CHECK_EQ(pool.available(), 4u);
+
+    // Both slots reusable
+    TestObj* c = pool.alloc();
+    TestObj* d = pool.alloc();
+    CHECK(c != nullptr);
+    CHECK(d != nullptr);
+
+    pool.free(c);
+    pool.free(d);
+    pool.destroy();
+}
+
+// SlabPool: alloc_with_id when empty returns nullptr
+TEST(slab_pool, alloc_with_id_empty) {
+    SlabPool<TestObj, 1> pool;
+    REQUIRE(pool.init().has_value());
+
+    u32 idx = 999;
+    pool.alloc();  // take the only slot
+
+    TestObj* obj = pool.alloc_with_id(idx);
+    CHECK(obj == nullptr);
+    CHECK_EQ(idx, 0u);  // idx set to 0 on failure
+
+    // Cleanup
+    pool.free(static_cast<u32>(0));
+    pool.destroy();
+}
+
+// SlabPool: destroy idempotent
+TEST(slab_pool, destroy_idempotent) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE(pool.init().has_value());
+    pool.destroy();
+    pool.destroy();  // second destroy should not crash
+    CHECK(pool.objects == nullptr);
+    CHECK(pool.free_stack == nullptr);
+}
+
+// SlabPool: stress alloc-free cycles
+TEST(slab_pool, stress_cycles) {
+    SlabPool<TestObj, 16> pool;
+    REQUIRE(pool.init().has_value());
+    for (int cycle = 0; cycle < 50; cycle++) {
+        TestObj* ptrs[16];
+        for (int j = 0; j < 16; j++) {
+            ptrs[j] = pool.alloc();
+            REQUIRE(ptrs[j] != nullptr);
+            ptrs[j]->value = cycle * 16 + j;
+        }
+        CHECK(pool.alloc() == nullptr);
+        // Verify values
+        for (int j = 0; j < 16; j++) CHECK_EQ(ptrs[j]->value, cycle * 16 + j);
+        // Free all
+        for (int j = 0; j < 16; j++) pool.free(ptrs[j]);
+        CHECK_EQ(pool.available(), 16u);
+    }
+    pool.destroy();
+}
+
+// SlabPool: different object type (small)
+struct SmallObj {
+    u8 tag;
+};
+
+TEST(slab_pool, small_object) {
+    SlabPool<SmallObj, 32> pool;
+    REQUIRE(pool.init().has_value());
+    SmallObj* a = pool.alloc();
+    REQUIRE(a != nullptr);
+    a->tag = 0xAB;
+    CHECK_EQ(&pool[pool.index_of(a)], a);  // index_of round-trips to same pointer
+    CHECK_EQ(a->tag, 0xABu);
+    pool.free(a);
+    pool.destroy();
+}
+
+// === Double-free detection ===
+
+TEST(slice_pool, double_free_rejected) {
+    SlicePool pool;
+    REQUIRE(pool.init(4));
+    u8* s = pool.alloc();
+    REQUIRE(s != nullptr);
+    CHECK_EQ(pool.available(), 3u);
+    pool.free(s);
+    CHECK_EQ(pool.available(), 4u);
+    pool.free(s);                    // double-free: should be silently rejected
+    CHECK_EQ(pool.available(), 4u);  // unchanged
+    pool.destroy();
+}
+
+TEST(slab_pool, double_free_by_ptr_rejected) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE(pool.init());
+    TestObj* a = pool.alloc();
+    REQUIRE(a != nullptr);
+    CHECK_EQ(pool.in_use(), 1u);
+    pool.free(a);
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.free(a);                 // double-free
+    CHECK_EQ(pool.in_use(), 0u);  // unchanged
+    pool.destroy();
+}
+
+TEST(slab_pool, double_free_by_idx_rejected) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE(pool.init());
+    u32 idx = 0;
+    pool.alloc_with_id(idx);
+    pool.free(idx);
+    CHECK_EQ(pool.available(), 4u);
+    pool.free(idx);                  // double-free
+    CHECK_EQ(pool.available(), 4u);  // unchanged
+    pool.destroy();
+}
+
+TEST(upstream_pool, double_free_rejected) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    u32 before = pool.free_top;
+    c->fd = -1;  // no real fd to close
+    pool.free(c);
+    CHECK_EQ(pool.free_top, before + 1);
+    pool.free(c);                         // double-free: allocated=false now
+    CHECK_EQ(pool.free_top, before + 1);  // unchanged
+}
+
+// === UpstreamPool validation ===
+
+TEST(upstream_pool, return_idle_null_safe) {
+    UpstreamPool pool;
+    pool.init();
+    pool.return_idle(nullptr);  // should not crash
+}
+
+TEST(upstream_pool, return_idle_requires_allocated) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    c->fd = -1;
+    pool.free(c);
+    // c is now free — return_idle should reject
+    pool.return_idle(c);
+    CHECK(!c->idle);  // not marked idle (allocated=false)
+}
+
+TEST(upstream_pool, shutdown_is_idempotent) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    c->fd = UpstreamPool::create_socket();
+    pool.shutdown();
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+    pool.shutdown();  // second shutdown
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+}
+
+TEST(upstream_pool, alloc_resets_upstream_id) {
+    UpstreamPool pool;
+    pool.init();
+    auto* c = pool.alloc();
+    REQUIRE(c != nullptr);
+    c->upstream_id = 42;
+    c->fd = -1;
+    pool.free(c);
+    auto* c2 = pool.alloc();
+    CHECK_EQ(c2->upstream_id, 0u);  // reset on alloc
+    c2->fd = -1;
+    pool.free(c2);
+}
+
+// === RouteTable validation ===
+
+TEST(route, add_proxy_invalid_upstream_id) {
+    RouteConfig cfg;
+    // No upstreams added — upstream_id 0 is invalid
+    CHECK(!cfg.add_proxy("/api/", 0, 0));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_proxy_path_too_long) {
+    RouteConfig cfg;
+    cfg.add_upstream("x", 0x7F000001, 80);
+    char long_path[256];
+    for (u32 i = 0; i < 255; i++) long_path[i] = 'a';
+    long_path[255] = '\0';
+    CHECK(!cfg.add_proxy(long_path, 0, 0));  // exceeds 128-char RouteEntry::path
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_static_path_too_long) {
+    RouteConfig cfg;
+    char long_path[256];
+    for (u32 i = 0; i < 255; i++) long_path[i] = 'b';
+    long_path[255] = '\0';
+    CHECK(!cfg.add_static(long_path, 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_upstream_at_capacity) {
+    RouteConfig cfg;
+    for (u32 i = 0; i < RouteConfig::kMaxUpstreams; i++) {
+        CHECK(cfg.add_upstream("x", 0x7F000001, static_cast<u16>(8080 + i)) >= 0);
+    }
+    CHECK(cfg.add_upstream("overflow", 0x7F000001, 9999) < 0);  // full
+}
+
+TEST(route, add_route_at_capacity) {
+    RouteConfig cfg;
+    cfg.add_upstream("x", 0x7F000001, 80);
+    for (u32 i = 0; i < RouteConfig::kMaxRoutes; i++) {
+        char path[8];
+        path[0] = '/';
+        path[1] = static_cast<char>('0' + (i / 100) % 10);
+        path[2] = static_cast<char>('0' + (i / 10) % 10);
+        path[3] = static_cast<char>('0' + i % 10);
+        path[4] = '\0';
+        CHECK(cfg.add_proxy(path, 0, 0));
+    }
+    CHECK(!cfg.add_proxy("/overflow", 0, 0));  // full
+}
+
+// === Error source ===
+
+TEST(error, from_errno_captures_source) {
+    errno = ENOMEM;
+    Error e = Error::from_errno(Error::Source::Mmap);
+    CHECK_EQ(e.code, ENOMEM);
+    CHECK_EQ(static_cast<u8>(e.source), static_cast<u8>(Error::Source::Mmap));
+}
+
+TEST(error, make_with_code) {
+    Error e = Error::make(EINVAL, Error::Source::Socket);
+    CHECK_EQ(e.code, EINVAL);
+    CHECK_EQ(static_cast<u8>(e.source), static_cast<u8>(Error::Source::Socket));
 }
 
 int main(int argc, char** argv) {

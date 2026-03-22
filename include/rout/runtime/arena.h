@@ -1,6 +1,9 @@
 #pragma once
 
 #include "rout/common/types.h"
+#include "rout/runtime/error.h"
+
+#include "core/expected.h"
 
 #include <errno.h>
 #include <sys/mman.h>  // mmap, munmap
@@ -38,11 +41,12 @@ struct Arena {
     u64 block_size = 0;
     u64 total_allocated = 0;
 
-    i32 init(u64 initial_block_size) {
+    core::Expected<void, Error> init(u64 initial_block_size) {
         block_size = initial_block_size < 256 ? 256 : initial_block_size;
         total_allocated = 0;
         current = alloc_block(block_size, nullptr);
-        return current ? 0 : -errno;
+        if (!current) return core::make_unexpected(Error::from_errno(Error::Source::Arena));
+        return {};
     }
 
     // Bump allocate, 8-byte aligned.

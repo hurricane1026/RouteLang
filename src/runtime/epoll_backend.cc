@@ -1,5 +1,9 @@
 #include "rout/runtime/epoll_backend.h"
 
+#include "rout/runtime/error.h"
+
+#include "core/expected.h"
+
 #include <errno.h>
 #include <string.h>  // memset
 #include <sys/epoll.h>
@@ -28,7 +32,7 @@ void EpollBackend::decode_data(u64 data, u32& conn_id, IoEventType& type) {
 
 // --- Init ---
 
-i32 EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
+core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
     listen_fd = lfd;
     epoll_fd = -1;
     timer_fd = -1;
@@ -39,7 +43,7 @@ i32 EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
     }
 
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd < 0) return -errno;
+    if (epoll_fd < 0) return core::make_unexpected(Error::from_errno(Error::Source::Epoll));
 
     // Create timerfd for 1-second ticks (drives timer wheel)
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -47,7 +51,7 @@ i32 EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
         i32 err = errno;
         close(epoll_fd);
         epoll_fd = -1;
-        return -err;
+        return core::make_unexpected(Error::make(err, Error::Source::Timerfd));
     }
 
     struct itimerspec ts;
@@ -61,11 +65,12 @@ i32 EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
     ev.events = EPOLLIN;
     ev.data.u64 = encode_data(kTimerConnId, IoEventType::Timeout);
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &ev) < 0) {
+        i32 err = errno;
         shutdown();
-        return -errno;
+        return core::make_unexpected(Error::make(err, Error::Source::Epoll));
     }
 
-    return 0;
+    return {};
 }
 
 // --- Operations ---

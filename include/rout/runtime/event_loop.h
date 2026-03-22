@@ -3,9 +3,12 @@
 #include "rout/common/types.h"
 #include "rout/runtime/callbacks.h"
 #include "rout/runtime/connection.h"
+#include "rout/runtime/error.h"
 #include "rout/runtime/io_backend.h"
 #include "rout/runtime/io_event.h"
 #include "rout/runtime/timer_wheel.h"
+
+#include "core/expected.h"
 
 #include <unistd.h>  // close()
 
@@ -53,8 +56,12 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
     Backend backend;
     TimerWheel timer;
     u32 shard_id;
-    bool running;
 
+private:
+    volatile bool running_;  // stop() from main thread, while loop in shard thread.
+                             // volatile prevents compiler from hoisting read out of loop.
+
+public:
     static constexpr u32 kMaxConns = 16384;
     Connection conns[kMaxConns];
     u32 free_stack[kMaxConns];
@@ -62,10 +69,10 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
 
     u32 keepalive_timeout = 60;
 
-    i32 init(u32 id, i32 listen_fd) {
+    core::Expected<void, Error> init(u32 id, i32 listen_fd) {
         shard_id = id;
-        running = true;
-        keepalive_timeout = 60;  // explicit: mmap zeroes memory, skipping default member init
+        running_ = true;
+        keepalive_timeout = 60;
         free_top = kMaxConns;
         timer.init();
         for (u32 i = 0; i < kMaxConns; i++) {
@@ -74,14 +81,15 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
         }
-        return backend.init(id, listen_fd);
+        TRY_VOID(backend.init(id, listen_fd));
+        return {};
     }
 
     void run() {
         backend.add_accept();
         IoEvent events[kMaxEventsPerWait];
 
-        while (running) {
+        while (is_running()) {
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
             for (u32 i = 0; i < n; i++) {
                 dispatch(events[i]);
@@ -89,7 +97,8 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
         }
     }
 
-    void stop() { running = false; }
+    void stop() { running_ = false; }
+    bool is_running() const { return running_; }
     void shutdown() { backend.shutdown(); }
 
     // --- CRTP implementations ---

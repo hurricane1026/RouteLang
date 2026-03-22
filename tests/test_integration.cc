@@ -1,5 +1,6 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
 #include "rout/runtime/io_uring_backend.h"
+#include "rout/runtime/shard.h"
 
 #include "test.h"
 #include "test_helpers.h"
@@ -7,14 +8,14 @@
 // === Socket Setup (libuv: test-tcp-bind-error, test-tcp-flags, test-tcp-reuseport) ===
 
 TEST(socket, nonblocking) {
-    i32 fd = create_listen_socket(0);
+    i32 fd = create_listen_socket(0).value_or(-1);
     REQUIRE(fd >= 0);
     CHECK(fcntl(fd, F_GETFL, 0) & O_NONBLOCK);
     close(fd);
 }
 
 TEST(socket, reuseport) {
-    i32 fd = create_listen_socket(0);
+    i32 fd = create_listen_socket(0).value_or(-1);
     REQUIRE(fd >= 0);
     i32 val = 0;
     socklen_t len = sizeof(val);
@@ -24,7 +25,7 @@ TEST(socket, reuseport) {
 }
 
 TEST(socket, nodelay) {
-    i32 fd = create_listen_socket(0);
+    i32 fd = create_listen_socket(0).value_or(-1);
     REQUIRE(fd >= 0);
     i32 val = 0;
     socklen_t len = sizeof(val);
@@ -34,9 +35,9 @@ TEST(socket, nodelay) {
 }
 
 TEST(socket, two_listeners_same_port) {
-    i32 fd1 = create_listen_socket(0);
+    i32 fd1 = create_listen_socket(0).value_or(-1);
     REQUIRE(fd1 >= 0);
-    i32 fd2 = create_listen_socket(get_port(fd1));
+    i32 fd2 = create_listen_socket(get_port(fd1)).value_or(-1);
     CHECK(fd2 >= 0);
     if (fd2 >= 0) close(fd2);
     close(fd1);
@@ -70,7 +71,7 @@ TEST(socket, double_bind_error) {
 }
 
 TEST(socket, double_listen_ok) {
-    i32 fd = create_listen_socket(0);
+    i32 fd = create_listen_socket(0).value_or(-1);
     REQUIRE(fd >= 0);
     CHECK_EQ(listen(fd, 4096), 0);
     close(fd);
@@ -289,7 +290,7 @@ TEST(error, server_shutdown_with_clients) {
 }
 
 TEST(error, double_close_no_crash) {
-    i32 fd = create_listen_socket(0);
+    i32 fd = create_listen_socket(0).value_or(-1);
     REQUIRE(fd >= 0);
     close(fd);
     CHECK(close(fd) < 0);
@@ -337,7 +338,7 @@ TEST(loop, stop_from_outside) {
     send_all(c, HTTP_REQ, HTTP_REQ_LEN);
     char buf[4096];
     recv_timeout(c, buf, sizeof(buf), 1000);
-    srv.loop->running = false;
+    srv.loop->stop();
     close(c);
     srv.teardown();
 }
@@ -349,9 +350,9 @@ TEST(loop, stop_from_outside) {
 TEST(partial_send, state_initialized) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
-    i32 fd = create_listen_socket(0);
+    i32 fd = create_listen_socket(0).value_or(-1);
     REQUIRE(fd >= 0);
-    REQUIRE_EQ(loop->init(0, fd), 0);
+    REQUIRE(loop->init(0, fd).has_value());
     // EpollBackend send_state should be zero-initialized
     for (u32 i = 0; i < EpollBackend::kMaxFdMap; i++) {
         CHECK_EQ(loop->backend.send_state[i].remaining, 0u);
@@ -380,7 +381,7 @@ TEST(partial_send, real_epollout_completion) {
     // Use init() so timerfd is created — gives wait() a bounded 1-second wakeup
     // to prevent indefinite hangs if EPOLLOUT doesn't fire immediately.
     EpollBackend backend;
-    REQUIRE_EQ(backend.init(0, -1), 0);
+    REQUIRE(backend.init(0, -1).has_value());
     backend.fd_map[0] = fds[0];
 
     Connection conn;
@@ -447,7 +448,7 @@ TEST(partial_send, socketpair_full_send) {
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
 
     EpollBackend backend;
-    REQUIRE_EQ(backend.init(0, -1), 0);
+    REQUIRE(backend.init(0, -1).has_value());
     backend.fd_map[0] = fds[0];
 
     Connection conn;
@@ -491,7 +492,7 @@ TEST(partial_send, send_to_closed_peer) {
     close(fds[1]);
 
     EpollBackend backend;
-    REQUIRE_EQ(backend.init(0, -1), 0);
+    REQUIRE(backend.init(0, -1).has_value());
 
     Connection conn;
     conn.reset();
@@ -521,7 +522,7 @@ TEST(partial_send, send_to_closed_peer) {
 // Verify send_state is zeroed per connection after init
 TEST(partial_send, state_zeroed_per_conn) {
     EpollBackend backend;
-    REQUIRE_EQ(backend.init(0, -1), 0);
+    REQUIRE(backend.init(0, -1).has_value());
     // Spot check several entries
     CHECK_EQ(backend.send_state[0].offset, 0u);
     CHECK_EQ(backend.send_state[0].remaining, 0u);
@@ -538,7 +539,7 @@ TEST(partial_send, epollout_no_pending_switches_to_epollin) {
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
 
     EpollBackend backend;
-    REQUIRE_EQ(backend.init(0, -1), 0);
+    REQUIRE(backend.init(0, -1).has_value());
     backend.fd_map[0] = fds[0];
 
     Connection conn;
@@ -592,10 +593,10 @@ TEST(partial_send, epollout_no_pending_switches_to_epollin) {
 TEST(uring, init_creates_timerfd) {
     // io_uring requires Linux 6.0+. If init fails, skip gracefully.
     IoUringBackend backend;
-    i32 lfd = create_listen_socket(0);
+    i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
-    i32 rc = backend.init(0, lfd);
-    if (rc < 0) {
+    auto rc = backend.init(0, lfd);
+    if (!rc) {
         // io_uring not available — skip
         close(lfd);
         CHECK(true);
@@ -609,10 +610,10 @@ TEST(uring, init_creates_timerfd) {
 // Verify return_buffer doesn't crash (ring structure test)
 TEST(uring, return_buffer_no_crash) {
     IoUringBackend backend;
-    i32 lfd = create_listen_socket(0);
+    i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
-    i32 rc = backend.init(0, lfd);
-    if (rc < 0) {
+    auto rc = backend.init(0, lfd);
+    if (!rc) {
         close(lfd);
         CHECK(true);
         return;
@@ -622,6 +623,192 @@ TEST(uring, return_buffer_no_crash) {
     // Return buffer at boundary
     backend.return_buffer(static_cast<u16>(kProvidedBufCount - 1));
     backend.shutdown();
+    close(lfd);
+}
+
+// === Shard lifecycle ===
+
+// Shard init + shutdown without spawning a thread
+TEST(shard, init_shutdown) {
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(shard.init(0, lfd).has_value());
+    CHECK(shard.loop != nullptr);
+    CHECK_EQ(shard.id, 0u);
+    CHECK_EQ(shard.listen_fd, lfd);
+    shard.shutdown();
+    CHECK(shard.loop == nullptr);
+    close(lfd);
+}
+
+// Shard spawn + stop + join
+TEST(shard, spawn_stop_join) {
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn(-1).has_value());  // no CPU pinning
+    CHECK(shard.thread_spawned);
+
+    // Let the shard run briefly, then stop
+    usleep(50000);  // 50ms
+    shard.stop();
+    shard.join();
+    CHECK(!shard.thread_spawned);
+    shard.shutdown();
+    close(lfd);
+}
+
+// Shard handles requests while running
+TEST(shard, serves_requests) {
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn(-1).has_value());
+
+    usleep(50000);  // let shard start
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    char buf[4096];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(n > 0);
+    CHECK(has_200(buf, n));
+    close(c);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// Two shards on same port (SO_REUSEPORT)
+TEST(shard, two_shards_same_port) {
+    i32 lfd1 = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd1 >= 0);
+    u16 port = get_port(lfd1);
+    i32 lfd2 = create_listen_socket(port).value_or(-1);
+    REQUIRE(lfd2 >= 0);
+
+    Shard<EpollBackend> s1, s2;
+    REQUIRE(s1.init(0, lfd1).has_value());
+    REQUIRE(s2.init(1, lfd2).has_value());
+    REQUIRE(s1.spawn(-1).has_value());
+    REQUIRE(s2.spawn(-1).has_value());
+
+    usleep(50000);
+
+    // Send requests — kernel distributes across shards
+    for (int i = 0; i < 5; i++) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+        char buf[4096];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK(n > 0);
+        close(c);
+    }
+
+    s1.stop();
+    s2.stop();
+    s1.join();
+    s2.join();
+    s1.shutdown();
+    s2.shutdown();
+    close(lfd1);
+    close(lfd2);
+}
+
+// detect_cpu_count returns > 0
+TEST(shard, detect_cpu_count) {
+    u32 cpus = detect_cpu_count();
+    CHECK(cpus > 0);
+    CHECK(cpus <= 1024);  // sanity upper bound
+}
+
+// Two shards with ephemeral port (port=0) bind the same port
+TEST(shard, ephemeral_port_two_shards) {
+    // First shard gets ephemeral port
+    i32 lfd1 = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd1 >= 0);
+    u16 port = get_port(lfd1);
+    CHECK(port > 0);
+
+    // Second shard should bind the same port (SO_REUSEPORT)
+    i32 lfd2 = create_listen_socket(port).value_or(-1);
+    REQUIRE(lfd2 >= 0);
+    CHECK_EQ(get_port(lfd2), port);
+
+    Shard<EpollBackend> s1, s2;
+    REQUIRE(s1.init(0, lfd1).has_value());
+    REQUIRE(s2.init(1, lfd2).has_value());
+    REQUIRE(s1.spawn(-1).has_value());
+    REQUIRE(s2.spawn(-1).has_value());
+
+    usleep(50000);
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    char buf[4096];
+    CHECK(recv_timeout(c, buf, sizeof(buf), 2000) > 0);
+    close(c);
+
+    s1.stop();
+    s2.stop();
+    s1.join();
+    s2.join();
+    s1.shutdown();
+    s2.shutdown();
+    close(lfd1);
+    close(lfd2);
+}
+
+// Shard with owns_listen_fd closes it on shutdown
+TEST(shard, owns_listen_fd) {
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.owns_listen_fd = true;
+    shard.shutdown();
+    // lfd should be closed now — verify by trying to close again
+    CHECK(close(lfd) < 0);
+}
+
+// Shard has upstream pool after init
+TEST(shard, upstream_pool_initialized) {
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(shard.init(0, lfd).has_value());
+    CHECK(shard.upstream != nullptr);
+    // Pool should be fresh (all free)
+    auto* c = shard.upstream->alloc();
+    CHECK(c != nullptr);
+    shard.upstream->free(c);
+    shard.shutdown();
+    close(lfd);
+}
+
+// Shard can hold a route config
+TEST(shard, route_config_attached) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 200);
+    cfg.add_upstream("api", 0x7F000001, 8080);
+    cfg.add_proxy("/api/", 0, 0);
+
+    Shard<EpollBackend> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    CHECK(shard.route_config != nullptr);
+    CHECK_EQ(shard.route_config->route_count, 2u);
+    CHECK_EQ(shard.route_config->upstream_count, 1u);
+    shard.shutdown();
     close(lfd);
 }
 
@@ -666,14 +853,14 @@ TEST(copilot, keepalive_20_cycles_eexist_regression) {
 // Regression: listen_fd must be closeable after server teardown.
 // Proves the fd isn't leaked or double-closed.
 TEST(copilot6, listen_fd_not_leaked) {
-    i32 fd1 = create_listen_socket(0);
+    i32 fd1 = create_listen_socket(0).value_or(-1);
     REQUIRE(fd1 >= 0);
     u16 port = get_port(fd1);
 
     // Use the fd in a server, tear it down
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
-    REQUIRE_EQ(loop->init(0, fd1), 0);
+    REQUIRE(loop->init(0, fd1).has_value());
     // Don't run the loop, just init + shutdown
     loop->shutdown();
     destroy_real_loop(loop);
@@ -683,7 +870,7 @@ TEST(copilot6, listen_fd_not_leaked) {
     CHECK_EQ(close(fd1), 0);
 
     // Now the port should be reusable
-    i32 fd2 = create_listen_socket(port);
+    i32 fd2 = create_listen_socket(port).value_or(-1);
     CHECK(fd2 >= 0);
     if (fd2 >= 0) close(fd2);
 }
@@ -693,9 +880,9 @@ TEST(copilot6, listen_fd_not_leaked) {
 TEST(copilot6, real_loop_keepalive_timeout) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
-    i32 fd = create_listen_socket(0);
+    i32 fd = create_listen_socket(0).value_or(-1);
     REQUIRE(fd >= 0);
-    REQUIRE_EQ(loop->init(0, fd), 0);
+    REQUIRE(loop->init(0, fd).has_value());
     CHECK_EQ(loop->keepalive_timeout, 60u);
     loop->shutdown();
     close(fd);

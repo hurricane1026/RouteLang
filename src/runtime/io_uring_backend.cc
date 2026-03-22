@@ -1,6 +1,9 @@
 #include "rout/runtime/io_uring_backend.h"
 
 #include "rout/runtime/connection.h"
+#include "rout/runtime/error.h"
+
+#include "core/expected.h"
 
 #include <errno.h>
 #include <linux/io_uring.h>
@@ -82,7 +85,7 @@ static void sqe_advance_tail(u32* sq_tail) {
 
 // --- Init ---
 
-i32 IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
+core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     listen_fd = lfd;
     // Explicitly init fds to -1: mmap-zeroed memory skips default member initializers,
     // so timer_fd/ring_fd could be 0. If init fails early and calls shutdown(), closing
@@ -101,7 +104,7 @@ i32 IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
 
     constexpr u32 kRingEntries = 16384;
     ring_fd = io_uring_setup(kRingEntries, &params);
-    if (ring_fd < 0) return ring_fd;
+    if (ring_fd < 0) return core::make_unexpected(Error::make(-ring_fd, Error::Source::IoUring));
 
     sq_ring_entries = params.sq_entries;
     cq_ring_entries = params.cq_entries;
@@ -115,8 +118,9 @@ i32 IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
                        ring_fd,
                        IORING_OFF_SQ_RING);
     if (sq_ring_ptr == MAP_FAILED) {
+        i32 err = errno;
         shutdown();
-        return -errno;
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
 
     auto* sq_base = static_cast<u8*>(sq_ring_ptr);
@@ -134,8 +138,9 @@ i32 IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
                     ring_fd,
                     IORING_OFF_SQES);
     if (sqes_ptr == MAP_FAILED) {
+        i32 err = errno;
         shutdown();
-        return -errno;
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
     sq_entries = static_cast<io_uring_sqe*>(sqes_ptr);
 
@@ -148,8 +153,9 @@ i32 IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
                        ring_fd,
                        IORING_OFF_CQ_RING);
     if (cq_ring_ptr == MAP_FAILED) {
+        i32 err = errno;
         shutdown();
-        return -errno;
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
 
     auto* cq_base = static_cast<u8*>(cq_ring_ptr);
@@ -159,15 +165,14 @@ i32 IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     cq_entries = reinterpret_cast<io_uring_cqe*>(cq_base + params.cq_off.cqes);
 
     // Setup provided buffer ring for zero-copy recv
-    i32 rc = setup_buf_ring();
-    if (rc < 0) return rc;
+    TRY_VOID(setup_buf_ring());
 
     // Create timerfd for 1-second ticks (drives timer wheel)
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (timer_fd < 0) {
         i32 err = errno;
         shutdown();
-        return -err;
+        return core::make_unexpected(Error::make(err, Error::Source::Timerfd));
     }
     struct itimerspec ts;
     memset(&ts, 0, sizeof(ts));
@@ -176,18 +181,18 @@ i32 IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     if (timerfd_settime(timer_fd, 0, &ts, nullptr) < 0) {
         i32 err = errno;
         shutdown();
-        return -err;
+        return core::make_unexpected(Error::make(err, Error::Source::Timerfd));
     }
 
     // Submit initial read on timerfd
     submit_timer_read();
 
-    return 0;
+    return {};
 }
 
 // --- Provided buffer ring ---
 
-i32 IoUringBackend::setup_buf_ring() {
+core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
     // Allocate buffer memory: kProvidedBufCount * kProvidedBufSize
     u64 total_buf_sz = static_cast<u64>(kProvidedBufCount) * kProvidedBufSize;
     buf_base = static_cast<u8*>(mmap(nullptr,
@@ -197,8 +202,9 @@ i32 IoUringBackend::setup_buf_ring() {
                                      -1,
                                      0));
     if (buf_base == MAP_FAILED) {
+        i32 err = errno;
         shutdown();
-        return -errno;
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
 
     // Allocate the buf_ring structure itself
@@ -210,8 +216,9 @@ i32 IoUringBackend::setup_buf_ring() {
                           -1,
                           0);
     if (ring_mem == MAP_FAILED) {
+        i32 err = errno;
         shutdown();
-        return -errno;
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
     buf_ring = static_cast<io_uring_buf_ring*>(ring_mem);
 
@@ -225,7 +232,7 @@ i32 IoUringBackend::setup_buf_ring() {
     i32 rc = io_uring_register(ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1);
     if (rc < 0) {
         shutdown();
-        return rc;
+        return core::make_unexpected(Error::make(-rc, Error::Source::IoUring));
     }
 
     // Fill the ring with buffer entries
@@ -238,7 +245,7 @@ i32 IoUringBackend::setup_buf_ring() {
     // Advance the ring tail to make all buffers available
     __atomic_store_n(&buf_ring->tail, static_cast<u16>(kProvidedBufCount), __ATOMIC_RELEASE);
 
-    return 0;
+    return {};
 }
 
 void IoUringBackend::return_buffer(u16 buf_id) {

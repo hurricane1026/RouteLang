@@ -1,7 +1,10 @@
 #pragma once
 
 #include "rout/common/types.h"
+#include "rout/runtime/error.h"
 #include "rout/runtime/io_event.h"
+
+#include "core/expected.h"
 
 namespace rout {
 
@@ -31,10 +34,10 @@ struct MockBackend {
     IoEvent pending[kMaxEvents];
     u32 pending_count = 0;
 
-    i32 init(u32 /*shard_id*/, i32 /*listen_fd*/) {
+    core::Expected<void, Error> init(u32 /*shard_id*/, i32 /*listen_fd*/) {
         op_count = 0;
         pending_count = 0;
-        return 0;
+        return {};
     }
 
     void add_accept() {

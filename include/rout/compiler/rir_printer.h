@@ -9,10 +9,14 @@ namespace rir {
 // Produces human-readable --emit-rir text output. Writes directly to
 // a file descriptor (no stdio, no stdlib).
 //
-// Output format (differs from DESIGN.md §11.2.5 in two ways:
+// Output format (differs from DESIGN.md §11.2.5 in several ways):
 // 1. All operands are SSA references — string/numeric literals are
 //    materialized as const.str/const.i32 instructions, not inlined.
 // 2. Header uses "route:" instead of "params:".
+// 3. Nil checks use explicit "opt.is_nil %v" instructions, not the
+//    "%v.is_nil" sugar shown in DESIGN.md.
+// 4. Domain immediates (Duration, ByteSize, Method) print as raw
+//    numeric values, not pretty-printed units.
 //
 //   === handle_get_users_id ===
 //     route: /users/:id

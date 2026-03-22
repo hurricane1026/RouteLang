@@ -132,10 +132,10 @@ enum class Opcode : u8 {
     ConstI32,       // %r = const.i32 42
     ConstI64,       // %r = const.i64 42
     ConstBool,      // %r = const.bool true
-    ConstDuration,  // %r = const.duration 5m  (stored as seconds)
-    ConstByteSize,  // %r = const.bytesize 1mb (stored as bytes)
-    ConstMethod,    // %r = const.method GET
-    ConstStatus,    // %r = const.status 200
+    ConstDuration,  // %r = const.duration <seconds>  (printed as raw i64)
+    ConstByteSize,  // %r = const.bytesize <bytes>   (printed as raw i64)
+    ConstMethod,    // %r = const.method <code>       (printed as raw u8)
+    ConstStatus,    // %r = const.status <code>       (printed as raw i32)
 
     // ── Request access ──
     ReqHeader,         // %r = req.header "Name"        → Optional(str)

@@ -199,7 +199,9 @@ struct Builder {
         return {};
     }
 
-    // Check that a ValueId is a valid SSA reference (not kNoValue sentinel).
+    // Check that a ValueId is a valid SSA reference in the current function.
+    // Note: cannot detect cross-function misuse (ValueId is a bare index by
+    // design — see rir.h comment). Callers must not mix IDs across functions.
     bool valid_val(ValueId v) const {
         return v != kNoValue && cur_func && v.id < cur_func->value_count;
     }
@@ -258,6 +260,7 @@ struct Builder {
     // ── Helpers for variadic operand storage ────────────────────────
 
     VoidResult set_operands(Instruction* inst, const ValueId* ops, u32 count) {
+        if (count > 0 && !ops) return err(RirError::InvalidState);
         for (u32 i = 0; i < count; i++) {
             if (!valid_val(ops[i])) return err(RirError::InvalidState);
         }

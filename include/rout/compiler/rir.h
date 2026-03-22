@@ -92,6 +92,12 @@ struct StructDef {
 // Index-based SSA: %0, %1, %2... are indices into the function's value
 // table. This is cache-friendly, trivially serializable, and works
 // naturally with FixedVec/Arena storage.
+//
+// IMPORTANT: ValueId and BlockId are function-scoped. They are bare
+// indices and do NOT encode which function they belong to. Callers
+// must never use a ValueId/BlockId produced by one function when
+// emitting into a different function — the builder validates index
+// range but cannot detect cross-function misuse by design.
 
 struct ValueId {
     u32 id;

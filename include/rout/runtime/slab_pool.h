@@ -14,6 +14,11 @@ namespace rout {
 
 template <typename T, u32 Cap>
 struct SlabPool {
+    static_assert(__is_trivially_constructible(T),
+                  "SlabPool<T>: T must be trivially constructible (mmap zeroes memory)");
+    static_assert(__is_trivially_destructible(T),
+                  "SlabPool<T>: T must be trivially destructible (no destructors called)");
+
     T* objects = nullptr;
     u32* free_stack = nullptr;
     u8* in_use_map = nullptr;  // 1 byte per slot: 0=free, 1=allocated

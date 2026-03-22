@@ -531,7 +531,8 @@ struct Builder {
         if (!valid_val(opt) || !inner_type) return err(RirError::InvalidState);
         // Verify operand is Optional and inner_type matches the payload.
         auto* opt_ty = cur_func->values[opt.id].type;
-        if (!opt_ty || opt_ty->kind != TypeKind::Optional || opt_ty->inner != inner_type)
+        if (!opt_ty || opt_ty->kind != TypeKind::Optional ||
+            !types_equal(opt_ty->inner, inner_type))
             return err(RirError::InvalidState);
         auto [inst, vid] = TRY(emit(Opcode::OptUnwrap, inner_type, loc));
         inst->operands[0] = opt;
@@ -546,6 +547,21 @@ struct Builder {
                                       const Type* field_type,
                                       SourceLoc loc = {}) {
         if (!val_has_type(s, TypeKind::Struct) || !field_type) return err(RirError::InvalidState);
+        // Validate field exists in the struct definition with matching type.
+        auto* s_ty = cur_func->values[s.id].type;
+        if (s_ty->struct_def) {
+            auto* sd = s_ty->struct_def;
+            bool found = false;
+            for (u32 i = 0; i < sd->field_count; i++) {
+                if (sd->fields()[i].name.eq(field_name)) {
+                    if (!types_equal(sd->fields()[i].type, field_type))
+                        return err(RirError::InvalidState);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return err(RirError::InvalidState);
+        }
         auto [inst, vid] = TRY(emit(Opcode::StructField, field_type, loc));
         inst->operands[0] = s;
         inst->operand_count = 1;

@@ -206,6 +206,17 @@ struct Builder {
         return v != kNoValue && cur_func && v.id < cur_func->value_count;
     }
 
+    // Structural type equality — handles composites (Optional, Array, Struct)
+    // that may have distinct Type* pointers but identical semantics.
+    static bool types_equal(const Type* a, const Type* b) {
+        if (a == b) return true;
+        if (!a || !b || a->kind != b->kind) return false;
+        if (a->kind == TypeKind::Optional || a->kind == TypeKind::Array)
+            return types_equal(a->inner, b->inner);
+        if (a->kind == TypeKind::Struct) return a->struct_def == b->struct_def;
+        return true;  // primitives with same kind
+    }
+
     // Check that a value has a specific type kind (for operand type enforcement).
     bool val_has_type(ValueId v, TypeKind kind) const {
         if (!valid_val(v)) return false;
@@ -466,8 +477,8 @@ struct Builder {
     Result<ValueId> emit_cmp(Opcode cmp_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
         if (!is_cmp_opcode(cmp_op) || !valid_val(lhs) || !valid_val(rhs))
             return err(RirError::InvalidState);
-        // Operands must have matching types.
-        if (cur_func->values[lhs.id].type != cur_func->values[rhs.id].type)
+        // Operands must have matching types (structural comparison).
+        if (!types_equal(cur_func->values[lhs.id].type, cur_func->values[rhs.id].type))
             return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(cmp_op, ty, loc));
@@ -508,7 +519,7 @@ struct Builder {
     // ── Optional operations ─────────────────────────────────────────
 
     Result<ValueId> emit_opt_is_nil(ValueId opt, SourceLoc loc = {}) {
-        if (!valid_val(opt)) return err(RirError::InvalidState);
+        if (!val_has_type(opt, TypeKind::Optional)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(Opcode::OptIsNil, ty, loc));
         inst->operands[0] = opt;

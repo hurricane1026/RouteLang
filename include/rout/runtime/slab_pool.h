@@ -14,10 +14,17 @@ namespace rout {
 
 template <typename T, u32 Cap>
 struct SlabPool {
+    // T must be trivially constructible (mmap zeroes) and destructible (no dtors called).
+    // GCC uses __has_trivial_constructor/__has_trivial_destructor;
+    // Clang uses __is_trivially_constructible/__is_trivially_destructible.
+#if defined(__clang__)
     static_assert(__is_trivially_constructible(T),
-                  "SlabPool<T>: T must be trivially constructible (mmap zeroes memory)");
-    static_assert(__is_trivially_destructible(T),
-                  "SlabPool<T>: T must be trivially destructible (no destructors called)");
+                  "SlabPool<T>: T must be trivially constructible");
+    static_assert(__is_trivially_destructible(T), "SlabPool<T>: T must be trivially destructible");
+#elif defined(__GNUC__)
+    static_assert(__has_trivial_constructor(T), "SlabPool<T>: T must be trivially constructible");
+    static_assert(__has_trivial_destructor(T), "SlabPool<T>: T must be trivially destructible");
+#endif
 
     T* objects = nullptr;
     u32* free_stack = nullptr;

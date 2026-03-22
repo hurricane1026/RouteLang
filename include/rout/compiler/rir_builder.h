@@ -197,6 +197,9 @@ struct Builder {
         return {};
     }
 
+    // Check that a ValueId is a valid SSA reference (not kNoValue sentinel).
+    bool valid_val(ValueId v) const { return v != kNoValue; }
+
     // ── Instruction emission ────────────────────────────────────────
 
     struct EmitResult {
@@ -376,6 +379,7 @@ struct Builder {
     // ── Request mutation ────────────────────────────────────────────
 
     VoidResult emit_req_set_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!valid_val(val)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetHeader, nullptr, loc));
         r.inst->imm.str_val = name;
         r.inst->operands[0] = val;
@@ -384,6 +388,7 @@ struct Builder {
     }
 
     VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}) {
+        if (!valid_val(path)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));
         r.inst->operands[0] = path;
         r.inst->operand_count = 1;
@@ -544,7 +549,7 @@ struct Builder {
     // ── Terminators ─────────────────────────────────────────────────
 
     VoidResult emit_br(ValueId cond, BlockId then_blk, BlockId else_blk, SourceLoc loc = {}) {
-        if (!cur_func) return err(RirError::InvalidState);
+        if (!cur_func || !valid_val(cond)) return err(RirError::InvalidState);
         if (then_blk.id >= cur_func->block_count || else_blk.id >= cur_func->block_count) {
             return err(RirError::InvalidState);
         }
@@ -571,6 +576,7 @@ struct Builder {
     }
 
     VoidResult emit_ret_proxy(ValueId upstream, SourceLoc loc = {}) {
+        if (!valid_val(upstream)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetProxy, nullptr, loc));
         r.inst->operands[0] = upstream;
         r.inst->operand_count = 1;

@@ -512,6 +512,20 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
             break;
+        case Opcode::StructCreate:
+            buf.put(' ');
+            if (inst.imm.struct_ref.type && inst.imm.struct_ref.type->struct_def) {
+                buf.put_str(inst.imm.struct_ref.type->struct_def->name);
+            }
+            if (inst.operand_count > 0) {
+                buf.put_cstr(" { ");
+                for (u32 i = 0; i < inst.operand_count; i++) {
+                    if (i > 0) buf.put_cstr(", ");
+                    print_value_ref(buf, inst.operand(i));
+                }
+                buf.put_cstr(" }");
+            }
+            break;
         case Opcode::StructField:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);

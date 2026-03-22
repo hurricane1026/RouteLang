@@ -120,7 +120,8 @@ struct Shard {
             return core::make_unexpected(Error::make(EEXIST, Error::Source::Thread));
 
         pthread_attr_t attr;
-        pthread_attr_init(&attr);
+        i32 attr_rc = pthread_attr_init(&attr);
+        if (attr_rc != 0) return core::make_unexpected(Error::make(attr_rc, Error::Source::Thread));
 
         // Pin to CPU if requested. Use sched_getaffinity to check allowed CPUs
         // (respects cpuset/cgroup restrictions). Fall back to unpinned on failure.

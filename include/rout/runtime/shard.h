@@ -48,9 +48,9 @@ struct Shard {
     // Upstream connection pool (per-shard, mmap'd due to size)
     UpstreamPool* upstream = nullptr;
 
-    // Route config — atomically swappable for hot reload.
-    // Shared across all shards (read-only after construction).
-    // Pointer swapped via atomic store; old config reclaimed after epoch drain.
+    // Route config — set before spawning threads, read-only during runtime.
+    // Phase 3 hot reload will use __atomic_load_n/__atomic_store_n for
+    // cross-thread swap + epoch-based reclamation. Currently immutable.
     const RouteConfig* route_config = nullptr;
 
     // Thread

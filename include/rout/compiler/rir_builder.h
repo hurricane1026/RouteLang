@@ -206,6 +206,13 @@ struct Builder {
         return v != kNoValue && cur_func && v.id < cur_func->value_count;
     }
 
+    // Check that a value has a specific type kind (for operand type enforcement).
+    bool val_has_type(ValueId v, TypeKind kind) const {
+        if (!valid_val(v)) return false;
+        auto* ty = cur_func->values[v.id].type;
+        return ty && ty->kind == kind;
+    }
+
     // ── Instruction emission ────────────────────────────────────────
 
     struct EmitResult {
@@ -408,7 +415,8 @@ struct Builder {
     // ── String operations ───────────────────────────────────────────
 
     Result<ValueId> emit_str_has_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
-        if (!valid_val(str) || !valid_val(prefix)) return err(RirError::InvalidState);
+        if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
+            return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(Opcode::StrHasPrefix, ty, loc));
         inst->operands[0] = str;
@@ -418,7 +426,8 @@ struct Builder {
     }
 
     Result<ValueId> emit_str_trim_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
-        if (!valid_val(str) || !valid_val(prefix)) return err(RirError::InvalidState);
+        if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
+            return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Str));
         auto [inst, vid] = TRY(emit(Opcode::StrTrimPrefix, ty, loc));
         inst->operands[0] = str;
@@ -517,7 +526,7 @@ struct Builder {
                                       Str field_name,
                                       const Type* field_type,
                                       SourceLoc loc = {}) {
-        if (!valid_val(s) || !field_type) return err(RirError::InvalidState);
+        if (!val_has_type(s, TypeKind::Struct) || !field_type) return err(RirError::InvalidState);
         auto [inst, vid] = TRY(emit(Opcode::StructField, field_type, loc));
         inst->operands[0] = s;
         inst->operand_count = 1;

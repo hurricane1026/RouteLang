@@ -211,12 +211,15 @@ TEST(RirBuilder, BinaryOperations) {
     b.set_insert_point(fn, entry);
 
     auto v0 = V(b.emit_const_str(lit("Bearer ")));
-    auto v1 = V(b.emit_req_header(lit("Authorization")));
+    auto v1_opt = V(b.emit_req_header(lit("Authorization")));
+    auto* t_s = V(b.make_type(TypeKind::Str));
+    auto v1 = V(b.emit_opt_unwrap(v1_opt, t_s));
     auto v2 = V(b.emit_str_has_prefix(v1, v0));
 
     CHECK_EQ(static_cast<u8>(fn->values[v2.id].type->kind), static_cast<u8>(TypeKind::Bool));
 
-    auto& inst = fn->entry()->insts[2];
+    // Insts: const.str, req.header, opt.unwrap, str.has_prefix
+    auto& inst = fn->entry()->insts[3];
     CHECK_EQ(inst.operand_count, 2u);
     CHECK_EQ(inst.operands[0].id, v1.id);
     CHECK_EQ(inst.operands[1].id, v0.id);
@@ -338,15 +341,17 @@ TEST(RirIntegration, AuthHandlerFromDesignDoc) {
     auto is_nil = V(b.emit_opt_is_nil(token, {42, 0}));
     VOK(b.emit_br(is_nil, blk_reject_401, blk_check_prefix, {42, 0}));
 
-    // block_check_prefix
+    // block_check_prefix — unwrap Optional(str) before string ops
     b.set_insert_point(fn, blk_check_prefix);
+    auto* t_str_early = V(b.make_type(TypeKind::Str));
+    auto token_str = V(b.emit_opt_unwrap(token, t_str_early, {43, 0}));
     auto bearer = V(b.emit_const_str(lit("Bearer ")));
-    auto has_pfx = V(b.emit_str_has_prefix(token, bearer, {43, 0}));
+    auto has_pfx = V(b.emit_str_has_prefix(token_str, bearer, {43, 0}));
     VOK(b.emit_br(has_pfx, blk_decode_jwt, blk_reject_401, {43, 0}));
 
     // block_decode_jwt
     b.set_insert_point(fn, blk_decode_jwt);
-    auto raw = V(b.emit_str_trim_prefix(token, bearer, {44, 0}));
+    auto raw = V(b.emit_str_trim_prefix(token_str, bearer, {44, 0}));
     auto secret = V(b.emit_const_str(lit("env(JWT_SECRET)"), {44, 0}));
     auto* t_str = V(b.make_type(TypeKind::Str));
     // Model Claims as a proper struct with role/sub/exp fields.
@@ -359,16 +364,17 @@ TEST(RirIntegration, AuthHandlerFromDesignDoc) {
     auto claims_nil = V(b.emit_opt_is_nil(claims, {45, 0}));
     VOK(b.emit_br(claims_nil, blk_reject_401, blk_check_role, {45, 0}));
 
-    // block_check_role
+    // block_check_role — unwrap Optional(Struct(Claims)) first
     b.set_insert_point(fn, blk_check_role);
-    auto role = V(b.emit_struct_field(claims, lit("role"), t_str, {46, 0}));
+    auto claims_unwrapped = V(b.emit_opt_unwrap(claims, t_claims, {46, 0}));
+    auto role = V(b.emit_struct_field(claims_unwrapped, lit("role"), t_str, {46, 0}));
     auto role_lit = V(b.emit_const_str(lit("user"), {46, 0}));
     auto role_ok = V(b.emit_cmp(Opcode::CmpEq, role, role_lit, {46, 0}));
     VOK(b.emit_br(role_ok, blk_auth_ok, blk_reject_403, {46, 0}));
 
-    // block_auth_ok
+    // block_auth_ok — claims_unwrapped is Struct(Claims), use it directly
     b.set_insert_point(fn, blk_auth_ok);
-    auto sub = V(b.emit_struct_field(claims, lit("sub"), t_str));
+    auto sub = V(b.emit_struct_field(claims_unwrapped, lit("sub"), t_str));
     VOK(b.emit_req_set_header(lit("X-User-ID"), sub));
     auto remote_addr = V(b.emit_req_remote_addr());
     auto count = V(b.emit_counter_incr(remote_addr, 60));

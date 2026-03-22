@@ -58,6 +58,8 @@ static void write_error(const char* prefix, const rout::Error& err) {
     write_str(prefix);
     write_str(" (errno=");
     write_u32(static_cast<u32>(err.code));
+    write_str(", source=");
+    write_u32(static_cast<u32>(err.source));
     write_str(")\n");
 }
 
@@ -74,7 +76,11 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
         if (i == 0 && port == 0 && lfd_result) {
             struct sockaddr_in a;
             socklen_t al = sizeof(a);
-            getsockname(lfd_result.value(), reinterpret_cast<struct sockaddr*>(&a), &al);
+            if (getsockname(lfd_result.value(), reinterpret_cast<struct sockaddr*>(&a), &al) < 0) {
+                write_str("Failed to resolve ephemeral port\n");
+                close(lfd_result.value());
+                return 1;
+            }
             port = __builtin_bswap16(a.sin_port);
         }
         if (!lfd_result) {

@@ -113,6 +113,8 @@ struct Shard {
     // pin_cpu: -1 = no pinning, >=0 = pin to that core.
     core::Expected<void, Error> spawn(i32 pin_cpu = -1) {
         if (!loop) return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+        if (thread_spawned)
+            return core::make_unexpected(Error::make(EEXIST, Error::Source::Thread));
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);
@@ -153,8 +155,10 @@ struct Shard {
         }
     }
 
-    // Release all resources.
+    // Release all resources. Stops and joins thread if still running.
     void shutdown() {
+        stop();
+        join();
         if (upstream) {
             upstream->shutdown();
             munmap(upstream, sizeof(UpstreamPool));

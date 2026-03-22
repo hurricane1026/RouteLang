@@ -69,6 +69,11 @@ struct Builder {
     Result<const Type*> make_type(TypeKind kind,
                                   const Type* inner = nullptr,
                                   StructDef* sd = nullptr) {
+        // Validate composite type metadata.
+        if ((kind == TypeKind::Optional || kind == TypeKind::Array) && !inner) {
+            return err(RirError::InvalidState);
+        }
+        if (kind == TypeKind::Struct && !sd) return err(RirError::InvalidState);
         // Return cached primitive type if available (no inner/struct_def).
         auto idx = static_cast<u32>(kind);
         if (!inner && !sd && idx < kTypeKindCount && type_cache[idx]) {
@@ -539,6 +544,7 @@ struct Builder {
     // ── Terminators ─────────────────────────────────────────────────
 
     VoidResult emit_br(ValueId cond, BlockId then_blk, BlockId else_blk, SourceLoc loc = {}) {
+        if (!cur_func) return err(RirError::InvalidState);
         if (then_blk.id >= cur_func->block_count || else_blk.id >= cur_func->block_count) {
             return err(RirError::InvalidState);
         }
@@ -551,6 +557,7 @@ struct Builder {
     }
 
     VoidResult emit_jmp(BlockId target, SourceLoc loc = {}) {
+        if (!cur_func) return err(RirError::InvalidState);
         if (target.id >= cur_func->block_count) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::Jmp, nullptr, loc));
         r.inst->imm.block_targets[0] = target;

@@ -16,17 +16,16 @@ void PrintBuf::flush() {
     while (written < len) {
         auto n = ::write(fd, data + written, len - written);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
+        if (n <= 0) {
+            // Hard error (EPIPE, EBADF, etc.) — mark overflow, drop buffer
+            // to avoid unbounded retry loops.
+            overflow = true;
+            len = 0;
+            return;
+        }
         written += static_cast<u32>(n);
     }
-    // Preserve unwritten tail on short write.
-    if (written < len) {
-        u32 remaining = len - written;
-        for (u32 i = 0; i < remaining; i++) data[i] = data[written + i];
-        len = remaining;
-    } else {
-        len = 0;
-    }
+    len = 0;
 }
 
 void PrintBuf::put(char c) {

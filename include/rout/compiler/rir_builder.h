@@ -258,6 +258,9 @@ struct Builder {
     // ── Helpers for variadic operand storage ────────────────────────
 
     VoidResult set_operands(Instruction* inst, const ValueId* ops, u32 count) {
+        for (u32 i = 0; i < count; i++) {
+            if (!valid_val(ops[i])) return err(RirError::InvalidState);
+        }
         if (count <= kMaxInlineOperands) {
             for (u32 i = 0; i < count; i++) inst->operands[i] = ops[i];
             inst->operand_count = count;
@@ -601,6 +604,7 @@ struct Builder {
         auto [inst, vid] = TRY(emit(Opcode::YieldHttpGet, ty, loc));
         inst->imm.str_val = url;
         if (headers != kNoValue) {
+            if (!valid_val(headers)) return err(RirError::InvalidState);
             inst->operands[0] = headers;
             inst->operand_count = 1;
         }

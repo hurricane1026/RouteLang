@@ -12,10 +12,11 @@ namespace rir {
 // All fallible operations return Expected<T, RirError>. Use the TRY()
 // macro for ergonomic error propagation:
 //
-//   auto* fn = TRY(b.create_function(name, pattern, method));
-//   auto entry = TRY(b.create_block(fn, "entry"));
+//   Str name = {.ptr = "handler", .len = 7};
+//   auto* fn = TRY(b.create_function(name, route, method));
+//   auto entry = TRY(b.create_block(fn, label));
 //   b.set_insert_point(fn, entry);
-//   auto v0 = TRY(b.emit_const_str("Bearer "));
+//   auto v0 = TRY(b.emit_const_str(prefix));
 
 // Convenience aliases.
 template <typename T>
@@ -199,7 +200,9 @@ struct Builder {
     }
 
     // Check that a ValueId is a valid SSA reference (not kNoValue sentinel).
-    bool valid_val(ValueId v) const { return v != kNoValue; }
+    bool valid_val(ValueId v) const {
+        return v != kNoValue && cur_func && v.id < cur_func->value_count;
+    }
 
     // ── Instruction emission ────────────────────────────────────────
 
@@ -399,6 +402,7 @@ struct Builder {
     // ── String operations ───────────────────────────────────────────
 
     Result<ValueId> emit_str_has_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
+        if (!valid_val(str) || !valid_val(prefix)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(Opcode::StrHasPrefix, ty, loc));
         inst->operands[0] = str;
@@ -408,6 +412,7 @@ struct Builder {
     }
 
     Result<ValueId> emit_str_trim_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
+        if (!valid_val(str) || !valid_val(prefix)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Str));
         auto [inst, vid] = TRY(emit(Opcode::StrTrimPrefix, ty, loc));
         inst->operands[0] = str;
@@ -444,7 +449,8 @@ struct Builder {
     }
 
     Result<ValueId> emit_cmp(Opcode cmp_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
-        if (!is_cmp_opcode(cmp_op)) return err(RirError::InvalidState);
+        if (!is_cmp_opcode(cmp_op) || !valid_val(lhs) || !valid_val(rhs))
+            return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(cmp_op, ty, loc));
         inst->operands[0] = lhs;
@@ -461,6 +467,7 @@ struct Builder {
     }
 
     Result<ValueId> emit_time_diff(ValueId a, ValueId b, SourceLoc loc = {}) {
+        if (!valid_val(a) || !valid_val(b)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Duration));
         auto [inst, vid] = TRY(emit(Opcode::TimeDiff, ty, loc));
         inst->operands[0] = a;
@@ -470,6 +477,7 @@ struct Builder {
     }
 
     Result<ValueId> emit_ip_in_cidr(ValueId ip, Str cidr_lit, SourceLoc loc = {}) {
+        if (!valid_val(ip)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(Opcode::IpInCidr, ty, loc));
         inst->operands[0] = ip;
@@ -481,6 +489,7 @@ struct Builder {
     // ── Optional operations ─────────────────────────────────────────
 
     Result<ValueId> emit_opt_is_nil(ValueId opt, SourceLoc loc = {}) {
+        if (!valid_val(opt)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(Opcode::OptIsNil, ty, loc));
         inst->operands[0] = opt;
@@ -489,7 +498,7 @@ struct Builder {
     }
 
     Result<ValueId> emit_opt_unwrap(ValueId opt, const Type* inner_type, SourceLoc loc = {}) {
-        if (!inner_type) return err(RirError::InvalidState);
+        if (!valid_val(opt) || !inner_type) return err(RirError::InvalidState);
         auto [inst, vid] = TRY(emit(Opcode::OptUnwrap, inner_type, loc));
         inst->operands[0] = opt;
         inst->operand_count = 1;
@@ -502,7 +511,7 @@ struct Builder {
                                       Str field_name,
                                       const Type* field_type,
                                       SourceLoc loc = {}) {
-        if (!field_type) return err(RirError::InvalidState);
+        if (!valid_val(s) || !field_type) return err(RirError::InvalidState);
         auto [inst, vid] = TRY(emit(Opcode::StructField, field_type, loc));
         inst->operands[0] = s;
         inst->operand_count = 1;
@@ -521,6 +530,7 @@ struct Builder {
     // ── Counter ─────────────────────────────────────────────────────
 
     Result<ValueId> emit_counter_incr(ValueId key, i64 window_seconds, SourceLoc loc = {}) {
+        if (!valid_val(key)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::I32));
         auto [inst, vid] = TRY(emit(Opcode::CounterIncr, ty, loc));
         inst->operands[0] = key;

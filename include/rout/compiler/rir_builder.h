@@ -514,6 +514,10 @@ struct Builder {
 
     Result<ValueId> emit_opt_unwrap(ValueId opt, const Type* inner_type, SourceLoc loc = {}) {
         if (!valid_val(opt) || !inner_type) return err(RirError::InvalidState);
+        // Verify operand is Optional and inner_type matches the payload.
+        auto* opt_ty = cur_func->values[opt.id].type;
+        if (!opt_ty || opt_ty->kind != TypeKind::Optional || opt_ty->inner != inner_type)
+            return err(RirError::InvalidState);
         auto [inst, vid] = TRY(emit(Opcode::OptUnwrap, inner_type, loc));
         inst->operands[0] = opt;
         inst->operand_count = 1;
@@ -575,7 +579,7 @@ struct Builder {
     // ── Terminators ─────────────────────────────────────────────────
 
     VoidResult emit_br(ValueId cond, BlockId then_blk, BlockId else_blk, SourceLoc loc = {}) {
-        if (!cur_func || !valid_val(cond)) return err(RirError::InvalidState);
+        if (!cur_func || !val_has_type(cond, TypeKind::Bool)) return err(RirError::InvalidState);
         if (then_blk.id >= cur_func->block_count || else_blk.id >= cur_func->block_count) {
             return err(RirError::InvalidState);
         }

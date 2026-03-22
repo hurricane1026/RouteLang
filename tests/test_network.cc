@@ -1852,7 +1852,7 @@ TEST(slab_pool, small_object) {
     SmallObj* a = pool.alloc();
     REQUIRE(a != nullptr);
     a->tag = 0xAB;
-    CHECK_EQ(pool.index_of(a), pool.index_of(a));  // consistent
+    CHECK_EQ(&pool[pool.index_of(a)], a);  // index_of round-trips to same pointer
     CHECK_EQ(a->tag, 0xABu);
     pool.free(a);
     pool.destroy();

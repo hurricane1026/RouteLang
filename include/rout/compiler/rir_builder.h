@@ -407,7 +407,7 @@ struct Builder {
     // ── Request mutation ────────────────────────────────────────────
 
     VoidResult emit_req_set_header(Str name, ValueId val, SourceLoc loc = {}) {
-        if (!valid_val(val)) return err(RirError::InvalidState);
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetHeader, nullptr, loc));
         r.inst->imm.str_val = name;
         r.inst->operands[0] = val;
@@ -416,7 +416,7 @@ struct Builder {
     }
 
     VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}) {
-        if (!valid_val(path)) return err(RirError::InvalidState);
+        if (!val_has_type(path, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));
         r.inst->operands[0] = path;
         r.inst->operand_count = 1;
@@ -478,8 +478,18 @@ struct Builder {
         if (!is_cmp_opcode(cmp_op) || !valid_val(lhs) || !valid_val(rhs))
             return err(RirError::InvalidState);
         // Operands must have matching types (structural comparison).
-        if (!types_equal(cur_func->values[lhs.id].type, cur_func->values[rhs.id].type))
-            return err(RirError::InvalidState);
+        auto* lhs_ty = cur_func->values[lhs.id].type;
+        if (!types_equal(lhs_ty, cur_func->values[rhs.id].type)) return err(RirError::InvalidState);
+        // Ordered comparisons (lt/gt/le/ge) only valid on orderable types.
+        if (cmp_op != Opcode::CmpEq && cmp_op != Opcode::CmpNe) {
+            if (!lhs_ty) return err(RirError::InvalidState);
+            auto k = lhs_ty->kind;
+            bool orderable = k == TypeKind::I32 || k == TypeKind::I64 || k == TypeKind::U32 ||
+                             k == TypeKind::U64 || k == TypeKind::F64 || k == TypeKind::ByteSize ||
+                             k == TypeKind::Duration || k == TypeKind::Time ||
+                             k == TypeKind::StatusCode;
+            if (!orderable) return err(RirError::InvalidState);
+        }
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(cmp_op, ty, loc));
         inst->operands[0] = lhs;

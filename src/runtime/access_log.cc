@@ -37,24 +37,24 @@ static u32 copy_str(char* dst, const char* src) {
 }
 
 static const char* method_str(u8 m) {
-    switch (static_cast<HttpMethod>(m)) {
-        case HttpMethod::Get:
+    switch (static_cast<LogHttpMethod>(m)) {
+        case LogHttpMethod::Get:
             return "GET";
-        case HttpMethod::Post:
+        case LogHttpMethod::Post:
             return "POST";
-        case HttpMethod::Put:
+        case LogHttpMethod::Put:
             return "PUT";
-        case HttpMethod::Delete:
+        case LogHttpMethod::Delete:
             return "DELETE";
-        case HttpMethod::Patch:
+        case LogHttpMethod::Patch:
             return "PATCH";
-        case HttpMethod::Head:
+        case LogHttpMethod::Head:
             return "HEAD";
-        case HttpMethod::Options:
+        case LogHttpMethod::Options:
             return "OPTIONS";
-        case HttpMethod::Connect:
+        case LogHttpMethod::Connect:
             return "CONNECT";
-        case HttpMethod::Trace:
+        case LogHttpMethod::Trace:
             return "TRACE";
         default:
             return "OTHER";

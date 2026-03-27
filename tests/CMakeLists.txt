@@ -14,6 +14,7 @@ target_include_directories(test_network PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 add_test(NAME test_network COMMAND test_network)
+set_tests_properties(test_network PROPERTIES LABELS "unit;network")
 
 find_package(Threads REQUIRED)
 
@@ -25,6 +26,7 @@ target_include_directories(test_integration PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 add_test(NAME test_integration COMMAND test_integration)
+set_tests_properties(test_integration PROPERTIES LABELS "integration;network")
 
 add_executable(test_arena test_arena.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_include_directories(test_arena PRIVATE
@@ -32,6 +34,7 @@ target_include_directories(test_arena PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 add_test(NAME test_arena COMMAND test_arena)
+set_tests_properties(test_arena PROPERTIES LABELS "unit")
 
 add_executable(test_expected test_expected.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_include_directories(test_expected PRIVATE
@@ -39,6 +42,7 @@ target_include_directories(test_expected PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 add_test(NAME test_expected COMMAND test_expected)
+set_tests_properties(test_expected PROPERTIES LABELS "unit")
 
 add_executable(test_http_parser test_http_parser.cc)
 target_link_libraries(test_http_parser rue_runtime)
@@ -48,6 +52,7 @@ target_include_directories(test_http_parser PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 add_test(NAME test_http_parser COMMAND test_http_parser)
+set_tests_properties(test_http_parser PROPERTIES LABELS "unit")
 
 add_executable(test_buffer test_buffer.cc)
 target_include_directories(test_buffer PRIVATE
@@ -55,6 +60,7 @@ target_include_directories(test_buffer PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 add_test(NAME test_buffer COMMAND test_buffer)
+set_tests_properties(test_buffer PROPERTIES LABELS "unit")
 
 add_executable(test_types test_types.cc)
 target_include_directories(test_types PRIVATE
@@ -62,6 +68,7 @@ target_include_directories(test_types PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 add_test(NAME test_types COMMAND test_types)
+set_tests_properties(test_types PROPERTIES LABELS "unit")
 
 add_executable(test_rir test_rir.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_link_libraries(test_rir rue_compiler)
@@ -70,6 +77,7 @@ target_include_directories(test_rir PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 add_test(NAME test_rir COMMAND test_rir)
+set_tests_properties(test_rir PROPERTIES LABELS "unit")
 
 add_executable(test_drain test_drain.cc)
 target_link_libraries(test_drain rue_runtime)
@@ -79,6 +87,7 @@ target_include_directories(test_drain PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 add_test(NAME test_drain COMMAND test_drain)
+set_tests_properties(test_drain PROPERTIES LABELS "unit")
 
 add_executable(test_access_log test_access_log.cc)
 target_link_libraries(test_access_log rue_runtime)
@@ -88,6 +97,7 @@ target_include_directories(test_access_log PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 add_test(NAME test_access_log COMMAND test_access_log)
+set_tests_properties(test_access_log PROPERTIES LABELS "unit")
 
 add_executable(test_metrics test_metrics.cc)
 target_link_libraries(test_metrics rue_runtime)
@@ -97,6 +107,7 @@ target_include_directories(test_metrics PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 add_test(NAME test_metrics COMMAND test_metrics)
+set_tests_properties(test_metrics PROPERTIES LABELS "unit")
 
 add_custom_target(check
     COMMAND $<TARGET_FILE:test_network>

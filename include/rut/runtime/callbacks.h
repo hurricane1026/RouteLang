@@ -2,6 +2,7 @@
 
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/metrics.h"
 
@@ -46,56 +47,82 @@ static inline bool ascii_ci_eq(const u8* data, const char* lit, u32 len) {
     return true;
 }
 
-static inline u8 parse_log_method(const u8* data, u32 len, u32* method_len) {
+static inline u8 map_log_method(HttpMethod method) {
+    switch (method) {
+        case HttpMethod::GET:
+            return static_cast<u8>(LogHttpMethod::Get);
+        case HttpMethod::POST:
+            return static_cast<u8>(LogHttpMethod::Post);
+        case HttpMethod::PUT:
+            return static_cast<u8>(LogHttpMethod::Put);
+        case HttpMethod::DELETE:
+            return static_cast<u8>(LogHttpMethod::Delete);
+        case HttpMethod::PATCH:
+            return static_cast<u8>(LogHttpMethod::Patch);
+        case HttpMethod::HEAD:
+            return static_cast<u8>(LogHttpMethod::Head);
+        case HttpMethod::OPTIONS:
+            return static_cast<u8>(LogHttpMethod::Options);
+        case HttpMethod::CONNECT:
+            return static_cast<u8>(LogHttpMethod::Connect);
+        case HttpMethod::TRACE:
+            return static_cast<u8>(LogHttpMethod::Trace);
+        case HttpMethod::Unknown:
+            return static_cast<u8>(LogHttpMethod::Other);
+    }
+    return static_cast<u8>(LogHttpMethod::Other);
+}
+
+static inline u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len) {
     *method_len = 0;
     if (len >= 4 && data[0] == 'G' && data[1] == 'E' && data[2] == 'T' && data[3] == ' ') {
         *method_len = 3;
-        return static_cast<u8>(HttpMethod::Get);
+        return static_cast<u8>(LogHttpMethod::Get);
     }
     if (len >= 5 && data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T' &&
         data[4] == ' ') {
         *method_len = 4;
-        return static_cast<u8>(HttpMethod::Post);
+        return static_cast<u8>(LogHttpMethod::Post);
     }
     if (len >= 4 && data[0] == 'P' && data[1] == 'U' && data[2] == 'T' && data[3] == ' ') {
         *method_len = 3;
-        return static_cast<u8>(HttpMethod::Put);
+        return static_cast<u8>(LogHttpMethod::Put);
     }
     if (len >= 7 && data[0] == 'D' && data[1] == 'E' && data[2] == 'L' && data[3] == 'E' &&
         data[4] == 'T' && data[5] == 'E' && data[6] == ' ') {
         *method_len = 6;
-        return static_cast<u8>(HttpMethod::Delete);
+        return static_cast<u8>(LogHttpMethod::Delete);
     }
     if (len >= 6 && data[0] == 'P' && data[1] == 'A' && data[2] == 'T' && data[3] == 'C' &&
         data[4] == 'H' && data[5] == ' ') {
         *method_len = 5;
-        return static_cast<u8>(HttpMethod::Patch);
+        return static_cast<u8>(LogHttpMethod::Patch);
     }
     if (len >= 5 && data[0] == 'H' && data[1] == 'E' && data[2] == 'A' && data[3] == 'D' &&
         data[4] == ' ') {
         *method_len = 4;
-        return static_cast<u8>(HttpMethod::Head);
+        return static_cast<u8>(LogHttpMethod::Head);
     }
     if (len >= 8 && data[0] == 'O' && data[1] == 'P' && data[2] == 'T' && data[3] == 'I' &&
         data[4] == 'O' && data[5] == 'N' && data[6] == 'S' && data[7] == ' ') {
         *method_len = 7;
-        return static_cast<u8>(HttpMethod::Options);
+        return static_cast<u8>(LogHttpMethod::Options);
     }
     if (len >= 8 && data[0] == 'C' && data[1] == 'O' && data[2] == 'N' && data[3] == 'N' &&
         data[4] == 'E' && data[5] == 'C' && data[6] == 'T' && data[7] == ' ') {
         *method_len = 7;
-        return static_cast<u8>(HttpMethod::Connect);
+        return static_cast<u8>(LogHttpMethod::Connect);
     }
     if (len >= 6 && data[0] == 'T' && data[1] == 'R' && data[2] == 'A' && data[3] == 'C' &&
         data[4] == 'E' && data[5] == ' ') {
         *method_len = 5;
-        return static_cast<u8>(HttpMethod::Trace);
+        return static_cast<u8>(LogHttpMethod::Trace);
     }
-    return static_cast<u8>(HttpMethod::Other);
+    return static_cast<u8>(LogHttpMethod::Other);
 }
 
 static inline void capture_request_metadata(Connection& conn) {
-    conn.req_method = static_cast<u8>(HttpMethod::Other);
+    conn.req_method = static_cast<u8>(LogHttpMethod::Other);
     conn.req_size = conn.recv_buf.len();
     conn.req_path[0] = '/';
     conn.req_path[1] = '\0';
@@ -106,8 +133,20 @@ static inline void capture_request_metadata(Connection& conn) {
     u32 len = conn.recv_buf.len();
     if (!data || len == 0) return;
 
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(data, len, &req) == ParseStatus::Complete) {
+        conn.req_method = map_log_method(req.method);
+        u32 copy_len = req.path.len;
+        if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;
+        for (u32 i = 0; i < copy_len; i++) conn.req_path[i] = req.path.ptr[i];
+        conn.req_path[copy_len] = '\0';
+        return;
+    }
+
     u32 method_len = 0;
-    conn.req_method = parse_log_method(data, len, &method_len);
+    conn.req_method = parse_log_method_fallback(data, len, &method_len);
     if (method_len == 0 || method_len + 1 >= len || data[method_len] != ' ') return;
 
     u32 path_start = method_len + 1;

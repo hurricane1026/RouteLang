@@ -11,7 +11,7 @@
 namespace rut {
 
 // HTTP methods (compact enum for log entries).
-enum class HttpMethod : u8 {
+enum class LogHttpMethod : u8 {
     Get = 0,
     Post,
     Put,
@@ -34,7 +34,7 @@ struct AccessLogEntry {
     u32 upstream_us;   // upstream latency (0 if no proxy)
     u32 addr;          // client IPv4 (network byte order)
     u16 status;        // HTTP status code
-    u8 method;         // HttpMethod enum
+    u8 method;         // LogHttpMethod enum
     u8 shard_id;
     char path[64];      // truncated if longer, null-terminated
     char upstream[24];  // upstream name, null-terminated

@@ -18,7 +18,7 @@ static AccessLogEntry make_entry(u16 status, u32 duration_us, u8 shard, const ch
     e.status = status;
     e.duration_us = duration_us;
     e.shard_id = shard;
-    e.method = static_cast<u8>(HttpMethod::Get);
+    e.method = static_cast<u8>(LogHttpMethod::Get);
     e.req_size = 256;
     e.resp_size = 1024;
     e.addr = 0x0100007F;  // 127.0.0.1 in network byte order
@@ -405,7 +405,7 @@ TEST(callback_log, captures_request_metadata) {
 
     AccessLogEntry out{};
     REQUIRE(ring.pop(out));
-    CHECK_EQ(out.method, static_cast<u8>(HttpMethod::Post));
+    CHECK_EQ(out.method, static_cast<u8>(LogHttpMethod::Post));
     CHECK_EQ(out.req_size, req_len);
     CHECK_EQ(out.addr, 0x0100007F);
     CHECK_EQ(out.path[0], '/');

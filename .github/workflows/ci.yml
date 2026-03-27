@@ -110,6 +110,10 @@ jobs:
           LLVM_PROFILE_FILE=build/test_arena.profraw ./build/tests/test_arena
           LLVM_PROFILE_FILE=build/test_expected.profraw ./build/tests/test_expected
           LLVM_PROFILE_FILE=build/test_http_parser.profraw ./build/tests/test_http_parser
+          LLVM_PROFILE_FILE=build/test_drain.profraw ./build/tests/test_drain
+          LLVM_PROFILE_FILE=build/test_access_log.profraw ./build/tests/test_access_log
+          LLVM_PROFILE_FILE=build/test_metrics.profraw ./build/tests/test_metrics
+          LLVM_PROFILE_FILE=build/test_rir.profraw ./build/tests/test_rir
 
       - name: Generate coverage report
         run: |
@@ -127,7 +131,11 @@ jobs:
             --object build/tests/test_arena \
             --object build/tests/test_http_parser \
             --object build/tests/test_expected \
-            --sources include/rout/common/ include/rout/runtime/ src/runtime/ \
+            --object build/tests/test_drain \
+            --object build/tests/test_access_log \
+            --object build/tests/test_metrics \
+            --object build/tests/test_rir \
+            --sources include/rut/common/ include/rut/runtime/ src/runtime/ \
             --ignore-filename-regex='io_uring_backend' | tee build/coverage.txt
 
           cat build/coverage.txt

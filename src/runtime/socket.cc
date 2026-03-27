@@ -1,4 +1,4 @@
-#include "rout/runtime/socket.h"
+#include "rut/runtime/socket.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -8,7 +8,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace rout {
+namespace rut {
 
 i32 set_nonblocking(i32 fd) {
     i32 flags = fcntl(fd, F_GETFL, 0);
@@ -47,4 +47,4 @@ core::Expected<i32, Error> create_listen_socket(u16 port) {
     return fd;
 }
 
-}  // namespace rout
+}  // namespace rut

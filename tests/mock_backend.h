@@ -1,12 +1,11 @@
 #pragma once
 
-#include "rout/common/types.h"
-#include "rout/runtime/error.h"
-#include "rout/runtime/io_event.h"
-
 #include "core/expected.h"
+#include "rut/common/types.h"
+#include "rut/runtime/error.h"
+#include "rut/runtime/io_event.h"
 
-namespace rout {
+namespace rut {
 
 struct Connection;  // forward declaration for wait() signature
 
@@ -112,4 +111,4 @@ struct MockBackend {
     void clear_ops() { op_count = 0; }
 };
 
-}  // namespace rout
+}  // namespace rut

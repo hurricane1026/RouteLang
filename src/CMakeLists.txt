@@ -36,6 +36,44 @@ else()
     message(FATAL_ERROR "Unknown SIMD_ARCH '${SIMD_ARCH}'. Valid options: auto, scalar, sse2, avx2, avx512, neon, sve")
 endif()
 
+# zstd — vendored, compress only, stripped strategies (fast + doubleFast only).
+# Excludes greedy/lazy/btlazy2/btopt/btultra to keep binary small (~120KB vs ~400KB).
+# Level 1-4 use fast, level 5 uses doubleFast. Higher levels are unsupported.
+set(ZSTD_DIR ${PROJECT_SOURCE_DIR}/third_party/zstd/lib)
+add_library(zstd_compress STATIC
+    ${ZSTD_DIR}/compress/zstd_compress.c
+    ${ZSTD_DIR}/compress/zstd_compress_literals.c
+    ${ZSTD_DIR}/compress/zstd_compress_sequences.c
+    ${ZSTD_DIR}/compress/zstd_compress_superblock.c
+    ${ZSTD_DIR}/compress/zstd_fast.c
+    ${ZSTD_DIR}/compress/zstd_double_fast.c
+    ${ZSTD_DIR}/compress/zstd_lazy.c
+    ${ZSTD_DIR}/compress/zstd_opt.c
+    ${ZSTD_DIR}/compress/zstd_ldm.c
+    ${ZSTD_DIR}/compress/zstd_preSplit.c
+    ${ZSTD_DIR}/compress/fse_compress.c
+    ${ZSTD_DIR}/compress/huf_compress.c
+    ${ZSTD_DIR}/compress/hist.c
+    ${ZSTD_DIR}/common/zstd_common.c
+    ${ZSTD_DIR}/common/entropy_common.c
+    ${ZSTD_DIR}/common/error_private.c
+    ${ZSTD_DIR}/common/debug.c
+    ${ZSTD_DIR}/common/xxhash.c
+    ${ZSTD_DIR}/common/fse_decompress.c
+)
+target_include_directories(zstd_compress PUBLIC ${ZSTD_DIR} ${ZSTD_DIR}/common)
+set_target_properties(zstd_compress PROPERTIES LANGUAGE C)
+target_compile_options(zstd_compress PRIVATE
+    -O2 -DNDEBUG
+    -DZSTD_EXCLUDE_GREEDY_BLOCK_COMPRESSOR
+    -DZSTD_EXCLUDE_LAZY_BLOCK_COMPRESSOR
+    -DZSTD_EXCLUDE_LAZY2_BLOCK_COMPRESSOR
+    -DZSTD_EXCLUDE_BTLAZY2_BLOCK_COMPRESSOR
+    -DZSTD_EXCLUDE_BTOPT_BLOCK_COMPRESSOR
+    -DZSTD_EXCLUDE_BTULTRA_BLOCK_COMPRESSOR
+    -ffunction-sections -fdata-sections
+)
+
 # Runtime library
 add_library(rue_runtime STATIC
     placement_new.cc
@@ -45,12 +83,14 @@ add_library(rue_runtime STATIC
     runtime/timer_wheel.cc
     runtime/socket.cc
     runtime/http_parser.cc
+    runtime/access_log.cc
     ${SIMD_SOURCE}
 )
 
 target_include_directories(rue_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
+target_link_libraries(rue_runtime zstd_compress)
 
 # SIMD source needs to find simd.h and char_tables.h via "simd.h" include
 target_include_directories(rue_runtime PRIVATE

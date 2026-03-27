@@ -1,9 +1,8 @@
 // Buffer/View typestate tests
-#include "rout/common/buffer.h"
-
+#include "rut/common/buffer.h"
 #include "test.h"
 
-using namespace rout;
+using namespace rut;
 
 // === Buffer write + read ===
 
@@ -672,5 +671,5 @@ TEST(io_coverage, reset_preserves_storage) {
 }
 
 int main(int argc, char** argv) {
-    return rout::test::run_all(argc, argv);
+    return rut::test::run_all(argc, argv);
 }

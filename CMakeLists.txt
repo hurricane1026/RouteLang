@@ -1,10 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 
+include(CheckIPOSupported)
+
 project(rue
     VERSION 0.1.0
     DESCRIPTION "A strongly-typed DSL and high-performance HTTP gateway runtime"
     LANGUAGES CXX C
 )
+
+enable_testing()
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,7 +26,10 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffunction-sections -fdata-sections -Wal
 # Applied to both C and C++ so mixed-language targets (bench/llhttp) link correctly.
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+check_ipo_supported(RESULT RUE_IPO_SUPPORTED OUTPUT RUE_IPO_OUTPUT LANGUAGES C CXX)
+if(RUE_IPO_SUPPORTED)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+endif()
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
 
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")

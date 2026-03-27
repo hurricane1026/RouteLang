@@ -1,9 +1,9 @@
-#include "rout/compiler/rir_printer.h"
+#include "rut/compiler/rir_printer.h"
 
 #include <errno.h>
 #include <unistd.h>
 
-namespace rout {
+namespace rut {
 namespace rir {
 
 // ── PrintBuf implementation ─────────────────────────────────────────
@@ -711,4 +711,4 @@ void print_module(PrintBuf& buf, const Module& mod) {
 }
 
 }  // namespace rir
-}  // namespace rout
+}  // namespace rut

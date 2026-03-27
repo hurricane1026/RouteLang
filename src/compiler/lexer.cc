@@ -1,7 +1,7 @@
-#include "rout/compiler/lexer.h"
+#include "rut/compiler/lexer.h"
 
-namespace rout {
+namespace rut {
 
 // Lexer implementation — Phase 2
 
-}  // namespace rout
+}  // namespace rut

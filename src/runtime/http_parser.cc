@@ -1,8 +1,8 @@
-#include "rout/runtime/http_parser.h"
+#include "rut/runtime/http_parser.h"
 
 #include "runtime/simd/simd.h"
 
-namespace rout {
+namespace rut {
 
 // ============================================================================
 // Branch prediction
@@ -421,4 +421,4 @@ Str http_method_str(HttpMethod m) {
     return {"UNKNOWN", 7};
 }
 
-}  // namespace rout
+}  // namespace rut

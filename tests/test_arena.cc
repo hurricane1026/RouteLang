@@ -1,11 +1,10 @@
 // Arena tests — comprehensive code path coverage.
 // Ported scenarios from clapdb/Arena test suite where applicable,
 // adapted to our no-stdlib Arena API.
-#include "rout/runtime/arena.h"
-
+#include "rut/runtime/arena.h"
 #include "test.h"
 
-using namespace rout;
+using namespace rut;
 
 // ============================================================
 // Block internals
@@ -571,5 +570,5 @@ TEST(arena, reset_before_init_no_crash) {
 }
 
 int main(int argc, char** argv) {
-    return rout::test::run_all(argc, argv);
+    return rut::test::run_all(argc, argv);
 }

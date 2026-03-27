@@ -3,16 +3,15 @@
 // Build:  ninja -C build bench_http_parser
 // Run:    ./build/bench/bench_http_parser
 
-#include "rout/runtime/http_parser.h"
-
 #include "bench.h"
+#include "rut/runtime/http_parser.h"
 
 // llhttp (C library)
 extern "C" {
 #include "llhttp.h"
 }
 
-using namespace rout;
+using namespace rut;
 
 // ============================================================================
 // Test payloads — representative HTTP requests

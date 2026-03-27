@@ -36,5 +36,5 @@ TEST(math, multiplication) {
 }
 
 int main(int argc, char** argv) {
-    return rout::test::run_all(argc, argv);
+    return rut::test::run_all(argc, argv);
 }

@@ -1,11 +1,10 @@
-#include "rout/compiler/rir.h"
-#include "rout/compiler/rir_builder.h"
-#include "rout/compiler/rir_printer.h"
-
+#include "rut/compiler/rir.h"
+#include "rut/compiler/rir_builder.h"
+#include "rut/compiler/rir_printer.h"
 #include "test.h"
 
-using namespace rout;
-using namespace rout::rir;
+using namespace rut;
+using namespace rut::rir;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -33,7 +32,7 @@ struct TestContext {
     Module mod;
 
     bool init() {
-        if (arena.init(4096) != 0) return false;
+        if (!arena.init(4096)) return false;
         mod.name = lit("test.rue");
         mod.arena = &arena;
 
@@ -676,5 +675,5 @@ TEST(RirModule, MultipleFunctions) {
 }
 
 int main(int argc, char** argv) {
-    return rout::test::run_all(argc, argv);
+    return rut::test::run_all(argc, argv);
 }

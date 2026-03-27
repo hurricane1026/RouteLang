@@ -1,7 +1,7 @@
 #include "char_tables.h"
 #include "simd.h"
 
-namespace rout::simd {
+namespace rut::simd {
 
 u32 find_header_end(const u8* buf, u32 len, u32 from) {
     u32 start = from > 3 ? from - 3 : 0;
@@ -40,4 +40,4 @@ u32 scan_header_name(const u8* buf, u32 pos, u32 end) {
     return static_cast<u32>(-1);
 }
 
-}  // namespace rout::simd
+}  // namespace rut::simd

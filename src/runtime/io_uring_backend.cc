@@ -1,9 +1,8 @@
-#include "rout/runtime/io_uring_backend.h"
-
-#include "rout/runtime/connection.h"
-#include "rout/runtime/error.h"
+#include "rut/runtime/io_uring_backend.h"
 
 #include "core/expected.h"
+#include "rut/runtime/connection.h"
+#include "rut/runtime/error.h"
 
 #include <errno.h>
 #include <linux/io_uring.h>
@@ -24,7 +23,7 @@
 #define IORING_ASYNC_CANCEL_ALL (1U << 0)
 #endif
 
-namespace rout {
+namespace rut {
 
 // Sentinel conn_id for timer events (same value as epoll backend)
 static constexpr u32 kTimerConnId = 0xFFFFFE;
@@ -348,6 +347,30 @@ void IoUringBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr
     pending++;
 }
 
+void IoUringBackend::cancel_accept() {
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_ASYNC_CANCEL;
+    sqe->fd = listen_fd;
+    // Cancel by user_data — matches the multishot accept SQE.
+    sqe->addr = encode_user_data(0, IoEventType::Accept);
+    sqe->cancel_flags = IORING_ASYNC_CANCEL_ALL;
+    sqe->user_data = encode_user_data(kCancelConnId, IoEventType::Accept);
+
+    sqe_advance_tail(sq_tail);
+    pending++;
+
+    // Submit immediately so the cancel takes effect before close_listen()
+    // closes the fd. Without this, the cancel SQE sits in the SQ until
+    // the next wait(), by which time the fd may already be closed/reused.
+    if (pending > 0) {
+        io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+        pending = 0;
+    }
+}
+
 void IoUringBackend::cancel(i32 fd, u32 conn_id) {
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return;
@@ -559,4 +582,4 @@ void IoUringBackend::shutdown() {
     }
 }
 
-}  // namespace rout
+}  // namespace rut

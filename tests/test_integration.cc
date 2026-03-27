@@ -1,7 +1,6 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
-#include "rout/runtime/io_uring_backend.h"
-#include "rout/runtime/shard.h"
-
+#include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/shard.h"
 #include "test.h"
 #include "test_helpers.h"
 
@@ -890,5 +889,5 @@ TEST(copilot6, real_loop_keepalive_timeout) {
 }
 
 int main(int argc, char** argv) {
-    return rout::test::run_all(argc, argv);
+    return rut::test::run_all(argc, argv);
 }

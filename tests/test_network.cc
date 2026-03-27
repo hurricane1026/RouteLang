@@ -1,11 +1,10 @@
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
-#include "rout/runtime/arena.h"
-#include "rout/runtime/error.h"
-#include "rout/runtime/route_table.h"
-#include "rout/runtime/slab_pool.h"
-#include "rout/runtime/slice_pool.h"
-#include "rout/runtime/upstream_pool.h"
-
+#include "rut/runtime/arena.h"
+#include "rut/runtime/error.h"
+#include "rut/runtime/route_table.h"
+#include "rut/runtime/slab_pool.h"
+#include "rut/runtime/slice_pool.h"
+#include "rut/runtime/upstream_pool.h"
 #include "test.h"
 #include "test_helpers.h"
 
@@ -2024,5 +2023,5 @@ TEST(error, make_with_code) {
 }
 
 int main(int argc, char** argv) {
-    return rout::test::run_all(argc, argv);
+    return rut::test::run_all(argc, argv);
 }

@@ -1,8 +1,7 @@
-#include "rout/runtime/http_parser.h"
-
+#include "rut/runtime/http_parser.h"
 #include "test.h"
 
-using namespace rout;
+using namespace rut;
 
 // ============================================================================
 // Helpers
@@ -676,9 +675,9 @@ TEST(Corpus, ValidRequests) {
         auto s = parse_one(v.raw, &req, &parser);
 
         if (s != ParseStatus::Complete) {
-            rout::test::out("  FAIL vector: ");
-            rout::test::out(v.name);
-            rout::test::out(" (expected Complete)\n");
+            rut::test::out("  FAIL vector: ");
+            rut::test::out(v.name);
+            rut::test::out(" (expected Complete)\n");
         }
         CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
         CHECK_EQ(static_cast<u8>(req.method), static_cast<u8>(v.method));
@@ -687,9 +686,9 @@ TEST(Corpus, ValidRequests) {
         u32 path_len = 0;
         while (v.path[path_len]) path_len++;
         if (!req.path.eq(Str{v.path, path_len})) {
-            rout::test::out("  FAIL vector: ");
-            rout::test::out(v.name);
-            rout::test::out(" (path mismatch)\n");
+            rut::test::out("  FAIL vector: ");
+            rut::test::out(v.name);
+            rut::test::out(" (path mismatch)\n");
         }
         CHECK(req.path.eq(Str{v.path, path_len}));
 
@@ -713,7 +712,7 @@ TEST(Corpus, InvalidRequests) {
         auto len = static_cast<u32>(__builtin_strlen(kInvalidRequestStrs[i]));
         auto s = parse_raw(reinterpret_cast<const u8*>(kInvalidRequestStrs[i]), len, &req, &parser);
         if (s != ParseStatus::Error) {
-            rout::test::out("  FAIL invalid[");
+            rut::test::out("  FAIL invalid[");
             // Print index
             char idx[8];
             int n = 0;
@@ -724,9 +723,9 @@ TEST(Corpus, InvalidRequests) {
             } while (tmp > 0);
             for (int j = n - 1; j >= 0; j--) {
                 char buf[2] = {idx[j], 0};
-                rout::test::out(buf);
+                rut::test::out(buf);
             }
-            rout::test::out("] expected Error\n");
+            rut::test::out("] expected Error\n");
         }
         CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
     }
@@ -758,9 +757,9 @@ TEST(Incremental, ValidByteByByte) {
         auto len = static_cast<u32>(__builtin_strlen(v.raw));
         auto s = parse_incremental(reinterpret_cast<const u8*>(v.raw), len, &req, &parser);
         if (s != ParseStatus::Complete) {
-            rout::test::out("  FAIL incremental: ");
-            rout::test::out(v.name);
-            rout::test::out("\n");
+            rut::test::out("  FAIL incremental: ");
+            rut::test::out(v.name);
+            rut::test::out("\n");
         }
         CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
         CHECK_EQ(static_cast<u8>(req.method), static_cast<u8>(v.method));
@@ -797,9 +796,9 @@ TEST(Split, ValidSplitAtEveryPosition) {
             // Second feed: full buffer
             auto s2 = parser.parse(reinterpret_cast<const u8*>(v.raw), len, &req);
             if (s2 != ParseStatus::Complete) {
-                rout::test::out("  FAIL split: ");
-                rout::test::out(v.name);
-                rout::test::out("\n");
+                rut::test::out("  FAIL split: ");
+                rut::test::out(v.name);
+                rut::test::out("\n");
             }
             CHECK_EQ(static_cast<u8>(s2), static_cast<u8>(ParseStatus::Complete));
             tested++;
@@ -3381,5 +3380,5 @@ TEST(HeaderCount, Exactly65Rejected) {
 }
 
 int main(int argc, char** argv) {
-    return rout::test::run_all(argc, argv);
+    return rut::test::run_all(argc, argv);
 }

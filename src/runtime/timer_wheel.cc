@@ -1,10 +1,10 @@
-#include "rout/runtime/timer_wheel.h"
+#include "rut/runtime/timer_wheel.h"
 
-#include "rout/runtime/connection.h"
+#include "rut/runtime/connection.h"
 
 #include <stddef.h>  // offsetof
 
-namespace rout {
+namespace rut {
 
 void TimerWheel::add(Connection* c, u32 seconds) {
     u32 slot = (cursor + seconds) & (kSlots - 1);
@@ -26,4 +26,4 @@ u64 TimerWheel::timer_node_offset() {
     return offsetof(Connection, timer_node);
 }
 
-}  // namespace rout
+}  // namespace rut

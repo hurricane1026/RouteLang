@@ -73,7 +73,7 @@ coverage() {
         --object "$BUILD_DIR-cov/tests/test_http_parser" \
         --object "$BUILD_DIR-cov/tests/test_expected" \
         --object "$BUILD_DIR-cov/tests/test_buffer" \
-        --sources include/rout/ src/
+        --sources include/rut/ src/
 }
 
 # ---- clang-tidy ----

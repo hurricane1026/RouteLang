@@ -2,15 +2,14 @@
 
 // Shared test infrastructure — mock event loop, real socket helpers.
 
-#include "rout/runtime/callbacks.h"
-#include "rout/runtime/connection.h"
-#include "rout/runtime/epoll_backend.h"
-#include "rout/runtime/event_loop.h"
-#include "rout/runtime/io_event.h"
-#include "rout/runtime/socket.h"
-#include "rout/runtime/timer_wheel.h"
-
 #include "mock_backend.h"
+#include "rut/runtime/callbacks.h"
+#include "rut/runtime/connection.h"
+#include "rut/runtime/epoll_backend.h"
+#include "rut/runtime/event_loop.h"
+#include "rut/runtime/io_event.h"
+#include "rut/runtime/socket.h"
+#include "rut/runtime/timer_wheel.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -22,7 +21,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-using namespace rout;
+using namespace rut;
 
 // ---- Mock event loop (64 conns, for unit tests) ----
 
@@ -37,9 +36,17 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     u32 free_stack[kMaxConns];
     u32 free_top = 0;
     u32 keepalive_timeout = 60;
+    bool draining = false;
+    AccessLogRing* access_log = nullptr;
+    ShardMetrics* metrics = nullptr;
+
+    bool is_draining() const { return draining; }
 
     void setup() {
         running = true;
+        draining = false;
+        access_log = nullptr;
+        metrics = nullptr;
         keepalive_timeout = 60;
         free_top = kMaxConns;
         timer.init();
@@ -78,6 +85,12 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     void close_conn_impl(Connection& c) {
         c.fd = -1;
         c.upstream_fd = -1;
+        if (metrics) {
+            if (c.req_start_us != 0) {
+                if (metrics->requests_active > 0) metrics->requests_active--;
+            }
+            metrics->on_close();
+        }
         this->free_conn(c);
     }
 

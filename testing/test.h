@@ -3,7 +3,7 @@
 // Lightweight test framework — zero stdlib dependency.
 //
 // Usage:
-//   #include "rout/test.h"
+//   #include "rut/test.h"
 //
 //   TEST(suite, name) {
 //       CHECK(1 + 1 == 2);
@@ -11,7 +11,7 @@
 //       REQUIRE(ptr != nullptr);  // stops test on failure
 //   }
 //
-//   int main(int argc, char** argv) { return rout::test::run_all(argc, argv); }
+//   int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }
 //
 // Filtering:
 //   ./test_foo                       # run all
@@ -21,7 +21,7 @@
 
 #include <unistd.h>  // write
 
-namespace rout::test {
+namespace rut::test {
 
 // --- Output ---
 
@@ -139,13 +139,13 @@ inline void register_test(TestCase* tc) {
 // --- Test definition ---
 
 #define TEST(suite, name)                                                          \
-    static void test_##suite##_##name(rout::test::TestCase*);                      \
-    static rout::test::TestCase tc_##suite##_##name = {                            \
+    static void test_##suite##_##name(rut::test::TestCase*);                       \
+    static rut::test::TestCase tc_##suite##_##name = {                             \
         #suite, #name, test_##suite##_##name, nullptr, 0, 0, nullptr, 0, nullptr}; \
     __attribute__((constructor)) static void reg_##suite##_##name() {              \
-        rout::test::register_test(&tc_##suite##_##name);                           \
+        rut::test::register_test(&tc_##suite##_##name);                            \
     }                                                                              \
-    static void test_##suite##_##name([[maybe_unused]] rout::test::TestCase* _tc)
+    static void test_##suite##_##name([[maybe_unused]] rut::test::TestCase* _tc)
 
 // --- Filter matching ---
 // "timer"         → suite or name contains "timer"
@@ -276,4 +276,4 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
     return total_fail > 0 ? 1 : 0;
 }
 
-}  // namespace rout::test
+}  // namespace rut::test

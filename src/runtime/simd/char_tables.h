@@ -1,8 +1,8 @@
 #pragma once
 
-#include "rout/common/types.h"
+#include "rut/common/types.h"
 
-namespace rout {
+namespace rut {
 
 // clang-format off
 
@@ -68,4 +68,4 @@ inline constexpr u8 kUriTable[256] = {
 
 // clang-format on
 
-}  // namespace rout
+}  // namespace rut

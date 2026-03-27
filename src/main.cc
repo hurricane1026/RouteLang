@@ -1,8 +1,9 @@
-#include "rout/runtime/epoll_backend.h"
-#include "rout/runtime/io_uring_backend.h"
-#include "rout/runtime/shard.h"
-#include "rout/runtime/socket.h"
+#include "rut/runtime/epoll_backend.h"
+#include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/shard.h"
+#include "rut/runtime/socket.h"
 
+#include <fcntl.h>
 #include <linux/io_uring.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -11,14 +12,16 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-using namespace rout;
+using namespace rut;
 
 static constexpr u32 kMaxShards = 64;
+static constexpr u32 kDefaultDrainSecs = 30;
 
+// Status messages go to stderr to avoid mixing with structured JSON access logs on stdout.
 static void write_str(const char* s) {
     u32 len = 0;
     while (s[len]) len++;
-    (void)write(1, s, len);
+    (void)write(2, s, len);
 }
 
 static void write_u32(u32 val) {
@@ -29,7 +32,7 @@ static void write_u32(u32 val) {
         buf[n++] = static_cast<char>('0' + tmp % 10);
         tmp /= 10;
     } while (tmp);
-    for (i32 i = n - 1; i >= 0; i--) (void)write(1, &buf[i], 1);
+    for (i32 i = n - 1; i >= 0; i--) (void)write(2, &buf[i], 1);
 }
 
 static bool str_eq(const char* a, const char* b) {
@@ -54,7 +57,7 @@ static bool detect_io_uring() {
 
 // --- Signal handling for graceful shutdown ---
 
-static void write_error(const char* prefix, const rout::Error& err) {
+static void write_error(const char* prefix, const rut::Error& err) {
     write_str(prefix);
     write_str(" (errno=");
     write_u32(static_cast<u32>(err.code));
@@ -64,7 +67,13 @@ static void write_error(const char* prefix, const rout::Error& err) {
 }
 
 template <typename Backend>
-static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
+static i32 run_shards(u16 port,
+                      u32 shard_count,
+                      bool pin_cpus,
+                      u32 drain_secs,
+                      const char* access_log_path,
+                      bool access_log_compress,
+                      i32 access_log_level) {
     Shard<Backend> shards[kMaxShards];
 
     // Create one SO_REUSEPORT listen socket per shard.
@@ -124,6 +133,36 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
     }
     port = __builtin_bswap16(bound_addr.sin_port);
 
+    // Set up access log flusher if --access-log was specified.
+    AccessLogFlusher log_flusher;
+    i32 access_log_fd = -1;
+    if (access_log_path) {
+        access_log_fd = open(access_log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (access_log_fd < 0) {
+            write_str("Failed to open access log: ");
+            write_str(access_log_path);
+            write_str("\n");
+            for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
+            return 1;
+        }
+        // Allocate per-shard access log rings.
+        for (u32 i = 0; i < shard_count; i++) {
+            auto rc = shards[i].init_access_log();
+            if (!rc) {
+                write_str("Failed to init access log ring for shard ");
+                write_u32(i);
+                write_error("", rc.error());
+                close(access_log_fd);
+                for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
+                return 1;
+            }
+        }
+        log_flusher.init(access_log_fd, access_log_compress, access_log_level);
+        for (u32 i = 0; i < shard_count; i++) {
+            log_flusher.add_ring(shards[i].log_ring);
+        }
+    }
+
     write_str("Listening on port ");
     write_u32(port);
     write_str(" with ");
@@ -154,15 +193,46 @@ static i32 run_shards(u16 port, u32 shard_count, bool pin_cpus) {
         }
     }
 
+    // Start access log background flusher (if configured).
+    if (access_log_fd >= 0) {
+        auto flusher_rc = log_flusher.start();
+        if (!flusher_rc) {
+            write_error("Failed to start access log flusher", flusher_rc.error());
+            for (u32 i = 0; i < shard_count; i++) shards[i].stop();
+            for (u32 i = 0; i < shard_count; i++) shards[i].join();
+            for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
+            close(access_log_fd);
+            return 1;
+        }
+    }
+
     // Wait for SIGINT/SIGTERM — sigwait() is race-free (signal is blocked).
     i32 sig = 0;
     sigwait(&wait_set, &sig);
 
-    // Stop all shards from main thread (not signal context)
-    for (u32 i = 0; i < shard_count; i++) shards[i].stop();
+    write_str("Draining connections (");
+    write_u32(drain_secs);
+    write_str("s)...\n");
+
+    // Begin graceful drain on all shards.
+    // Each shard will: respond with Connection: close on new requests,
+    // probabilistically close idle connections, and exit when empty or
+    // when the drain deadline is reached.
+    for (u32 i = 0; i < shard_count; i++) shards[i].drain(drain_secs);
+
+    // Wait for all shard threads to finish (they exit after drain completes).
     for (u32 i = 0; i < shard_count; i++) shards[i].join();
+
+    // Stop access log flusher (final flush of remaining entries).
+    if (access_log_fd >= 0) {
+        log_flusher.stop();
+        close(access_log_fd);
+    }
+
+    // Release resources.
     for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
 
+    write_str("Shutdown complete.\n");
     return 0;
 }
 
@@ -170,25 +240,80 @@ int main(int argc, char** argv) {
     u16 port = 8080;
     u32 shard_count = 0;  // 0 = auto-detect
     bool pin_cpus = true;
+    u32 drain_secs = kDefaultDrainSecs;
+    const char* access_log_path = nullptr;
+    bool access_log_compress = false;
+    i32 access_log_level = 3;  // default: doubleFast
 
-    // Simple arg parsing: [port] [--shards N] [--no-pin]
+    // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
+    //                      [--access-log PATH] [--access-log-compress]
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] >= '0' && argv[i][0] <= '9') {
             port = 0;
             for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                 port = port * 10 + static_cast<u16>(*p - '0');
         }
-        // Check --shards
         if (i + 1 < argc) {
             if (str_eq(argv[i], "--shards")) {
+                if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
+                    write_str("--shards requires a numeric argument\n");
+                    return 1;
+                }
                 i++;
                 shard_count = 0;
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                     shard_count = shard_count * 10 + static_cast<u32>(*p - '0');
+            } else if (str_eq(argv[i], "--drain")) {
+                if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
+                    write_str("--drain requires a numeric argument\n");
+                    return 1;
+                }
+                i++;
+                drain_secs = 0;
+                for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
+                    drain_secs = drain_secs * 10 + static_cast<u32>(*p - '0');
+            } else if (str_eq(argv[i], "--access-log")) {
+                if (argv[i + 1][0] == '-' && argv[i + 1][1] == '-') {
+                    write_str("--access-log requires a path argument\n");
+                    return 1;
+                }
+                i++;
+                access_log_path = argv[i];
+            } else if (str_eq(argv[i], "--access-log-level")) {
+                if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
+                    write_str("--access-log-level requires a numeric argument\n");
+                    return 1;
+                }
+                i++;
+                access_log_level = 0;
+                for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
+                    access_log_level = access_log_level * 10 + static_cast<i32>(*p - '0');
             }
         }
-        // Check --no-pin
         if (str_eq(argv[i], "--no-pin")) pin_cpus = false;
+        if (str_eq(argv[i], "--access-log-compress")) access_log_compress = true;
+        // Catch flags that require a value but appear as the last argument.
+        if (i + 1 >= argc) {
+            if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
+                str_eq(argv[i], "--access-log") || str_eq(argv[i], "--access-log-level")) {
+                write_str(argv[i]);
+                write_str(" requires an argument\n");
+                return 1;
+            }
+        }
+    }
+
+    // Environment variable override: RUE_ACCESS_LOG_COMPRESS=1
+    // getenv without stdlib — scan environ directly.
+    {
+        extern char** environ;
+        static const char kEnv[] = "RUE_ACCESS_LOG_COMPRESS=1";
+        for (char** e = environ; *e; e++) {
+            if (str_eq(*e, kEnv)) {
+                access_log_compress = true;
+                break;
+            }
+        }
     }
 
     if (shard_count == 0) shard_count = detect_cpu_count();
@@ -196,8 +321,20 @@ int main(int argc, char** argv) {
 
     if (detect_io_uring()) {
         write_str("Backend: io_uring\n");
-        return run_shards<IoUringBackend>(port, shard_count, pin_cpus);
+        return run_shards<IoUringBackend>(port,
+                                          shard_count,
+                                          pin_cpus,
+                                          drain_secs,
+                                          access_log_path,
+                                          access_log_compress,
+                                          access_log_level);
     }
     write_str("Backend: epoll\n");
-    return run_shards<EpollBackend>(port, shard_count, pin_cpus);
+    return run_shards<EpollBackend>(port,
+                                    shard_count,
+                                    pin_cpus,
+                                    drain_secs,
+                                    access_log_path,
+                                    access_log_compress,
+                                    access_log_level);
 }

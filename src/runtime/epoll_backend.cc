@@ -1,8 +1,7 @@
-#include "rout/runtime/epoll_backend.h"
-
-#include "rout/runtime/error.h"
+#include "rut/runtime/epoll_backend.h"
 
 #include "core/expected.h"
+#include "rut/runtime/error.h"
 
 #include <errno.h>
 #include <string.h>  // memset
@@ -12,7 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
-namespace rout {
+namespace rut {
 
 // --- Encode/decode epoll_event.data.u64 ---
 // Same layout as io_uring: [63:8] = conn_id, [7:0] = IoEventType
@@ -202,6 +201,12 @@ void EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
 
 void EpollBackend::cancel(i32 fd, u32 /*conn_id*/) {
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+}
+
+void EpollBackend::cancel_accept() {
+    if (listen_fd >= 0) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, listen_fd, nullptr);
+    }
 }
 
 // --- Wait ---
@@ -400,4 +405,4 @@ void EpollBackend::shutdown() {
     }
 }
 
-}  // namespace rout
+}  // namespace rut

@@ -1,9 +1,8 @@
 // Tests for common/types.h: Str, FixedVec, ListNode
-#include "rout/common/types.h"
-
+#include "rut/common/types.h"
 #include "test.h"
 
-using namespace rout;
+using namespace rut;
 
 // === Str ===
 
@@ -216,5 +215,5 @@ TEST(listnode, insert_three_remove_middle) {
 }
 
 int main(int argc, char** argv) {
-    return rout::test::run_all(argc, argv);
+    return rut::test::run_all(argc, argv);
 }

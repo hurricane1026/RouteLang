@@ -3,7 +3,7 @@
 
 #include <arm_neon.h>
 
-namespace rout::simd {
+namespace rut::simd {
 
 static inline bool neon_any(uint8x16_t v) {
     return vmaxvq_u8(v) != 0;
@@ -123,4 +123,4 @@ u32 scan_header_name(const u8* buf, u32 pos, u32 end) {
     return static_cast<u32>(-1);
 }
 
-}  // namespace rout::simd
+}  // namespace rut::simd

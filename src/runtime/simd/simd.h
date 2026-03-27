@@ -1,8 +1,8 @@
 #pragma once
 
-#include "rout/common/types.h"
+#include "rut/common/types.h"
 
-namespace rout::simd {
+namespace rut::simd {
 
 // Find \r\n\r\n in buffer starting from `from`.
 // Returns offset past terminator (first body byte), or 0 if not found.
@@ -20,4 +20,4 @@ u32 scan_uri(const u8* buf, u32 pos, u32 end);
 // Returns position of ':', or (u32)-1 on invalid/not found.
 u32 scan_header_name(const u8* buf, u32 pos, u32 end);
 
-}  // namespace rout::simd
+}  // namespace rut::simd

@@ -7,7 +7,7 @@
 //   #include "bench.h"
 //
 //   int main() {
-//       rout::bench::Bench b;
+//       rut::bench::Bench b;
 //       b.title("HTTP parser");
 //       b.min_iterations(1000000);
 //       b.warmup(100000);
@@ -15,18 +15,18 @@
 //       b.run("rue_parse", [&] {
 //           parser.reset();
 //           parser.parse(buf, len, &req);
-//           rout::bench::do_not_optimize(&req);
+//           rut::bench::do_not_optimize(&req);
 //       });
 //
 //       b.run("llhttp_parse", [&] { ... });
 //   }
 
-#include "rout/common/types.h"
+#include "rut/common/types.h"
 
 #include <time.h>    // clock_gettime, CLOCK_MONOTONIC
 #include <unistd.h>  // write
 
-namespace rout::bench {
+namespace rut::bench {
 
 // ============================================================================
 // Prevent dead-code elimination
@@ -318,4 +318,4 @@ struct Bench {
     }
 };
 
-}  // namespace rout::bench
+}  // namespace rut::bench

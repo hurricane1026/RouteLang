@@ -10,6 +10,7 @@
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/slice_pool.h"
 #include "rut/runtime/timer_wheel.h"
 
 #include <netinet/in.h>
@@ -75,11 +76,27 @@ private:
 
 public:
     static constexpr u32 kMaxConns = 16384;
+    static constexpr u32 kDefaultKeepaliveTimeout = 60;
+    SlicePool pool;  // per-shard buffer pool (2 slices per active connection)
     Connection conns[kMaxConns];
     u32 free_stack[kMaxConns];
     u32 free_top;
 
-    u32 keepalive_timeout = 60;
+    // Pending-free list: slots closed during the current dispatch batch.
+    // Moved to free_stack (and deferred slices returned to pool) after the
+    // next wait() cycle, which submits cancel SQEs and harvests CQEs so
+    // the kernel no longer references the buffers.
+    u32 pending_free[kMaxConns];
+    u32 pending_free_count;
+
+    // Deferred accepts: accepted fds that couldn't be allocated during
+    // dispatch because all slots were in pending_free. Retried after the
+    // batch finishes and reclaim_pending() frees slots.
+    static constexpr u32 kMaxDeferredAccepts = 64;
+    i32 deferred_accepts[kMaxDeferredAccepts];
+    u32 deferred_accept_count;
+
+    u32 keepalive_timeout = kDefaultKeepaliveTimeout;
     i32 listen_fd = -1;  // stored for drain: close to stop kernel routing new connections
 
     // Per-shard access log ring. Set by Shard before run(). Null = no logging.
@@ -88,15 +105,17 @@ public:
     // Per-shard metrics. Set by Shard before run(). Null = no metrics.
     ShardMetrics* metrics = nullptr;
 
-    core::Expected<void, Error> init(u32 id, i32 lfd) {
+    core::Expected<void, Error> init(u32 id, i32 lfd, u32 pool_prealloc = 0) {
         shard_id = id;
         listen_fd = lfd;
         __atomic_store_n(&running_, true, __ATOMIC_RELAXED);
         __atomic_store_n(&draining_, false, __ATOMIC_RELAXED);
         __atomic_store_n(&drain_start_, static_cast<u64>(0), __ATOMIC_RELAXED);
         __atomic_store_n(&drain_period_, static_cast<u32>(0), __ATOMIC_RELAXED);
-        keepalive_timeout = 60;
+        keepalive_timeout = kDefaultKeepaliveTimeout;
         free_top = kMaxConns;
+        pending_free_count = 0;
+        deferred_accept_count = 0;
         timer.init();
         for (u32 i = 0; i < kMaxConns; i++) {
             conns[i].reset();
@@ -104,7 +123,12 @@ public:
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
         }
-        TRY_VOID(backend.init(id, lfd));
+        TRY_VOID(pool.init(kMaxConns * 2, pool_prealloc));
+        auto be = backend.init(id, lfd);
+        if (!be) {
+            pool.destroy();
+            return core::make_unexpected(be.error());
+        }
         return {};
     }
 
@@ -116,6 +140,13 @@ public:
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
             for (u32 i = 0; i < n; i++) {
                 dispatch(events[i]);
+            }
+            // Async backend: reclaim closed slots whose CQEs have all been
+            // harvested. Runs AFTER dispatch so stale CQEs decrement
+            // pending_ops before we check. Then retry any deferred accepts.
+            if constexpr (Backend::kAsyncIo) {
+                reclaim_pending();
+                retry_deferred_accepts();
             }
             // Close listen fd after dispatching the current batch so any
             // already-queued accepts (epoll backlog) get a proper response
@@ -138,7 +169,59 @@ public:
     void stop() { __atomic_store_n(&running_, false, __ATOMIC_RELEASE); }
     bool is_running() const { return __atomic_load_n(&running_, __ATOMIC_ACQUIRE); }
     bool is_draining() const { return __atomic_load_n(&draining_, __ATOMIC_ACQUIRE); }
-    void shutdown() { backend.shutdown(); }
+    void shutdown() {
+        if constexpr (Backend::kAsyncIo) reclaim_pending();
+        backend.shutdown();
+        pool.destroy();
+    }
+
+    // Reclaim a single slot from pending_free by conn_id. Frees slices,
+    // pushes to free_stack, and removes from the pending_free array.
+    // Called inline from dispatch() when a stale CQE completes reclamation,
+    // so a later Accept in the same batch can reuse the slot immediately.
+    void reclaim_slot(u32 cid) {
+        if (conns[cid].recv_slice) {
+            pool.free(conns[cid].recv_slice);
+            conns[cid].recv_slice = nullptr;
+        }
+        if (conns[cid].send_slice) {
+            pool.free(conns[cid].send_slice);
+            conns[cid].send_slice = nullptr;
+        }
+        free_stack[free_top++] = cid;
+        // Remove from pending_free (swap with last element).
+        for (u32 i = 0; i < pending_free_count; i++) {
+            if (pending_free[i] == cid) {
+                pending_free[i] = pending_free[--pending_free_count];
+                break;
+            }
+        }
+    }
+
+    // CQE-driven reclamation: only reclaim slots whose in-flight I/O has
+    // fully completed (pending_ops == 0). Slots still waiting for CQEs
+    // remain in pending_free until a future dispatch() decrements their
+    // pending_ops to 0.
+    void reclaim_pending() {
+        u32 remaining = 0;
+        for (u32 i = 0; i < pending_free_count; i++) {
+            u32 cid = pending_free[i];
+            if (conns[cid].pending_ops == 0) {
+                if (conns[cid].recv_slice) {
+                    pool.free(conns[cid].recv_slice);
+                    conns[cid].recv_slice = nullptr;
+                }
+                if (conns[cid].send_slice) {
+                    pool.free(conns[cid].send_slice);
+                    conns[cid].send_slice = nullptr;
+                }
+                free_stack[free_top++] = cid;
+            } else {
+                pending_free[remaining++] = cid;
+            }
+        }
+        pending_free_count = remaining;
+    }
 
     // Begin graceful drain. New requests get Connection: close.
     // Idle connections are probabilistically closed on each timer tick.
@@ -164,40 +247,131 @@ public:
         }
     }
 
-    // Number of allocated (in-use) connections.
+    // Number of connections not yet fully reclaimed.
+    // Includes pending_free slots: they're closed but still waiting for
+    // CQEs, so drain must keep running until they're reclaimed too.
     u32 active_count() const { return kMaxConns - free_top; }
 
     // --- CRTP implementations ---
 
     Connection* alloc_conn_impl() {
         if (free_top == 0) return nullptr;
+        // Allocate buffer slices from pool before committing the conn slot.
+        u8* rs = pool.alloc();
+        u8* ss = pool.alloc();
+        if (!rs || !ss) {
+            if (rs) pool.free(rs);
+            if (ss) pool.free(ss);
+            return nullptr;  // pool exhausted — back-pressure
+        }
         u32 id = free_stack[--free_top];
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
+        conns[id].recv_slice = rs;
+        conns[id].send_slice = ss;
+        conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);
+        conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         return &conns[id];
     }
 
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
-        c.reset();
-        free_stack[free_top++] = cid;
+        if constexpr (Backend::kAsyncIo) {
+            // Async backend (io_uring): if no ops are in flight (the close
+            // was triggered by the final CQE), reclaim immediately — no
+            // need to defer. This avoids blocking alloc_conn at saturation
+            // when a close and accept arrive in the same dispatch batch.
+            if (c.pending_ops == 0) {
+                if (c.recv_slice) pool.free(c.recv_slice);
+                if (c.send_slice) pool.free(c.send_slice);
+                c.reset();
+                free_stack[free_top++] = cid;
+                return;
+            }
+            // Ops still in flight: defer until CQEs arrive and pending_ops
+            // reaches 0 in reclaim_pending().
+            u8* rs = c.recv_slice;
+            u8* ss = c.send_slice;
+            u32 ops = c.pending_ops;
+            c.reset();
+            conns[cid].recv_slice = rs;
+            conns[cid].send_slice = ss;
+            conns[cid].pending_ops = ops;
+            pending_free[pending_free_count++] = cid;
+        } else {
+            // Sync backend (epoll): kernel is done with buffers when
+            // read/write returns. Return slices to pool immediately.
+            if (c.recv_slice) pool.free(c.recv_slice);
+            if (c.send_slice) pool.free(c.send_slice);
+            c.reset();
+            free_stack[free_top++] = cid;
+        }
     }
 
-    void submit_recv_impl(Connection& c) { backend.add_recv(c.fd, c.id); }
+    void submit_recv_impl(Connection& c) {
+        if constexpr (Backend::kAsyncIo) {
+            // Multishot recv stays armed across keep-alive cycles.
+            // Skip re-submit to avoid inflating pending_ops.
+            if (c.recv_armed) return;
+        }
+        if (backend.add_recv(c.fd, c.id)) {
+            if constexpr (Backend::kAsyncIo) {
+                c.pending_ops++;
+                c.recv_armed = true;
+            }
+        }
+    }
     void submit_send_impl(Connection& c, const u8* buf, u32 len) {
-        backend.add_send(c.fd, c.id, buf, len);
+        if (backend.add_send(c.fd, c.id, buf, len)) {
+            if constexpr (Backend::kAsyncIo) {
+                c.pending_ops++;
+                c.send_armed = true;
+            }
+        }
     }
     void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
+        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
+            if constexpr (Backend::kAsyncIo) c.pending_ops++;
+        }
     }
     void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        backend.add_send(c.upstream_fd, c.id, buf, len);
+        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
+            if constexpr (Backend::kAsyncIo) {
+                c.pending_ops++;
+                c.upstream_send_armed = true;
+            }
+        }
     }
-    void submit_recv_upstream_impl(Connection& c) { backend.add_recv(c.upstream_fd, c.id); }
+    void submit_recv_upstream_impl(Connection& c) {
+        if constexpr (Backend::kAsyncIo) {
+            if (c.upstream_recv_armed) return;
+        }
+        if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
+            if constexpr (Backend::kAsyncIo) {
+                c.pending_ops++;
+                c.upstream_recv_armed = true;
+            }
+        }
+    }
 
     void close_conn_impl(Connection& c) {
+        if constexpr (Backend::kAsyncIo) {
+            // Only cancel when ops are in flight. If pending_ops == 0,
+            // the slot is freed immediately — no cancels needed.
+            // Add cancel count to pending_ops so the slot isn't reclaimed
+            // until all cancel CQEs have been processed.
+            if (c.pending_ops > 0) {
+                c.pending_ops += backend.cancel(c.fd,
+                                                c.id,
+                                                c.recv_armed,
+                                                c.send_armed,
+                                                c.upstream_recv_armed,
+                                                c.upstream_send_armed,
+                                                c.upstream_fd >= 0);
+            }
+        }
         if (c.fd >= 0) {
             ::close(c.fd);
             c.fd = -1;
@@ -254,9 +428,32 @@ public:
         }
         if (ev.conn_id < kMaxConns) {
             auto& conn = conns[ev.conn_id];
+            if constexpr (Backend::kAsyncIo) {
+                // Decrement pending_ops only on the final CQE for this op.
+                // Multishot recv (IORING_RECV_MULTISHOT) sets ev.more on
+                // intermediate CQEs — the SQE stays armed, so the op is
+                // still in-flight and must not be counted as complete.
+                if (!ev.more) {
+                    if (conn.pending_ops > 0) conn.pending_ops--;
+                    // Multishot recv ended — clear the armed flag using
+                    // event type (not state) to distinguish client vs upstream.
+                    if (ev.type == IoEventType::Recv) conn.recv_armed = false;
+                    if (ev.type == IoEventType::Send) conn.send_armed = false;
+                    if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
+                    if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
+                }
+            }
             if (conn.on_complete) {
                 timer.refresh(&conn, keepalive_timeout);
                 conn.on_complete(this, conn, ev);
+            } else if constexpr (Backend::kAsyncIo) {
+                // Stale CQE for a closed connection. If all ops are now
+                // complete, reclaim the slot immediately so a later Accept
+                // in the same batch can reuse it (avoids dropping connections
+                // at saturation).
+                if (conn.pending_ops == 0) {
+                    reclaim_slot(ev.conn_id);
+                }
             }
         }
     }
@@ -268,8 +465,24 @@ private:
         if (ev.result < 0) return;
         Connection* c = this->alloc_conn();
         if (!c) {
-            ::close(ev.result);
-            return;
+            if constexpr (Backend::kAsyncIo) {
+                // Try reclaiming slots from stale CQEs earlier in this batch.
+                reclaim_pending();
+                c = this->alloc_conn();
+                if (!c) {
+                    // Still no slot — a later CQE in this batch may free one.
+                    // Defer the accept fd and retry after the batch finishes.
+                    if (deferred_accept_count < kMaxDeferredAccepts) {
+                        deferred_accepts[deferred_accept_count++] = ev.result;
+                    } else {
+                        ::close(ev.result);
+                    }
+                    return;
+                }
+            } else {
+                ::close(ev.result);
+                return;
+            }
         }
         c->fd = ev.result;
         struct sockaddr_in peer = {};
@@ -285,6 +498,34 @@ private:
         timer.add(c, keepalive_timeout);
         if (metrics) metrics->on_accept();
         this->submit_recv(*c);
+    }
+
+    // Retry accepts that were deferred because no slot was available
+    // during the dispatch batch. Now that reclaim_pending() has run,
+    // slots may have become available.
+    void retry_deferred_accepts() {
+        for (u32 i = 0; i < deferred_accept_count; i++) {
+            i32 fd = deferred_accepts[i];
+            Connection* c = this->alloc_conn();
+            if (!c) {
+                ::close(fd);
+                continue;
+            }
+            c->fd = fd;
+            struct sockaddr_in peer = {};
+            socklen_t peer_len = sizeof(peer);
+            if (::getpeername(c->fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0 &&
+                peer.sin_family == AF_INET) {
+                c->peer_addr = peer.sin_addr.s_addr;
+            }
+            c->state = ConnState::ReadingHeader;
+            c->keep_alive = !__atomic_load_n(&draining_, __ATOMIC_RELAXED);
+            c->on_complete = &on_header_received<Self>;
+            timer.add(c, keepalive_timeout);
+            if (metrics) metrics->on_accept();
+            this->submit_recv(*c);
+        }
+        deferred_accept_count = 0;
     }
 
     // Stop accepting new connections: cancel the backend's accept request

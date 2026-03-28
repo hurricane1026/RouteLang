@@ -24,6 +24,10 @@ namespace rut {
 //   - No zero-copy send
 //
 struct EpollBackend {
+    // epoll uses synchronous read/write: the kernel is done with user
+    // buffers when the syscall returns. No deferred reclamation needed.
+    static constexpr bool kAsyncIo = false;
+
     i32 epoll_fd = -1;
     i32 timer_fd = -1;
     i32 listen_fd = -1;
@@ -59,16 +63,24 @@ struct EpollBackend {
     void add_accept();
 
     // Register fd for EPOLLIN — actual recv happens inside wait().
-    void add_recv(i32 fd, u32 conn_id);
+    bool add_recv(i32 fd, u32 conn_id);
+    bool add_recv_upstream(i32 fd, u32 conn_id);
 
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
-    void add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);
 
     // Register fd for connect completion (EPOLLOUT).
-    void add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
+    bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
 
     // Remove fd from epoll.
-    void cancel(i32 fd, u32 conn_id);
+    u32 cancel(i32 fd,
+               u32 conn_id,
+               bool recv_armed = false,
+               bool send_armed = false,
+               bool upstream_recv_armed = false,
+               bool upstream_send_armed = false,
+               bool has_upstream = false);
 
     // Remove listen socket from epoll. For epoll this is sufficient to stop
     // accepting — no multishot to cancel (unlike io_uring).

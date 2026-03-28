@@ -27,6 +27,11 @@ struct Connection;  // forward declaration for wait() signature
 //   [*] IORING_SETUP_COOP_TASKRUN — cooperative task running
 //
 struct IoUringBackend {
+    // io_uring is async: the kernel may still access user buffers between
+    // SQE submission and CQE completion. EventLoop uses this trait to
+    // enable CQE-driven deferred slice reclamation (pending_ops tracking).
+    static constexpr bool kAsyncIo = true;
+
     // Ring file descriptor
     i32 ring_fd = -1;
 
@@ -90,16 +95,34 @@ struct IoUringBackend {
 
     // Submit a multishot recv with provided buffer selection.
     // No user buffer needed — kernel picks from provided ring.
-    void add_recv(i32 fd, u32 conn_id);
+    // Returns false if SQ is full (no SQE submitted).
+    bool add_recv(i32 fd, u32 conn_id);
+
+    // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
+    // can distinguish upstream vs client recv CQEs.
+    bool add_recv_upstream(i32 fd, u32 conn_id);
 
     // Submit a send (or zero-copy send).
-    void add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    // Returns false if SQ is full (no SQE submitted).
+    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
+
+    // Same as add_send but encodes UpstreamSend in user_data.
+    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);
 
     // Submit a connect to upstream.
-    void add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
+    // Returns false if SQ is full (no SQE submitted).
+    bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
 
-    // Cancel an outstanding operation.
-    void cancel(i32 fd, u32 conn_id);
+    // Cancel outstanding operations for a connection (by user_data match).
+    // Only submits cancel SQEs for op types actually in flight.
+    // Returns the number of cancel SQEs submitted (for pending_ops tracking).
+    u32 cancel(i32 fd,
+               u32 conn_id,
+               bool recv_armed,
+               bool send_armed,
+               bool upstream_recv_armed,
+               bool upstream_send_armed,
+               bool has_upstream);
 
     // Cancel the multishot accept request. Must be called before closing
     // listen_fd during drain to stop io_uring from accepting new connections.
@@ -118,6 +141,11 @@ struct IoUringBackend {
     void return_buffer(u16 buf_id);
 
 private:
+    // Submit a cancel SQE matching a specific user_data value.
+    // conn_id is encoded in the cancel CQE's user_data so dispatch()
+    // can decrement pending_ops when the cancel completes.
+    bool cancel_by_user_data(u64 target, u32 conn_id, IoEventType type);
+
     // Get next available SQE. Returns nullptr if SQ is full.
     io_uring_sqe* get_sqe();
 

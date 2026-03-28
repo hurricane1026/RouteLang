@@ -11,6 +11,7 @@ enum class IoEventType : u8 {
     Send,
     UpstreamConnect,
     UpstreamRecv,
+    UpstreamSend,
     Timeout,
 };
 
@@ -21,6 +22,7 @@ struct IoEvent {
     u16 buf_id;  // provided buffer id (io_uring only; valid iff has_buf != 0)
     u8 has_buf;  // non-zero if this event owns a provided buffer in buf_id
     IoEventType type;
+    u8 more;  // non-zero if the SQE will produce more CQEs (multishot recv)
 };
 
 }  // namespace rut

@@ -10,10 +10,13 @@ namespace rut {
 //
 // Required interface:
 //   i32  init(u32 shard_id, i32 listen_fd);  // returns 0 on success, -errno on failure
+//   static constexpr bool kAsyncIo;  // true for io_uring, false for epoll
 //   void add_accept();
-//   void add_recv(i32 fd, u32 conn_id);
-//   void add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
-//   void add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
+//   bool add_recv(i32 fd, u32 conn_id);          // false if SQ full (io_uring)
+//   bool add_recv_upstream(i32 fd, u32 conn_id); // upstream recv (UpstreamRecv type)
+//   bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
+//   bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len); // UpstreamSend
+//   bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
 //   void cancel(i32 fd, u32 conn_id);
 //   u32  wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
 //

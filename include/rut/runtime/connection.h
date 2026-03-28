@@ -2,9 +2,17 @@
 
 #include "rut/common/buffer.h"
 #include "rut/common/types.h"
+#include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
 
 namespace rut {
+
+enum class BodyMode : u8 {
+    None,           // No body
+    ContentLength,  // Known size via Content-Length
+    Chunked,        // Transfer-Encoding: chunked
+    UntilClose,     // Read until EOF (HTTP/1.0)
+};
 
 enum class ConnState : u8 {
     Idle,
@@ -41,6 +49,18 @@ struct Connection {
     void* handler_ctx;
 
     bool keep_alive;
+
+    // Body streaming state (proxy large body support)
+    u32 req_header_end;        // offset past request headers (\r\n\r\n)
+    u32 req_content_length;    // original Content-Length value (for send capping)
+    u32 req_initial_send_len;  // max bytes to send in initial upstream forward
+    BodyMode req_body_mode;
+    u32 req_body_remaining;          // bytes left for request body (Content-Length)
+    ChunkedParser req_chunk_parser;  // for chunked request body end detection
+    BodyMode resp_body_mode;
+    u32 resp_body_remaining;          // bytes left for Content-Length mode
+    ChunkedParser resp_chunk_parser;  // for chunked mode end detection
+    u32 resp_body_sent;               // total response body bytes sent (for access log)
 
     // io_uring multishot recv tracking: true while the multishot SQE is
     // armed in the kernel (set on submit, cleared on final CQE without
@@ -104,6 +124,16 @@ struct Connection {
         handler_state = 0;
         handler_ctx = nullptr;
         keep_alive = false;
+        req_header_end = 0;
+        req_content_length = 0;
+        req_initial_send_len = 0;
+        req_body_mode = BodyMode::None;
+        req_body_remaining = 0;
+        req_chunk_parser.reset();
+        resp_body_mode = BodyMode::None;
+        resp_body_remaining = 0;
+        resp_chunk_parser.reset();
+        resp_body_sent = 0;
         recv_armed = false;
         send_armed = false;
         upstream_recv_armed = false;

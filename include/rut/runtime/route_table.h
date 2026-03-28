@@ -1,7 +1,10 @@
 #pragma once
 
+#include "core/expected.h"
 #include "rut/common/types.h"
+#include "rut/runtime/error.h"
 
+#include <errno.h>
 #include <netinet/in.h>
 #include <string.h>
 
@@ -15,9 +18,11 @@ enum class RouteAction : u8 {
 
 // Upstream target — address:port for a backend server.
 struct UpstreamTarget {
+    static constexpr u32 kMaxUpstreamNameLen = 32;
+
     struct sockaddr_in addr;
     // Short name for logging/debugging (e.g., "api-v1")
-    char name[32];
+    char name[kMaxUpstreamNameLen];
     u32 name_len;
 
     void set_name(const char* n) {
@@ -40,8 +45,10 @@ struct UpstreamTarget {
 
 // Single route entry: matches method + path prefix → action.
 struct RouteEntry {
+    static constexpr u32 kMaxPathLen = 128;
+
     // Match criteria
-    char path[128];  // path prefix (e.g., "/api/v1/")
+    char path[kMaxPathLen];  // path prefix (e.g., "/api/v1/")
     u32 path_len;
     u8 method;  // 0 = any, 'G' = GET, 'P' = POST, etc. (first char)
 
@@ -107,13 +114,14 @@ struct RouteConfig {
         return true;
     }
 
-    // Add an upstream target. Returns its index.
-    i32 add_upstream(const char* name, u32 ip, u16 port) {
-        if (upstream_count >= kMaxUpstreams) return -1;
+    // Add an upstream target. Returns its index, or error if at capacity.
+    core::Expected<u32, Error> add_upstream(const char* name, u32 ip, u16 port) {
+        if (upstream_count >= kMaxUpstreams)
+            return core::make_unexpected(Error::make(ENOSPC, Error::Source::RouteTable));
         u32 idx = upstream_count++;
         upstreams[idx].set_name(name);
         upstreams[idx].set_addr(ip, port);
-        return static_cast<i32>(idx);
+        return idx;
     }
 
     // Match a request path (prefix match, first match wins).

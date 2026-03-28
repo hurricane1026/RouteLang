@@ -23,6 +23,9 @@ struct MockOp {
 };
 
 struct MockBackend {
+    // Mock backend: synchronous like epoll (no deferred reclamation).
+    static constexpr bool kAsyncIo = false;
+
     // Recorded operations (submitted by event loop / callbacks)
     static constexpr u32 kMaxOps = 256;
     MockOp ops[kMaxOps];
@@ -45,28 +48,44 @@ struct MockBackend {
         }
     }
 
-    void add_recv(i32 fd, u32 conn_id) {
+    bool add_recv(i32 fd, u32 conn_id) {
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::Recv, fd, conn_id, nullptr, 0};
         }
+        return true;
     }
 
-    void add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+    bool add_recv_upstream(i32 fd, u32 conn_id) { return add_recv(fd, conn_id); }
+
+    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+        return add_send(fd, conn_id, buf, len);
+    }
+
+    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::Send, fd, conn_id, buf, len};
         }
+        return true;
     }
 
-    void add_connect(i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/) {
+    bool add_connect(i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/) {
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::Connect, fd, conn_id, nullptr, 0};
         }
+        return true;
     }
 
-    void cancel(i32 fd, u32 conn_id) {
+    u32 cancel(i32 fd,
+               u32 conn_id,
+               bool /*recv_armed*/ = false,
+               bool /*send_armed*/ = false,
+               bool /*upstream_recv_armed*/ = false,
+               bool /*upstream_send_armed*/ = false,
+               bool /*has_upstream*/ = false) {
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::Cancel, fd, conn_id, nullptr, 0};
         }
+        return 0;  // sync backend: no cancel CQEs to track
     }
 
     void shutdown() {}

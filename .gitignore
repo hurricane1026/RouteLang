@@ -2,3 +2,4 @@ build/
 build-cov/
 .cache/
 build-release/
+node_modules/

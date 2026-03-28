@@ -16,6 +16,8 @@ enum class ConnState : u8 {
 };
 
 struct Connection {
+    static constexpr u32 kMaxReqPathLen = 64;
+    static constexpr u32 kMaxUpstreamNameLen = 24;
     // fp callback: what to do when the next I/O completes.
     // This IS the state — no enum switch needed.
     // Typed as void* to avoid circular dependency; cast in event_loop.h.
@@ -40,6 +42,15 @@ struct Connection {
 
     bool keep_alive;
 
+    // io_uring multishot recv tracking: true while the multishot SQE is
+    // armed in the kernel (set on submit, cleared on final CQE without
+    // IORING_CQE_F_MORE). Separate flags for client and upstream to avoid
+    // an upstream recv CQE clearing the client's armed state.
+    bool recv_armed;
+    bool send_armed;
+    bool upstream_recv_armed;
+    bool upstream_send_armed;
+
     // Response status (set by handler/proxy, used by access log)
     u16 resp_status;
 
@@ -47,24 +58,35 @@ struct Connection {
     u8 req_method;
     u32 req_size;
     u32 peer_addr;
-    char req_path[64];
+    char req_path[kMaxReqPathLen];
 
     // Proxy timing/name for access log.
     u32 upstream_us;
-    char upstream_name[24];
+    char upstream_name[kMaxUpstreamNameLen];
     u64 upstream_start_us;
 
     // Request timing (for access log)
     u64 req_start_us;
 
-    // Recv buffer: Buffer wraps recv_storage_ for typestate-safe I/O.
-    // Backend recv's directly via write_ptr()/commit(); callbacks read via data()/len().
-    u8 recv_storage[4096];
-    Buffer recv_buf;
+    // Outstanding I/O ops submitted to the backend. Incremented on
+    // submit_recv/submit_send/etc., decremented when the final CQE
+    // arrives in dispatch() (multishot CQEs with IORING_CQE_F_MORE
+    // don't decrement). Used to drive CQE-based slice reclamation:
+    // a closed connection's pooled slices are only returned to the pool
+    // after all in-flight ops have completed (pending_ops reaches 0).
+    //
+    // u32: multishot recv stays armed across keep-alive cycles, but
+    // on_response_sent re-submits submit_recv each cycle, growing the
+    // counter by ~1 per request. u32 avoids wraparound (~4B requests).
+    // The proper fix is to not re-arm multishot recv on keep-alive.
+    u32 pending_ops;
 
-    // Send buffer: Buffer wraps send_storage for typestate-safe I/O.
-    // Callbacks write via write()/data(); backend reads via data()/len() for send().
-    u8 send_storage[4096];
+    // Recv/send buffers — backed by SlicePool slices (16KB each).
+    // Slices are allocated in EventLoop::alloc_conn_impl() and freed in free_conn_impl().
+    // Idle/free connections hold nullptr (zero buffer memory).
+    u8* recv_slice;
+    u8* send_slice;
+    Buffer recv_buf;
     Buffer send_buf;
 
     void reset() {
@@ -82,6 +104,10 @@ struct Connection {
         handler_state = 0;
         handler_ctx = nullptr;
         keep_alive = false;
+        recv_armed = false;
+        send_armed = false;
+        upstream_recv_armed = false;
+        upstream_send_armed = false;
         resp_status = 0;
         req_method = 0;
         req_size = 0;
@@ -91,8 +117,11 @@ struct Connection {
         upstream_name[0] = '\0';
         upstream_start_us = 0;
         req_start_us = 0;
-        recv_buf.bind(recv_storage, sizeof(recv_storage));
-        send_buf.bind(send_storage, sizeof(send_storage));
+        pending_ops = 0;
+        recv_slice = nullptr;
+        send_slice = nullptr;
+        recv_buf.bind(nullptr, 0);
+        send_buf.bind(nullptr, 0);
     }
 };
 

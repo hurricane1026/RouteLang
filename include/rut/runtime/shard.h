@@ -36,6 +36,7 @@ inline u32 detect_cpu_count();
 
 template <typename Backend>
 struct Shard {
+    static constexpr u32 kScratchArenaSize = 65536;
     u32 id = 0;
     i32 listen_fd = -1;
     bool owns_listen_fd = false;  // if true, close on shutdown
@@ -66,7 +67,7 @@ struct Shard {
 
     // Initialize shard: mmap EventLoop, init backend + arena.
     // listen_fd must already be created with SO_REUSEPORT.
-    core::Expected<void, Error> init(u32 shard_id, i32 lfd) {
+    core::Expected<void, Error> init(u32 shard_id, i32 lfd, u32 pool_prealloc = 0) {
         id = shard_id;
         listen_fd = lfd;
 
@@ -80,7 +81,7 @@ struct Shard {
         if (mem == MAP_FAILED) return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
         loop = new (mem) EventLoop<Backend>();
 
-        auto loop_result = loop->init(shard_id, listen_fd);
+        auto loop_result = loop->init(shard_id, listen_fd, pool_prealloc);
         if (!loop_result) {
             loop->~EventLoop();
             munmap(loop, sizeof(EventLoop<Backend>));
@@ -89,7 +90,7 @@ struct Shard {
         }
 
         // Init scratch arena (64KB initial block, grows on demand)
-        auto arena_result = scratch.init(65536);
+        auto arena_result = scratch.init(kScratchArenaSize);
         if (!arena_result) {
             loop->shutdown();
             loop->~EventLoop();

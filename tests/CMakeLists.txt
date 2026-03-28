@@ -54,6 +54,16 @@ target_include_directories(test_http_parser PRIVATE
 add_test(NAME test_http_parser COMMAND test_http_parser)
 set_tests_properties(test_http_parser PROPERTIES LABELS "unit")
 
+add_executable(test_chunked_parser test_chunked_parser.cc)
+target_link_libraries(test_chunked_parser rue_runtime)
+target_include_directories(test_chunked_parser PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME test_chunked_parser COMMAND test_chunked_parser)
+set_tests_properties(test_chunked_parser PROPERTIES LABELS "unit")
+
 add_executable(test_buffer test_buffer.cc)
 target_include_directories(test_buffer PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -131,7 +141,8 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_drain>
     COMMAND $<TARGET_FILE:test_access_log>
     COMMAND $<TARGET_FILE:test_metrics>
+    COMMAND $<TARGET_FILE:test_chunked_parser>
     COMMAND $<TARGET_FILE:test_shard_control>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_buffer test_types test_rir test_drain test_access_log test_metrics test_shard_control
+    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_drain test_access_log test_metrics test_shard_control
     COMMENT "Running all tests..."
 )

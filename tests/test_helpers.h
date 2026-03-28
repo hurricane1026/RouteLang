@@ -799,5 +799,32 @@ struct TestServer {
     }
 };
 
+// Valid HTTP response for proxy tests. Must be parseable by HttpResponseParser.
+static const char kMockHttpResponse[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Length: 2\r\n"
+    "\r\n"
+    "OK";
+static constexpr u32 kMockHttpResponseLen = sizeof(kMockHttpResponse) - 1;
+
+// Write a valid HTTP response into conn's recv_buf and dispatch UpstreamRecv.
+// This replaces inject_and_dispatch for upstream response events so the
+// response parser sees valid HTTP (inject_and_dispatch writes garbage bytes).
+template <typename Loop>
+static void inject_upstream_response(Loop& loop, Connection& conn) {
+    conn.recv_buf.reset();
+    u8* dst = conn.recv_buf.write_ptr();
+    for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
+    conn.recv_buf.commit(kMockHttpResponseLen);
+    IoEvent ev =
+        make_ev(conn.id, IoEventType::UpstreamRecv, static_cast<i32>(kMockHttpResponseLen));
+    // Inject directly without going through inject_and_dispatch (which would
+    // overwrite our carefully crafted recv_buf with garbage bytes).
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+}
+
 #define HTTP_REQ "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
 #define HTTP_REQ_LEN 27

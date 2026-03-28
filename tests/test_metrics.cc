@@ -359,7 +359,8 @@ TEST(proxy_callback, upstream_request_sent_error) {
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
-TEST(proxy_callback, upstream_request_sent_partial) {
+TEST(proxy_callback, upstream_request_sent_any_positive_succeeds) {
+    // Backends guarantee full sends. Any positive result is success.
     SmallLoop loop;
     loop.setup();
 
@@ -367,9 +368,9 @@ TEST(proxy_callback, upstream_request_sent_partial) {
     u32 cid = 0;
     setup_proxy_conn(loop, c, cid);
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    // Partial send
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    // Should proceed to upstream response phase, not close.
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 TEST(proxy_callback, upstream_request_sent_wrong_event) {
@@ -406,7 +407,7 @@ TEST(proxy_callback, upstream_response_success) {
     advance_to_upstream_response(loop, c, cid);
 
     // Simulate upstream response data in recv_buf
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
+    inject_upstream_response(loop, *c);
     CHECK_EQ(c->state, ConnState::Sending);
 }
 
@@ -445,7 +446,7 @@ TEST(proxy_callback, proxy_response_sent_success) {
     Connection* c = nullptr;
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
+    inject_upstream_response(loop, *c);
     // Now at on_proxy_response_sent, send the proxied response to client
     u32 resp_len = c->recv_buf.len();
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(resp_len)));
@@ -461,23 +462,24 @@ TEST(proxy_callback, proxy_response_sent_error) {
     Connection* c = nullptr;
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
+    inject_upstream_response(loop, *c);
     // Send error
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -1));
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
-TEST(proxy_callback, proxy_response_sent_partial) {
+TEST(proxy_callback, proxy_response_sent_any_positive_succeeds) {
+    // Backends guarantee full sends. Any positive result is success.
     SmallLoop loop;
     loop.setup();
 
     Connection* c = nullptr;
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
-    // Partial send
+    inject_upstream_response(loop, *c);
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    // Should complete the request, not close on "partial".
+    CHECK_EQ(loop.conns[cid].state, ConnState::ReadingHeader);
 }
 
 TEST(proxy_callback, proxy_response_sent_wrong_event) {
@@ -487,7 +489,7 @@ TEST(proxy_callback, proxy_response_sent_wrong_event) {
     Connection* c = nullptr;
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
+    inject_upstream_response(loop, *c);
     // Wrong event type
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 1));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -504,10 +506,14 @@ TEST(proxy_callback, proxy_response_sent_draining_closes) {
     Connection* c = nullptr;
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
-    u32 resp_len = c->recv_buf.len();
+    inject_upstream_response(loop, *c);
+    // During drain with no Connection header, on_upstream_response rebuilds
+    // the response in send_buf with "Connection: close" injected, and routes
+    // through on_response_sent. Use send_buf.len() for the send result.
+    u32 resp_len = c->send_buf.len();
+    CHECK_GT(resp_len, 0u);
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(resp_len)));
-    // During drain, proxy connections should be closed after send
+    // During drain, connections should be closed after send
     CHECK_EQ(loop.conns[cid].fd, -1);
     CHECK_EQ(m.requests_total, 1u);
 }

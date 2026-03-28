@@ -406,7 +406,7 @@ TEST(proxy_callback, upstream_response_success) {
     advance_to_upstream_response(loop, c, cid);
 
     // Simulate upstream response data in recv_buf
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
     CHECK_EQ(c->state, ConnState::Sending);
 }
 
@@ -445,7 +445,7 @@ TEST(proxy_callback, proxy_response_sent_success) {
     Connection* c = nullptr;
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
     // Now at on_proxy_response_sent, send the proxied response to client
     u32 resp_len = c->recv_buf.len();
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(resp_len)));
@@ -461,7 +461,7 @@ TEST(proxy_callback, proxy_response_sent_error) {
     Connection* c = nullptr;
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
     // Send error
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -1));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -474,7 +474,7 @@ TEST(proxy_callback, proxy_response_sent_partial) {
     Connection* c = nullptr;
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
     // Partial send
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -487,7 +487,7 @@ TEST(proxy_callback, proxy_response_sent_wrong_event) {
     Connection* c = nullptr;
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
     // Wrong event type
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 1));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -504,7 +504,7 @@ TEST(proxy_callback, proxy_response_sent_draining_closes) {
     Connection* c = nullptr;
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 50));
     u32 resp_len = c->recv_buf.len();
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(resp_len)));
     // During drain, proxy connections should be closed after send

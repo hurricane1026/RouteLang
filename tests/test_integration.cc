@@ -4,6 +4,25 @@
 #include "test.h"
 #include "test_helpers.h"
 
+// Helper: Connection with local buffer storage (for tests that use raw backends).
+static constexpr u32 kTestBufSize = 4096;
+
+struct TestConn {
+    Connection conn;
+    u8 recv_storage[kTestBufSize];
+    u8 send_storage[kTestBufSize];
+
+    void init(u32 id, i32 fd) {
+        conn.reset();
+        conn.id = id;
+        conn.fd = fd;
+        conn.recv_slice = recv_storage;
+        conn.send_slice = send_storage;
+        conn.recv_buf.bind(recv_storage, kTestBufSize);
+        conn.send_buf.bind(send_storage, kTestBufSize);
+    }
+};
+
 // === Socket Setup (libuv: test-tcp-bind-error, test-tcp-flags, test-tcp-reuseport) ===
 
 TEST(socket, nonblocking) {
@@ -383,10 +402,9 @@ TEST(partial_send, real_epollout_completion) {
     REQUIRE(backend.init(0, -1).has_value());
     backend.fd_map[0] = fds[0];
 
-    Connection conn;
-    conn.reset();
-    conn.id = 0;
-    conn.fd = fds[0];
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
 
     // Fill send_buf with 4096 bytes (larger than the tiny socket buffer)
     u8 fill_data[4096];
@@ -450,10 +468,9 @@ TEST(partial_send, socketpair_full_send) {
     REQUIRE(backend.init(0, -1).has_value());
     backend.fd_map[0] = fds[0];
 
-    Connection conn;
-    conn.reset();
-    conn.id = 0;
-    conn.fd = fds[0];
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
 
     // Small payload — immediate full send
     conn.send_buf.write(reinterpret_cast<const u8*>("OK"), 2);
@@ -493,10 +510,9 @@ TEST(partial_send, send_to_closed_peer) {
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
 
-    Connection conn;
-    conn.reset();
-    conn.id = 0;
-    conn.fd = fds[0];
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
     conn.send_buf.write(reinterpret_cast<const u8*>("data"), 4);
 
     // send to closed peer — may succeed (kernel buffers) or fail with EPIPE/ECONNRESET
@@ -541,10 +557,9 @@ TEST(partial_send, epollout_no_pending_switches_to_epollin) {
     REQUIRE(backend.init(0, -1).has_value());
     backend.fd_map[0] = fds[0];
 
-    Connection conn;
-    conn.reset();
-    conn.id = 0;
-    conn.fd = fds[0];
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
 
     // Do a small immediate send — completes fully, send_state.remaining stays 0
     conn.send_buf.write(reinterpret_cast<const u8*>("hi"), 2);

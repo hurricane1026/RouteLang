@@ -337,22 +337,28 @@ TEST(pool, exhaust_and_recover) {
 }
 
 TEST(pool, reset_clears_fields) {
-    Connection c;
-    c.reset();  // first reset to bind recv_buf to storage
-    c.fd = 42;
-    c.on_complete = &on_header_received<SmallLoop>;
-    c.state = ConnState::Sending;
+    SmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    c->on_complete = &on_header_received<SmallLoop>;
+    c->state = ConnState::Sending;
     // Write some data into recv_buf
     const u8 data[] = "hello";
-    c.recv_buf.write(data, 5);
-    c.keep_alive = true;
-    c.reset();
-    CHECK_EQ(c.fd, -1);
-    CHECK(c.on_complete == nullptr);
-    CHECK_EQ(c.state, ConnState::Idle);
-    CHECK_EQ(c.recv_buf.len(), 0u);
-    CHECK(c.recv_buf.valid());  // bound to storage after reset
-    CHECK_EQ(c.keep_alive, false);
+    c->recv_buf.write(data, 5);
+    c->keep_alive = true;
+    u32 cid = c->id;
+    loop.free_conn(*c);
+    // After free, connection is fully reset (sync backend frees immediately).
+    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].on_complete == nullptr);
+    CHECK_EQ(loop.conns[cid].state, ConnState::Idle);
+    CHECK_EQ(loop.conns[cid].keep_alive, false);
+    CHECK_EQ(loop.conns[cid].recv_slice, nullptr);
+    CHECK_EQ(loop.conns[cid].send_slice, nullptr);
+    CHECK_EQ(loop.conns[cid].recv_buf.write_avail(), 0u);
+    CHECK_EQ(loop.conns[cid].send_buf.write_avail(), 0u);
 }
 
 // === Dispatch Edge Cases ===
@@ -539,7 +545,7 @@ TEST(proxy, full_cycle) {
 
     // Upstream response → forward to client
     loop.backend.clear_ops();
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 200));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamRecv, 200));
     CHECK_EQ(conn->state, ConnState::Sending);
     CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
@@ -634,7 +640,7 @@ TEST(proxy, client_send_error) {
 
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 100));
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 200));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 200));
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -32));  // client EPIPE
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
@@ -655,7 +661,7 @@ TEST(proxy, keepalive_two_cycles) {
         loop.submit_connect(*conn, nullptr, 0);
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
-        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 200));
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamRecv, 200));
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 200));
         CHECK_EQ(conn->state, ConnState::ReadingHeader);
     }
@@ -709,14 +715,17 @@ TEST(recv_buf, reset_between_keepalive_cycles) {
 
 // Verify recv_buf capacity via direct Buffer API (not through dispatch)
 TEST(recv_buf, capacity_boundary) {
-    Connection c;
-    c.reset();
+    SmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
     // Fill recv_buf to capacity
-    u32 avail = c.recv_buf.write_avail();
-    CHECK_EQ(avail, 4096u);
-    c.recv_buf.commit(avail);
-    CHECK_EQ(c.recv_buf.len(), 4096u);
-    CHECK_EQ(c.recv_buf.write_avail(), 0u);
+    u32 avail = c->recv_buf.write_avail();
+    CHECK_EQ(avail, SmallLoop::kBufSize);
+    c->recv_buf.commit(avail);
+    CHECK_EQ(c->recv_buf.len(), SmallLoop::kBufSize);
+    CHECK_EQ(c->recv_buf.write_avail(), 0u);
+    loop.free_conn(*c);
 }
 
 // Verify recv_buf survives connection reuse (alloc → close → alloc)
@@ -744,7 +753,7 @@ TEST(recv_buf, survives_connection_reuse) {
     // recv_buf must be fresh after reset
     CHECK_EQ(c2->recv_buf.len(), 0u);
     CHECK(c2->recv_buf.valid());
-    CHECK_EQ(c2->recv_buf.write_avail(), 4096u);
+    CHECK_EQ(c2->recv_buf.write_avail(), SmallLoop::kBufSize);
 }
 
 // Proxy: verify recv_buf.data() is what gets forwarded upstream
@@ -798,7 +807,7 @@ TEST(recv_buf, buffer_state_through_proxy_cycle) {
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
 
     // upstream response → recv_buf gets new data (upstream response)
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 200));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamRecv, 200));
     CHECK_EQ(conn->recv_buf.len(), 200u);
     CHECK(!conn->recv_buf.is_released());
 
@@ -899,8 +908,8 @@ TEST(recv_semantic, send_state_no_leak_across_reuse) {
     REQUIRE(c2 != nullptr);
     CHECK_EQ(c2->recv_buf.len(), 0u);
     CHECK_EQ(c2->send_buf.len(), 0u);
-    CHECK_EQ(c2->recv_buf.write_avail(), 4096u);
-    CHECK_EQ(c2->send_buf.write_avail(), 4096u);
+    CHECK_EQ(c2->recv_buf.write_avail(), SmallLoop::kBufSize);
+    CHECK_EQ(c2->send_buf.write_avail(), SmallLoop::kBufSize);
 
     // New cycle works cleanly
     loop.inject_and_dispatch(make_ev(c2->id, IoEventType::Recv, 80));
@@ -933,7 +942,7 @@ TEST(recv_semantic, proxy_recv_buf_lifetime) {
     CHECK_EQ(conn->recv_buf.len(), 0u);  // reset by on_upstream_request_sent
 
     // Upstream response received → data goes into recv_buf
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 200));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamRecv, 200));
     // on_upstream_response does NOT reset recv_buf (send still in progress)
     CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
 
@@ -943,26 +952,33 @@ TEST(recv_semantic, proxy_recv_buf_lifetime) {
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
 }
 
-// Connection reset clears both buffers to valid state
+// Connection alloc+free clears buffers, re-alloc rebinds them
 TEST(recv_semantic, reset_clears_both_buffers) {
-    Connection c;
-    c.reset();
+    SmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
 
     // Write data to both buffers
-    c.recv_buf.write(reinterpret_cast<const u8*>("GET"), 3);
-    c.send_buf.write(reinterpret_cast<const u8*>("HTTP"), 4);
-    CHECK_EQ(c.recv_buf.len(), 3u);
-    CHECK_EQ(c.send_buf.len(), 4u);
+    c->recv_buf.write(reinterpret_cast<const u8*>("GET"), 3);
+    c->send_buf.write(reinterpret_cast<const u8*>("HTTP"), 4);
+    CHECK_EQ(c->recv_buf.len(), 3u);
+    CHECK_EQ(c->send_buf.len(), 4u);
 
-    c.reset();
-    CHECK_EQ(c.recv_buf.len(), 0u);
-    CHECK_EQ(c.send_buf.len(), 0u);
-    CHECK(c.recv_buf.valid());
-    CHECK(c.send_buf.valid());
-    CHECK_EQ(c.recv_buf.write_avail(), 4096u);
-    CHECK_EQ(c.send_buf.write_avail(), 4096u);
-    CHECK(!c.recv_buf.is_released());
-    CHECK(!c.send_buf.is_released());
+    loop.free_conn(*c);
+
+    // Re-alloc: buffers should be rebound and empty
+    Connection* c2 = loop.alloc_conn();
+    REQUIRE(c2 != nullptr);
+    CHECK_EQ(c2->recv_buf.len(), 0u);
+    CHECK_EQ(c2->send_buf.len(), 0u);
+    CHECK(c2->recv_buf.valid());
+    CHECK(c2->send_buf.valid());
+    CHECK_EQ(c2->recv_buf.write_avail(), SmallLoop::kBufSize);
+    CHECK_EQ(c2->send_buf.write_avail(), SmallLoop::kBufSize);
+    CHECK(!c2->recv_buf.is_released());
+    CHECK(!c2->send_buf.is_released());
+    loop.free_conn(*c2);
 }
 
 // === Callback type guard: close on unexpected event type ===
@@ -1023,7 +1039,7 @@ TEST(type_guard, upstream_request_sent_rejects_recv) {
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
-// on_upstream_response expects Recv — Send should close
+// on_upstream_response expects UpstreamRecv — Send should close
 TEST(type_guard, upstream_response_rejects_send) {
     SmallLoop loop;
     loop.setup();
@@ -1197,7 +1213,7 @@ TEST(send_buf, survives_reuse) {
     REQUIRE(c2 != nullptr);
     CHECK_EQ(c2->send_buf.len(), 0u);
     CHECK(c2->send_buf.valid());
-    CHECK_EQ(c2->send_buf.write_avail(), 4096u);
+    CHECK_EQ(c2->send_buf.write_avail(), SmallLoop::kBufSize);
 }
 
 // EpollBackend::add_send immediate success → synthetic completion with byte count
@@ -1375,15 +1391,15 @@ TEST(copilot6, keepalive_timeout_is_60) {
 
 TEST(route, match_prefix) {
     RouteConfig cfg;
-    i32 up = cfg.add_upstream("backend", 0x7F000001, 8080);
-    REQUIRE(up >= 0);
-    cfg.add_proxy("/api/", 0, static_cast<u16>(up));
+    auto up = cfg.add_upstream("backend", 0x7F000001, 8080);
+    REQUIRE(up.has_value());
+    cfg.add_proxy("/api/", 0, static_cast<u16>(up.value()));
 
     const u8 path1[] = "/api/users";
     auto* r = cfg.match(path1, sizeof(path1) - 1, 0);
     REQUIRE(r != nullptr);
     CHECK_EQ(r->action, RouteAction::Proxy);
-    CHECK_EQ(r->upstream_id, static_cast<u16>(up));
+    CHECK_EQ(r->upstream_id, static_cast<u16>(up.value()));
 
     const u8 path2[] = "/health";
     CHECK(cfg.match(path2, sizeof(path2) - 1, 0) == nullptr);
@@ -1400,15 +1416,15 @@ TEST(route, method_filter) {
 
 TEST(route, first_match_wins) {
     RouteConfig cfg;
-    i32 up1 = cfg.add_upstream("v1", 0x7F000001, 8081);
-    i32 up2 = cfg.add_upstream("v2", 0x7F000001, 8082);
-    cfg.add_proxy("/api/v1/", 0, static_cast<u16>(up1));
-    cfg.add_proxy("/api/", 0, static_cast<u16>(up2));
+    auto up1 = cfg.add_upstream("v1", 0x7F000001, 8081);
+    auto up2 = cfg.add_upstream("v2", 0x7F000001, 8082);
+    cfg.add_proxy("/api/v1/", 0, static_cast<u16>(up1.value()));
+    cfg.add_proxy("/api/", 0, static_cast<u16>(up2.value()));
 
     const u8 path[] = "/api/v1/users";
     auto* r = cfg.match(path, sizeof(path) - 1, 0);
     REQUIRE(r != nullptr);
-    CHECK_EQ(r->upstream_id, static_cast<u16>(up1));
+    CHECK_EQ(r->upstream_id, static_cast<u16>(up1.value()));
 }
 
 TEST(route, static_response) {
@@ -1430,9 +1446,9 @@ TEST(route, empty_config_no_match) {
 
 TEST(route, upstream_target_addr) {
     RouteConfig cfg;
-    i32 idx = cfg.add_upstream("api", 0x0A000101, 9090);
-    REQUIRE(idx >= 0);
-    auto& t = cfg.upstreams[idx];
+    auto idx = cfg.add_upstream("api", 0x0A000101, 9090);
+    REQUIRE(idx.has_value());
+    auto& t = cfg.upstreams[idx.value()];
     CHECK_EQ(t.addr.sin_family, AF_INET);
     CHECK_EQ(__builtin_bswap16(t.addr.sin_port), 9090u);
     CHECK_EQ(__builtin_bswap32(t.addr.sin_addr.s_addr), 0x0A000101u);
@@ -1497,9 +1513,10 @@ TEST(upstream_pool, shutdown_closes_fds) {
 TEST(slice_pool, init_destroy) {
     SlicePool pool;
     REQUIRE(pool.init(64).has_value());
-    CHECK_EQ(pool.count, 64u);
-    CHECK_EQ(pool.available(), 64u);
-    CHECK_EQ(pool.in_use(), 0u);
+    // Lazy commit: count starts at 0, grows on first alloc.
+    CHECK_EQ(pool.max_count, 64u);
+    CHECK_EQ(pool.count, 0u);
+    CHECK_EQ(pool.available(), 0u);
     pool.destroy();
 }
 
@@ -1570,7 +1587,7 @@ TEST(slice_pool, free_null_safe) {
     SlicePool pool;
     REQUIRE(pool.init(2).has_value());
     pool.free(nullptr);              // should not crash
-    CHECK_EQ(pool.available(), 2u);  // unchanged
+    CHECK_EQ(pool.available(), 0u);  // lazy: no slices committed yet
     pool.destroy();
 }
 
@@ -1637,8 +1654,8 @@ TEST(slice_pool, alloc_after_destroy) {
 // SlicePool: large pool (verify mmap works at scale)
 TEST(slice_pool, large_pool) {
     SlicePool pool;
-    REQUIRE(pool.init(1024).has_value());  // 1024 * 16KB = 16MB
-    CHECK_EQ(pool.available(), 1024u);
+    REQUIRE(pool.init(1024).has_value());  // max 1024 slices, lazy commit
+    CHECK_EQ(pool.max_count, 1024u);
 
     // Alloc a few, verify they don't overlap
     u8* first = pool.alloc();
@@ -1967,7 +1984,7 @@ TEST(route, add_proxy_invalid_upstream_id) {
 
 TEST(route, add_proxy_path_too_long) {
     RouteConfig cfg;
-    cfg.add_upstream("x", 0x7F000001, 80);
+    (void)cfg.add_upstream("x", 0x7F000001, 80);
     char long_path[256];
     for (u32 i = 0; i < 255; i++) long_path[i] = 'a';
     long_path[255] = '\0';
@@ -1987,14 +2004,14 @@ TEST(route, add_static_path_too_long) {
 TEST(route, add_upstream_at_capacity) {
     RouteConfig cfg;
     for (u32 i = 0; i < RouteConfig::kMaxUpstreams; i++) {
-        CHECK(cfg.add_upstream("x", 0x7F000001, static_cast<u16>(8080 + i)) >= 0);
+        CHECK(cfg.add_upstream("x", 0x7F000001, static_cast<u16>(8080 + i)).has_value());
     }
-    CHECK(cfg.add_upstream("overflow", 0x7F000001, 9999) < 0);  // full
+    CHECK(!cfg.add_upstream("overflow", 0x7F000001, 9999).has_value());  // full
 }
 
 TEST(route, add_route_at_capacity) {
     RouteConfig cfg;
-    cfg.add_upstream("x", 0x7F000001, 80);
+    (void)cfg.add_upstream("x", 0x7F000001, 80);
     for (u32 i = 0; i < RouteConfig::kMaxRoutes; i++) {
         char path[8];
         path[0] = '/';
@@ -2020,6 +2037,450 @@ TEST(error, make_with_code) {
     Error e = Error::make(EINVAL, Error::Source::Socket);
     CHECK_EQ(e.code, EINVAL);
     CHECK_EQ(static_cast<u8>(e.source), static_cast<u8>(Error::Source::Socket));
+}
+
+// === SlicePool integration ===
+
+TEST(slice_conn, alloc_binds_slices) {
+    SmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    CHECK(c->recv_slice != nullptr);
+    CHECK(c->send_slice != nullptr);
+    CHECK(c->recv_buf.valid());
+    CHECK(c->send_buf.valid());
+    CHECK_EQ(c->recv_buf.write_avail(), SmallLoop::kBufSize);
+    CHECK_EQ(c->send_buf.write_avail(), SmallLoop::kBufSize);
+    loop.free_conn(*c);
+}
+
+TEST(slice_conn, free_clears_slices) {
+    SmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    loop.free_conn(*c);
+    // Sync backend: slices freed immediately, pointers cleared by reset.
+    CHECK_EQ(loop.conns[cid].recv_slice, nullptr);
+    CHECK_EQ(loop.conns[cid].send_slice, nullptr);
+    CHECK_EQ(loop.conns[cid].recv_buf.write_avail(), 0u);
+    CHECK_EQ(loop.conns[cid].send_buf.write_avail(), 0u);
+}
+
+TEST(slice_conn, slice_reuse_after_free) {
+    SmallLoop loop;
+    loop.setup();
+    Connection* c1 = loop.alloc_conn();
+    REQUIRE(c1 != nullptr);
+    u8* r1 = c1->recv_slice;
+    u8* s1 = c1->send_slice;
+    // Write data then free
+    c1->recv_buf.write(reinterpret_cast<const u8*>("hello"), 5);
+    loop.free_conn(*c1);
+
+    // Re-alloc should get same slot back (LIFO) with inline storage
+    Connection* c2 = loop.alloc_conn();
+    REQUIRE(c2 != nullptr);
+    // SmallLoop uses per-slot inline arrays; same slot ⇒ same storage.
+    CHECK(c2->recv_slice == r1);
+    CHECK(c2->send_slice == s1);
+    // Buffer should be fresh (reset by bind)
+    CHECK_EQ(c2->recv_buf.len(), 0u);
+    loop.free_conn(*c2);
+}
+
+TEST(slice_conn, pool_exhaustion_returns_null) {
+    SmallLoop loop;
+    loop.setup();
+    Connection* conns[SmallLoop::kMaxConns];
+    u32 alloc_count = 0;
+    // Allocate all connections
+    for (u32 i = 0; i < SmallLoop::kMaxConns; i++) {
+        conns[i] = loop.alloc_conn();
+        if (conns[i]) alloc_count++;
+    }
+    CHECK_EQ(alloc_count, SmallLoop::kMaxConns);
+    // Next alloc should fail
+    CHECK(loop.alloc_conn() == nullptr);
+    // Free one and retry
+    loop.free_conn(*conns[0]);
+    Connection* c = loop.alloc_conn();
+    CHECK(c != nullptr);
+    CHECK(c->recv_buf.valid());
+    // Cleanup
+    loop.free_conn(*c);
+    for (u32 i = 1; i < alloc_count; i++) loop.free_conn(*conns[i]);
+}
+
+TEST(slice_conn, buffers_usable_through_request_cycle) {
+    SmallLoop loop;
+    loop.setup();
+    // Accept → recv → build response → send → free
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    CHECK(c->recv_buf.valid());
+    CHECK(c->send_buf.valid());
+
+    // Recv fills recv_buf
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK(c->recv_buf.len() > 0);
+    CHECK(c->send_buf.len() > 0);  // response built by on_header_received
+
+    // Send completes
+    u32 send_len = c->send_buf.len();
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(send_len)));
+    // Keep-alive: buffers reset for next request
+    CHECK_EQ(c->recv_buf.len(), 0u);
+    CHECK(c->recv_buf.valid());
+}
+
+TEST(slice_conn, real_eventloop_pool_init) {
+    // Verify real EventLoop allocates pool with 2*kMaxConns slices.
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    auto rc = loop->init(0, lfd);
+    REQUIRE(rc.has_value());
+
+    // Lazy commit: pool starts empty, max set to 2 * kMaxConns.
+    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 2);
+    CHECK_EQ(loop->pool.count, 0u);
+
+    // Alloc a connection — triggers lazy grow, consumes 2 slices
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    CHECK_GT(loop->pool.count, 0u);  // grew from 0
+    CHECK_EQ(c->recv_buf.write_avail(), SlicePool::kSliceSize);
+    CHECK_EQ(c->send_buf.write_avail(), SlicePool::kSliceSize);
+
+    // Sync backend (epoll): slices returned to pool immediately on free.
+    u32 avail_before = loop->pool.available();
+    loop->free_conn(*c);
+    CHECK_EQ(loop->pool.available(), avail_before + 2);
+
+    // Realloc works normally.
+    Connection* c2 = loop->alloc_conn();
+    REQUIRE(c2 != nullptr);
+
+    loop->free_conn(*c2);
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+// === close_conn cancels in-flight I/O before freeing ===
+
+// Closing a connection in Sending state must cancel I/O on its fd
+// before the slot (and its pooled slices) become reusable.
+TEST(close_cancel, cancels_client_fd) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+
+    // Drive to Sending state (recv → response built → waiting for send completion).
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    CHECK_EQ(c->state, ConnState::Sending);
+
+    loop.backend.clear_ops();
+    loop.close_conn(*c);
+
+    // A Cancel op must have been recorded for the client fd before free.
+    const MockOp* cancel_op = loop.backend.last_op(MockOp::Cancel);
+    REQUIRE(cancel_op != nullptr);
+    CHECK_EQ(cancel_op->conn_id, cid);
+}
+
+// Closing a proxying connection must cancel I/O on both client and upstream fds.
+TEST(close_cancel, cancels_both_fds_when_proxying) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+
+    // Simulate a proxying connection with both fds active.
+    c->upstream_fd = 99;
+    c->state = ConnState::Proxying;
+
+    loop.backend.clear_ops();
+    loop.close_conn(*c);
+
+    // Should have two Cancel ops: one for client fd, one for upstream fd.
+    CHECK_EQ(loop.backend.count_ops(MockOp::Cancel), 2u);
+    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK_EQ(loop.conns[cid].upstream_fd, -1);
+}
+
+// After close+cancel, the freed slot is fully reusable.
+TEST(close_cancel, slot_reusable_after_cancel) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+
+    loop.close_conn(*c);
+
+    // Reuse the slot with a new accept.
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 55));
+    auto* c2 = loop.find_fd(55);
+    REQUIRE(c2 != nullptr);
+    CHECK_EQ(c2->recv_buf.len(), 0u);
+    CHECK_EQ(c2->send_buf.len(), 0u);
+}
+
+// No cancel should be emitted for fds that are already -1 (idle connection).
+TEST(close_cancel, no_cancel_for_idle_conn) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    // Complete the full request-response cycle so fds get cleared normally.
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    u32 send_len = c->send_buf.len();
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(send_len)));
+
+    // Now force-close a connection whose fd is already -1 (keep-alive idle
+    // would not have fd=-1, but test the guard path).
+    c->fd = -1;
+    c->upstream_fd = -1;
+    loop.backend.clear_ops();
+    loop.close_conn(*c);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Cancel), 0u);
+}
+
+// === SlicePool prealloc ===
+
+TEST(pool_prealloc, prealloc_commits_slices) {
+    SlicePool pool;
+    auto rc = pool.init(64, 32);
+    REQUIRE(rc.has_value());
+    // prealloc rounds up to kGrowStep (256), so count >= 32.
+    CHECK_GE(pool.count, 32u);
+    // All committed slices are on free stack (none allocated yet).
+    CHECK_EQ(pool.available(), pool.count);
+    pool.destroy();
+}
+
+TEST(pool_prealloc, prealloc_zero_is_lazy) {
+    SlicePool pool;
+    auto rc = pool.init(64, 0);
+    REQUIRE(rc.has_value());
+    CHECK_EQ(pool.count, 0u);
+    CHECK_EQ(pool.available(), 0u);
+    pool.destroy();
+}
+
+// === Async reclaim (io_uring-style deferred reclamation) ===
+
+TEST(async_reclaim, pending_ops_tracks_submits) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    CHECK_EQ(c->pending_ops, 0u);
+    loop.submit_recv(*c);
+    CHECK_EQ(c->pending_ops, 1u);
+    loop.submit_send(*c, c->send_buf.data(), 10);
+    CHECK_EQ(c->pending_ops, 2u);
+}
+
+TEST(async_reclaim, pending_ops_decrements_on_dispatch) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    c->state = ConnState::ReadingHeader;
+    loop.submit_recv(*c);
+    CHECK_EQ(c->pending_ops, 1u);
+    // Clear on_complete so dispatch only does CQE accounting, not callbacks.
+    c->on_complete = nullptr;
+    // Dispatch a recv CQE with more=0 (final).
+    loop.dispatch(make_ev_more(c->id, IoEventType::Recv, 50, 0));
+    CHECK_EQ(c->pending_ops, 0u);
+}
+
+TEST(async_reclaim, pending_ops_no_decrement_on_more) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    c->state = ConnState::ReadingHeader;
+    loop.submit_recv(*c);
+    CHECK_EQ(c->pending_ops, 1u);
+    // Clear on_complete so dispatch only does CQE accounting.
+    c->on_complete = nullptr;
+    // Dispatch a recv CQE with more=1 (multishot intermediate).
+    loop.dispatch(make_ev_more(c->id, IoEventType::Recv, 50, 1));
+    CHECK_EQ(c->pending_ops, 1u);
+    CHECK_EQ(c->recv_armed, true);
+}
+
+TEST(async_reclaim, reclaim_pending_skips_nonzero_ops) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    c->fd = 42;
+    // Submit recv so pending_ops > 0.
+    loop.submit_recv(*c);
+    CHECK_EQ(c->pending_ops, 1u);
+    u32 free_before = loop.free_top;
+    // Close the connection: pending_ops>0 so it goes to pending_free.
+    loop.close_conn(*c);
+    CHECK_EQ(loop.pending_free_count, 1u);
+    CHECK_EQ(loop.free_top, free_before);  // not reclaimed yet
+    // Call reclaim_pending: pending_ops still > 0, should stay deferred.
+    loop.reclaim_pending();
+    CHECK_EQ(loop.pending_free_count, 1u);
+    CHECK_EQ(loop.free_top, free_before);
+    // Verify the slot is the one we closed.
+    CHECK_EQ(loop.pending_free[0], cid);
+}
+
+TEST(async_reclaim, reclaim_pending_reclaims_zero_ops) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    c->fd = 42;
+    // Submit recv so pending_ops > 0, then close.
+    loop.submit_recv(*c);
+    loop.close_conn(*c);
+    CHECK_EQ(loop.pending_free_count, 1u);
+    u32 free_before = loop.free_top;
+    // Manually zero out pending_ops to simulate CQEs having drained.
+    loop.conns[cid].pending_ops = 0;
+    loop.reclaim_pending();
+    CHECK_EQ(loop.pending_free_count, 0u);
+    CHECK_EQ(loop.free_top, free_before + 1);
+}
+
+TEST(async_reclaim, inline_reclaim_on_stale_cqe) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    c->fd = 42;
+    // Submit recv (pending_ops=1), then close.
+    // close_conn adds cancel count to pending_ops (pending_ops=1+1=2),
+    // then defers to pending_free since pending_ops > 0.
+    loop.submit_recv(*c);
+    CHECK_EQ(c->pending_ops, 1u);
+    loop.close_conn(*c);
+    CHECK_EQ(loop.pending_free_count, 1u);
+    CHECK_GT(loop.conns[cid].pending_ops, 1u);  // recv + cancel CQEs
+
+    u32 free_before = loop.free_top;
+    u32 ops = loop.conns[cid].pending_ops;
+    // Dispatch stale CQEs until pending_ops reaches 0.
+    // Each CQE represents either the cancelled recv or the cancel op itself.
+    for (u32 i = 0; i < ops; i++) {
+        IoEvent stale = make_ev_more(cid, IoEventType::Recv, -125, 0);
+        loop.dispatch(stale);
+    }
+    CHECK_EQ(loop.conns[cid].pending_ops, 0u);
+    CHECK_EQ(loop.pending_free_count, 0u);
+    CHECK_EQ(loop.free_top, free_before + 1);
+}
+
+TEST(async_reclaim, recv_armed_skips_duplicate_submit) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    loop.submit_recv(*c);
+    CHECK_EQ(c->recv_armed, true);
+    CHECK_EQ(c->pending_ops, 1u);
+    u32 ops_before = loop.backend.count_ops(MockOp::Recv);
+    // Second submit should be a no-op.
+    loop.submit_recv(*c);
+    CHECK_EQ(c->pending_ops, 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), ops_before);
+}
+
+TEST(async_reclaim, upstream_recv_armed_independent) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    c->upstream_fd = 43;
+    c->state = ConnState::Proxying;
+    // Submit both client recv and upstream recv.
+    loop.submit_recv(*c);
+    loop.submit_recv_upstream(*c);
+    CHECK_EQ(c->recv_armed, true);
+    CHECK_EQ(c->upstream_recv_armed, true);
+    CHECK_EQ(c->pending_ops, 2u);
+    // Clear on_complete so dispatch only does CQE accounting.
+    c->on_complete = nullptr;
+    // Dispatch final upstream recv CQE (more=0).
+    IoEvent ev = make_ev_more(c->id, IoEventType::UpstreamRecv, 100, 0);
+    loop.dispatch(ev);
+    // upstream_recv_armed cleared, but recv_armed still set.
+    CHECK_EQ(c->upstream_recv_armed, false);
+    CHECK_EQ(c->recv_armed, true);
+    CHECK_EQ(c->pending_ops, 1u);
+}
+
+TEST(async_reclaim, close_skips_cancel_when_no_ops) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    // pending_ops == 0: no in-flight I/O.
+    CHECK_EQ(c->pending_ops, 0u);
+    loop.backend.clear_ops();
+    loop.close_conn(*c);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Cancel), 0u);
+}
+
+TEST(async_reclaim, close_cancels_when_ops_pending) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    loop.submit_recv(*c);
+    CHECK_GT(c->pending_ops, 0u);
+    loop.backend.clear_ops();
+    loop.close_conn(*c);
+    CHECK_GT(loop.backend.count_ops(MockOp::Cancel), 0u);
+}
+
+TEST(async_reclaim, sqe_fail_no_pending_ops_increment) {
+    FailRecvAsyncSmallLoop loop;
+    loop.setup();
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = 42;
+    CHECK_EQ(c->pending_ops, 0u);
+    loop.submit_recv(*c);
+    // add_recv returned false: pending_ops must not have incremented.
+    CHECK_EQ(c->pending_ops, 0u);
+    CHECK_EQ(c->recv_armed, false);
 }
 
 int main(int argc, char** argv) {

@@ -32,6 +32,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     bool running = true;
 
     static constexpr u32 kMaxConns = 64;
+    static constexpr u32 kBufSize = 4096;  // test buffer size per direction
     Connection conns[kMaxConns];
     u32 free_stack[kMaxConns];
     u32 free_top = 0;
@@ -39,6 +40,10 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     bool draining = false;
     AccessLogRing* access_log = nullptr;
     ShardMetrics* metrics = nullptr;
+
+    // Inline buffer storage for tests (no SlicePool dependency).
+    u8 recv_storage[kMaxConns][kBufSize];
+    u8 send_storage[kMaxConns][kBufSize];
 
     bool is_draining() const { return draining; }
 
@@ -63,11 +68,16 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         u32 id = free_stack[--free_top];
         conns[id].reset();
         conns[id].id = id;
+        conns[id].recv_slice = recv_storage[id];
+        conns[id].send_slice = send_storage[id];
+        conns[id].recv_buf.bind(recv_storage[id], kBufSize);
+        conns[id].send_buf.bind(send_storage[id], kBufSize);
         return &conns[id];
     }
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        // MockBackend::kAsyncIo == false: sync backend, free immediately.
         c.reset();
         free_stack[free_top++] = cid;
     }
@@ -76,15 +86,24 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         backend.add_send(c.fd, c.id, buf, len);
     }
     void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        backend.add_send(c.upstream_fd, c.id, buf, len);
+        backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
     }
-    void submit_recv_upstream_impl(Connection& c) { backend.add_recv(c.upstream_fd, c.id); }
+    void submit_recv_upstream_impl(Connection& c) {
+        backend.add_recv_upstream(c.upstream_fd, c.id);
+    }
     void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
     }
     void close_conn_impl(Connection& c) {
-        c.fd = -1;
-        c.upstream_fd = -1;
+        // Mirror real EventLoop: cancel in-flight I/O before freeing.
+        if (c.fd >= 0) {
+            backend.cancel(c.fd, c.id);
+            c.fd = -1;
+        }
+        if (c.upstream_fd >= 0) {
+            backend.cancel(c.upstream_fd, c.id);
+            c.upstream_fd = -1;
+        }
         if (metrics) {
             if (c.req_start_us != 0) {
                 if (metrics->requests_active > 0) metrics->requests_active--;
@@ -99,7 +118,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     // append mock data into the connection's recv_buf (backend no longer resets).
     // Syncs ev.result to actual committed bytes, or -ENOBUFS if buffer full.
     void inject_and_dispatch(IoEvent ev) {
-        if (ev.type == IoEventType::Recv && ev.result > 0 && ev.conn_id < kMaxConns) {
+        if ((ev.type == IoEventType::Recv || ev.type == IoEventType::UpstreamRecv) &&
+            ev.result > 0 && ev.conn_id < kMaxConns) {
             auto& buf = conns[ev.conn_id].recv_buf;
             u32 n = static_cast<u32>(ev.result);
             u32 avail = buf.write_avail();
@@ -155,8 +175,432 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
 };
 
 inline IoEvent make_ev(u32 conn_id, IoEventType type, i32 result, u16 buf_id = 0, u8 has_buf = 0) {
-    return {conn_id, result, buf_id, has_buf, type};
+    return {conn_id, result, buf_id, has_buf, type, 0};
 }
+
+inline IoEvent make_ev_more(u32 conn_id, IoEventType type, i32 result, u8 more) {
+    return {conn_id, result, 0, 0, type, more};
+}
+
+// ---- Async mock backend (kAsyncIo = true) for io_uring-style tests ----
+
+struct AsyncMockBackend {
+    static constexpr bool kAsyncIo = true;
+
+    static constexpr u32 kMaxOps = 256;
+    MockOp ops[kMaxOps];
+    u32 op_count = 0;
+
+    static constexpr u32 kMaxEvents = 256;
+    IoEvent pending[kMaxEvents];
+    u32 pending_count = 0;
+
+    core::Expected<void, Error> init(u32 /*shard_id*/, i32 /*listen_fd*/) {
+        op_count = 0;
+        pending_count = 0;
+        return {};
+    }
+
+    void add_accept() {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::Accept, -1, 0, nullptr, 0};
+        }
+    }
+
+    bool add_recv(i32 fd, u32 conn_id) {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::Recv, fd, conn_id, nullptr, 0};
+        }
+        return true;
+    }
+
+    bool add_recv_upstream(i32 fd, u32 conn_id) { return add_recv(fd, conn_id); }
+
+    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::Send, fd, conn_id, buf, len};
+        }
+        return true;
+    }
+
+    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+        return add_send(fd, conn_id, buf, len);
+    }
+
+    bool add_connect(i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/) {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::Connect, fd, conn_id, nullptr, 0};
+        }
+        return true;
+    }
+
+    u32 cancel(i32 fd,
+               u32 conn_id,
+               bool /*recv_armed*/ = false,
+               bool /*send_armed*/ = false,
+               bool /*upstream_recv_armed*/ = false,
+               bool /*upstream_send_armed*/ = false,
+               bool /*has_upstream*/ = false) {
+        u32 n = 0;
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::Cancel, fd, conn_id, nullptr, 0};
+            n++;
+        }
+        return n;
+    }
+
+    void cancel_accept() {}
+    void shutdown() {}
+
+    void inject(IoEvent ev) {
+        if (pending_count < kMaxEvents) {
+            pending[pending_count++] = ev;
+        }
+    }
+
+    u32 wait(IoEvent* events, u32 max, Connection* /*conns*/ = nullptr, u32 /*max_conns*/ = 0) {
+        u32 n = pending_count < max ? pending_count : max;
+        for (u32 i = 0; i < n; i++) events[i] = pending[i];
+        for (u32 i = n; i < pending_count; i++) pending[i - n] = pending[i];
+        pending_count -= n;
+        return n;
+    }
+
+    const MockOp* last_op(MockOp::Type type) const {
+        for (i32 i = static_cast<i32>(op_count) - 1; i >= 0; i--) {
+            if (ops[i].type == type) return &ops[i];
+        }
+        return nullptr;
+    }
+
+    u32 count_ops(MockOp::Type type) const {
+        u32 n = 0;
+        for (u32 i = 0; i < op_count; i++) {
+            if (ops[i].type == type) n++;
+        }
+        return n;
+    }
+
+    void clear_ops() { op_count = 0; }
+};
+
+// Async mock backend that fails add_recv (returns false).
+struct FailRecvAsyncMockBackend : AsyncMockBackend {
+    bool add_recv(i32 /*fd*/, u32 /*conn_id*/) { return false; }
+    bool add_recv_upstream(i32 fd, u32 conn_id) { return add_recv(fd, conn_id); }
+};
+
+// ---- Async mock event loop (64 conns, io_uring-style deferred reclaim) ----
+
+struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
+    AsyncMockBackend backend;
+    TimerWheel timer;
+    u32 shard_id = 0;
+    bool running = true;
+
+    static constexpr u32 kMaxConns = 64;
+    static constexpr u32 kBufSize = 4096;
+    Connection conns[kMaxConns];
+    u32 free_stack[kMaxConns];
+    u32 free_top = 0;
+
+    u32 pending_free[kMaxConns];
+    u32 pending_free_count = 0;
+
+    u32 keepalive_timeout = 60;
+    bool draining = false;
+    AccessLogRing* access_log = nullptr;
+    ShardMetrics* metrics = nullptr;
+
+    u8 recv_storage[kMaxConns][kBufSize];
+    u8 send_storage[kMaxConns][kBufSize];
+
+    bool is_draining() const { return draining; }
+
+    void setup() {
+        running = true;
+        draining = false;
+        access_log = nullptr;
+        metrics = nullptr;
+        keepalive_timeout = 60;
+        free_top = kMaxConns;
+        pending_free_count = 0;
+        timer.init();
+        for (u32 i = 0; i < kMaxConns; i++) {
+            conns[i].reset();
+            conns[i].id = i;
+            free_stack[i] = i;
+        }
+        backend.init(0, -1);
+    }
+
+    Connection* alloc_conn_impl() {
+        if (free_top == 0) return nullptr;
+        u32 id = free_stack[--free_top];
+        conns[id].reset();
+        conns[id].id = id;
+        conns[id].recv_slice = recv_storage[id];
+        conns[id].send_slice = send_storage[id];
+        conns[id].recv_buf.bind(recv_storage[id], kBufSize);
+        conns[id].send_buf.bind(send_storage[id], kBufSize);
+        return &conns[id];
+    }
+
+    void free_conn_impl(Connection& c) {
+        u32 cid = c.id;
+        timer.remove(&c);
+        if (c.pending_ops == 0) {
+            // No in-flight ops: reclaim immediately.
+            c.reset();
+            free_stack[free_top++] = cid;
+        } else {
+            // Defer until CQEs drain pending_ops to 0.
+            u8* rs = c.recv_slice;
+            u8* ss = c.send_slice;
+            u32 ops = c.pending_ops;
+            c.reset();
+            conns[cid].recv_slice = rs;
+            conns[cid].send_slice = ss;
+            conns[cid].pending_ops = ops;
+            pending_free[pending_free_count++] = cid;
+        }
+    }
+
+    void submit_recv_impl(Connection& c) {
+        if (c.recv_armed) return;
+        if (backend.add_recv(c.fd, c.id)) {
+            c.pending_ops++;
+            c.recv_armed = true;
+        }
+    }
+    void submit_send_impl(Connection& c, const u8* buf, u32 len) {
+        if (backend.add_send(c.fd, c.id, buf, len)) {
+            c.pending_ops++;
+            c.send_armed = true;
+        }
+    }
+    void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
+            c.pending_ops++;
+            c.upstream_send_armed = true;
+        }
+    }
+    void submit_recv_upstream_impl(Connection& c) {
+        if (c.upstream_recv_armed) return;
+        if (backend.add_recv(c.upstream_fd, c.id)) {
+            c.pending_ops++;
+            c.upstream_recv_armed = true;
+        }
+    }
+    void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
+        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
+            c.pending_ops++;
+        }
+    }
+
+    void close_conn_impl(Connection& c) {
+        if (c.pending_ops > 0) {
+            c.pending_ops += backend.cancel(c.fd,
+                                            c.id,
+                                            c.recv_armed,
+                                            c.send_armed,
+                                            c.upstream_recv_armed,
+                                            c.upstream_send_armed,
+                                            c.upstream_fd >= 0);
+        }
+        c.fd = -1;
+        c.upstream_fd = -1;
+        if (metrics) {
+            if (c.req_start_us != 0) {
+                if (metrics->requests_active > 0) metrics->requests_active--;
+            }
+            metrics->on_close();
+        }
+        this->free_conn(c);
+    }
+
+    void reclaim_slot(u32 cid) {
+        // Inline reclaim from dispatch: push to free_stack, remove from pending_free.
+        free_stack[free_top++] = cid;
+        for (u32 i = 0; i < pending_free_count; i++) {
+            if (pending_free[i] == cid) {
+                pending_free[i] = pending_free[--pending_free_count];
+                break;
+            }
+        }
+    }
+
+    void reclaim_pending() {
+        u32 remaining = 0;
+        for (u32 i = 0; i < pending_free_count; i++) {
+            u32 cid = pending_free[i];
+            if (conns[cid].pending_ops == 0) {
+                free_stack[free_top++] = cid;
+            } else {
+                pending_free[remaining++] = cid;
+            }
+        }
+        pending_free_count = remaining;
+    }
+
+    void dispatch(const IoEvent& ev) {
+        if (ev.type == IoEventType::Accept) {
+            if (ev.result < 0) return;
+            Connection* c = this->alloc_conn();
+            if (!c) return;
+            c->fd = ev.result;
+            c->state = ConnState::ReadingHeader;
+            c->on_complete = &on_header_received<AsyncSmallLoop>;
+            timer.add(c, keepalive_timeout);
+            this->submit_recv(*c);
+            return;
+        }
+        if (ev.type == IoEventType::Timeout) {
+            timer.tick([this](Connection* c) { this->close_conn(*c); });
+            return;
+        }
+        if (ev.conn_id < kMaxConns) {
+            auto& conn = conns[ev.conn_id];
+            // Async CQE accounting: decrement pending_ops on final CQE.
+            if (!ev.more) {
+                if (conn.pending_ops > 0) conn.pending_ops--;
+                if (ev.type == IoEventType::Recv) conn.recv_armed = false;
+                if (ev.type == IoEventType::Send) conn.send_armed = false;
+                if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
+                if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
+            }
+            if (conn.on_complete) {
+                timer.refresh(&conn, keepalive_timeout);
+                conn.on_complete(this, conn, ev);
+            } else {
+                // Stale CQE: if all ops complete, reclaim immediately.
+                if (conn.pending_ops == 0) {
+                    reclaim_slot(ev.conn_id);
+                }
+            }
+        }
+    }
+
+    // Inject + dispatch convenience (mirrors SmallLoop).
+    void inject_and_dispatch(IoEvent ev) {
+        if ((ev.type == IoEventType::Recv || ev.type == IoEventType::UpstreamRecv) &&
+            ev.result > 0 && ev.conn_id < kMaxConns) {
+            auto& buf = conns[ev.conn_id].recv_buf;
+            u32 n = static_cast<u32>(ev.result);
+            u32 avail = buf.write_avail();
+            if (avail == 0) {
+                ev.result = -ENOBUFS;
+            } else {
+                if (n > avail) n = avail;
+                u8* dst = buf.write_ptr();
+                for (u32 j = 0; j < n; j++) dst[j] = static_cast<u8>(j & 0xFF);
+                buf.commit(n);
+                ev.result = static_cast<i32>(n);
+            }
+        }
+        backend.inject(ev);
+        IoEvent events[8];
+        u32 n = backend.wait(events, 8);
+        for (u32 i = 0; i < n; i++) dispatch(events[i]);
+    }
+
+    Connection* find_fd(i32 fd) {
+        for (u32 i = 0; i < kMaxConns; i++)
+            if (conns[i].fd == fd) return &conns[i];
+        return nullptr;
+    }
+};
+
+// ---- Async loop with failing recv backend ----
+
+struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
+    FailRecvAsyncMockBackend backend;
+    TimerWheel timer;
+    u32 shard_id = 0;
+    bool running = true;
+
+    static constexpr u32 kMaxConns = 64;
+    static constexpr u32 kBufSize = 4096;
+    Connection conns[kMaxConns];
+    u32 free_stack[kMaxConns];
+    u32 free_top = 0;
+
+    u32 keepalive_timeout = 60;
+    bool draining = false;
+    AccessLogRing* access_log = nullptr;
+    ShardMetrics* metrics = nullptr;
+
+    u8 recv_storage[kMaxConns][kBufSize];
+    u8 send_storage[kMaxConns][kBufSize];
+
+    bool is_draining() const { return draining; }
+
+    void setup() {
+        running = true;
+        draining = false;
+        access_log = nullptr;
+        metrics = nullptr;
+        keepalive_timeout = 60;
+        free_top = kMaxConns;
+        timer.init();
+        for (u32 i = 0; i < kMaxConns; i++) {
+            conns[i].reset();
+            conns[i].id = i;
+            free_stack[i] = i;
+        }
+        backend.init(0, -1);
+    }
+
+    Connection* alloc_conn_impl() {
+        if (free_top == 0) return nullptr;
+        u32 id = free_stack[--free_top];
+        conns[id].reset();
+        conns[id].id = id;
+        conns[id].recv_slice = recv_storage[id];
+        conns[id].send_slice = send_storage[id];
+        conns[id].recv_buf.bind(recv_storage[id], kBufSize);
+        conns[id].send_buf.bind(send_storage[id], kBufSize);
+        return &conns[id];
+    }
+
+    void free_conn_impl(Connection& c) {
+        u32 cid = c.id;
+        timer.remove(&c);
+        c.reset();
+        free_stack[free_top++] = cid;
+    }
+
+    void submit_recv_impl(Connection& c) {
+        if (c.recv_armed) return;
+        if (backend.add_recv(c.fd, c.id)) {
+            c.pending_ops++;
+            c.recv_armed = true;
+        }
+    }
+    void submit_send_impl(Connection& c, const u8* buf, u32 len) {
+        if (backend.add_send(c.fd, c.id, buf, len)) c.pending_ops++;
+    }
+    void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+        if (backend.add_send(c.upstream_fd, c.id, buf, len)) c.pending_ops++;
+    }
+    void submit_recv_upstream_impl(Connection& c) {
+        if (c.upstream_recv_armed) return;
+        if (backend.add_recv(c.upstream_fd, c.id)) {
+            c.pending_ops++;
+            c.upstream_recv_armed = true;
+        }
+    }
+    void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
+        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) c.pending_ops++;
+    }
+    void close_conn_impl(Connection& c) {
+        c.fd = -1;
+        c.upstream_fd = -1;
+        this->free_conn(c);
+    }
+
+    void dispatch(const IoEvent&) {}
+};
 
 // ---- Real socket helpers ----
 

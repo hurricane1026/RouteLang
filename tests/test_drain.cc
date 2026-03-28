@@ -252,7 +252,7 @@ TEST(drain_proxy, upstream_response_rewrites_connection_header) {
     c->recv_buf.commit(resp_len);
 
     // Inject the recv event manually (bypass inject_and_dispatch mock data fill)
-    IoEvent ev = make_ev(cid, IoEventType::Recv, static_cast<rut::i32>(resp_len));
+    IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
     loop.backend.inject(ev);
     IoEvent events[8];
     rut::u32 n = loop.backend.wait(events, 8);
@@ -300,7 +300,7 @@ TEST(drain_proxy, upstream_response_rewrites_lowercase_connection_header) {
     for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
     c->recv_buf.commit(resp_len);
 
-    IoEvent ev = make_ev(cid, IoEventType::Recv, static_cast<rut::i32>(resp_len));
+    IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
     loop.backend.inject(ev);
     IoEvent events[8];
     rut::u32 n = loop.backend.wait(events, 8);
@@ -347,7 +347,7 @@ TEST(drain_proxy, upstream_response_injects_close_when_missing) {
     for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
     c->recv_buf.commit(resp_len);
 
-    IoEvent ev = make_ev(cid, IoEventType::Recv, static_cast<rut::i32>(resp_len));
+    IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
     loop.backend.inject(ev);
     IoEvent events[8];
     rut::u32 n = loop.backend.wait(events, 8);
@@ -383,13 +383,44 @@ TEST(drain_proxy, upstream_status_parsed) {
     for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
     c->recv_buf.commit(resp_len);
 
-    IoEvent ev = make_ev(cid, IoEventType::Recv, static_cast<rut::i32>(resp_len));
+    IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
     loop.backend.inject(ev);
     IoEvent events[8];
     rut::u32 n = loop.backend.wait(events, 8);
     for (rut::u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     CHECK_EQ(c->resp_status, static_cast<rut::u16>(404));
+}
+
+// === Drain: slice pool state ===
+
+TEST(drain_pool, all_slices_returned_after_drain) {
+    SmallLoop loop;
+    loop.setup();
+    loop.draining = true;
+
+    // Accept 5 connections, complete their request cycles
+    rut::u32 cids[5];
+    for (rut::u32 i = 0; i < 5; i++) {
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, static_cast<rut::i32>(100 + i)));
+        auto* c = loop.find_fd(static_cast<rut::i32>(100 + i));
+        REQUIRE(c != nullptr);
+        cids[i] = c->id;
+        loop.inject_and_dispatch(make_ev(cids[i], IoEventType::Recv, 50));
+        rut::u32 send_len = loop.conns[cids[i]].send_buf.len();
+        loop.inject_and_dispatch(
+            make_ev(cids[i], IoEventType::Send, static_cast<rut::i32>(send_len)));
+        // Connection closed by drain (keep_alive=false)
+        CHECK_EQ(loop.conns[cids[i]].fd, -1);
+    }
+
+    // Sync backend: all connections freed immediately during dispatch.
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    // Slice pointers cleared by reset.
+    for (rut::u32 i = 0; i < 5; i++) {
+        CHECK_EQ(loop.conns[cids[i]].recv_slice, nullptr);
+        CHECK_EQ(loop.conns[cids[i]].send_slice, nullptr);
+    }
 }
 
 int main(int argc, char** argv) {

@@ -83,6 +83,7 @@ add_library(rue_runtime STATIC
     runtime/timer_wheel.cc
     runtime/socket.cc
     runtime/http_parser.cc
+    runtime/chunked_parser.cc
     runtime/access_log.cc
     ${SIMD_SOURCE}
 )

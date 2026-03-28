@@ -91,6 +91,48 @@ struct HttpParser {
     ParseStatus parse(const u8* buf, u32 len, ParsedRequest* req);
 };
 
+// Parsed HTTP response — all Str fields point into the original recv buffer.
+// Zero-copy: no allocations, no memcpy for headers.
+struct ParsedResponse {
+    u16 status_code;  // 100-599
+    u32 header_count;
+    Header headers[kMaxHeaders];
+    u32 content_length;
+    bool has_content_length;
+    bool chunked;
+    bool keep_alive;        // HTTP/1.1 default true, HTTP/1.0 default false
+    bool connection_close;  // explicit Connection: close
+
+    void reset() {
+        status_code = 0;
+        header_count = 0;
+        content_length = 0;
+        has_content_length = false;
+        chunked = false;
+        keep_alive = true;  // HTTP/1.1 default
+        connection_close = false;
+    }
+};
+
+// Incremental HTTP/1.x response parser.
+//
+// Usage:
+//   HttpResponseParser parser;
+//   parser.reset();
+//   ParseStatus s = parser.parse(buf, len, &resp);
+//   if (s == ParseStatus::Complete) { /* headers done, body at buf + parser.header_end */ }
+//   if (s == ParseStatus::Incomplete) { /* wait for more data */ }
+//   if (s == ParseStatus::Error) { /* 502, close connection */ }
+struct HttpResponseParser {
+    u32 header_end;  // Set on Complete: offset of first body byte.
+
+    void reset() { header_end = 0; }
+
+    // Parse response status-line + headers from buf[0..len).
+    // On Complete, populates `resp` and sets `header_end`.
+    ParseStatus parse(const u8* buf, u32 len, ParsedResponse* resp);
+};
+
 // --- Utility ---
 
 // Convert HttpMethod enum to string (for logging/responses).

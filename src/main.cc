@@ -16,6 +16,7 @@ using namespace rut;
 
 static constexpr u32 kMaxShards = 64;
 static constexpr u32 kDefaultDrainSecs = 30;
+static constexpr u16 kDefaultPort = 8080;
 
 // Status messages go to stderr to avoid mixing with structured JSON access logs on stdout.
 static void write_str(const char* s) {
@@ -71,6 +72,7 @@ static i32 run_shards(u16 port,
                       u32 shard_count,
                       bool pin_cpus,
                       u32 drain_secs,
+                      u32 pool_prealloc,
                       const char* access_log_path,
                       bool access_log_compress,
                       i32 access_log_level) {
@@ -107,7 +109,7 @@ static i32 run_shards(u16 port,
         i32 lfd = lfd_result.value();
         shards[i].owns_listen_fd = true;
 
-        auto rc = shards[i].init(i, lfd);
+        auto rc = shards[i].init(i, lfd, pool_prealloc);
         if (!rc) {
             write_str("Failed to init shard ");
             write_u32(i);
@@ -237,13 +239,14 @@ static i32 run_shards(u16 port,
 }
 
 int main(int argc, char** argv) {
-    u16 port = 8080;
+    u16 port = kDefaultPort;
     u32 shard_count = 0;  // 0 = auto-detect
     bool pin_cpus = true;
     u32 drain_secs = kDefaultDrainSecs;
+    u32 pool_prealloc = 0;  // 0 = fully lazy
     const char* access_log_path = nullptr;
     bool access_log_compress = false;
-    i32 access_log_level = 3;  // default: doubleFast
+    i32 access_log_level = AccessLogFlusher::kDefaultLevel;
 
     // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
     //                      [--access-log PATH] [--access-log-compress]
@@ -272,6 +275,15 @@ int main(int argc, char** argv) {
                 drain_secs = 0;
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                     drain_secs = drain_secs * 10 + static_cast<u32>(*p - '0');
+            } else if (str_eq(argv[i], "--pool-prealloc")) {
+                if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
+                    write_str("--pool-prealloc requires a numeric argument\n");
+                    return 1;
+                }
+                i++;
+                pool_prealloc = 0;
+                for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
+                    pool_prealloc = pool_prealloc * 10 + static_cast<u32>(*p - '0');
             } else if (str_eq(argv[i], "--access-log")) {
                 if (argv[i + 1][0] == '-' && argv[i + 1][1] == '-') {
                     write_str("--access-log requires a path argument\n");
@@ -295,7 +307,8 @@ int main(int argc, char** argv) {
         // Catch flags that require a value but appear as the last argument.
         if (i + 1 >= argc) {
             if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
-                str_eq(argv[i], "--access-log") || str_eq(argv[i], "--access-log-level")) {
+                str_eq(argv[i], "--pool-prealloc") || str_eq(argv[i], "--access-log") ||
+                str_eq(argv[i], "--access-log-level")) {
                 write_str(argv[i]);
                 write_str(" requires an argument\n");
                 return 1;
@@ -325,6 +338,7 @@ int main(int argc, char** argv) {
                                           shard_count,
                                           pin_cpus,
                                           drain_secs,
+                                          pool_prealloc,
                                           access_log_path,
                                           access_log_compress,
                                           access_log_level);
@@ -334,6 +348,7 @@ int main(int argc, char** argv) {
                                     shard_count,
                                     pin_cpus,
                                     drain_secs,
+                                    pool_prealloc,
                                     access_log_path,
                                     access_log_compress,
                                     access_log_level);

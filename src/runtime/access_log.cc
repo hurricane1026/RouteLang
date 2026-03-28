@@ -172,11 +172,11 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
 // Write with non-blocking I/O + poll. Never blocks in write() — if the pipe/socket
 // buffer is full, write returns EAGAIN and we re-poll. Small chunks (4KB) ensure
 // write completes quickly even on pipes.
-static bool write_with_poll(i32 fd, const u8* buf, u32 len, const bool* running_flag) {
+static bool write_with_poll(
+    i32 fd, const u8* buf, u32 len, const bool* running_flag, u32 max_stall = 50) {
     static constexpr u32 kChunkSize = 4096;  // bounded write size
     u32 written = 0;
     u32 stall_polls = 0;
-    static constexpr u32 kMaxStall = 50;  // 50 × 100ms = 5 seconds
     while (written < len) {
         struct pollfd pfd;
         pfd.fd = fd;
@@ -186,7 +186,7 @@ static bool write_with_poll(i32 fd, const u8* buf, u32 len, const bool* running_
 
         if (rc == 0) {
             if (!__atomic_load_n(running_flag, __ATOMIC_RELAXED)) {
-                if (++stall_polls >= kMaxStall) return false;
+                if (++stall_polls >= max_stall) return false;
             }
             continue;
         }
@@ -266,12 +266,20 @@ void AccessLogFlusher::stop() {
         // ZSTD_endStream must be called repeatedly until it returns 0,
         // indicating all compressed data (including the end marker) has
         // been flushed to the output buffer.
-        u8 out_buf[4096];
+        //
+        // running is already false (set above to stop the flusher thread).
+        // Use a longer stall limit (300 × 100ms = 30s) so the zstd
+        // end-frame survives transient backpressure, but stop() still
+        // returns if the sink is permanently wedged.
+        static constexpr u32 kFinishMaxStall = 300;  // 30 seconds
+        static constexpr u32 kOutBufSize = 4096;
+        u8 out_buf[kOutBufSize];
         for (;;) {
             ZSTD_outBuffer output = {out_buf, sizeof(out_buf), 0};
             size_t remaining = ZSTD_endStream(cstream, &output);
             if (output.pos > 0) {
-                write_with_poll(output_fd, out_buf, static_cast<u32>(output.pos), &running);
+                write_with_poll(
+                    output_fd, out_buf, static_cast<u32>(output.pos), &running, kFinishMaxStall);
             }
             if (ZSTD_isError(remaining) || remaining == 0) break;
         }

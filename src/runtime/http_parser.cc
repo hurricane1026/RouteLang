@@ -399,6 +399,222 @@ maybe_incomplete:
 }
 
 // ============================================================================
+// Response parser — semantic header matching
+// ============================================================================
+
+// Connection header parsing for responses (sets both keep_alive and connection_close).
+static inline void match_connection_response(const u8* val, u32 vlen, ParsedResponse* resp) {
+    u32 i = 0;
+    while (i < vlen) {
+        // Skip leading OWS and commas
+        while (i < vlen && (val[i] == ' ' || val[i] == '\t' || val[i] == ',')) i++;
+        if (i >= vlen) break;
+
+        // Find end of token
+        u32 tok_start = i;
+        while (i < vlen && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
+        u32 tok_len = i - tok_start;
+
+        if (tok_len == 5 && str_ci_eq(val + tok_start, "close", 5)) {
+            resp->connection_close = true;
+            resp->keep_alive = false;
+            return;  // close is sticky (RFC 7230)
+        } else if (tok_len == 10 && str_ci_eq(val + tok_start, "keep-alive", 10)) {
+            resp->keep_alive = true;
+        }
+    }
+}
+
+// Check and apply semantic headers for responses.
+static inline ParseStatus apply_semantic_header_response(
+    const u8* name, u32 name_len, const u8* val, u32 vlen, ParsedResponse* resp) {
+    u8 first = name[0] | 0x20;
+
+    if (first == 'c') {
+        if (name_len == 14 && str_ci_eq(name + 1, "ontent-length", 13)) {
+            auto cl = parse_uint(val, vlen);
+            if (UNLIKELY(!cl)) return ParseStatus::Error;
+            if (UNLIKELY(resp->has_content_length)) {
+                if (resp->content_length != cl.value()) return ParseStatus::Error;
+                return ParseStatus::Complete;
+            }
+            resp->content_length = cl.value();
+            resp->has_content_length = true;
+            return ParseStatus::Complete;
+        }
+        if (name_len == 10 && str_ci_eq(name + 1, "onnection", 9)) {
+            match_connection_response(val, vlen, resp);
+            return ParseStatus::Complete;
+        }
+    } else if (first == 't') {
+        if (name_len == 17 && str_ci_eq(name + 1, "ransfer-encoding", 16)) {
+            u32 ti = 0;
+            while (ti < vlen) {
+                while (ti < vlen && (val[ti] == ' ' || val[ti] == '\t' || val[ti] == ',')) ti++;
+                if (ti >= vlen) break;
+                u32 tok_start = ti;
+                while (ti < vlen && val[ti] != ',' && val[ti] != ' ' && val[ti] != '\t') ti++;
+                u32 tok_len = ti - tok_start;
+                if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
+                    resp->chunked = true;
+                    break;
+                }
+            }
+            return ParseStatus::Complete;
+        }
+    }
+    return ParseStatus::Complete;
+}
+
+// ============================================================================
+// Response parser — single-pass
+// ============================================================================
+
+ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* resp) {
+    header_end = 0;
+
+    // Minimum: "HTTP/1.x NNN\r\n\r\n" = 17 bytes for an empty-header response.
+    // But we need at least 12 to even begin parsing the status line.
+    if (UNLIKELY(len < 12)) {
+        return ParseStatus::Incomplete;
+    }
+
+    resp->reset();
+    u32 pos = 0;
+    u32 hdr_count = 0;
+    Header* headers = resp->headers;
+
+    // --- Status line: HTTP/1.x SP NNN SP reason CRLF ---
+
+    // Check "HTTP/1." prefix (7 bytes) via u64 load
+    if (UNLIKELY(pos + 10 > len)) return ParseStatus::Incomplete;
+    {
+        u64 ver_prefix = load_u64(buf + pos);
+        // Mask off the version digit (byte 7) to check "HTTP/1."
+        constexpr u64 kHttpSlash1Dot = u64_lit("HTTP/1.0") & 0x00FFFFFFFFFFFFFFULL;
+        if (UNLIKELY((ver_prefix & 0x00FFFFFFFFFFFFFFULL) != kHttpSlash1Dot))
+            return ParseStatus::Error;
+
+        u8 ver_digit = buf[pos + 7];
+        if (LIKELY(ver_digit == '1')) {
+            resp->keep_alive = true;  // HTTP/1.1 default
+        } else if (ver_digit == '0') {
+            resp->keep_alive = false;  // HTTP/1.0 default
+        } else {
+            return ParseStatus::Error;
+        }
+    }
+    pos += 8;  // past "HTTP/1.x"
+
+    // Expect SP
+    if (UNLIKELY(buf[pos] != ' ')) return ParseStatus::Error;
+    pos++;
+
+    // Parse 3-digit status code
+    if (UNLIKELY(pos + 3 > len)) return ParseStatus::Incomplete;
+    {
+        u32 d0 = buf[pos] - '0';
+        u32 d1 = buf[pos + 1] - '0';
+        u32 d2 = buf[pos + 2] - '0';
+        if (UNLIKELY(d0 > 9 || d1 > 9 || d2 > 9)) return ParseStatus::Error;
+        u16 code = static_cast<u16>(d0 * 100 + d1 * 10 + d2);
+        if (UNLIKELY(code < 100 || code > 599)) return ParseStatus::Error;
+        resp->status_code = code;
+    }
+    pos += 3;
+
+    // Skip reason phrase until \r\n
+    // After the 3-digit status code, there should be a SP or \r
+    if (UNLIKELY(pos >= len)) return ParseStatus::Incomplete;
+    // Allow SP before reason phrase, or \r for missing reason
+    {
+        u32 scan = pos;
+        while (scan < len && buf[scan] != '\r') scan++;
+        if (UNLIKELY(scan + 1 >= len)) return ParseStatus::Incomplete;
+        if (UNLIKELY(buf[scan + 1] != '\n')) return ParseStatus::Error;
+        pos = scan + 2;  // past \r\n
+    }
+
+    // --- Headers (single-pass, same as request parser) ---
+    for (;;) {
+        if (UNLIKELY(pos + 2 > len)) {
+            return ParseStatus::Incomplete;
+        }
+
+        // End of headers?
+        if (buf[pos] == '\r') {
+            if (LIKELY(buf[pos + 1] == '\n')) {
+                pos += 2;
+                break;
+            }
+            return ParseStatus::Error;
+        }
+
+        // Header name
+        u32 name_start = pos;
+        u32 colon_pos = fast_scan_header_name(buf, pos, len);
+        if (UNLIKELY(colon_pos == static_cast<u32>(-1))) goto maybe_incomplete;
+        if (UNLIKELY(colon_pos == name_start)) return ParseStatus::Error;
+        u32 name_len = colon_pos - name_start;
+        pos = colon_pos + 1;
+
+        // Skip OWS
+        if (UNLIKELY(pos >= len)) goto maybe_incomplete;
+        if (LIKELY(buf[pos] == ' ')) {
+            pos++;
+        }
+        while (UNLIKELY(pos < len && (buf[pos] == ' ' || buf[pos] == '\t'))) pos++;
+        if (UNLIKELY(pos >= len)) goto maybe_incomplete;
+
+        {
+            // Header value — SIMD scan for \r
+            u32 value_start = pos;
+            u32 cr_pos = simd::scan_header_value(buf, pos, len);
+            if (cr_pos == static_cast<u32>(-1)) return ParseStatus::Error;
+            if (UNLIKELY(cr_pos >= len || cr_pos + 1 >= len)) goto maybe_incomplete;
+            if (UNLIKELY(buf[cr_pos + 1] != '\n')) return ParseStatus::Error;
+            pos = cr_pos;
+
+            // Trim trailing OWS
+            u32 value_end = pos;
+            if (UNLIKELY(value_end > value_start && buf[value_end - 1] <= ' ')) {
+                while (value_end > value_start &&
+                       (buf[value_end - 1] == ' ' || buf[value_end - 1] == '\t')) {
+                    value_end--;
+                }
+            }
+
+            // Store header (skip storage if at capacity — proxy only needs
+            // semantic headers, so exceeding kMaxHeaders is not an error).
+            if (LIKELY(hdr_count < kMaxHeaders)) {
+                headers[hdr_count].name = {reinterpret_cast<const char*>(buf + name_start),
+                                           name_len};
+                headers[hdr_count].value = {reinterpret_cast<const char*>(buf + value_start),
+                                            value_end - value_start};
+                hdr_count++;
+            }
+
+            // Semantic header detection (always runs, even if header not stored)
+            ParseStatus sem = apply_semantic_header_response(
+                buf + name_start, name_len, buf + value_start, value_end - value_start, resp);
+            if (UNLIKELY(sem == ParseStatus::Error)) return ParseStatus::Error;
+        }
+
+        pos += 2;  // skip \r\n
+    }
+
+    resp->header_count = hdr_count;
+    header_end = pos;
+    return ParseStatus::Complete;
+
+maybe_incomplete:
+    if (simd::find_header_end(buf, len, 0) > 0) {
+        return ParseStatus::Error;
+    }
+    return ParseStatus::Incomplete;
+}
+
+// ============================================================================
 // Utility
 // ============================================================================
 

@@ -1,6 +1,8 @@
 #include "rut/runtime/http_parser.h"
 
+#include "core/expected.h"
 #include "runtime/simd/simd.h"
+#include "rut/runtime/error.h"
 
 namespace rut {
 
@@ -70,17 +72,22 @@ static inline bool str_ci_eq(const u8* a, const char* b, u32 len) {
 // parse_uint — branchless digit check
 // ============================================================================
 
-static inline i64 parse_uint(const u8* p, u32 len) {
-    if (UNLIKELY(len == 0)) return -1;
+// Parse a decimal unsigned integer from `p[0..len)`.
+// Returns the parsed value, or error on empty input, non-digit, or overflow.
+static inline core::Expected<u32, Error> parse_uint(const u8* p, u32 len) {
+    if (UNLIKELY(len == 0))
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::HttpParser));
     u32 val = 0;
     for (u32 i = 0; i < len; i++) {
         u32 d = p[i] - '0';
-        if (UNLIKELY(d > 9)) return -1;
+        if (UNLIKELY(d > 9))
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::HttpParser));
         // Pre-multiply overflow check: val * 10 + d <= 0xFFFFFFFF
-        if (UNLIKELY(val > (0xFFFFFFFFU - d) / 10)) return -1;
+        if (UNLIKELY(val > (0xFFFFFFFFU - d) / 10))
+            return core::make_unexpected(Error::make(ERANGE, Error::Source::HttpParser));
         val = val * 10 + d;
     }
-    return static_cast<i64>(val);
+    return val;
 }
 
 // ============================================================================
@@ -208,14 +215,14 @@ static inline ParseStatus apply_semantic_header(
 
     if (first == 'c') {
         if (name_len == 14 && str_ci_eq(name + 1, "ontent-length", 13)) {
-            i64 cl = parse_uint(val, vlen);
-            if (UNLIKELY(cl < 0)) return ParseStatus::Error;
+            auto cl = parse_uint(val, vlen);
+            if (UNLIKELY(!cl)) return ParseStatus::Error;
             if (UNLIKELY(req->has_content_length)) {
                 // Duplicate Content-Length with different value → reject
-                if (req->content_length != static_cast<u32>(cl)) return ParseStatus::Error;
+                if (req->content_length != cl.value()) return ParseStatus::Error;
                 return ParseStatus::Complete;
             }
-            req->content_length = static_cast<u32>(cl);
+            req->content_length = cl.value();
             req->has_content_length = true;
             return ParseStatus::Complete;
         }

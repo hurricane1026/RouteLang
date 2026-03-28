@@ -12,15 +12,17 @@ struct Error {
     i32 code;  // errno value (positive, e.g., ENOMEM=12)
 
     enum class Source : u8 {
-        Mmap,       // mmap failed
-        Epoll,      // epoll_create/ctl failed
-        IoUring,    // io_uring_setup/register failed
-        Timerfd,    // timerfd_create/settime failed
-        Socket,     // socket/bind/listen failed
-        Thread,     // pthread_create failed
-        Arena,      // Arena block allocation failed
-        SlicePool,  // SlicePool init failed
-        SlabPool,   // SlabPool init failed
+        Mmap,        // mmap failed
+        Epoll,       // epoll_create/ctl failed
+        IoUring,     // io_uring_setup/register failed
+        Timerfd,     // timerfd_create/settime failed
+        Socket,      // socket/bind/listen failed
+        Thread,      // pthread_create failed
+        Arena,       // Arena block allocation failed
+        SlicePool,   // SlicePool init failed
+        SlabPool,    // SlabPool init failed
+        RouteTable,  // RouteTable capacity exceeded
+        HttpParser,  // HTTP parse error (invalid input)
     };
     Source source;
 

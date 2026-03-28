@@ -10,11 +10,12 @@
 
 namespace rut {
 
-i32 set_nonblocking(i32 fd) {
+core::Expected<void, Error> set_nonblocking(i32 fd) {
     i32 flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -errno;
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -errno;
-    return 0;
+    if (flags < 0) return core::make_unexpected(Error::from_errno(Error::Source::Socket));
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return core::make_unexpected(Error::from_errno(Error::Source::Socket));
+    return {};
 }
 
 core::Expected<i32, Error> create_listen_socket(u16 port) {

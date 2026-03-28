@@ -10,8 +10,10 @@
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/timer_wheel.h"
+#include <atomic>
 
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -65,14 +67,14 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
 
 private:
     // Cross-thread state — main thread writes (stop/drain), shard thread reads.
-    // All access via __atomic builtins for portability (ARM weak memory model).
+    // All access via std::atomic for portability (ARM weak memory model).
     // draining_ is the release/acquire gate: drain_start_/drain_period_ are
     // written with relaxed ordering before draining_ is stored with release,
     // so the shard thread sees consistent values after acquiring draining_.
-    bool running_;
-    bool draining_;
-    u64 drain_start_;   // monotonic seconds when drain began
-    u32 drain_period_;  // seconds until force-close
+    std::atomic<bool> running_;
+    std::atomic<bool> draining_;
+    std::atomic<u64> drain_start_;   // monotonic seconds when drain began
+    std::atomic<u32> drain_period_;  // seconds until force-close
 
 public:
     static constexpr u32 kMaxConns = 16384;
@@ -105,14 +107,26 @@ public:
     // Per-shard metrics. Set by Shard before run(). Null = no metrics.
     ShardMetrics* metrics = nullptr;
 
+    // Per-shard control plane pointers. Set by Shard::init(), read by
+    // poll_command() / epoch_enter() / epoch_leave() on the shard thread.
+    // Null = no control plane (standalone EventLoop in tests).
+    const RouteConfig** config_ptr = nullptr;
+    ShardControlBlock* control = nullptr;
+    ShardEpoch* epoch = nullptr;
+    void** jit_code_ptr = nullptr;
+
     core::Expected<void, Error> init(u32 id, i32 lfd, u32 pool_prealloc = 0) {
         shard_id = id;
         listen_fd = lfd;
-        __atomic_store_n(&running_, true, __ATOMIC_RELAXED);
-        __atomic_store_n(&draining_, false, __ATOMIC_RELAXED);
-        __atomic_store_n(&drain_start_, static_cast<u64>(0), __ATOMIC_RELAXED);
-        __atomic_store_n(&drain_period_, static_cast<u32>(0), __ATOMIC_RELAXED);
+        running_.store(true, std::memory_order_relaxed);
+        draining_.store(false, std::memory_order_relaxed);
+        drain_start_.store(0, std::memory_order_relaxed);
+        drain_period_.store(0, std::memory_order_relaxed);
         keepalive_timeout = kDefaultKeepaliveTimeout;
+        config_ptr = nullptr;
+        control = nullptr;
+        epoch = nullptr;
+        jit_code_ptr = nullptr;
         free_top = kMaxConns;
         pending_free_count = 0;
         deferred_accept_count = 0;
@@ -148,27 +162,57 @@ public:
                 reclaim_pending();
                 retry_deferred_accepts();
             }
+            poll_command();
             // Close listen fd after dispatching the current batch so any
             // already-queued accepts (epoll backlog) get a proper response
             // with Connection: close, rather than being dropped/reset.
             // Idempotent — only effective on the first drain iteration.
-            if (__atomic_load_n(&draining_, __ATOMIC_ACQUIRE)) {
+            if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
-                u64 start = __atomic_load_n(&drain_start_, __ATOMIC_RELAXED);
-                u32 period = __atomic_load_n(&drain_period_, __ATOMIC_RELAXED);
+                u64 start = drain_start_.load(std::memory_order_relaxed);
+                u32 period = drain_period_.load(std::memory_order_relaxed);
                 if (active_count() == 0) {
-                    __atomic_store_n(&running_, false, __ATOMIC_RELAXED);
+                    running_.store(false, std::memory_order_relaxed);
                 } else if (monotonic_secs() >= start + period) {
                     force_close_all();
-                    __atomic_store_n(&running_, false, __ATOMIC_RELAXED);
+                    running_.store(false, std::memory_order_relaxed);
                 }
             }
         }
     }
 
-    void stop() { __atomic_store_n(&running_, false, __ATOMIC_RELEASE); }
-    bool is_running() const { return __atomic_load_n(&running_, __ATOMIC_ACQUIRE); }
-    bool is_draining() const { return __atomic_load_n(&draining_, __ATOMIC_ACQUIRE); }
+    void stop() { running_.store(false, std::memory_order_release); }
+    bool is_running() const { return running_.load(std::memory_order_acquire); }
+    bool is_draining() const { return draining_.load(std::memory_order_acquire); }
+
+    // Poll the per-shard control block. Independent config + JIT slots.
+    // Zero-cost when neither flag is set (two atomic loads, both predicted
+    // not-taken).
+    void poll_command() {
+        if (!control) return;
+        // Single atomic exchange per slot: read + clear in one op.
+        // nullptr = no update; non-null = apply.
+        auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
+        if (cfg && config_ptr) *config_ptr = cfg;
+
+        auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
+        if (jit && jit_code_ptr) *jit_code_ptr = jit;
+    }
+
+    // RCU monotonic epoch. Both enter and leave increment, so the control
+    // plane can snapshot before a swap and wait for advancement.
+    // Zero-cost when epoch pointer is null (no control plane wired).
+    void epoch_enter() {
+        if (epoch)
+            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_release);
+    }
+    void epoch_leave() {
+        if (epoch)
+            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_release);
+    }
+
     void shutdown() {
         if constexpr (Backend::kAsyncIo) reclaim_pending();
         backend.shutdown();
@@ -231,9 +275,9 @@ public:
     // release store on draining_ — shard thread's acquire load on
     // draining_ guarantees it sees consistent period/start values.
     void drain(u32 period_secs) {
-        __atomic_store_n(&drain_period_, period_secs, __ATOMIC_RELAXED);
-        __atomic_store_n(&drain_start_, monotonic_secs(), __ATOMIC_RELAXED);
-        __atomic_store_n(&draining_, true, __ATOMIC_RELEASE);
+        drain_period_.store(period_secs, std::memory_order_relaxed);
+        drain_start_.store(monotonic_secs(), std::memory_order_relaxed);
+        draining_.store(true, std::memory_order_release);
 
         // Wake the shard thread if it's blocked in backend.wait().
         // timerfd_settime is async-signal-safe and thread-safe (POSIX).
@@ -357,6 +401,10 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
+        // If a request was in flight (epoch_enter called), leave the epoch
+        // before closing. This covers timer wheel timeouts, force_close_all
+        // during drain, and any other path that bypasses normal callbacks.
+        if (c.req_start_us != 0) epoch_leave();
         if constexpr (Backend::kAsyncIo) {
             // Only cancel when ops are in flight. If pending_ops == 0,
             // the slot is freed immediately — no cancels needed.
@@ -413,9 +461,9 @@ public:
 
             // During drain: probabilistically close idle connections.
             // ReadingHeader = waiting for next request on keep-alive (effectively idle).
-            if (__atomic_load_n(&draining_, __ATOMIC_ACQUIRE)) {
-                u64 start = __atomic_load_n(&drain_start_, __ATOMIC_RELAXED);
-                u32 period = __atomic_load_n(&drain_period_, __ATOMIC_RELAXED);
+            if (draining_.load(std::memory_order_acquire)) {
+                u64 start = drain_start_.load(std::memory_order_relaxed);
+                u32 period = drain_period_.load(std::memory_order_relaxed);
                 u64 now = monotonic_secs();
                 for (u32 i = 0; i < kMaxConns; i++) {
                     if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
@@ -493,7 +541,7 @@ private:
         }
         c->state = ConnState::ReadingHeader;
         // During drain: mark new connections for close after first response.
-        c->keep_alive = !__atomic_load_n(&draining_, __ATOMIC_RELAXED);
+        c->keep_alive = !draining_.load(std::memory_order_relaxed);
         c->on_complete = &on_header_received<Self>;
         timer.add(c, keepalive_timeout);
         if (metrics) metrics->on_accept();
@@ -519,7 +567,7 @@ private:
                 c->peer_addr = peer.sin_addr.s_addr;
             }
             c->state = ConnState::ReadingHeader;
-            c->keep_alive = !__atomic_load_n(&draining_, __ATOMIC_RELAXED);
+            c->keep_alive = !draining_.load(std::memory_order_relaxed);
             c->on_complete = &on_header_received<Self>;
             timer.add(c, keepalive_timeout);
             if (metrics) metrics->on_accept();

@@ -8,11 +8,13 @@
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/shard_control.h"
 #include "rut/runtime/upstream_pool.h"
 
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 namespace rut {
@@ -57,13 +59,25 @@ struct Shard {
     ShardMetrics shard_metrics{};
 
     // Route config — set before spawning threads, read-only during runtime.
-    // Phase 3 hot reload will use __atomic_load_n/__atomic_store_n for
+    // Phase 3 hot reload will use std::atomic store/load for
     // cross-thread swap + epoch-based reclamation. Currently immutable.
     const RouteConfig* route_config = nullptr;
 
+    // Per-shard control block (control plane → shard thread).
+    ShardControlBlock control{};
+
+    // Per-shard RCU epoch (shard thread → control plane reads).
+    ShardEpoch epoch{};
+
+    // Active config pointer — updated atomically by poll_command().
+    const RouteConfig* active_config = nullptr;
+
+    // Active JIT code pointer — updated atomically by poll_command().
+    void* jit_code = nullptr;
+
     // Thread
     pthread_t thread = 0;
-    bool thread_spawned = false;
+    bool thread_spawned = false;  // true between spawn() and join()
 
     // Initialize shard: mmap EventLoop, init backend + arena.
     // listen_fd must already be created with SO_REUSEPORT.
@@ -124,6 +138,17 @@ struct Shard {
         shard_metrics.init();
         loop->metrics = &shard_metrics;
 
+        // Init per-shard control block and epoch.
+        control.pending_config.store(nullptr, std::memory_order_relaxed);
+        control.pending_jit.store(nullptr, std::memory_order_relaxed);
+        epoch.epoch.store(0, std::memory_order_relaxed);
+
+        // Wire control pointers into EventLoop for poll_command/epoch.
+        loop->config_ptr = &active_config;
+        loop->control = &control;
+        loop->epoch = &epoch;
+        loop->jit_code_ptr = &jit_code;
+
         return {};
     }
 
@@ -148,6 +173,9 @@ struct Shard {
     // pin_cpu: -1 = no pinning, >=0 = pin to that core.
     core::Expected<void, Error> spawn(i32 pin_cpu = -1) {
         if (!loop) return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+        // Seed from route_config only if active_config wasn't already set
+        // by a reload_config() call before spawn.
+        if (!active_config) active_config = route_config;
         if (thread_spawned)
             return core::make_unexpected(Error::make(EEXIST, Error::Source::Thread));
 
@@ -191,11 +219,40 @@ struct Shard {
         if (loop) loop->drain(period_secs);
     }
 
+    // Send a config reload to the shard (fire-and-forget).
+    // If the shard is running, writes to control block.
+    // If stopped/not spawned, applies directly (no thread to race with).
+    void reload_config(const RouteConfig* cfg) {
+        if (!thread_spawned) {
+            // No thread — direct apply.
+            active_config = cfg;
+            return;
+        }
+        // Thread may be running or exiting. Queue atomically.
+        // If thread consumes it — good. If not, join() applies it.
+        control.pending_config.store(cfg, std::memory_order_release);
+    }
+
+    // Send a JIT swap to the shard (fire-and-forget).
+    void swap_jit(void* code) {
+        if (!thread_spawned) {
+            jit_code = code;
+            return;
+        }
+        control.pending_jit.store(code, std::memory_order_release);
+    }
+
     // Wait for the shard's thread to finish.
     void join() {
         if (thread_spawned) {
             pthread_join(thread, nullptr);
             thread_spawned = false;
+            // Apply any pending updates the thread didn't consume.
+            // Thread is guaranteed gone — no race.
+            auto* cfg = control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
+            if (cfg) active_config = cfg;
+            auto* jit = control.pending_jit.exchange(nullptr, std::memory_order_acq_rel);
+            if (jit) jit_code = jit;
         }
     }
 
@@ -236,6 +293,12 @@ private:
         self->loop->run();
         return nullptr;
     }
+
+    // No explicit wake — poll_command runs every event loop iteration,
+    // and the timerfd fires every 1 second. Perturbing the timerfd to
+    // wake the shard immediately would push out the next periodic tick
+    // and stall keepalive/drain processing. For admin operations (config
+    // reload, JIT swap), up to 1 second latency is acceptable.
 };
 
 // Detect CPU count (online cores).

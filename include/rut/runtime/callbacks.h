@@ -251,6 +251,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 
     conn.req_start_us = monotonic_us();
     capture_request_metadata(conn);
+    loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
     conn.state = ConnState::Sending;
     conn.resp_status = kStatusOK;
@@ -294,6 +295,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
 
     // Record metrics + access log only after send is confirmed successful.
     on_request_complete(loop, conn, conn.resp_status, conn.send_buf.len());
+    loop->epoch_leave();
 
     if (!conn.keep_alive) {
         loop->close_conn(conn);
@@ -510,6 +512,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
 
     // Record metrics + access log only after send is confirmed successful.
     on_request_complete(loop, conn, conn.resp_status, conn.recv_buf.len());
+    loop->epoch_leave();
 
     // During drain: close proxy connections instead of re-arming for next request.
     if (loop->is_draining()) {

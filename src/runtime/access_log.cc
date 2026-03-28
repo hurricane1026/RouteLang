@@ -1,5 +1,7 @@
 #include "rut/runtime/access_log.h"
 
+#include <atomic>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -173,7 +175,7 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
 // buffer is full, write returns EAGAIN and we re-poll. Small chunks (4KB) ensure
 // write completes quickly even on pipes.
 static bool write_with_poll(
-    i32 fd, const u8* buf, u32 len, const bool* running_flag, u32 max_stall = 50) {
+    i32 fd, const u8* buf, u32 len, const std::atomic<bool>* running_flag, u32 max_stall = 50) {
     static constexpr u32 kChunkSize = 4096;  // bounded write size
     u32 written = 0;
     u32 stall_polls = 0;
@@ -185,7 +187,7 @@ static bool write_with_poll(
         i32 rc = poll(&pfd, 1, 100);
 
         if (rc == 0) {
-            if (!__atomic_load_n(running_flag, __ATOMIC_RELAXED)) {
+            if (!running_flag->load(std::memory_order_relaxed)) {
                 if (++stall_polls >= max_stall) return false;
             }
             continue;
@@ -217,7 +219,7 @@ static bool write_with_poll(
 // --- AccessLogFlusher ---
 
 core::Expected<void, Error> AccessLogFlusher::start() {
-    if (__atomic_load_n(&running, __ATOMIC_RELAXED)) return {};
+    if (running.load(std::memory_order_relaxed)) return {};
 
     // Set output fd non-blocking so write() never blocks the flusher thread.
     // Combined with poll(POLLOUT) + bounded 4KB chunks, this guarantees the
@@ -241,10 +243,10 @@ core::Expected<void, Error> AccessLogFlusher::start() {
         zstd_ctx = cstream;
     }
 
-    __atomic_store_n(&running, true, __ATOMIC_RELAXED);
+    running.store(true, std::memory_order_relaxed);
     i32 rc = pthread_create(&thread, nullptr, thread_entry, this);
     if (rc != 0) {
-        __atomic_store_n(&running, false, __ATOMIC_RELAXED);
+        running.store(false, std::memory_order_relaxed);
         if (zstd_ctx) {
             ZSTD_freeCStream(static_cast<ZSTD_CStream*>(zstd_ctx));
             zstd_ctx = nullptr;
@@ -255,8 +257,8 @@ core::Expected<void, Error> AccessLogFlusher::start() {
 }
 
 void AccessLogFlusher::stop() {
-    if (!__atomic_load_n(&running, __ATOMIC_RELAXED)) return;
-    __atomic_store_n(&running, false, __ATOMIC_RELEASE);
+    if (!running.load(std::memory_order_relaxed)) return;
+    running.store(false, std::memory_order_release);
     pthread_join(thread, nullptr);
 
     // Flush remaining zstd data and free context.
@@ -369,7 +371,7 @@ void* AccessLogFlusher::thread_entry(void* arg) {
     sleep_ts.tv_sec = self->flush_interval_ms / 1000;
     sleep_ts.tv_nsec = static_cast<long>(self->flush_interval_ms % 1000) * 1000000L;
 
-    while (__atomic_load_n(&self->running, __ATOMIC_ACQUIRE)) {
+    while (self->running.load(std::memory_order_acquire)) {
         self->flush_once();
         nanosleep(&sleep_ts, nullptr);
     }

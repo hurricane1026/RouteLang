@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
+#include <atomic>
 
 #include <pthread.h>
 #include <time.h>
@@ -74,8 +75,8 @@ struct AccessLogRing {
     static constexpr u32 kMask = kCapacity - 1;
 
     // Cache-line aligned to prevent false sharing between producer and consumer.
-    alignas(64) u32 write_pos;  // written by shard thread only
-    alignas(64) u32 read_pos;   // written by flusher thread only
+    alignas(64) std::atomic<u32> write_pos;  // written by shard thread only
+    alignas(64) std::atomic<u32> read_pos;   // written by flusher thread only
     AccessLogEntry entries[kCapacity];
 
     void init() {
@@ -92,35 +93,35 @@ struct AccessLogRing {
     // Dropping newest under backpressure is acceptable for access logs —
     // the flusher will catch up and future entries will succeed.
     bool push(const AccessLogEntry& entry) {
-        u32 wp = __atomic_load_n(&write_pos, __ATOMIC_RELAXED);
-        u32 rp = __atomic_load_n(&read_pos, __ATOMIC_ACQUIRE);
+        u32 wp = write_pos.load(std::memory_order_relaxed);
+        u32 rp = read_pos.load(std::memory_order_acquire);
 
         if (wp - rp >= kCapacity) {
             return false;  // full — drop this entry
         }
 
         entries[wp & kMask] = entry;
-        __atomic_store_n(&write_pos, wp + 1, __ATOMIC_RELEASE);
+        write_pos.store(wp + 1, std::memory_order_release);
         return true;
     }
 
     // Consumer: read one entry. Returns false if empty.
     // Called from flusher thread only — no contention on read_pos.
     bool pop(AccessLogEntry& out) {
-        u32 rp = __atomic_load_n(&read_pos, __ATOMIC_RELAXED);
-        u32 wp = __atomic_load_n(&write_pos, __ATOMIC_ACQUIRE);
+        u32 rp = read_pos.load(std::memory_order_relaxed);
+        u32 wp = write_pos.load(std::memory_order_acquire);
 
         if (rp == wp) return false;  // empty
 
         out = entries[rp & kMask];
-        __atomic_store_n(&read_pos, rp + 1, __ATOMIC_RELEASE);
+        read_pos.store(rp + 1, std::memory_order_release);
         return true;
     }
 
     // Number of entries available to read.
     u32 available() const {
-        u32 wp = __atomic_load_n(&write_pos, __ATOMIC_ACQUIRE);
-        u32 rp = __atomic_load_n(&read_pos, __ATOMIC_RELAXED);
+        u32 wp = write_pos.load(std::memory_order_acquire);
+        u32 rp = read_pos.load(std::memory_order_relaxed);
         return wp - rp;
     }
 };
@@ -153,7 +154,7 @@ struct AccessLogFlusher {
     i32 compress_level;     // zstd level: 1-4 (fast/doubleFast only)
 
     pthread_t thread;
-    bool running;  // cross-thread: accessed via __atomic builtins
+    std::atomic<bool> running;  // cross-thread: accessed via std::atomic
 
     // Opaque zstd state (ZSTD_CStream*), managed in access_log.cc.
     void* zstd_ctx;

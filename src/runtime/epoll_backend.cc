@@ -81,7 +81,7 @@ void EpollBackend::add_accept() {
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
 }
 
-void EpollBackend::add_recv(i32 fd, u32 conn_id) {
+bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
     if (conn_id < kMaxFdMap) fd_map[conn_id] = fd;
     struct epoll_event ev;
     ev.events = EPOLLIN;
@@ -91,9 +91,25 @@ void EpollBackend::add_recv(i32 fd, u32 conn_id) {
     if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) < 0 && errno == ENOENT) {
         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
     }
+    return true;
 }
 
-void EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+    return add_send(fd, conn_id, buf, len);
+}
+
+bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
+    if (conn_id < kMaxFdMap) fd_map[conn_id] = fd;
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.u64 = encode_data(conn_id, IoEventType::UpstreamRecv);
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) < 0 && errno == ENOENT) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    }
+    return true;
+}
+
+bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     // Try immediate send first (common case: socket buffer not full)
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
 
@@ -107,7 +123,7 @@ void EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
             pending_completions[pending_count].has_buf = 0;
             pending_count++;
         }
-        return;
+        return true;
     }
 
     if (nw < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -120,7 +136,7 @@ void EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
             pending_completions[pending_count].has_buf = 0;
             pending_count++;
         }
-        return;
+        return true;
     }
 
     // Partial send or EAGAIN: track remaining bytes, register for EPOLLOUT.
@@ -156,17 +172,19 @@ void EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
         pending_completions[pending_count].has_buf = 0;
         pending_count++;
     }
+    return true;
 }
 
-void EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len) {
+bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len) {
     if (conn_id < kMaxFdMap) fd_map[conn_id] = fd;
     // Initiate non-blocking connect
     i32 rc = connect(fd, static_cast<const struct sockaddr*>(addr), addr_len);
     if (rc == 0) {
-        // Immediate connect (loopback) — register fd for future I/O
+        // Immediate connect (loopback) — register upstream fd for recv.
+        // Use UpstreamRecv so on_upstream_response accepts the event.
         struct epoll_event reg_ev;
         reg_ev.events = EPOLLIN;
-        reg_ev.data.u64 = encode_data(conn_id, IoEventType::Recv);
+        reg_ev.data.u64 = encode_data(conn_id, IoEventType::UpstreamRecv);
         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &reg_ev);
         if (pending_count < 64) {
             pending_completions[pending_count].conn_id = conn_id;
@@ -176,7 +194,7 @@ void EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
             pending_completions[pending_count].has_buf = 0;
             pending_count++;
         }
-        return;
+        return true;
     }
 
     if (errno == EINPROGRESS) {
@@ -185,7 +203,7 @@ void EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
         ev.events = EPOLLOUT;
         ev.data.u64 = encode_data(conn_id, IoEventType::UpstreamConnect);
         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
-        return;
+        return true;
     }
 
     // Connect failed immediately
@@ -197,10 +215,18 @@ void EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
         pending_completions[pending_count].has_buf = 0;
         pending_count++;
     }
+    return true;
 }
 
-void EpollBackend::cancel(i32 fd, u32 /*conn_id*/) {
+u32 EpollBackend::cancel(i32 fd,
+                         u32 /*conn_id*/,
+                         bool /*recv_armed*/,
+                         bool /*send_armed*/,
+                         bool /*upstream_recv_armed*/,
+                         bool /*upstream_send_armed*/,
+                         bool /*has_upstream*/) {
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    return 0;  // sync backend: no cancel CQEs to track
 }
 
 void EpollBackend::cancel_accept() {
@@ -301,10 +327,11 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 result = -EINVAL;  // invalid conn_id
             }
             events[out].conn_id = conn_id;
-            events[out].type = IoEventType::Recv;
+            events[out].type = type;  // Recv or UpstreamRecv
             events[out].result = result;
             events[out].buf_id = 0;
             events[out].has_buf = 0;
+            events[out].more = 0;
             out++;
         } else if (ep_events[i].events & EPOLLOUT) {
             if (type == IoEventType::UpstreamConnect) {

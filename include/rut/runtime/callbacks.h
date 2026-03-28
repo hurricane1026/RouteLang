@@ -8,6 +8,19 @@
 
 namespace rut {
 
+// HTTP status codes used in callbacks.
+static constexpr u16 kStatusOK = 200;
+static constexpr u16 kStatusBadGateway = 502;
+
+// Minimum bytes for a valid HTTP response status line ("HTTP/1.x NNN").
+static constexpr u32 kMinResponseLen = 12;
+
+// Length of "Connection: close\r\n".
+static constexpr u32 kConnCloseLen = 19;
+
+// Length of the header terminator "\r\n\r\n".
+static constexpr u32 kHeaderEndLen = 4;
+
 // Callbacks are template functions parameterized on the concrete EventLoop type.
 // When EventLoop<Backend> sets conn.on_complete, it instantiates the callback
 // for its own type. The static_cast inside is free — the compiler inlines
@@ -240,7 +253,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     capture_request_metadata(conn);
     if (loop->metrics) loop->metrics->on_request_start();
     conn.state = ConnState::Sending;
-    conn.resp_status = 200;
+    conn.resp_status = kStatusOK;
 
     // During drain: respond with Connection: close to signal client migration.
     if (loop->is_draining()) {
@@ -318,7 +331,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         conn.send_buf.reset();
         conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
         conn.keep_alive = false;  // Connection: close — don't loop back
-        conn.resp_status = 502;
+        conn.resp_status = kStatusBadGateway;
         conn.on_complete = &on_response_sent<Loop>;
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
@@ -335,7 +348,7 @@ template <typename Loop>
 void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::Send) {
+    if (ev.type != IoEventType::Send && ev.type != IoEventType::UpstreamSend) {
         loop->close_conn(conn);
         return;
     }
@@ -363,7 +376,10 @@ template <typename Loop>
 void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::Recv) {
+    // Accept both UpstreamRecv (io_uring multishot / epoll add_recv_upstream)
+    // and Recv (epoll fast-upstream: immediate connect or send completion
+    // re-registers the upstream fd as Recv before submit_recv_upstream runs).
+    if (ev.type != IoEventType::UpstreamRecv && ev.type != IoEventType::Recv) {
         loop->close_conn(conn);
         return;
     }
@@ -380,8 +396,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     // Extract status from upstream response (first line: "HTTP/1.1 NNN ...").
     // TODO: replace with proper HTTP parser when integrated.
-    conn.resp_status = 200;  // default
-    if (conn.recv_buf.len() >= 12) {
+    conn.resp_status = kStatusOK;  // default
+    if (conn.recv_buf.len() >= kMinResponseLen) {
         const u8* d = conn.recv_buf.data();
         // "HTTP/1.x NNN" — status starts at offset 9
         if (d[0] == 'H' && d[4] == '/' && d[8] == ' ') {
@@ -444,12 +460,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // No Connection header found: rebuild response in send_buf with one injected.
         // This handles HTTP/1.1 responses that omit Connection (default keep-alive).
         if (!rewritten && hdr_end > 0) {
-            u32 body_start = hdr_end + 4;  // skip \r\n\r\n
+            u32 body_start = hdr_end + kHeaderEndLen;  // skip \r\n\r\n
             u32 body_len = (len > body_start) ? len - body_start : 0;
             static const char kConnClose[] = "Connection: close\r\n";
-            constexpr u32 kConnCloseLen = 19;
             // Only inject if it fits in send_buf.
-            if (hdr_end + kConnCloseLen + 4 + body_len <= sizeof(conn.send_storage)) {
+            if (hdr_end + kConnCloseLen + kHeaderEndLen + body_len <= conn.send_buf.capacity()) {
                 conn.send_buf.reset();
                 conn.send_buf.write(d, hdr_end + 2);  // headers up to last \r\n
                 conn.send_buf.write(reinterpret_cast<const u8*>(kConnClose), kConnCloseLen);

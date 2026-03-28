@@ -294,9 +294,9 @@ void IoUringBackend::add_accept() {
     pending++;
 }
 
-void IoUringBackend::add_recv(i32 fd, u32 conn_id) {
+bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
     io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_RECV;
@@ -309,11 +309,30 @@ void IoUringBackend::add_recv(i32 fd, u32 conn_id) {
 
     sqe_advance_tail(sq_tail);
     pending++;
+    return true;
 }
 
-void IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id) {
     io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;  // SQ full — don't record send_state without a submitted SQE
+    if (!sqe) return false;
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_RECV;
+    sqe->fd = fd;
+    sqe->len = kProvidedBufSize;
+    sqe->buf_group = kBufGroupId;
+    sqe->flags = IOSQE_BUFFER_SELECT;
+    sqe->ioprio = IORING_RECV_MULTISHOT;
+    sqe->user_data = encode_user_data(conn_id, IoEventType::UpstreamRecv);
+
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
+bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;  // SQ full — don't record send_state without a submitted SQE
 
     // Record send state only after acquiring SQE — if kernel returns partial,
     // wait() re-submits the remainder.
@@ -330,11 +349,32 @@ void IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
 
     sqe_advance_tail(sq_tail);
     pending++;
+    return true;
 }
 
-void IoUringBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len) {
+bool IoUringBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
+
+    if (conn_id < kMaxSendState) {
+        send_state[conn_id] = {buf, fd, 0, len};
+    }
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_SEND;
+    sqe->fd = fd;
+    sqe->addr = reinterpret_cast<u64>(buf);
+    sqe->len = len;
+    sqe->user_data = encode_user_data(conn_id, IoEventType::UpstreamSend);
+
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
+bool IoUringBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len) {
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_CONNECT;
@@ -345,6 +385,7 @@ void IoUringBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr
 
     sqe_advance_tail(sq_tail);
     pending++;
+    return true;
 }
 
 void IoUringBackend::cancel_accept() {
@@ -366,26 +407,93 @@ void IoUringBackend::cancel_accept() {
     // closes the fd. Without this, the cancel SQE sits in the SQ until
     // the next wait(), by which time the fd may already be closed/reused.
     if (pending > 0) {
-        io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
-        pending = 0;
+        i32 ret = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+        if (ret > 0) pending -= static_cast<u32>(ret);
     }
 }
 
-void IoUringBackend::cancel(i32 fd, u32 conn_id) {
+// Submit a cancel SQE matching a specific user_data value.
+// Returns true if the SQE was queued, false if SQ is full.
+bool IoUringBackend::cancel_by_user_data(u64 target, u32 conn_id, IoEventType type) {
     io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) {
+        // SQ ring full — flush pending SQEs to make room, then retry.
+        if (pending > 0) {
+            i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+            if (flushed > 0) pending -= static_cast<u32>(flushed);
+        }
+        sqe = get_sqe();
+        if (!sqe) return false;
+    }
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_ASYNC_CANCEL;
-    sqe->fd = fd;
-    // Cancel by user_data — matches any pending SQE with this conn_id for Recv
-    sqe->addr = encode_user_data(conn_id, IoEventType::Recv);
+    // Cancel by user_data match (not fd) — safe across fd reuse after close().
+    sqe->addr = target;
     sqe->cancel_flags = IORING_ASYNC_CANCEL_ALL;
-    // Use a sentinel that won't collide with real conn_ids or Accept(conn_id=0).
-    sqe->user_data = encode_user_data(kCancelConnId, IoEventType::Accept);
+    // Encode the real conn_id in the cancel CQE's user_data so dispatch()
+    // can decrement pending_ops when the cancel completes. This prevents
+    // slot reuse before all cancel CQEs have been processed.
+    sqe->user_data = encode_user_data(conn_id, type);
 
     sqe_advance_tail(sq_tail);
     pending++;
+    return true;
+}
+
+u32 IoUringBackend::cancel(i32 /*fd*/,
+                           u32 conn_id,
+                           bool recv_armed,
+                           bool send_armed,
+                           bool upstream_recv_armed,
+                           bool upstream_send_armed,
+                           bool has_upstream) {
+    // Only cancel op types that are actually in flight to avoid wasting
+    // SQ/CQ capacity with no-op cancels that produce -ENOENT completions.
+    u32 submitted = 0;
+    if (recv_armed) {
+        if (cancel_by_user_data(
+                encode_user_data(conn_id, IoEventType::Recv), conn_id, IoEventType::Recv))
+            submitted++;
+    }
+    if (send_armed) {
+        if (cancel_by_user_data(
+                encode_user_data(conn_id, IoEventType::Send), conn_id, IoEventType::Send))
+            submitted++;
+    }
+    // Upstream ops only if the connection was proxying.
+    if (has_upstream) {
+        if (upstream_recv_armed) {
+            if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::UpstreamRecv),
+                                    conn_id,
+                                    IoEventType::UpstreamRecv))
+                submitted++;
+        }
+        if (upstream_send_armed) {
+            if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::UpstreamSend),
+                                    conn_id,
+                                    IoEventType::UpstreamSend))
+                submitted++;
+        }
+        // UpstreamConnect: short-lived, cancel to be safe.
+        if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::UpstreamConnect),
+                                conn_id,
+                                IoEventType::UpstreamConnect))
+            submitted++;
+    }
+
+    // Submit immediately so cancels take effect before close_conn_impl()
+    // closes the fd. Retry on EINTR; subtract actually submitted count.
+    for (;;) {
+        i32 ret = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+        if (ret >= 0) {
+            pending -= static_cast<u32>(ret);
+            break;
+        }
+        if (ret == -EINTR) continue;
+        break;  // other error — SQEs remain pending for next wait()
+    }
+    return submitted;
 }
 
 // --- Wait (submit + harvest) ---
@@ -400,7 +508,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
     for (;;) {
         if (pending > 0) {
             ret = io_uring_enter(ring_fd, pending, 1, flags);
-            if (ret >= 0) pending = 0;
+            if (ret >= 0) pending -= static_cast<u32>(ret);
         } else {
             ret = io_uring_enter(ring_fd, 0, 1, flags);
         }
@@ -440,6 +548,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 events[count].result = ticks;
                 events[count].buf_id = 0;
                 events[count].has_buf = 0;
+                events[count].more = 0;
                 count++;
             }
             // Re-submit read on timerfd for next tick
@@ -480,6 +589,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             events[count].result = buf_result;
             events[count].buf_id = 0;
             events[count].has_buf = 0;
+            events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
             head++;
             count++;
             continue;
@@ -488,7 +598,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // --- Send completion: enforce full-send proactor semantics ---
         // If IORING_OP_SEND returned partial, re-submit the remainder.
         // Only emit completion when all bytes sent (or error).
-        if (type == IoEventType::Send && conn_id < kMaxSendState) {
+        if ((type == IoEventType::Send || type == IoEventType::UpstreamSend) &&
+            conn_id < kMaxSendState) {
             auto& ss = send_state[conn_id];
             if (cqe->res > 0 && ss.remaining > 0) {
                 u32 nw = static_cast<u32>(cqe->res);
@@ -503,7 +614,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                         sqe->fd = ss.fd;
                         sqe->addr = reinterpret_cast<u64>(ss.src + ss.offset);
                         sqe->len = ss.remaining;
-                        sqe->user_data = encode_user_data(conn_id, IoEventType::Send);
+                        sqe->user_data = encode_user_data(conn_id, type);
                         sqe_advance_tail(sq_tail);
                         pending++;
                         head++;
@@ -516,6 +627,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     events[count].result = -ENOSPC;
                     events[count].buf_id = 0;
                     events[count].has_buf = 0;
+                    events[count].more = 0;
                     head++;
                     count++;
                     continue;
@@ -526,6 +638,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 events[count].result = static_cast<i32>(ss.offset);
                 events[count].buf_id = 0;
                 events[count].has_buf = 0;
+                events[count].more = 0;
                 head++;
                 count++;
                 continue;
@@ -539,6 +652,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         events[count].result = cqe->res;
         events[count].buf_id = 0;
         events[count].has_buf = 0;
+        events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
 
         head++;
         count++;

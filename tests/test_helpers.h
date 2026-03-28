@@ -8,8 +8,11 @@
 #include "rut/runtime/epoll_backend.h"
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/route_table.h"
+#include "rut/runtime/shard_control.h"
 #include "rut/runtime/socket.h"
 #include "rut/runtime/timer_wheel.h"
+#include <atomic>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -47,11 +50,42 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
 
     bool is_draining() const { return draining; }
 
+    // Per-shard control plane pointers (mirrors EventLoop for testing).
+    const RouteConfig** config_ptr = nullptr;
+    ShardControlBlock* control = nullptr;
+    ShardEpoch* epoch = nullptr;
+    void** jit_code_ptr = nullptr;
+
+    // Epoch helpers — functional when epoch pointer is wired.
+    void epoch_enter() {
+        if (epoch)
+            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_release);
+    }
+    void epoch_leave() {
+        if (epoch)
+            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_release);
+    }
+
+    // Poll the per-shard control block (mirrors EventLoop::poll_command).
+    void poll_command() {
+        if (!control) return;
+        auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
+        if (cfg && config_ptr) *config_ptr = cfg;
+        auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
+        if (jit && jit_code_ptr) *jit_code_ptr = jit;
+    }
+
     void setup() {
         running = true;
         draining = false;
         access_log = nullptr;
         metrics = nullptr;
+        config_ptr = nullptr;
+        control = nullptr;
+        epoch = nullptr;
+        jit_code_ptr = nullptr;
         keepalive_timeout = 60;
         free_top = kMaxConns;
         timer.init();
@@ -95,6 +129,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
     }
     void close_conn_impl(Connection& c) {
+        if (c.req_start_us != 0) epoch_leave();
         // Mirror real EventLoop: cancel in-flight I/O before freeing.
         if (c.fd >= 0) {
             backend.cancel(c.fd, c.id);
@@ -317,11 +352,33 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
 
     bool is_draining() const { return draining; }
 
+    // Per-shard control plane pointers (mirrors EventLoop for testing).
+    const RouteConfig** config_ptr = nullptr;
+    ShardControlBlock* control = nullptr;
+    ShardEpoch* epoch = nullptr;
+    void** jit_code_ptr = nullptr;
+
+    // Epoch helpers — functional when epoch pointer is wired.
+    void epoch_enter() {
+        if (epoch)
+            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_release);
+    }
+    void epoch_leave() {
+        if (epoch)
+            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_release);
+    }
+
     void setup() {
         running = true;
         draining = false;
         access_log = nullptr;
         metrics = nullptr;
+        config_ptr = nullptr;
+        control = nullptr;
+        epoch = nullptr;
+        jit_code_ptr = nullptr;
         keepalive_timeout = 60;
         free_top = kMaxConns;
         pending_free_count = 0;
@@ -399,6 +456,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     }
 
     void close_conn_impl(Connection& c) {
+        if (c.req_start_us != 0) epoch_leave();
         if (c.pending_ops > 0) {
             c.pending_ops += backend.cancel(c.fd,
                                             c.id,
@@ -535,11 +593,27 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
 
     bool is_draining() const { return draining; }
 
+    // Per-shard control plane pointers (mirrors EventLoop for testing).
+    ShardEpoch* epoch = nullptr;
+
+    // Epoch helpers — functional when epoch pointer is wired.
+    void epoch_enter() {
+        if (epoch)
+            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_release);
+    }
+    void epoch_leave() {
+        if (epoch)
+            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_release);
+    }
+
     void setup() {
         running = true;
         draining = false;
         access_log = nullptr;
         metrics = nullptr;
+        epoch = nullptr;
         keepalive_timeout = 60;
         free_top = kMaxConns;
         timer.init();
@@ -594,6 +668,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) c.pending_ops++;
     }
     void close_conn_impl(Connection& c) {
+        if (c.req_start_us != 0) epoch_leave();
         c.fd = -1;
         c.upstream_fd = -1;
         this->free_conn(c);

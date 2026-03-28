@@ -3379,6 +3379,233 @@ TEST(HeaderCount, Exactly65Rejected) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
 }
 
+// ============================================================================
+// Response parser helpers
+// ============================================================================
+
+static ParseStatus parse_response(const char* raw,
+                                  ParsedResponse* resp,
+                                  HttpResponseParser* parser) {
+    parser->reset();
+    auto len = static_cast<u32>(__builtin_strlen(raw));
+    return parser->parse(reinterpret_cast<const u8*>(raw), len, resp);
+}
+
+static ParseStatus parse_response_raw(const u8* raw,
+                                      u32 len,
+                                      ParsedResponse* resp,
+                                      HttpResponseParser* parser) {
+    parser->reset();
+    return parser->parse(raw, len, resp);
+}
+
+static bool find_resp_header(const ParsedResponse& resp, const char* name, Str* out_value) {
+    u32 name_len = 0;
+    while (name[name_len]) name_len++;
+    for (u32 i = 0; i < resp.header_count; i++) {
+        if (resp.headers[i].name.len == name_len) {
+            bool match = true;
+            for (u32 j = 0; j < name_len; j++) {
+                if (resp.headers[i].name.ptr[j] != name[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                *out_value = resp.headers[i].value;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Response parser tests
+// ============================================================================
+
+TEST(response_parser, basic_200) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n"
+        "hello",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(resp.status_code, 200);
+    CHECK_EQ(resp.header_count, 1u);
+    CHECK(resp.has_content_length);
+    CHECK_EQ(resp.content_length, 5u);
+    CHECK(resp.keep_alive);  // HTTP/1.1 default
+    CHECK(!resp.chunked);
+    CHECK(!resp.connection_close);
+
+    // header_end should point to first body byte
+    Str val;
+    CHECK(find_resp_header(resp, "Content-Length", &val));
+    CHECK_EQ(val.len, 1u);  // "5"
+
+    // Verify body starts at header_end
+    const char* raw =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n"
+        "hello";
+    CHECK_EQ(raw[parser.header_end], 'h');
+}
+
+TEST(response_parser, 404) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Length: 9\r\n"
+        "\r\n"
+        "Not Found",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(resp.status_code, 404);
+    CHECK_EQ(resp.content_length, 9u);
+    CHECK(resp.has_content_length);
+}
+
+TEST(response_parser, chunked) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(resp.status_code, 200);
+    CHECK(resp.chunked);
+    CHECK(!resp.has_content_length);
+}
+
+TEST(response_parser, connection_close) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Connection: close\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "OK",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(resp.status_code, 200);
+    CHECK(resp.connection_close);
+    CHECK(!resp.keep_alive);
+    CHECK_EQ(resp.content_length, 2u);
+}
+
+TEST(response_parser, incomplete) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+
+    // Partial status line
+    auto s = parse_response("HTTP/1.1 20", &resp, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Incomplete));
+
+    // Status line complete but no header terminator
+    s = parse_response("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n", &resp, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Incomplete));
+
+    // Very short input
+    s = parse_response("HTTP", &resp, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Incomplete));
+}
+
+TEST(response_parser, no_headers) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "\r\n",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(resp.status_code, 200);
+    CHECK_EQ(resp.header_count, 0u);
+    CHECK(!resp.has_content_length);
+    CHECK(!resp.chunked);
+    CHECK(resp.keep_alive);
+}
+
+TEST(response_parser, content_length_body_split) {
+    // Headers complete but body not fully in buffer — parser should still
+    // return Complete (it only parses headers, not body).
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 100\r\n"
+        "\r\n"
+        "partial",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(resp.status_code, 200);
+    CHECK_EQ(resp.content_length, 100u);
+    CHECK(resp.has_content_length);
+    // header_end should be valid — body starts after \r\n\r\n
+    CHECK_GT(parser.header_end, 0u);
+}
+
+TEST(response_parser, http10_no_keepalive) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "OK",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(resp.status_code, 200);
+    CHECK(!resp.keep_alive);  // HTTP/1.0 default
+}
+
+TEST(response_parser, connection_keepalive_explicit) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.0 200 OK\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(resp.keep_alive);
+    CHECK(!resp.connection_close);
+}
+
+TEST(response_parser, multiple_headers) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 301 Moved Permanently\r\n"
+        "Location: /new-path\r\n"
+        "Content-Length: 0\r\n"
+        "X-Custom: value\r\n"
+        "\r\n",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(resp.status_code, 301);
+    CHECK_EQ(resp.header_count, 3u);
+    CHECK_EQ(resp.content_length, 0u);
+    CHECK(resp.has_content_length);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

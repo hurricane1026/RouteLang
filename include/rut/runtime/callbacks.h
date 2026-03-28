@@ -158,6 +158,7 @@ static inline void capture_request_metadata(Connection& conn) {
     conn.req_body_mode = BodyMode::None;
     conn.req_body_remaining = 0;
     conn.req_chunk_parser.reset();
+    conn.req_malformed = false;
 
     const u8* data = conn.recv_buf.data();
     u32 len = conn.recv_buf.len();
@@ -193,14 +194,18 @@ static inline void capture_request_metadata(Connection& conn) {
                     pos += consumed;
                     if (cs == ChunkStatus::Done || cs == ChunkStatus::NeedMore) break;
                     if (cs == ChunkStatus::Error) {
-                        // Malformed chunked request — reject immediately.
-                        // Don't forward invalid body to upstream.
-                        conn.req_body_mode = BodyMode::None;
-                        conn.req_chunk_parser.state = ChunkedParser::State::Complete;
+                        conn.req_malformed = true;
                         break;
                     }
                 }
                 chunk_consumed = pos;
+            }
+            // Set initial send len. chunk_consumed == 0 with body_in_buf > 0
+            // means chunk error → set to 0 as rejection sentinel.
+            if (chunk_consumed == 0 && conn.req_body_mode == BodyMode::None) {
+                conn.req_initial_send_len = 0;  // malformed → reject
+            } else {
+                conn.req_initial_send_len = parser.header_end + chunk_consumed;
             }
         } else if (req.has_content_length && req.content_length > 0) {
             conn.req_body_mode = BodyMode::ContentLength;
@@ -213,15 +218,14 @@ static inline void capture_request_metadata(Connection& conn) {
             else
                 conn.req_body_remaining -= body_in_buf;
         }
-        // Compute max initial send length (headers + body in buffer).
+        // Compute initial send length for all modes.
         if (conn.req_body_mode == BodyMode::None) {
             conn.req_initial_send_len = parser.header_end;
         } else if (conn.req_body_mode == BodyMode::ContentLength) {
             u32 body_in_initial = conn.req_content_length - conn.req_body_remaining;
             conn.req_initial_send_len = parser.header_end + body_in_initial;
-        } else if (conn.req_body_mode == BodyMode::Chunked) {
-            conn.req_initial_send_len = parser.header_end + chunk_consumed;
         }
+        // Chunked: already set above (parser.header_end + chunk_consumed).
         return;
     }
 
@@ -299,10 +303,16 @@ template <typename Loop>
 void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    // Guard: unexpected event type (e.g., multishot recv CQE arriving while
-    // in Send state) indicates a protocol/IO error — close to prevent silent
-    // recv_buf accumulation or masked errors.
+    // Guard: unexpected event type.
     if (ev.type != IoEventType::Recv) {
+        // Stale UpstreamRecv/Send CQEs from a previous proxy request.
+        // UpstreamRecv: backend already appended bytes to recv_buf — purge them.
+        if (ev.type == IoEventType::UpstreamRecv) {
+            conn.recv_buf.reset();
+            loop->submit_recv(conn);  // re-arm client recv with clean buffer
+            return;
+        }
+        if (ev.type == IoEventType::UpstreamSend) return;
         loop->close_conn(conn);
         return;
     }
@@ -406,6 +416,12 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    // Reject malformed requests (e.g., invalid chunked body).
+    if (conn.req_malformed) {
+        loop->close_conn(conn);
+        return;
+    }
+
     conn.state = ConnState::Proxying;
     // Use pre-computed initial send length (capped to request boundary).
     u32 req_send_len =
@@ -443,6 +459,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
          conn.req_chunk_parser.state != ChunkedParser::State::Complete);
     if (more_req_body) {
         // More body to read from client and forward to upstream.
+        // TODO(task5): also arm upstream recv to handle early responses
+        // (401/413) before body is fully sent. Currently, the proxy
+        // blocks on body streaming and can miss early error responses.
         conn.recv_buf.reset();
         conn.on_complete = &on_request_body_recvd<Loop>;
         loop->submit_recv(conn);
@@ -450,6 +469,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // Original request forwarded — reset recv_buf for upstream response data.
+    // TODO(task4): if recv_buf had bytes past req_initial_send_len (pipelined
+    // request), they are discarded here. HTTP pipelining support should
+    // preserve them for the next keep-alive cycle.
     conn.upstream_start_us = monotonic_us();
     conn.recv_buf.reset();
     conn.on_complete = &on_upstream_response<Loop>;
@@ -487,7 +509,16 @@ template <typename Loop>
 void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::UpstreamRecv && ev.type != IoEventType::Recv) {
+    if (ev.type != IoEventType::UpstreamRecv) {
+        // Client Recv during response streaming: backend already appended
+        // client bytes to recv_buf at offset 0. Must discard and re-arm
+        // upstream recv — otherwise the next UpstreamRecv appends after
+        // the client bytes and submit_send forwards client data as response.
+        if (ev.type == IoEventType::Recv) {
+            conn.recv_buf.reset();
+            loop->submit_recv_upstream(conn);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -534,6 +565,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             }
             if (cs == ChunkStatus::NeedMore) break;
         }
+        send_len = pos;  // cap at chunk parser boundary
     }
     // UntilClose: end detected by EOF in the ev.result <= 0 check above.
 
@@ -554,11 +586,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    if (ev.result < 0) {
-        loop->close_conn(conn);
-        return;
-    }
-    if (static_cast<u32>(ev.result) != conn.recv_buf.len()) {
+    if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
     }
@@ -581,6 +609,8 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;
         }
+        conn.upstream_recv_armed = false;
+        conn.upstream_send_armed = false;
 
         if (!conn.keep_alive || loop->is_draining()) {
             loop->close_conn(conn);
@@ -756,11 +786,35 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.resp_status = resp.status_code;
 
+    // 1xx responses are interim — skip and read the final response.
+    // Exception: 101 Switching Protocols is terminal (upgrade handshake).
+    if (resp.status_code >= 100 && resp.status_code < 200 && resp.status_code != 101) {
+        u32 interim_end = resp_parser.header_end;
+        u32 total = conn.recv_buf.len();
+        if (interim_end < total) {
+            // Remaining bytes after the 1xx may contain the final response.
+            // Shift remaining bytes to buffer start (same backing slice).
+            u32 remaining = total - interim_end;
+            const u8* src = conn.recv_buf.data() + interim_end;
+            conn.recv_buf.reset();
+            // After reset, write_ptr() points to start of slice.
+            u8* dst = conn.recv_buf.write_ptr();
+            __builtin_memmove(dst, src, remaining);
+            conn.recv_buf.commit(remaining);
+            // Re-enter to parse the remaining data.
+            on_upstream_response<Loop>(lp, conn, ev);
+            return;
+        }
+        // No remaining data — wait for the final response.
+        conn.recv_buf.reset();
+        loop->submit_recv_upstream(conn);
+        return;
+    }
+
     // Determine body mode based on response characteristics.
-    // HEAD requests and certain status codes have no body regardless of headers.
     bool is_head = (conn.req_method == static_cast<u8>(LogHttpMethod::Head));
-    bool no_body_status = (resp.status_code >= 100 && resp.status_code < 200) ||
-                          resp.status_code == 204 || resp.status_code == 304;
+    bool no_body_status =
+        resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304;
 
     if (is_head || no_body_status) {
         conn.resp_body_mode = BodyMode::None;
@@ -780,9 +834,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.resp_body_mode = BodyMode::UntilClose;
         conn.resp_body_remaining = 0;
     } else {
-        // Keep-alive upstream with no CL/TE — can't determine body end.
-        // Treat as no body to avoid hanging indefinitely.
-        conn.resp_body_mode = BodyMode::None;
+        // No CL/TE: RFC 7230 says read until EOF (close-delimited).
+        // Even for HTTP/1.1, non-conformant origins may send bodies
+        // without framing. UntilClose prevents dropping such bodies.
+        conn.resp_body_mode = BodyMode::UntilClose;
         conn.resp_body_remaining = 0;
     }
 
@@ -800,6 +855,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     // For Chunked mode: feed initial body fragment through parser to detect early end.
     bool chunked_done = false;
+    u32 chunked_consumed = initial_body_len;  // default: all bytes
     if (conn.resp_body_mode == BodyMode::Chunked && initial_body_len > 0) {
         const u8* body_start = conn.recv_buf.data() + header_len;
         u32 pos = 0;
@@ -835,6 +891,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             }
             if (cs == ChunkStatus::NeedMore) break;
         }
+        chunked_consumed = pos;
     }
 
     // During drain: rewrite the Connection header value to "close" so the
@@ -889,14 +946,21 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // This handles HTTP/1.1 responses that omit Connection (default keep-alive).
         if (!rewritten && hdr_end > 0) {
             u32 body_start = hdr_end + kHeaderEndLen;  // skip \r\n\r\n
-            u32 body_len = (len > body_start) ? len - body_start : 0;
+            u32 raw_body_len = (len > body_start) ? len - body_start : 0;
+            // Cap body to parsed boundary (HEAD/204/CL/chunked).
+            u32 body_len = raw_body_len;
+            if (conn.resp_body_mode == BodyMode::None)
+                body_len = 0;
+            else if (conn.resp_body_mode == BodyMode::ContentLength &&
+                     body_len > resp.content_length)
+                body_len = resp.content_length;
             static const char kConnClose[] = "Connection: close\r\n";
             // Only inject if it fits in send_buf.
             if (hdr_end + kConnCloseLen + kHeaderEndLen + body_len <= conn.send_buf.capacity()) {
                 conn.send_buf.reset();
                 conn.send_buf.write(d, hdr_end + 2);  // headers up to last \r\n
                 conn.send_buf.write(reinterpret_cast<const u8*>(kConnClose), kConnCloseLen);
-                conn.send_buf.write(d + hdr_end + 2, len - hdr_end - 2);  // \r\n + body
+                conn.send_buf.write(d + hdr_end + 2, 2 + body_len);  // \r\n + capped body
                 conn.keep_alive = false;
                 conn.resp_body_sent = conn.send_buf.len();
                 // Check if the body is already complete in this buffer.
@@ -932,10 +996,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // Cap initial send to headers + actual body bytes (don't leak excess).
     u32 actual_body = initial_body_len;
     if (conn.resp_body_mode == BodyMode::None)
-        actual_body = 0;  // HEAD/1xx/204/304: no body, discard any trailing bytes
+        actual_body = 0;
     else if (conn.resp_body_mode == BodyMode::ContentLength &&
              initial_body_len > resp.content_length)
         actual_body = resp.content_length;
+    else if (conn.resp_body_mode == BodyMode::Chunked)
+        actual_body = chunked_consumed;  // cap at chunk parser boundary
     u32 initial_send_len = header_len + actual_body;
 
     conn.resp_body_sent = initial_send_len;
@@ -969,7 +1035,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     // length may be less than recv_buf.len() (trimmed for HEAD/204/CL cap).
 
     // Record metrics + access log only after send is confirmed successful.
-    on_request_complete(loop, conn, conn.resp_status, conn.recv_buf.len());
+    on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
     loop->epoch_leave();
 
     // During drain: close proxy connections instead of re-arming for next request.
@@ -978,9 +1044,17 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    // Upstream response forwarded — reset recv_buf for next request.
-    conn.recv_buf.reset();
+    // Close upstream fd and clear armed flags before re-arming for next request.
+    // Without this: upstream_recv_armed stays true → next proxy request's
+    // submit_recv_upstream is a no-op → permanent hang on io_uring.
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+    }
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
 
+    conn.recv_buf.reset();
     conn.state = ConnState::ReadingHeader;
     conn.on_complete = &on_header_received<Loop>;
     loop->submit_recv(conn);

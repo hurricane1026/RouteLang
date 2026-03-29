@@ -5732,6 +5732,312 @@ TEST(access_log, request_complete_writes_entry) {
     CHECK_GT(metrics.requests_total, 0u);
 }
 
+// === Task5: Early upstream response during body streaming ===
+
+// Helper: set up proxy with POST CL body that has remaining bytes to stream.
+// Returns connection in on_request_body_recvd state waiting for more client body.
+static Connection* setup_body_streaming_proxy(SmallLoop& loop,
+                                              u32 body_total,
+                                              u32 body_in_initial) {
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    if (!c) return nullptr;
+
+    // Build POST request with partial body
+    char req_buf[512];
+    u32 off = 0;
+    const char* prefix = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ";
+    for (u32 i = 0; prefix[i]; i++) req_buf[off++] = prefix[i];
+    char num[16];
+    u32 nlen = 0;
+    u32 tmp = body_total;
+    do {
+        num[nlen++] = static_cast<char>('0' + tmp % 10);
+        tmp /= 10;
+    } while (tmp > 0);
+    for (u32 i = nlen; i > 0; i--) req_buf[off++] = num[i - 1];
+    req_buf[off++] = '\r';
+    req_buf[off++] = '\n';
+    req_buf[off++] = '\r';
+    req_buf[off++] = '\n';
+    for (u32 i = 0; i < body_in_initial && off < sizeof(req_buf); i++) req_buf[off++] = 'A';
+
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < off; j++) dst[j] = static_cast<u8>(req_buf[j]);
+    c->recv_buf.commit(off);
+    IoEvent rev = make_ev(c->id, IoEventType::Recv, static_cast<i32>(off));
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Switch to proxy
+    c->upstream_fd = 100;
+    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->state = ConnState::Proxying;
+    loop.submit_connect(*c, nullptr, 0);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+
+    // Initial request sent → enters body streaming
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
+    return c;
+}
+
+TEST(early_response, 413_during_body_recvd) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_GT(c->req_body_remaining, 0u);
+
+    // Upstream sends 413 while we're waiting for client body
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 11\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "Too Large!!";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Should have transitioned to sending the 413 to client
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+    CHECK_EQ(c->state, ConnState::Sending);
+}
+
+TEST(early_response, 401_during_body_recvd) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    static const char kResp401[] =
+        "HTTP/1.1 401 Unauthorized\r\n"
+        "Content-Length: 12\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "Unauthorized";
+    u32 rlen = sizeof(kResp401) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp401[j]);
+    c->upstream_recv_buf.commit(rlen);
+
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK_EQ(c->resp_status, static_cast<u16>(401));
+}
+
+TEST(early_response, 100_continue_skipped) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+
+    // Upstream sends 100 Continue — should be skipped, body streaming continues
+    static const char kResp100[] = "HTTP/1.1 100 Continue\r\n\r\n";
+    u32 rlen = sizeof(kResp100) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp100[j]);
+    c->upstream_recv_buf.commit(rlen);
+
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Should still be in body streaming mode (100 Continue skipped)
+    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK(c->fd >= 0);
+}
+
+TEST(early_response, during_body_send_wait) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    // Simulate: client sends more body data → now in on_request_body_sent
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+
+    // While waiting for upstream send ack, upstream sends 413
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+}
+
+TEST(early_response, upstream_eof_during_body_streaming) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+
+    // Upstream closes during body streaming
+    IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, 0);
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed
+}
+
+TEST(early_response, incomplete_response_waits) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    // Upstream sends partial HTTP response (incomplete headers)
+    static const char kPartial[] = "HTTP/1.1 413 Request";
+    u32 plen = sizeof(kPartial) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < plen; j++) dst[j] = static_cast<u8>(kPartial[j]);
+    c->upstream_recv_buf.commit(plen);
+
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(plen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Should still be waiting (incomplete response, re-armed upstream recv)
+    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK(c->fd >= 0);
+}
+
+// P1: Stale UpstreamSend CQE after early response must not close connection.
+TEST(early_response, stale_upstream_send_after_early_response) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    // Client sends body chunk → on_request_body_sent waiting for upstream send ack
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+
+    // Upstream sends 413 BEFORE the UpstreamSend completion arrives
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+
+    // Now the stale UpstreamSend completion arrives.
+    // on_upstream_response should ignore it (not close the connection).
+    CHECK(c->fd >= 0);
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    CHECK(c->fd >= 0);  // still alive — stale send was ignored
+}
+
+// P2: 100 Continue + final response coalesced in one read.
+TEST(early_response, 100_continue_with_trailing_final_response) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    // Upstream sends 100 Continue followed by 413 in one buffer
+    static const char kCoalesced[] =
+        "HTTP/1.1 100 Continue\r\n\r\n"
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kCoalesced) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kCoalesced[j]);
+    c->upstream_recv_buf.commit(rlen);
+
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Should have skipped 100, parsed 413, and started forwarding
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+    CHECK_EQ(c->state, ConnState::Sending);
+}
+
+// P2: 100 Continue with trailing bytes that form only a partial final response.
+TEST(early_response, 100_continue_with_partial_trailing) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    // 100 Continue + incomplete final response
+    static const char kPartial[] =
+        "HTTP/1.1 100 Continue\r\n\r\n"
+        "HTTP/1.1 200 OK\r\n";
+    u32 rlen = sizeof(kPartial) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kPartial[j]);
+    c->upstream_recv_buf.commit(rlen);
+
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // 100 skipped, partial 200 remains → should still be in body streaming, waiting
+    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK(c->fd >= 0);
+    // upstream_recv_buf should contain the partial "HTTP/1.1 200 OK\r\n"
+    CHECK_GT(c->upstream_recv_buf.len(), 0u);
+}
+
 // === Coverage: upstream pool free with open fd ===
 
 TEST(upstream_pool, free_closes_fd) {

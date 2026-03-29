@@ -565,12 +565,13 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
          conn.req_chunk_parser.state != ChunkedParser::State::Complete);
     if (more_req_body) {
         // More body to read from client and forward to upstream.
-        // TODO(task5): also arm upstream recv to handle early responses
-        // (401/413) before body is fully sent. Currently, the proxy
-        // blocks on body streaming and can miss early error responses.
+        // Also arm upstream recv to detect early error responses
+        // (401/413) before body is fully sent.
         conn.recv_buf.reset();
         conn.on_complete = &on_request_body_recvd<Loop>;
         loop->submit_recv(conn);
+        conn.upstream_recv_buf.reset();
+        loop->submit_recv_upstream(conn);
         return;
     }
 
@@ -592,6 +593,8 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::Send) {
+        // Stale UpstreamSend from body streaming interrupted by early response.
+        if (ev.type == IoEventType::UpstreamSend) return;
         loop->close_conn(conn);
         return;
     }
@@ -688,6 +691,8 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::Send) {
+        // Stale UpstreamSend from body streaming interrupted by early response.
+        if (ev.type == IoEventType::UpstreamSend) return;
         loop->close_conn(conn);
         return;
     }
@@ -775,6 +780,65 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
 // --- Request body streaming callbacks ---
 // Multi-pass cycle: recv from client → send to upstream → recv more → until done.
+//
+// During body streaming, upstream recv is also armed to detect early error
+// responses (413/401/etc) before the client body is fully forwarded.
+
+// Helper: handle an UpstreamRecv event that arrives during request body streaming.
+// Returns true if the event was consumed (caller should return).
+// Handles: EOF/error → close, 1xx → skip and continue, non-1xx → forward to client.
+template <typename Loop>
+static inline bool handle_early_upstream_response(Loop* loop,
+                                                  void* lp,
+                                                  Connection& conn,
+                                                  IoEvent ev) {
+    if (ev.result <= 0) {
+        // Upstream closed/error during body streaming.
+        loop->close_conn(conn);
+        return true;
+    }
+    // Parse the upstream response to determine what it is.
+    HttpResponseParser resp_parser;
+    ParsedResponse resp;
+    resp.reset();
+    resp_parser.reset();
+    ParseStatus ps =
+        resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
+    if (ps == ParseStatus::Incomplete) {
+        // Partial response header — re-arm and wait for more.
+        loop->submit_recv_upstream(conn);
+        return true;
+    }
+    if (ps == ParseStatus::Complete && resp.status_code >= 100 && resp.status_code < 200 &&
+        resp.status_code != 101) {
+        // 1xx interim (e.g., 100 Continue): skip, continue body streaming.
+        // Preserve trailing bytes — origin may coalesce 1xx + final response.
+        u32 interim_end = resp_parser.header_end;
+        u32 total = conn.upstream_recv_buf.len();
+        if (interim_end < total) {
+            // Remaining bytes after the 1xx may contain the final response.
+            // Shift them down and re-enter this handler to parse them.
+            u32 remaining = total - interim_end;
+            const u8* src = conn.upstream_recv_buf.data() + interim_end;
+            conn.upstream_recv_buf.reset();
+            u8* dst = conn.upstream_recv_buf.write_ptr();
+            __builtin_memmove(dst, src, remaining);
+            conn.upstream_recv_buf.commit(remaining);
+            // Re-enter: the remaining data might be a full final response.
+            return handle_early_upstream_response<Loop>(loop, lp, conn, ev);
+        }
+        conn.upstream_recv_buf.reset();
+        loop->submit_recv_upstream(conn);
+        return true;
+    }
+    // Non-1xx response (error like 413/401, or unexpected 2xx).
+    // Stop body streaming, forward the response to client.
+    pipeline_stash(conn);
+    conn.recv_buf.reset();
+    conn.upstream_start_us = monotonic_us();
+    on_upstream_response<Loop>(lp, conn, ev);
+    return true;
+}
 
 // Called when request body chunk has been sent to upstream.
 template <typename Loop>
@@ -782,6 +846,11 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::Send && ev.type != IoEventType::UpstreamSend) {
+        // Early upstream response arrived while waiting for send completion.
+        if (ev.type == IoEventType::UpstreamRecv) {
+            handle_early_upstream_response<Loop>(loop, lp, conn, ev);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -813,9 +882,12 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // More body to stream — recv next chunk from client.
+    // Also arm upstream recv to detect early error responses (413/401).
     conn.recv_buf.reset();
     conn.on_complete = &on_request_body_recvd<Loop>;
     loop->submit_recv(conn);
+    conn.upstream_recv_buf.reset();
+    loop->submit_recv_upstream(conn);
 }
 
 // Called when more request body data arrives from client.
@@ -824,6 +896,11 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::Recv) {
+        // Early upstream response during body streaming (413/401/100 Continue).
+        if (ev.type == IoEventType::UpstreamRecv) {
+            handle_early_upstream_response<Loop>(loop, lp, conn, ev);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -885,6 +962,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             loop->submit_recv(conn);  // re-arm if multishot terminated
             return;
         }
+        // Stale UpstreamSend from body streaming that was interrupted by
+        // an early response. The send completed after we transitioned to
+        // response forwarding — harmlessly ignore it.
+        if (ev.type == IoEventType::UpstreamSend) return;
         loop->close_conn(conn);
         return;
     }
@@ -1173,6 +1254,8 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::Send) {
+        // Stale UpstreamSend from body streaming interrupted by early response.
+        if (ev.type == IoEventType::UpstreamSend) return;
         loop->close_conn(conn);
         return;
     }

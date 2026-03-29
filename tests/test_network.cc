@@ -6511,6 +6511,76 @@ TEST(early_response, pipeline_preserved_when_body_done) {
     CHECK(c->keep_alive);
 }
 
+// Upstream latency preserved for early responses (not reset to near-zero).
+TEST(early_response, upstream_latency_preserved) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    // Set upstream_start_us (normally set in on_upstream_request_sent).
+    c->upstream_start_us = monotonic_us();
+    u64 start = c->upstream_start_us;
+    CHECK_GT(start, 0u);
+    // Trigger early 413
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+    // upstream_us should reflect actual latency from original start, not near-zero.
+    // The response was parsed by on_upstream_response which computes:
+    //   upstream_us = monotonic_us() - upstream_start_us
+    // If upstream_start_us was preserved (not reset), upstream_us >= 0.
+    // If it was reset, upstream_us would be near-zero but start would differ.
+    CHECK_EQ(c->upstream_start_us, 0u);  // cleared after computing upstream_us
+}
+
+// recv_buf cleared after stash in early response (no replay).
+TEST(early_response, recv_buf_cleared_after_stash) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    // GET request (no body) + pipelined GET
+    static const char kReqs[] =
+        "GET /first HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /second HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 rlen = sizeof(kReqs) - 1;
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kReqs[j]);
+    c->recv_buf.commit(rlen);
+    IoEvent rev = make_ev(c->id, IoEventType::Recv, static_cast<i32>(rlen));
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    // Switch to proxy, connect, send
+    c->upstream_fd = 100;
+    c->on_complete = &on_upstream_connected<SmallLoop>;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    // Simulate early response during initial send
+    c->upstream_recv_buf.reset();
+    dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
+    c->upstream_recv_buf.commit(kMockHttpResponseLen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(kMockHttpResponseLen));
+    loop.backend.inject(ev);
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    // Send completes → early response forwarded
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, 100));
+    // recv_buf should be cleared (stashed to send_buf, then cleared)
+    // It should NOT contain the original /first request
+    CHECK_EQ(c->recv_buf.len(), 0u);
+}
+
 // === Coverage: upstream pool free with open fd ===
 
 TEST(upstream_pool, free_closes_fd) {

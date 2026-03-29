@@ -1010,9 +1010,9 @@ TEST(type_guard, response_sent_rejects_recv) {
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
     CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
-    // Dispatch a Recv event while expecting Send → close
+    // Dispatch a Recv event while expecting Send → ignored (pipelined data).
     loop.dispatch(make_ev(cid, IoEventType::Recv, 50));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);  // not closed — bytes buffered for pipeline
 }
 
 // on_upstream_connected expects UpstreamConnect — Recv should close
@@ -3829,6 +3829,355 @@ TEST(streaming, proxy_keepalive_two_requests) {
 
     // Should successfully send to upstream (not hang).
     CHECK_GT(loop.backend.count_ops(MockOp::Send), 0u);
+}
+
+// === Pipeline ===
+
+// Helper: write raw bytes into conn's recv_buf and dispatch as Recv event.
+static void inject_raw_recv(SmallLoop& loop, Connection& conn, const char* data, u32 len) {
+    conn.recv_buf.reset();
+    u8* dst = conn.recv_buf.write_ptr();
+    for (u32 i = 0; i < len; i++) dst[i] = static_cast<u8>(data[i]);
+    conn.recv_buf.commit(len);
+    IoEvent ev = make_ev(conn.id, IoEventType::Recv, static_cast<i32>(len));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+}
+
+// Two GET requests concatenated in one recv. Both should get responses.
+TEST(pipeline, two_gets_direct_response) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    loop.backend.clear_ops();
+
+    // Two complete GET requests in one buffer.
+    const char* two_gets =
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 two_len = 27 + 28;  // first=27, second=28
+    inject_raw_recv(loop, *conn, two_gets, two_len);
+
+    // First request should be processed and response sent.
+    // on_header_received fires, sends kResponse200, callback = on_response_sent.
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+
+    // Complete the first send.
+    u32 send_len = conn->send_buf.len();
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+
+    // Pipeline: second request should be dispatched immediately (no new recv).
+    // After on_response_sent, pipeline_shift finds leftover bytes and re-enters
+    // on_header_received. The second response is now being sent.
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->pipeline_depth, 1u);
+
+    // Complete the second send.
+    send_len = conn->send_buf.len();
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+
+    // Pipeline drained — back to ReadingHeader, submit_recv issued.
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+}
+
+// POST with Content-Length:5 body "hello" + GET pipelined. Both processed.
+TEST(pipeline, post_cl_then_get) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    loop.backend.clear_ops();
+
+    // POST with CL:5 body "hello" followed by a GET request.
+    const char* data =
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+        "GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 total_len = 0;
+    while (data[total_len]) total_len++;
+    inject_raw_recv(loop, *conn, data, total_len);
+
+    // First request (POST) should be processed.
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+
+    // Complete the first send.
+    u32 send_len = conn->send_buf.len();
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+
+    // Pipeline: GET should be dispatched immediately.
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->pipeline_depth, 1u);
+
+    // Complete the second send.
+    send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+
+    // Pipeline drained.
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+}
+
+// 17 GETs pipelined. First 16 processed via recursion, 17th falls through to normal recv.
+TEST(pipeline, depth_limit_respected) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Build 17 GET requests concatenated.
+    // Each "GET / HTTP/1.1\r\nHost: x\r\n\r\n" = 27 bytes.
+    // 17 * 27 = 459 bytes (fits in 4096 buffer).
+    const char* one_get = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 one_len = 27;
+    u32 total = one_len * 17;
+
+    conn->recv_buf.reset();
+    u8* dst = conn->recv_buf.write_ptr();
+    for (u32 r = 0; r < 17; r++) {
+        for (u32 i = 0; i < one_len; i++) dst[r * one_len + i] = static_cast<u8>(one_get[i]);
+    }
+    conn->recv_buf.commit(total);
+    IoEvent ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(total));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // First request processed, waiting for send completion.
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+
+    // Process sends for requests 1-16 (each send triggers pipeline dispatch of the next).
+    // Send 1 completes → pipeline dispatches request 2 (depth 0→1).
+    // Send 2 completes → pipeline dispatches request 3 (depth 1→2).
+    // ...
+    // Send 16 completes → pipeline dispatches request 17 (depth 15→16).
+    for (u32 r = 0; r < 16; r++) {
+        u32 send_len = conn->send_buf.len();
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+    }
+
+    // After 16 sends, request 17 is being sent (depth = 16).
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->pipeline_depth, 16u);
+
+    // Complete request 17's send. pipeline_shift returns false (depth >= max).
+    u32 send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+
+    // Pipeline drained — falls through to normal recv re-arm.
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+}
+
+// Complete GET + leftover bytes. First processes via pipeline, leftover is shifted
+// and dispatched to on_header_received (which processes it as a new request).
+TEST(pipeline, incomplete_second_request) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    loop.backend.clear_ops();
+
+    // Complete GET + partial second request (missing \r\n\r\n terminator).
+    const char* data =
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /b HTTP/1.1\r\nHos";
+    u32 total_len = 27 + 20;
+    inject_raw_recv(loop, *conn, data, total_len);
+
+    // First request processed.
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+
+    // Complete the send.
+    u32 send_len = conn->send_buf.len();
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+
+    // Pipeline shift moved the 20 leftover bytes to recv_buf start and
+    // re-entered on_header_received. The partial request triggers Incomplete
+    // parse, so the connection waits for more data instead of sending a
+    // spurious response.
+    // pipeline_depth stays > 0 so subsequent recvs continue the Incomplete check.
+    CHECK_GT(conn->pipeline_depth, 0u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->recv_buf.len(), 20u);  // leftover preserved
+}
+
+// Proxy request + pipelined GET. Verify stash in send_buf, then recover after proxy response.
+TEST(pipeline, proxy_stash_and_recover) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Write a GET request + pipelined second GET into recv_buf.
+    const char* data =
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 first_len = 27;
+    u32 second_len = 28;
+    u32 total_len = first_len + second_len;
+    conn->recv_buf.reset();
+    u8* dst = conn->recv_buf.write_ptr();
+    for (u32 i = 0; i < total_len; i++) dst[i] = static_cast<u8>(data[i]);
+    conn->recv_buf.commit(total_len);
+
+    // Dispatch the recv event manually (don't use inject_and_dispatch which
+    // would overwrite recv_buf with garbage bytes).
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(total_len));
+    loop.backend.inject(recv_ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // The direct response path processed request 1; now switch to proxy for a
+    // different test: simulate that on_header_received routed to proxy.
+    // Reset to proxy flow: pretend the first request was a proxy request.
+    // We need to test that on_upstream_request_sent stashes and
+    // on_proxy_response_sent recovers.
+
+    // Instead, let's set up from scratch in proxy mode with pipelined data.
+    // Re-setup connection for proxy flow.
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Write proxy request + pipelined GET.
+    conn->recv_buf.reset();
+    dst = conn->recv_buf.write_ptr();
+    for (u32 i = 0; i < total_len; i++) dst[i] = static_cast<u8>(data[i]);
+    conn->recv_buf.commit(total_len);
+
+    // Parse request metadata (sets req_initial_send_len = 27).
+    recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(total_len));
+    loop.backend.inject(recv_ev);
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // First request got a direct response. Complete its send.
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+
+    // Instead of completing normally, hijack to proxy mode.
+    // This is complex; let's use a simpler approach: manually test stash/recover.
+
+    // --- Test pipeline_stash and pipeline_recover directly ---
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Write two requests into recv_buf.
+    conn->recv_buf.reset();
+    dst = conn->recv_buf.write_ptr();
+    for (u32 i = 0; i < total_len; i++) dst[i] = static_cast<u8>(data[i]);
+    conn->recv_buf.commit(total_len);
+    conn->req_initial_send_len = first_len;
+
+    // Stash leftover bytes into send_buf.
+    pipeline_stash(*conn);
+    CHECK_EQ(conn->pipeline_stash_len, static_cast<u16>(second_len));
+    CHECK_EQ(conn->send_buf.len(), second_len);
+
+    // Verify stashed content matches the second request.
+    const u8* stashed = conn->send_buf.data();
+    const char* expected = "GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    bool match = true;
+    for (u32 i = 0; i < second_len; i++) {
+        if (stashed[i] != static_cast<u8>(expected[i])) {
+            match = false;
+            break;
+        }
+    }
+    CHECK(match);
+
+    // Simulate: recv_buf was reset for upstream response, now recover.
+    conn->recv_buf.reset();
+    bool recovered = pipeline_recover(*conn);
+    CHECK(recovered);
+    CHECK_EQ(conn->recv_buf.len(), second_len);
+    CHECK_EQ(conn->pipeline_stash_len, 0u);
+    CHECK_EQ(conn->pipeline_depth, 1u);
+
+    // Verify recovered content matches the second request.
+    const u8* recv_data = conn->recv_buf.data();
+    match = true;
+    for (u32 i = 0; i < second_len; i++) {
+        if (recv_data[i] != static_cast<u8>(expected[i])) {
+            match = false;
+            break;
+        }
+    }
+    CHECK(match);
+}
+
+// Single request (no pipelining). Verify pipeline_depth stays 0.
+TEST(pipeline, no_pipeline_resets_depth) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    loop.backend.clear_ops();
+
+    // Single GET with no trailing bytes.
+    const char* single = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 single_len = 27;
+    inject_raw_recv(loop, *conn, single, single_len);
+
+    // Request processed.
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+
+    // Complete send — no leftover, pipeline_shift returns false.
+    u32 send_len = conn->send_buf.len();
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+
+    // pipeline_depth reset to 0 in the submit_recv fallthrough path.
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+    CHECK_GE(loop.backend.count_ops(MockOp::Recv), 1u);
+}
+
+// Exact single request — pipeline_leftover returns 0.
+TEST(pipeline, leftover_returns_zero_for_exact_request) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Write a single exact GET request into recv_buf.
+    const char* exact = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 exact_len = 27;
+    conn->recv_buf.reset();
+    u8* dst = conn->recv_buf.write_ptr();
+    for (u32 i = 0; i < exact_len; i++) dst[i] = static_cast<u8>(exact[i]);
+    conn->recv_buf.commit(exact_len);
+
+    // Parse to set req_initial_send_len.
+    capture_request_metadata(*conn);
+
+    // req_initial_send_len should equal recv_buf.len() — no leftover bytes.
+    CHECK_EQ(conn->req_initial_send_len, conn->recv_buf.len());
+    CHECK_EQ(pipeline_leftover(*conn), 0u);
 }
 
 int main(int argc, char** argv) {

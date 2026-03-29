@@ -557,7 +557,9 @@ static inline void prepare_early_response_state(Connection& conn) {
         pipeline_stash(conn);
         conn.recv_buf.reset();
     }
-    conn.upstream_start_us = monotonic_us();
+    // Preserve original upstream start time for accurate latency reporting.
+    // Only set if not already recording (first call in the request cycle).
+    if (conn.upstream_start_us == 0) conn.upstream_start_us = monotonic_us();
 }
 
 // Step: request forwarded to upstream, now wait for upstream response.

@@ -590,7 +590,15 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             on_upstream_response<Loop>(lp, conn, synth);
             return;
         }
-        if (conn.upstream_fd >= 0 && !conn.upstream_recv_armed) {
+        // 3. io_uring: upstream recv still armed — wait for CQE.
+        if (conn.upstream_recv_armed) {
+            prepare_early_response_state(conn);
+            conn.on_complete = &on_upstream_response<Loop>;
+            loop->submit_recv_upstream(conn);
+            return;
+        }
+        // 4. Epoll only: sync recv fallback.
+        if (conn.upstream_fd >= 0) {
             u32 avail = conn.upstream_recv_buf.write_avail();
             if (avail > 0) {
                 ssize_t nr;
@@ -1051,8 +1059,16 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             on_upstream_response<Loop>(lp, conn, synth);
             return;
         }
-        // 3. Epoll only: sync recv fallback.
-        if (conn.upstream_fd >= 0 && !conn.upstream_recv_armed) {
+        // 3. io_uring: upstream recv is still armed — the CQE hasn't arrived
+        //    yet. Transition to on_upstream_response to wait for it.
+        if (conn.upstream_recv_armed) {
+            prepare_early_response_state(conn);
+            conn.on_complete = &on_upstream_response<Loop>;
+            loop->submit_recv_upstream(conn);  // no-op if already armed
+            return;
+        }
+        // 4. Epoll only: sync recv fallback.
+        if (conn.upstream_fd >= 0) {
             u32 avail = conn.upstream_recv_buf.write_avail();
             if (avail > 0) {
                 ssize_t nr;

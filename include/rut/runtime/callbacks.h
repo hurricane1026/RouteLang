@@ -796,26 +796,31 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 // responses (413/401/etc) before the client body is fully forwarded.
 
 // Helper: handle an UpstreamRecv event that arrives during request body streaming.
-// Returns true if the event was consumed (caller should return).
-// Handles: EOF/error → close, 1xx → skip and continue, non-1xx → forward to client.
+// Handles: EOF/error → close/502, 1xx → skip and continue, non-1xx → flag pending.
+//
+// IMPORTANT: This must NOT call on_upstream_response directly because an
+// upstream send may still be in-flight. Epoll reports upstream send completions
+// as IoEventType::Send (not UpstreamSend), so transitioning to response
+// forwarding while a send is pending would cause the stale send completion
+// to be misinterpreted as the client-response send ack.
+//
+// Instead, non-1xx responses set early_response_pending = true. The caller
+// (on_request_body_sent body_done or more_body paths) checks this flag after
+// the upstream send settles and transitions to on_upstream_response then.
 template <typename Loop>
-static inline bool handle_early_upstream_response(Loop* loop,
-                                                  void* lp,
-                                                  Connection& conn,
-                                                  IoEvent ev) {
+static inline void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev) {
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
-        // Upstream closed/error with no buffered data.
+        // Upstream closed with no data — close immediately (no send in-flight
+        // concern since the connection is dead anyway).
         loop->close_conn(conn);
-        return true;
+        return;  // conn freed, early_response_pending irrelevant
     }
-    if (ev.result <= 0 && conn.upstream_recv_buf.len() > 0) {
-        // EOF with partial data — delegate to on_upstream_response which
-        // produces 502 for truncated headers (matching normal proxy path).
-        conn.upstream_start_us = monotonic_us();
-        on_upstream_response<Loop>(lp, conn, ev);
-        return true;
+    if (ev.result <= 0) {
+        // EOF with partial data — mark pending, on_upstream_response will 502.
+        conn.early_response_pending = true;
+        return;
     }
-    // Parse the upstream response to determine what it is.
+    // Parse to determine what it is.
     HttpResponseParser resp_parser;
     ParsedResponse resp;
     resp.reset();
@@ -825,7 +830,7 @@ static inline bool handle_early_upstream_response(Loop* loop,
     if (ps == ParseStatus::Incomplete) {
         // Partial response header — re-arm and wait for more.
         loop->submit_recv_upstream(conn);
-        return true;
+        return;
     }
     if (ps == ParseStatus::Complete && resp.status_code >= 100 && resp.status_code < 200 &&
         resp.status_code != 101) {
@@ -834,31 +839,52 @@ static inline bool handle_early_upstream_response(Loop* loop,
         u32 interim_end = resp_parser.header_end;
         u32 total = conn.upstream_recv_buf.len();
         if (interim_end < total) {
-            // Remaining bytes after the 1xx may contain the final response.
-            // Shift them down and re-enter this handler to parse them.
             u32 remaining = total - interim_end;
             const u8* src = conn.upstream_recv_buf.data() + interim_end;
             conn.upstream_recv_buf.reset();
             u8* dst = conn.upstream_recv_buf.write_ptr();
             __builtin_memmove(dst, src, remaining);
             conn.upstream_recv_buf.commit(remaining);
-            // Re-enter: the remaining data might be a full final response.
-            return handle_early_upstream_response<Loop>(loop, lp, conn, ev);
+            // Re-enter: trailing data might be a full final response.
+            handle_early_upstream_recv<Loop>(loop, conn, ev);
+            return;
         }
         conn.upstream_recv_buf.reset();
         loop->submit_recv_upstream(conn);
-        return true;
+        return;
     }
-    // Non-1xx response (error like 413/401, or unexpected 2xx).
-    // Stop body streaming, forward the response to client.
-    //
-    // Don't reset recv_buf: it may contain client data from the same wait()
-    // batch (remaining upload or pipelined next request). on_upstream_response
-    // and on_proxy_response_sent handle recv_buf data naturally — it's either
-    // ignored or used for keep-alive pipeline recovery.
+    // Non-1xx response: flag pending. Don't transition yet — upstream send
+    // may still be in-flight. on_request_body_sent will check and transition
+    // after the send settles.
+    conn.early_response_pending = true;
+}
+
+// Transition to forwarding a pending early upstream response.
+// Called after the in-flight upstream send has settled.
+template <typename Loop>
+static inline void forward_early_response(Loop* loop, void* lp, Connection& conn) {
+    conn.early_response_pending = false;
+    // Discard unread client body bytes — they're upload data, not a pipelined
+    // next request. Feeding them into pipeline_dispatch would corrupt the
+    // session with spurious parse failures.
+    conn.recv_buf.reset();
+    conn.keep_alive = false;  // can't reuse: unread body on client side
     conn.upstream_start_us = monotonic_us();
-    on_upstream_response<Loop>(lp, conn, ev);
-    return true;
+    // Synthesize an UpstreamRecv event. Use result=0 (EOF) if the upstream
+    // closed, so on_upstream_response produces 502 for truncated headers.
+    // If upstream_recv_buf has a complete response, result>0 tells the parser
+    // to proceed normally.
+    HttpResponseParser probe;
+    ParsedResponse probe_resp;
+    probe_resp.reset();
+    probe.reset();
+    ParseStatus ps =
+        probe.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &probe_resp);
+    // If parse is Incomplete, the upstream must have closed (EOF with partial data).
+    i32 synth_result =
+        (ps == ParseStatus::Incomplete) ? 0 : static_cast<i32>(conn.upstream_recv_buf.len());
+    IoEvent synth = {conn.id, synth_result, 0, 0, IoEventType::UpstreamRecv, 0};
+    on_upstream_response<Loop>(lp, conn, synth);
 }
 
 // Called when request body chunk has been sent to upstream.
@@ -867,9 +893,10 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::Send && ev.type != IoEventType::UpstreamSend) {
-        // Early upstream response arrived while waiting for send completion.
+        // Early upstream response arrived while upstream send is in-flight.
+        // Don't transition yet — flag it and wait for the send to settle.
         if (ev.type == IoEventType::UpstreamRecv) {
-            handle_early_upstream_response<Loop>(loop, lp, conn, ev);
+            handle_early_upstream_recv<Loop>(loop, conn, ev);
             return;
         }
         loop->close_conn(conn);
@@ -879,9 +906,12 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    // Don't validate against recv_buf.len() — send may have been capped
-    // to body boundary (less than full buffer). Backends guarantee full
-    // send of the submitted length.
+    // Upstream send completed. Check if an early response was flagged
+    // while the send was in-flight — if so, handle it now.
+    if (conn.early_response_pending) {
+        forward_early_response<Loop>(loop, lp, conn);
+        return;
+    }
 
     // Check if request body is complete.
     bool body_done = false;
@@ -898,7 +928,6 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_start_us = monotonic_us();
         // Don't reset upstream_recv_buf — it may hold a partial early response
         // header that was buffered during body streaming (Incomplete parse).
-        // on_upstream_response will parse whatever is there.
         if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
         conn.on_complete = &on_upstream_response<Loop>;
         loop->submit_recv_upstream(conn);
@@ -907,8 +936,6 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     // More body to stream — recv next chunk from client.
     // Also arm upstream recv to detect early error responses (413/401).
-    // Don't reset upstream_recv_buf — it may hold a partial early response
-    // header from a previous Incomplete parse that needs more data.
     conn.recv_buf.reset();
     conn.on_complete = &on_request_body_recvd<Loop>;
     loop->submit_recv(conn);
@@ -922,8 +949,13 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     if (ev.type != IoEventType::Recv) {
         // Early upstream response during body streaming (413/401/100 Continue).
+        // No upstream send is in-flight here (we haven't submitted one yet),
+        // so it's safe to transition immediately if non-1xx.
         if (ev.type == IoEventType::UpstreamRecv) {
-            handle_early_upstream_response<Loop>(loop, lp, conn, ev);
+            handle_early_upstream_recv<Loop>(loop, conn, ev);
+            if (conn.early_response_pending) {
+                forward_early_response<Loop>(loop, lp, conn);
+            }
             return;
         }
         loop->close_conn(conn);

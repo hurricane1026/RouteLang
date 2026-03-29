@@ -5898,6 +5898,12 @@ TEST(early_response, during_body_send_wait) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
+    // Early response is deferred until upstream send completes
+    CHECK(c->early_response_pending);
+    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+
+    // Upstream send completion arrives → now forward the 413
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
     CHECK_EQ(c->resp_status, static_cast<u16>(413));
 }
 
@@ -5943,8 +5949,9 @@ TEST(early_response, incomplete_response_waits) {
     CHECK(c->fd >= 0);
 }
 
-// P1: Stale UpstreamSend CQE after early response must not close connection.
-TEST(early_response, stale_upstream_send_after_early_response) {
+// P1: UpstreamRecv before UpstreamSend completion → deferred, then Send triggers forward.
+// No stale Send race because forward_early_response runs AFTER the Send settles.
+TEST(early_response, deferred_until_send_completes) {
     SmallLoop loop;
     loop.setup();
     auto* c = setup_body_streaming_proxy(loop, 200, 10);
@@ -5970,13 +5977,14 @@ TEST(early_response, stale_upstream_send_after_early_response) {
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-    CHECK_EQ(c->resp_status, static_cast<u16>(413));
-
-    // Now the stale UpstreamSend completion arrives.
-    // on_upstream_response should ignore it (not close the connection).
+    // Deferred — waiting for send to settle
+    CHECK(c->early_response_pending);
     CHECK(c->fd >= 0);
-    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
-    CHECK(c->fd >= 0);  // still alive — stale send was ignored
+
+    // UpstreamSend completion arrives → forward_early_response triggers
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+    CHECK_EQ(c->keep_alive, false);  // forced close — unread body
 }
 
 // P2: 100 Continue + final response coalesced in one read.

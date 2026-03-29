@@ -76,6 +76,7 @@ struct ConnectionBase {
     bool send_armed;
     bool upstream_recv_armed;
     bool upstream_send_armed;
+    bool early_response_pending;  // upstream sent early response during body streaming
 
     // Response status (set by handler/proxy, used by access log)
     u16 resp_status;
@@ -155,6 +156,7 @@ struct ConnectionBase {
         send_armed = false;
         upstream_recv_armed = false;
         upstream_send_armed = false;
+        early_response_pending = false;
         resp_status = 0;
         req_method = 0;
         req_size = 0;

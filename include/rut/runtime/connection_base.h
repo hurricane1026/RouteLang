@@ -115,6 +115,14 @@ struct ConnectionBase {
     Buffer recv_buf;
     Buffer send_buf;
 
+    // Upstream recv buffer — separate from client recv_buf to prevent:
+    // 1. Client pipelined data being parsed as upstream response
+    // 2. Stale UpstreamRecv CQEs corrupting client request parsing
+    // 3. Client Recv during response streaming polluting upstream body data
+    // Lazy-allocated: only proxy connections pay the cost.
+    u8* upstream_recv_slice;
+    Buffer upstream_recv_buf;
+
     void reset() {
         on_complete = nullptr;
         fd = -1;
@@ -161,6 +169,8 @@ struct ConnectionBase {
         send_slice = nullptr;
         recv_buf.bind(nullptr, 0);
         send_buf.bind(nullptr, 0);
+        upstream_recv_slice = nullptr;
+        upstream_recv_buf.bind(nullptr, 0);
     }
 };
 

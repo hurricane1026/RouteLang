@@ -171,6 +171,18 @@ public:
 
     u32 active_count() const { return kMaxConns - free_top; }
 
+    // Lazy-allocate upstream recv buffer for proxy connections.
+    // Only called when a connection starts proxying — non-proxy connections
+    // never pay the cost. Returns false if SlicePool is exhausted.
+    bool alloc_upstream_buf(ConnectionBase& c) {
+        if (c.upstream_recv_slice) return true;  // already allocated
+        u8* s = pool.alloc();
+        if (!s) return false;
+        c.upstream_recv_slice = s;
+        c.upstream_recv_buf.bind(s, SlicePool::kSliceSize);
+        return true;
+    }
+
     void reclaim_slot(u32 cid) {
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
@@ -179,6 +191,10 @@ public:
         if (conns[cid].send_slice) {
             pool.free(conns[cid].send_slice);
             conns[cid].send_slice = nullptr;
+        }
+        if (conns[cid].upstream_recv_slice) {
+            pool.free(conns[cid].upstream_recv_slice);
+            conns[cid].upstream_recv_slice = nullptr;
         }
         free_stack[free_top++] = cid;
         for (u32 i = 0; i < pending_free_count; i++) {
@@ -201,6 +217,10 @@ public:
                 if (conns[cid].send_slice) {
                     pool.free(conns[cid].send_slice);
                     conns[cid].send_slice = nullptr;
+                }
+                if (conns[cid].upstream_recv_slice) {
+                    pool.free(conns[cid].upstream_recv_slice);
+                    conns[cid].upstream_recv_slice = nullptr;
                 }
                 free_stack[free_top++] = cid;
             } else {
@@ -239,6 +259,7 @@ public:
         if (c.pending_ops == 0) {
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
+            if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
             c.reset();
             free_stack[free_top++] = cid;
             return;
@@ -246,10 +267,12 @@ public:
         // Ops still in flight: defer until CQEs arrive.
         u8* rs = c.recv_slice;
         u8* ss = c.send_slice;
+        u8* us = c.upstream_recv_slice;
         u32 ops = c.pending_ops;
         c.reset();
         conns[cid].recv_slice = rs;
         conns[cid].send_slice = ss;
+        conns[cid].upstream_recv_slice = us;
         conns[cid].pending_ops = ops;
         pending_free[pending_free_count++] = cid;
     }

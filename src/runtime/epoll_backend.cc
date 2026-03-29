@@ -300,12 +300,14 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             // Readiness → recv directly into Connection::recv_buf
             i32 fd = (conn_id < kMaxFdMap) ? fd_map[conn_id] : -1;
             if (fd < 0) continue;
-            // Append recv data into Connection::recv_buf.
+            // Append recv data into the appropriate recv buffer.
+            // UpstreamRecv → upstream_recv_buf; Recv → recv_buf.
             // Buffer is NOT reset here — callback resets when it consumes data.
             // This allows multi-packet requests to accumulate.
             i32 result = 0;
             if (conn_id < max_conns) {
-                auto& buf = conns[conn_id].recv_buf;
+                auto& buf = (type == IoEventType::UpstreamRecv) ? conns[conn_id].upstream_recv_buf
+                                                                : conns[conn_id].recv_buf;
                 u32 avail = buf.write_avail();
                 if (avail > 0) {
                     ssize_t nr;

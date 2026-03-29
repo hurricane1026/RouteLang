@@ -623,7 +623,7 @@ TEST(proxy, upstream_eof) {
 
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 100));
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 0));  // EOF
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 0));  // EOF
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
@@ -808,10 +808,10 @@ TEST(recv_buf, buffer_state_through_proxy_cycle) {
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
 
-    // upstream response → recv_buf gets new data (valid HTTP response)
+    // upstream response → upstream_recv_buf gets new data (valid HTTP response)
     inject_upstream_response(loop, *conn);
-    CHECK_EQ(conn->recv_buf.len(), kMockHttpResponseLen);
-    CHECK(!conn->recv_buf.is_released());
+    CHECK_EQ(conn->upstream_recv_buf.len(), kMockHttpResponseLen);
+    CHECK(!conn->upstream_recv_buf.is_released());
 
     // send to client → back to ReadingHeader
     loop.inject_and_dispatch(
@@ -940,19 +940,21 @@ TEST(recv_semantic, proxy_recv_buf_lifetime) {
     // Upstream connect succeeds → forwards recv_buf to upstream
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
 
-    // Upstream request sent → on_upstream_request_sent resets recv_buf for response
+    // Upstream request sent → on_upstream_request_sent resets upstream_recv_buf for response.
+    // recv_buf retains original request data (not touched).
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
-    CHECK_EQ(conn->recv_buf.len(), 0u);  // reset by on_upstream_request_sent
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);  // reset by on_upstream_request_sent
 
-    // Upstream response received → data goes into recv_buf (valid HTTP response)
+    // Upstream response received → data goes into upstream_recv_buf (valid HTTP response)
     inject_upstream_response(loop, *conn);
-    // on_upstream_response does NOT reset recv_buf (send still in progress)
+    // on_upstream_response does NOT reset upstream_recv_buf (send still in progress)
     CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
 
-    // Proxy response sent → on_proxy_response_sent resets recv_buf
+    // Proxy response sent → on_proxy_response_sent resets upstream_recv_buf and recv_buf.
     loop.inject_and_dispatch(
         make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
-    CHECK_EQ(conn->recv_buf.len(), 0u);  // reset by on_proxy_response_sent
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);  // reset by on_proxy_response_sent
+    CHECK_EQ(conn->recv_buf.len(), 0u);           // reset by on_proxy_response_sent (keep-alive)
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
 }
 
@@ -2494,12 +2496,14 @@ TEST(async_reclaim, sqe_fail_no_pending_ops_increment) {
 template <typename Loop>
 static void inject_custom_recv(
     Loop& loop, Connection& conn, IoEventType type, const u8* data, u32 len) {
-    conn.recv_buf.reset();
-    u8* dst = conn.recv_buf.write_ptr();
-    u32 avail = conn.recv_buf.write_avail();
+    // Route to upstream_recv_buf for UpstreamRecv, recv_buf for Recv.
+    auto& buf = (type == IoEventType::UpstreamRecv) ? conn.upstream_recv_buf : conn.recv_buf;
+    buf.reset();
+    u8* dst = buf.write_ptr();
+    u32 avail = buf.write_avail();
     u32 n = len < avail ? len : avail;
     for (u32 j = 0; j < n; j++) dst[j] = data[j];
-    conn.recv_buf.commit(n);
+    buf.commit(n);
     IoEvent ev = make_ev(conn.id, type, static_cast<i32>(n));
     loop.backend.inject(ev);
     IoEvent events[8];
@@ -2596,13 +2600,13 @@ TEST(streaming, large_content_length) {
     u32 hdr_len = 0;
     while (resp_hdr[hdr_len]) hdr_len++;
 
-    // Build initial recv_buf: headers + as much body as fits in 4KB.
+    // Build initial upstream_recv_buf: headers + as much body as fits in 4KB.
     u32 initial_body = SmallLoop::kBufSize - hdr_len;
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < hdr_len; i++) dst[i] = static_cast<u8>(resp_hdr[i]);
     for (u32 i = 0; i < initial_body; i++) dst[hdr_len + i] = static_cast<u8>(i & 0xFF);
-    conn->recv_buf.commit(hdr_len + initial_body);
+    conn->upstream_recv_buf.commit(hdr_len + initial_body);
 
     // Dispatch: upstream response with headers + initial body.
     IoEvent ev =
@@ -2670,10 +2674,10 @@ TEST(streaming, chunked_response) {
     u32 hdr_len = 0;
     while (resp_hdr[hdr_len]) hdr_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < hdr_len; i++) dst[i] = static_cast<u8>(resp_hdr[i]);
-    conn->recv_buf.commit(hdr_len);
+    conn->upstream_recv_buf.commit(hdr_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(hdr_len));
     loop.backend.inject(ev);
@@ -2730,10 +2734,10 @@ TEST(streaming, no_body_204) {
     u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
     loop.backend.inject(ev);
@@ -2761,10 +2765,10 @@ TEST(streaming, head_no_body) {
     u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
     loop.backend.inject(ev);
@@ -2808,10 +2812,10 @@ TEST(streaming, until_close) {
     u32 hdr_len = 0;
     while (resp_hdr[hdr_len]) hdr_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < hdr_len; i++) dst[i] = static_cast<u8>(resp_hdr[i]);
-    conn->recv_buf.commit(hdr_len);
+    conn->upstream_recv_buf.commit(hdr_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(hdr_len));
     loop.backend.inject(ev);
@@ -2867,10 +2871,10 @@ TEST(streaming, chunked_over_content_length) {
     u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
     loop.backend.inject(ev);
@@ -2911,10 +2915,10 @@ TEST(streaming, no_body_head_strips_trailing_bytes) {
     }
     REQUIRE(hdr_len > 0);
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     loop.backend.clear_ops();
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
@@ -2958,10 +2962,10 @@ TEST(streaming, content_length_excess_bytes_trimmed) {
     }
     REQUIRE(hdr_len > 0);
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     loop.backend.clear_ops();
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
@@ -3148,10 +3152,10 @@ TEST(streaming, http10_until_close) {
     u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
     loop.backend.inject(ev);
@@ -3206,10 +3210,10 @@ TEST(streaming, keepalive_no_cl_no_body) {
     u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
     loop.backend.inject(ev);
@@ -3365,11 +3369,11 @@ TEST(streaming, upstream_armed_cleared_after_body_complete) {
 
     // Build initial recv_buf: headers + as much body as fits.
     u32 initial_body = SmallLoop::kBufSize - hdr_len;
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < hdr_len; i++) dst[i] = static_cast<u8>(resp_hdr[i]);
     for (u32 i = 0; i < initial_body; i++) dst[hdr_len + i] = static_cast<u8>(i & 0xFF);
-    conn->recv_buf.commit(hdr_len + initial_body);
+    conn->upstream_recv_buf.commit(hdr_len + initial_body);
 
     // Dispatch: parse upstream response headers + initial body.
     IoEvent ev =
@@ -3512,10 +3516,10 @@ TEST(streaming, response_body_sent_trimmed_not_closed) {
     u32 hdr_len = 0;
     while (resp_hdr[hdr_len]) hdr_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < hdr_len; i++) dst[i] = static_cast<u8>(resp_hdr[i]);
-    conn->recv_buf.commit(hdr_len);
+    conn->upstream_recv_buf.commit(hdr_len);
 
     // Dispatch: parse upstream response headers (no body yet).
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(hdr_len));
@@ -3568,10 +3572,10 @@ TEST(streaming, skip_1xx_continue_then_200) {
     u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
     loop.backend.inject(ev);
@@ -3600,10 +3604,10 @@ TEST(streaming, _101_not_skipped) {
     u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
     loop.backend.inject(ev);
@@ -3630,10 +3634,10 @@ TEST(streaming, status_205_no_body) {
     u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
     loop.backend.inject(ev);
@@ -3660,10 +3664,10 @@ TEST(streaming, response_body_ignores_client_recv) {
     u32 hdr_len = 0;
     while (resp_hdr[hdr_len]) hdr_len++;
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < hdr_len; i++) dst[i] = static_cast<u8>(resp_hdr[i]);
-    conn->recv_buf.commit(hdr_len);
+    conn->upstream_recv_buf.commit(hdr_len);
 
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(hdr_len));
     loop.backend.inject(ev);
@@ -3678,15 +3682,14 @@ TEST(streaming, response_body_ignores_client_recv) {
     CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
 
     // Inject a client Recv event (wrong type — should be UpstreamRecv).
-    // on_response_body_recvd resets recv_buf and re-arms upstream recv.
+    // With separate buffers, client data goes to recv_buf (harmless),
+    // and on_response_body_recvd ignores it. No purge needed.
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
 
-    // Connection stays alive, recv_buf purged, upstream recv re-armed.
+    // Connection stays alive, still waiting for upstream body.
     CHECK(conn->fd >= 0);
     CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
-    CHECK_EQ(conn->recv_buf.len(), 0u);                  // purged
-    CHECK_GT(loop.backend.count_ops(MockOp::Recv), 0u);  // upstream recv re-armed
 }
 
 // After streaming completes and connection returns to ReadingHeader,
@@ -3742,10 +3745,10 @@ TEST(streaming, chunked_response_initial_buffer_capped) {
     }
     REQUIRE(hdr_len > 0);
 
-    conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
     for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
-    conn->recv_buf.commit(resp_len);
+    conn->upstream_recv_buf.commit(resp_len);
 
     loop.backend.clear_ops();
     IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
@@ -3776,7 +3779,7 @@ TEST(streaming, proxy_response_sent_closes_upstream) {
 
     // Inject a small response (fits in one buffer → on_proxy_response_sent).
     inject_upstream_response(loop, *conn);
-    u32 resp_len = conn->recv_buf.len();
+    u32 resp_len = conn->upstream_recv_buf.len();
 
     // Complete the send → on_proxy_response_sent.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));
@@ -3812,7 +3815,7 @@ TEST(streaming, proxy_keepalive_two_requests) {
 
     // Upstream response.
     inject_upstream_response(loop, *conn);
-    u32 resp_len = conn->recv_buf.len();
+    u32 resp_len = conn->upstream_recv_buf.len();
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));
 
     // Should be back to ReadingHeader with upstream closed.

@@ -421,7 +421,7 @@ TEST(proxy_callback, upstream_response_error) {
     advance_to_upstream_response(loop, c, cid);
 
     // Upstream recv error
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, -1));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, -1));
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
@@ -449,7 +449,7 @@ TEST(proxy_callback, proxy_response_sent_success) {
     advance_to_upstream_response(loop, c, cid);
     inject_upstream_response(loop, *c);
     // Now at on_proxy_response_sent, send the proxied response to client
-    u32 resp_len = c->recv_buf.len();
+    u32 resp_len = c->upstream_recv_buf.len();
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(resp_len)));
     // Should have completed the request cycle
     CHECK_EQ(m.requests_total, 1u);

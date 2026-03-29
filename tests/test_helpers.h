@@ -47,6 +47,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     // Inline buffer storage for tests (no SlicePool dependency).
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];
+    u8 upstream_recv_storage[kMaxConns][kBufSize];
 
     bool is_draining() const { return draining; }
 
@@ -95,6 +96,16 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
             free_stack[i] = i;
         }
         backend.init(0, -1);
+    }
+
+    // Lazy-allocate upstream recv buffer (mirrors real event loops).
+    bool alloc_upstream_buf(ConnectionBase& c) {
+        if (c.upstream_recv_slice) return true;
+        u32 id = c.id;
+        if (id >= kMaxConns) return false;
+        c.upstream_recv_slice = upstream_recv_storage[id];
+        c.upstream_recv_buf.bind(upstream_recv_storage[id], kBufSize);
+        return true;
     }
 
     Connection* alloc_conn_impl() {
@@ -150,12 +161,14 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
 
     // Inject + dispatch convenience.
     // For Recv events with result>0, simulates what a real backend does:
-    // append mock data into the connection's recv_buf (backend no longer resets).
-    // Syncs ev.result to actual committed bytes, or -ENOBUFS if buffer full.
+    // append mock data into the connection's recv_buf (or upstream_recv_buf
+    // for UpstreamRecv). Syncs ev.result to actual committed bytes, or
+    // -ENOBUFS if buffer full.
     void inject_and_dispatch(IoEvent ev) {
         if ((ev.type == IoEventType::Recv || ev.type == IoEventType::UpstreamRecv) &&
             ev.result > 0 && ev.conn_id < kMaxConns) {
-            auto& buf = conns[ev.conn_id].recv_buf;
+            auto& buf = (ev.type == IoEventType::UpstreamRecv) ? conns[ev.conn_id].upstream_recv_buf
+                                                               : conns[ev.conn_id].recv_buf;
             u32 n = static_cast<u32>(ev.result);
             u32 avail = buf.write_avail();
             if (avail == 0) {
@@ -349,6 +362,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
 
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];
+    u8 upstream_recv_storage[kMaxConns][kBufSize];
 
     bool is_draining() const { return draining; }
 
@@ -368,6 +382,16 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         if (epoch)
             epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
                                std::memory_order_release);
+    }
+
+    // Lazy-allocate upstream recv buffer (mirrors real event loops).
+    bool alloc_upstream_buf(ConnectionBase& c) {
+        if (c.upstream_recv_slice) return true;
+        u32 id = c.id;
+        if (id >= kMaxConns) return false;
+        c.upstream_recv_slice = upstream_recv_storage[id];
+        c.upstream_recv_buf.bind(upstream_recv_storage[id], kBufSize);
+        return true;
     }
 
     void setup() {
@@ -414,10 +438,12 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             // Defer until CQEs drain pending_ops to 0.
             u8* rs = c.recv_slice;
             u8* ss = c.send_slice;
+            u8* us = c.upstream_recv_slice;
             u32 ops = c.pending_ops;
             c.reset();
             conns[cid].recv_slice = rs;
             conns[cid].send_slice = ss;
+            conns[cid].upstream_recv_slice = us;
             conns[cid].pending_ops = ops;
             pending_free[pending_free_count++] = cid;
         }
@@ -543,7 +569,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     void inject_and_dispatch(IoEvent ev) {
         if ((ev.type == IoEventType::Recv || ev.type == IoEventType::UpstreamRecv) &&
             ev.result > 0 && ev.conn_id < kMaxConns) {
-            auto& buf = conns[ev.conn_id].recv_buf;
+            auto& buf = (ev.type == IoEventType::UpstreamRecv) ? conns[ev.conn_id].upstream_recv_buf
+                                                               : conns[ev.conn_id].recv_buf;
             u32 n = static_cast<u32>(ev.result);
             u32 avail = buf.write_avail();
             if (avail == 0) {
@@ -590,6 +617,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
 
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];
+    u8 upstream_recv_storage[kMaxConns][kBufSize];
 
     bool is_draining() const { return draining; }
 
@@ -606,6 +634,16 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         if (epoch)
             epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
                                std::memory_order_release);
+    }
+
+    // Lazy-allocate upstream recv buffer (mirrors real event loops).
+    bool alloc_upstream_buf(ConnectionBase& c) {
+        if (c.upstream_recv_slice) return true;
+        u32 id = c.id;
+        if (id >= kMaxConns) return false;
+        c.upstream_recv_slice = upstream_recv_storage[id];
+        c.upstream_recv_buf.bind(upstream_recv_storage[id], kBufSize);
+        return true;
     }
 
     void setup() {
@@ -807,19 +845,19 @@ static const char kMockHttpResponse[] =
     "OK";
 static constexpr u32 kMockHttpResponseLen = sizeof(kMockHttpResponse) - 1;
 
-// Write a valid HTTP response into conn's recv_buf and dispatch UpstreamRecv.
+// Write a valid HTTP response into conn's upstream_recv_buf and dispatch UpstreamRecv.
 // This replaces inject_and_dispatch for upstream response events so the
 // response parser sees valid HTTP (inject_and_dispatch writes garbage bytes).
 template <typename Loop>
 static void inject_upstream_response(Loop& loop, Connection& conn) {
-    conn.recv_buf.reset();
-    u8* dst = conn.recv_buf.write_ptr();
+    conn.upstream_recv_buf.reset();
+    u8* dst = conn.upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
-    conn.recv_buf.commit(kMockHttpResponseLen);
+    conn.upstream_recv_buf.commit(kMockHttpResponseLen);
     IoEvent ev =
         make_ev(conn.id, IoEventType::UpstreamRecv, static_cast<i32>(kMockHttpResponseLen));
     // Inject directly without going through inject_and_dispatch (which would
-    // overwrite our carefully crafted recv_buf with garbage bytes).
+    // overwrite our carefully crafted upstream_recv_buf with garbage bytes).
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);

@@ -563,18 +563,21 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         if (cqe->flags & IORING_CQE_F_BUFFER) {
             u16 buf_id = static_cast<u16>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
 
-            // Append data into Connection::recv_buf only on success + valid conn.
+            // Append data into the appropriate recv buffer only on success + valid conn.
+            // UpstreamRecv → upstream_recv_buf; Recv → recv_buf.
             // Buffer is NOT reset here — callback resets when it consumes data.
             i32 buf_result = cqe->res;
             if (cqe->res > 0 && conn_id < max_conns) {
                 u32 nbytes = static_cast<u32>(cqe->res);
-                auto& recv_buf = conns[conn_id].recv_buf;
+                auto& target_buf = (type == IoEventType::UpstreamRecv)
+                                       ? conns[conn_id].upstream_recv_buf
+                                       : conns[conn_id].recv_buf;
                 const u8* src = buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
-                u32 avail = recv_buf.write_avail();
+                u32 avail = target_buf.write_avail();
                 u32 to_copy = nbytes < avail ? nbytes : avail;
                 if (to_copy > 0) {
-                    __builtin_memcpy(recv_buf.write_ptr(), src, to_copy);
-                    recv_buf.commit(to_copy);
+                    __builtin_memcpy(target_buf.write_ptr(), src, to_copy);
+                    target_buf.commit(to_copy);
                 }
                 // Report actual bytes copied, not kernel bytes (may differ if buf full)
                 buf_result = (to_copy < nbytes) ? -ENOBUFS : static_cast<i32>(to_copy);

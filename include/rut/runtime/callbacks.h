@@ -379,12 +379,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // Guard: unexpected event type.
     if (ev.type != IoEventType::Recv) {
         // Stale UpstreamRecv/Send CQEs from a previous proxy request.
-        // UpstreamRecv: backend already appended bytes to recv_buf — purge them.
-        if (ev.type == IoEventType::UpstreamRecv) {
-            conn.recv_buf.reset();
-            loop->submit_recv(conn);  // re-arm client recv with clean buffer
-            return;
-        }
+        // With separate buffers, UpstreamRecv data goes to upstream_recv_buf
+        // (not recv_buf), so no purge needed — just ignore.
+        if (ev.type == IoEventType::UpstreamRecv) return;
         if (ev.type == IoEventType::UpstreamSend) return;
         loop->close_conn(conn);
         return;
@@ -523,6 +520,14 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    // Allocate upstream recv buffer for this proxy connection.
+    // This is lazy — only proxy connections pay the cost.
+    if (!loop->alloc_upstream_buf(conn)) {
+        // Pool exhausted — can't proxy, close.
+        loop->close_conn(conn);
+        return;
+    }
+
     conn.state = ConnState::Proxying;
     // Use pre-computed initial send length (capped to request boundary).
     u32 req_send_len =
@@ -569,10 +574,10 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    // Stash pipelined bytes before resetting recv_buf for upstream response.
+    // Stash pipelined bytes before waiting for upstream response.
     pipeline_stash(conn);
     conn.upstream_start_us = monotonic_us();
-    conn.recv_buf.reset();
+    conn.upstream_recv_buf.reset();
     conn.on_complete = &on_upstream_response<Loop>;
     loop->submit_recv_upstream(conn);
 }
@@ -598,7 +603,7 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     // write never reaches callbacks.
 
     // More body to stream — recv next chunk from upstream.
-    conn.recv_buf.reset();
+    conn.upstream_recv_buf.reset();
     conn.on_complete = &on_response_body_recvd<Loop>;
     loop->submit_recv_upstream(conn);
 }
@@ -609,15 +614,10 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::UpstreamRecv) {
-        // Client Recv during response streaming: backend already appended
-        // client bytes to recv_buf at offset 0. Must discard and re-arm
-        // upstream recv — otherwise the next UpstreamRecv appends after
-        // the client bytes and submit_send forwards client data as response.
-        if (ev.type == IoEventType::Recv) {
-            conn.recv_buf.reset();
-            loop->submit_recv_upstream(conn);
-            return;
-        }
+        // Client Recv during response streaming: with separate buffers,
+        // client data goes to recv_buf (not upstream_recv_buf), so no
+        // cross-contamination. Just ignore and wait for upstream data.
+        if (ev.type == IoEventType::Recv) return;
         loop->close_conn(conn);
         return;
     }
@@ -638,7 +638,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    u32 data_len = conn.recv_buf.len();
+    u32 data_len = conn.upstream_recv_buf.len();
     // How many bytes to forward (capped to body boundary for CL mode).
     u32 send_len = data_len;
 
@@ -650,7 +650,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     } else if (conn.resp_body_mode == BodyMode::Chunked) {
         // Feed through chunk parser to detect the end marker.
         // Forward raw bytes as-is (proxy pass-through, no decode).
-        const u8* body_data = conn.recv_buf.data();
+        const u8* body_data = conn.upstream_recv_buf.data();
         u32 pos = 0;
         while (pos < data_len) {
             u32 consumed = 0, out_start = 0, out_len = 0;
@@ -670,10 +670,10 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     conn.resp_body_sent += send_len;
 
-    // Forward body data to client (capped to body boundary).
+    // Forward upstream body data to client (capped to body boundary).
     conn.on_complete = &on_response_body_sent<Loop>;
     conn.state = ConnState::Sending;
-    loop->submit_send(conn, conn.recv_buf.data(), send_len);
+    loop->submit_send(conn, conn.upstream_recv_buf.data(), send_len);
 }
 
 // Called when a response body chunk has been sent to client.
@@ -700,7 +700,9 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     // UntilClose: never done here; on_response_body_recvd handles EOF.
 
     if (body_done) {
-        // Body streaming complete.
+        // Body streaming complete — reset upstream buffer (keep slice for reuse).
+        conn.upstream_recv_buf.reset();
+
         on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
         loop->epoch_leave();
 
@@ -729,7 +731,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // More body to stream — recv next chunk from upstream.
-    conn.recv_buf.reset();
+    conn.upstream_recv_buf.reset();
     conn.on_complete = &on_response_body_recvd<Loop>;
     loop->submit_recv_upstream(conn);
 }
@@ -766,7 +768,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         // Request body fully forwarded — stash leftovers, wait for upstream response.
         pipeline_stash(conn);
         conn.upstream_start_us = monotonic_us();
-        conn.recv_buf.reset();
+        conn.upstream_recv_buf.reset();
         conn.on_complete = &on_upstream_response<Loop>;
         loop->submit_recv_upstream(conn);
         return;
@@ -832,12 +834,10 @@ template <typename Loop>
 void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    // Accept both UpstreamRecv (io_uring multishot / epoll add_recv_upstream)
-    // Accept UpstreamRecv and Recv (epoll fast-upstream: send completion
-    // re-registers upstream fd as Recv). A pipelined client Recv could be
-    // misinterpreted as upstream data — this is a known limitation until
-    // epoll uses UpstreamRecv for all upstream recv paths.
-    if (ev.type != IoEventType::UpstreamRecv && ev.type != IoEventType::Recv) {
+    // Accept UpstreamRecv only — upstream data now goes to upstream_recv_buf,
+    // so client Recv events are harmless (they go to recv_buf). Ignore them.
+    if (ev.type != IoEventType::UpstreamRecv) {
+        if (ev.type == IoEventType::Recv) return;  // client data, ignore
         loop->close_conn(conn);
         return;
     }
@@ -849,7 +849,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     // EOF or error with no data → close.
     // EOF with partial data → parse will return Incomplete → 502 below.
-    if (ev.result <= 0 && conn.recv_buf.len() == 0) {
+    if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
         loop->close_conn(conn);
         return;
     }
@@ -859,7 +859,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     ParsedResponse resp;
     resp.reset();
     resp_parser.reset();
-    ParseStatus ps = resp_parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &resp);
+    ParseStatus ps =
+        resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
     if (ps == ParseStatus::Incomplete) {
         // If upstream closed (EOF), headers are truncated → 502.
         if (ev.result <= 0)
@@ -898,23 +899,23 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // Exception: 101 Switching Protocols is terminal (upgrade handshake).
     if (resp.status_code >= 100 && resp.status_code < 200 && resp.status_code != 101) {
         u32 interim_end = resp_parser.header_end;
-        u32 total = conn.recv_buf.len();
+        u32 total = conn.upstream_recv_buf.len();
         if (interim_end < total) {
             // Remaining bytes after the 1xx may contain the final response.
             // Shift remaining bytes to buffer start (same backing slice).
             u32 remaining = total - interim_end;
-            const u8* src = conn.recv_buf.data() + interim_end;
-            conn.recv_buf.reset();
+            const u8* src = conn.upstream_recv_buf.data() + interim_end;
+            conn.upstream_recv_buf.reset();
             // After reset, write_ptr() points to start of slice.
-            u8* dst = conn.recv_buf.write_ptr();
+            u8* dst = conn.upstream_recv_buf.write_ptr();
             __builtin_memmove(dst, src, remaining);
-            conn.recv_buf.commit(remaining);
+            conn.upstream_recv_buf.commit(remaining);
             // Re-enter to parse the remaining data.
             on_upstream_response<Loop>(lp, conn, ev);
             return;
         }
         // No remaining data — wait for the final response.
-        conn.recv_buf.reset();
+        conn.upstream_recv_buf.reset();
         loop->submit_recv_upstream(conn);
         return;
     }
@@ -944,9 +945,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.resp_body_remaining = 0;
     }
 
-    // Calculate how much body data is already in recv_buf from the initial recv.
+    // Calculate how much body data is already in upstream_recv_buf from the initial recv.
     u32 header_len = resp_parser.header_end;
-    u32 total_len = conn.recv_buf.len();
+    u32 total_len = conn.upstream_recv_buf.len();
     u32 initial_body_len = (total_len > header_len) ? total_len - header_len : 0;
 
     // Track initial body consumption for Content-Length mode.
@@ -960,7 +961,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     bool chunked_done = false;
     u32 chunked_consumed = initial_body_len;  // default: all bytes
     if (conn.resp_body_mode == BodyMode::Chunked && initial_body_len > 0) {
-        const u8* body_start = conn.recv_buf.data() + header_len;
+        const u8* body_start = conn.upstream_recv_buf.data() + header_len;
         u32 pos = 0;
         while (pos < initial_body_len) {
             u32 consumed = 0, out_start = 0, out_len = 0;
@@ -1007,8 +1008,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // Connection header exists, rebuild the response in send_buf with
     // "Connection: close" injected.
     if (loop->is_draining()) {
-        u8* d = const_cast<u8*>(conn.recv_buf.data());
-        u32 len = conn.recv_buf.len();
+        u8* d = const_cast<u8*>(conn.upstream_recv_buf.data());
+        u32 len = conn.upstream_recv_buf.len();
 
         // Use parser-provided header end offset.
         // header_end points past \r\n\r\n, so the \r\n\r\n starts at header_end - 4.
@@ -1112,10 +1113,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     if (body_complete) {
         conn.on_complete = &on_proxy_response_sent<Loop>;
-        loop->submit_send(conn, conn.recv_buf.data(), initial_send_len);
+        loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
     } else {
         conn.on_complete = &on_response_header_sent<Loop>;
-        loop->submit_send(conn, conn.recv_buf.data(), initial_send_len);
+        loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
     }
 }
 
@@ -1146,6 +1147,9 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+
+    // Reset upstream buffer — keep slice for potential next proxy request.
+    conn.upstream_recv_buf.reset();
 
     // Close upstream fd and clear armed flags before re-arming for next request.
     // Without this: upstream_recv_armed stays true → next proxy request's

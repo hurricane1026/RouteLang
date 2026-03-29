@@ -154,6 +154,18 @@ public:
 
     u32 active_count() const { return kMaxConns - free_top; }
 
+    // Lazy-allocate upstream recv buffer for proxy connections.
+    // Only called when a connection starts proxying — non-proxy connections
+    // never pay the cost. Returns false if SlicePool is exhausted.
+    bool alloc_upstream_buf(ConnectionBase& c) {
+        if (c.upstream_recv_slice) return true;  // already allocated
+        u8* s = pool.alloc();
+        if (!s) return false;
+        c.upstream_recv_slice = s;
+        c.upstream_recv_buf.bind(s, SlicePool::kSliceSize);
+        return true;
+    }
+
     // --- CRTP implementations (no if constexpr — epoll only) ---
 
     Connection* alloc_conn_impl() {
@@ -182,6 +194,7 @@ public:
         // Sync backend: kernel is done with buffers. Free immediately.
         if (c.recv_slice) pool.free(c.recv_slice);
         if (c.send_slice) pool.free(c.send_slice);
+        if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
         c.reset();
         free_stack[free_top++] = cid;
     }

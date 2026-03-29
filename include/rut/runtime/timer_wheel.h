@@ -4,7 +4,8 @@
 
 namespace rut {
 
-struct Connection;  // forward decl
+struct ConnectionBase;              // forward decl
+using Connection = ConnectionBase;  // alias (matches connection.h)
 
 // Timer wheel — O(1) add, refresh, tick.
 // 64 slots (power of 2 for fast modulo), 1-second resolution, driven by single timerfd per shard.

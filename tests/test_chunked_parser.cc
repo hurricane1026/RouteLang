@@ -386,6 +386,65 @@ TEST(chunk, empty_size_semicolon) {
              static_cast<u8>(ChunkStatus::Error));
 }
 
+// === Error edge cases for coverage ===
+
+TEST(error, size_lf_missing) {
+    // "3\rX" — \r in size line followed by non-\n → Error in SizeLF
+    const u8 input[] = "3\rX";
+    ChunkedParser p;
+    p.reset();
+    u32 consumed = 0, out_start = 0, out_len = 0;
+    // First feed: "3" → Size, "\r" → SizeLF state
+    // "X" → not \n → Error
+    ChunkStatus s = p.feed(input, 3, &consumed, &out_start, &out_len);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ChunkStatus::Error));
+}
+
+TEST(error, data_lf_missing) {
+    // After reading chunk data, \r must be followed by \n
+    // "3\r\nabc\rX" — data "abc" complete, DataCR→DataLF expects \n, gets X
+    const u8 input[] = "3\r\nabc\rX";
+    ChunkedParser p;
+    p.reset();
+    u8 body[64];
+    u32 body_len = 0;
+    ChunkStatus s = feed_all(&p, input, 8, body, &body_len);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ChunkStatus::Error));
+}
+
+TEST(error, trailer_lf_missing) {
+    // "0\r\n\rX" — trailer expects \r\n, but \r followed by non-\n
+    const u8 input[] = "0\r\n\rX";
+    ChunkedParser p;
+    p.reset();
+    u32 consumed = 0, out_start = 0, out_len = 0;
+    // Feed everything
+    u32 offset = 0;
+    ChunkStatus s = ChunkStatus::NeedMore;
+    while (offset < 5) {
+        s = p.feed(input + offset, 5 - offset, &consumed, &out_start, &out_len);
+        offset += consumed;
+        if (s == ChunkStatus::Error || s == ChunkStatus::Done) break;
+    }
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ChunkStatus::Error));
+}
+
+TEST(error, trailer_end_lf_missing) {
+    // "0\r\n\r\nX" feed after complete → Done
+    const u8 input[] = "0\r\n\r\n";
+    ChunkedParser p;
+    p.reset();
+    u8 body[64];
+    u32 body_len = 0;
+    ChunkStatus s = feed_all(&p, input, 5, body, &body_len);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ChunkStatus::Done));
+    // Feed more after completion
+    u32 consumed = 0, out_start = 0, out_len = 0;
+    const u8 extra[] = "extra data";
+    s = p.feed(extra, 10, &consumed, &out_start, &out_len);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ChunkStatus::Done));
+}
+
 // ============================================================================
 
 int main(int argc, char** argv) {

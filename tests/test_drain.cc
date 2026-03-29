@@ -242,14 +242,14 @@ TEST(drain_proxy, upstream_response_rewrites_connection_header) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<rut::i32>(req_len)));
 
     // Now inject upstream response with Connection: keep-alive header
-    // Manually write HTTP response into recv_buf
-    c->recv_buf.reset();
+    // Manually write HTTP response into upstream_recv_buf
+    c->upstream_recv_buf.reset();
     const char* resp = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK";
     rut::u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
-    rut::u8* dst = c->recv_buf.write_ptr();
+    rut::u8* dst = c->upstream_recv_buf.write_ptr();
     for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
-    c->recv_buf.commit(resp_len);
+    c->upstream_recv_buf.commit(resp_len);
 
     // Inject the recv event manually (bypass inject_and_dispatch mock data fill)
     IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
@@ -258,9 +258,9 @@ TEST(drain_proxy, upstream_response_rewrites_connection_header) {
     rut::u32 n = loop.backend.wait(events, 8);
     for (rut::u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
-    // The Connection header should have been rewritten to "close"
-    const char* data = reinterpret_cast<const char*>(c->recv_buf.data());
-    rut::u32 len = c->recv_buf.len();
+    // The Connection header should have been rewritten to "close" in upstream_recv_buf
+    const char* data = reinterpret_cast<const char*>(c->upstream_recv_buf.data());
+    rut::u32 len = c->upstream_recv_buf.len();
     bool found_close = false;
     for (rut::u32 i = 0; i + 15 <= len; i++) {
         if (data[i] == 'C' && data[i + 1] == 'o' && data[i + 2] == 'n' && data[i + 3] == 'n' &&
@@ -292,13 +292,13 @@ TEST(drain_proxy, upstream_response_rewrites_lowercase_connection_header) {
     rut::u32 req_len = c->recv_buf.len();
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<rut::i32>(req_len)));
 
-    c->recv_buf.reset();
+    c->upstream_recv_buf.reset();
     const char* resp = "HTTP/1.1 200 OK\r\nconnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK";
     rut::u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
-    rut::u8* dst = c->recv_buf.write_ptr();
+    rut::u8* dst = c->upstream_recv_buf.write_ptr();
     for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
-    c->recv_buf.commit(resp_len);
+    c->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
     loop.backend.inject(ev);
@@ -306,9 +306,9 @@ TEST(drain_proxy, upstream_response_rewrites_lowercase_connection_header) {
     rut::u32 n = loop.backend.wait(events, 8);
     for (rut::u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
-    const char* data = reinterpret_cast<const char*>(c->recv_buf.data());
+    const char* data = reinterpret_cast<const char*>(c->upstream_recv_buf.data());
     bool found_close = false;
-    for (rut::u32 i = 0; i + 18 <= c->recv_buf.len(); i++) {
+    for (rut::u32 i = 0; i + 18 <= c->upstream_recv_buf.len(); i++) {
         if (data[i] == 'c' && data[i + 1] == 'o' && data[i + 2] == 'n' && data[i + 3] == 'n' &&
             data[i + 4] == 'e' && data[i + 5] == 'c' && data[i + 6] == 't' && data[i + 7] == 'i' &&
             data[i + 8] == 'o' && data[i + 9] == 'n' && data[i + 10] == ':' &&
@@ -339,13 +339,13 @@ TEST(drain_proxy, upstream_response_injects_close_when_missing) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<rut::i32>(req_len)));
 
     // Upstream response WITHOUT Connection header
-    c->recv_buf.reset();
+    c->upstream_recv_buf.reset();
     const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
     rut::u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
-    rut::u8* dst = c->recv_buf.write_ptr();
+    rut::u8* dst = c->upstream_recv_buf.write_ptr();
     for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
-    c->recv_buf.commit(resp_len);
+    c->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
     loop.backend.inject(ev);
@@ -375,13 +375,13 @@ TEST(drain_proxy, upstream_status_parsed) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<rut::i32>(req_len)));
 
     // Upstream 404 response
-    c->recv_buf.reset();
+    c->upstream_recv_buf.reset();
     const char* resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
     rut::u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
-    rut::u8* dst = c->recv_buf.write_ptr();
+    rut::u8* dst = c->upstream_recv_buf.write_ptr();
     for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
-    c->recv_buf.commit(resp_len);
+    c->upstream_recv_buf.commit(resp_len);
 
     IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
     loop.backend.inject(ev);

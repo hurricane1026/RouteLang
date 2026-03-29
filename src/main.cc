@@ -1,5 +1,5 @@
-#include "rut/runtime/epoll_backend.h"
-#include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/epoll_event_loop.h"
+#include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/socket.h"
 
@@ -67,7 +67,7 @@ static void write_error(const char* prefix, const rut::Error& err) {
     write_str(")\n");
 }
 
-template <typename Backend>
+template <typename EventLoopType>
 static i32 run_shards(u16 port,
                       u32 shard_count,
                       bool pin_cpus,
@@ -76,7 +76,7 @@ static i32 run_shards(u16 port,
                       const char* access_log_path,
                       bool access_log_compress,
                       i32 access_log_level) {
-    Shard<Backend> shards[kMaxShards];
+    Shard<EventLoopType> shards[kMaxShards];
 
     // Create one SO_REUSEPORT listen socket per shard.
     // If port==0 (ephemeral), create shard 0 first to get the assigned port,
@@ -334,22 +334,22 @@ int main(int argc, char** argv) {
 
     if (detect_io_uring()) {
         write_str("Backend: io_uring\n");
-        return run_shards<IoUringBackend>(port,
-                                          shard_count,
-                                          pin_cpus,
-                                          drain_secs,
-                                          pool_prealloc,
-                                          access_log_path,
-                                          access_log_compress,
-                                          access_log_level);
+        return run_shards<IoUringEventLoop>(port,
+                                            shard_count,
+                                            pin_cpus,
+                                            drain_secs,
+                                            pool_prealloc,
+                                            access_log_path,
+                                            access_log_compress,
+                                            access_log_level);
     }
     write_str("Backend: epoll\n");
-    return run_shards<EpollBackend>(port,
-                                    shard_count,
-                                    pin_cpus,
-                                    drain_secs,
-                                    pool_prealloc,
-                                    access_log_path,
-                                    access_log_compress,
-                                    access_log_level);
+    return run_shards<EpollEventLoop>(port,
+                                      shard_count,
+                                      pin_cpus,
+                                      drain_secs,
+                                      pool_prealloc,
+                                      access_log_path,
+                                      access_log_compress,
+                                      access_log_level);
 }

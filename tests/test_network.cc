@@ -6038,6 +6038,90 @@ TEST(early_response, 100_continue_with_partial_trailing) {
     CHECK_GT(c->upstream_recv_buf.len(), 0u);
 }
 
+// P1: Fragmented early response across two UpstreamRecvs must not be lost.
+TEST(early_response, fragmented_413_across_two_reads) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+
+    // First UpstreamRecv: partial 413 header (Incomplete)
+    static const char kPart1[] = "HTTP/1.1 413 Request";
+    u32 p1len = sizeof(kPart1) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < p1len; j++) dst[j] = static_cast<u8>(kPart1[j]);
+    c->upstream_recv_buf.commit(p1len);
+    IoEvent ev1 = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(p1len));
+    loop.backend.inject(ev1);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    // Still in body streaming (Incomplete response)
+    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    // Partial bytes must be preserved in upstream_recv_buf
+    CHECK_EQ(c->upstream_recv_buf.len(), p1len);
+
+    // Simulate: client sends more body → upstream send → back to body_recvd
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 30));
+    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 30));
+    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    // Partial bytes must STILL be in upstream_recv_buf (not reset)
+    CHECK_EQ(c->upstream_recv_buf.len(), p1len);
+
+    // Second UpstreamRecv: rest of 413 header
+    static const char kPart2[] =
+        " Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    u32 p2len = sizeof(kPart2) - 1;
+    dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < p2len; j++) dst[j] = static_cast<u8>(kPart2[j]);
+    c->upstream_recv_buf.commit(p2len);
+    IoEvent ev2 = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(p2len));
+    loop.backend.inject(ev2);
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    // Now the full 413 should be parsed and forwarded
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+}
+
+// P2: Client body + pipelined request in recv_buf during early response.
+TEST(early_response, client_data_in_recv_buf_not_lost) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    // Simulate: client sends remaining body (completes it) but we haven't
+    // dispatched it yet — it's sitting in recv_buf from same wait() batch.
+    // Meanwhile upstream sends 413.
+    // The early response handler should not corrupt recv_buf state.
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Should have forwarded 413 to client
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+    CHECK_EQ(c->state, ConnState::Sending);
+}
+
 // === Coverage: upstream pool free with open fd ===
 
 TEST(upstream_pool, free_closes_fd) {

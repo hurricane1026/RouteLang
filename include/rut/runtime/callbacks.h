@@ -570,7 +570,6 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.recv_buf.reset();
         conn.on_complete = &on_request_body_recvd<Loop>;
         loop->submit_recv(conn);
-        conn.upstream_recv_buf.reset();
         loop->submit_recv_upstream(conn);
         return;
     }
@@ -833,7 +832,12 @@ static inline bool handle_early_upstream_response(Loop* loop,
     }
     // Non-1xx response (error like 413/401, or unexpected 2xx).
     // Stop body streaming, forward the response to client.
-    pipeline_stash(conn);
+    //
+    // Don't pipeline_stash here: recv_buf may contain fresh body data from the
+    // same wait() batch whose req_initial_send_len doesn't correspond to the
+    // current buffer contents. The error response will typically close the
+    // connection (Connection: close). If keep-alive, the proxy_response_sent
+    // path handles any remaining recv_buf data naturally.
     conn.recv_buf.reset();
     conn.upstream_start_us = monotonic_us();
     on_upstream_response<Loop>(lp, conn, ev);
@@ -883,10 +887,11 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     // More body to stream — recv next chunk from client.
     // Also arm upstream recv to detect early error responses (413/401).
+    // Don't reset upstream_recv_buf — it may hold a partial early response
+    // header from a previous Incomplete parse that needs more data.
     conn.recv_buf.reset();
     conn.on_complete = &on_request_body_recvd<Loop>;
     loop->submit_recv(conn);
-    conn.upstream_recv_buf.reset();
     loop->submit_recv_upstream(conn);
 }
 

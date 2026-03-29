@@ -614,15 +614,11 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
 
     if (ev.type != IoEventType::Send) {
         if (ev.type == IoEventType::UpstreamSend) return;
-        // UpstreamRecv with data: already appended to upstream_recv_buf.
-        // UpstreamRecv with error/-ENOBUFS: buffer full or upstream error.
-        // Close on error to avoid busy-loop (epoll level-triggered EPOLLIN
-        // keeps firing while upstream_recv_buf is full).
-        if (ev.type == IoEventType::UpstreamRecv) {
-            if (ev.result > 0) return;
-            loop->close_conn(conn);
-            return;
-        }
+        // UpstreamRecv: data appended to upstream_recv_buf if result > 0.
+        // -ENOBUFS (buffer full): ignore — Send completion will drain the
+        // buffer via consume_upstream_sent, then re-arm recv for more.
+        // Brief epoll level-triggered re-wakes are bounded by Send latency.
+        if (ev.type == IoEventType::UpstreamRecv) return;
         // Client Recv: drain upload body if early response. Don't re-arm —
         // submit_recv on epoll clobbers EPOLLOUT for backpressured sends.
         if (ev.type == IoEventType::Recv) {
@@ -730,13 +726,8 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     if (ev.type != IoEventType::Send) {
         if (ev.type == IoEventType::UpstreamSend) return;
-        // UpstreamRecv with data: keep in buffer.
-        // UpstreamRecv with error: close to avoid busy-loop.
-        if (ev.type == IoEventType::UpstreamRecv) {
-            if (ev.result > 0) return;
-            loop->close_conn(conn);
-            return;
-        }
+        // UpstreamRecv: data in buffer if > 0, -ENOBUFS if full. Ignore both.
+        if (ev.type == IoEventType::UpstreamRecv) return;
         // Client Recv: drain upload body if early response. Don't re-arm.
         if (ev.type == IoEventType::Recv) {
             if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
@@ -965,16 +956,27 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         body_done = (conn.req_chunk_parser.state == ChunkedParser::State::Complete);
     }
 
-    // If body is done AND an early response is pending, the upload is fully
-    // synchronized — handle through the normal body_done path (preserves
-    // pipelined bytes) rather than forward_early_response (which forces close).
-    if (body_done && conn.early_response_pending) {
-        conn.early_response_pending = false;
-    }
-
     // Upstream send completed. Check if an early response was flagged
     // while the send was in-flight — if so, handle it now.
     if (conn.early_response_pending) {
+        if (body_done) {
+            // Body done + early response buffered: stash pipeline data, then
+            // dispatch directly to on_upstream_response with buffered data.
+            conn.early_response_pending = false;
+            pipeline_stash(conn);
+            conn.recv_buf.reset();
+            conn.upstream_start_us = monotonic_us();
+            conn.on_complete = &on_upstream_response<Loop>;
+            // Data already in upstream_recv_buf — dispatch directly.
+            IoEvent synth = {conn.id,
+                             static_cast<i32>(conn.upstream_recv_buf.len()),
+                             0,
+                             0,
+                             IoEventType::UpstreamRecv,
+                             0};
+            on_upstream_response<Loop>(lp, conn, synth);
+            return;
+        }
         forward_early_response<Loop>(loop, lp, conn);
         return;
     }
@@ -984,11 +986,21 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         pipeline_stash(conn);
         conn.recv_buf.reset();
         conn.upstream_start_us = monotonic_us();
-        // Don't reset upstream_recv_buf — it may hold a partial early response
-        // header that was buffered during body streaming (Incomplete parse).
         if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
         conn.on_complete = &on_upstream_response<Loop>;
-        loop->submit_recv_upstream(conn);
+        // If upstream_recv_buf has data (partial early response from body streaming),
+        // dispatch directly instead of re-arming.
+        if (conn.upstream_recv_buf.len() > 0) {
+            IoEvent synth = {conn.id,
+                             static_cast<i32>(conn.upstream_recv_buf.len()),
+                             0,
+                             0,
+                             IoEventType::UpstreamRecv,
+                             0};
+            on_upstream_response<Loop>(lp, conn, synth);
+        } else {
+            loop->submit_recv_upstream(conn);
+        }
         return;
     }
 
@@ -1321,9 +1333,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     conn.on_complete = &on_response_sent<Loop>;
                 }
                 conn.state = ConnState::Sending;
-                // Sending from send_buf, not upstream_recv_buf — clear
-                // upstream_send_len so consume_upstream_sent is a no-op.
-                conn.upstream_send_len = 0;
+                // Sending from send_buf (rebuilt with Connection: close), not
+                // upstream_recv_buf. Set upstream_send_len to full buffer so
+                // consume_upstream_sent eats all old data (headers+initial body).
+                conn.upstream_send_len = conn.upstream_recv_buf.len();
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }

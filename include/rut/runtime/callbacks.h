@@ -872,10 +872,11 @@ static inline void handle_early_upstream_recv(Loop* loop,
     ParseStatus ps =
         resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
     if (ps == ParseStatus::Incomplete) {
-        // Partial response header — wait for more. Don't re-arm recv if a
-        // send is in-flight: epoll EPOLLIN|EPOLLOUT is already armed and
-        // submit_recv_upstream would clobber EPOLLOUT.
-        if (!send_in_flight) loop->submit_recv_upstream(conn);
+        // Partial response header — wait for more. Re-arm only if the
+        // upstream recv is no longer armed (io_uring multishot terminated).
+        // On epoll with send_in_flight, EPOLLIN|EPOLLOUT is still active
+        // and submit_recv_upstream would clobber EPOLLOUT.
+        if (!conn.upstream_recv_armed) loop->submit_recv_upstream(conn);
         return;
     }
     if (ps == ParseStatus::Complete && resp.status_code >= 100 && resp.status_code < 200 &&
@@ -895,7 +896,7 @@ static inline void handle_early_upstream_recv(Loop* loop,
             return;
         }
         conn.upstream_recv_buf.reset();
-        if (!send_in_flight) loop->submit_recv_upstream(conn);
+        if (!conn.upstream_recv_armed) loop->submit_recv_upstream(conn);
         return;
     }
     // Non-1xx response: flag pending. Don't transition yet — upstream send
@@ -1128,14 +1129,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // Accept UpstreamRecv only — upstream data now goes to upstream_recv_buf,
     // so client Recv events are harmless (they go to recv_buf). Ignore them.
     if (ev.type != IoEventType::UpstreamRecv) {
-        // Client Recv with data: pipelined request, harmless (in recv_buf).
-        // Client Recv with EOF/error: client disconnected, close proxy.
+        // Client Recv: if early response (keep_alive=false), drain upload body
+        // to prevent recv_buf filling → -ENOBUFS → premature close.
+        // If normal proxy, preserve pipelined data in recv_buf.
+        // Don't close on EOF — client may have half-closed (SHUT_WR).
         if (ev.type == IoEventType::Recv) {
-            if (ev.result <= 0) {
-                loop->close_conn(conn);
-                return;
+            if (ev.result > 0) {
+                if (!conn.keep_alive) conn.recv_buf.reset();
+                loop->submit_recv(conn);  // re-arm if multishot terminated
             }
-            loop->submit_recv(conn);  // re-arm if multishot terminated
             return;
         }
         // Stale UpstreamSend from body streaming that was interrupted by

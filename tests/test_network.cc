@@ -4324,11 +4324,11 @@ TEST(buffer_isolation, client_eof_during_proxy_closes) {
     u32 cid = conn->id;
 
     // Connection is waiting for upstream response (on_upstream_response).
-    // Client sends EOF (disconnect).
+    // Client sends EOF (half-close / SHUT_WR) — tolerated, client can still read.
     loop.dispatch(make_ev(cid, IoEventType::Recv, 0));  // EOF
 
-    // Connection should be closed (client disconnected).
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    // Connection stays open — client may have half-closed but can still read response.
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 // Client Recv with data during proxy wait is ignored (pipelined).
@@ -5024,9 +5024,9 @@ TEST(streaming, upstream_response_client_eof_during_proxy) {
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     u32 cid = c->id;
-    // Client EOF while proxying → close
+    // Client EOF while proxying — tolerated (half-close, client can still read)
     loop.dispatch(make_ev(cid, IoEventType::Recv, 0));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 TEST(streaming, upstream_connected_malformed_request_closes) {

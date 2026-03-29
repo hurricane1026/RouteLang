@@ -937,6 +937,12 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     if (ev.result <= 0) {
+        // Upstream send failed, but an early response may be buffered.
+        // Forward it instead of just dropping the connection.
+        if (conn.early_response_pending) {
+            forward_early_response<Loop>(loop, lp, conn);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -1297,6 +1303,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     conn.on_complete = &on_response_sent<Loop>;
                 }
                 conn.state = ConnState::Sending;
+                // Sending from send_buf, not upstream_recv_buf — clear
+                // upstream_send_len so consume_upstream_sent is a no-op.
+                conn.upstream_send_len = 0;
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }

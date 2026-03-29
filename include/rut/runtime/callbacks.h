@@ -735,13 +735,14 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::UpstreamRecv) {
-        // Client Recv during response streaming: data goes to recv_buf,
-        // not upstream_recv_buf. Ignore but re-arm if multishot terminated
-        // (io_uring dispatch may have cleared recv_armed on ev.more=0).
-        // Don't close on client EOF — may be half-close (SHUT_WR) while
-        // client still reads the response. Re-arm for data; ignore EOF.
+        // Client Recv during response streaming: data goes to recv_buf.
+        // If early response (keep_alive=false), drain upload body to prevent
+        // recv_buf filling → -ENOBUFS → premature close. Re-arm on data.
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) loop->submit_recv(conn);
+            if (ev.result > 0) {
+                if (!conn.keep_alive) conn.recv_buf.reset();
+                loop->submit_recv(conn);
+            }
             return;
         }
         loop->close_conn(conn);

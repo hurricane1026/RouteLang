@@ -614,9 +614,15 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
 
     if (ev.type != IoEventType::Send) {
         if (ev.type == IoEventType::UpstreamSend) return;
-        // UpstreamRecv: data already appended to upstream_recv_buf. Keep it —
-        // consume_upstream_sent will preserve it after the Send completes.
-        if (ev.type == IoEventType::UpstreamRecv) return;
+        // UpstreamRecv with data: already appended to upstream_recv_buf.
+        // UpstreamRecv with error/-ENOBUFS: buffer full or upstream error.
+        // Close on error to avoid busy-loop (epoll level-triggered EPOLLIN
+        // keeps firing while upstream_recv_buf is full).
+        if (ev.type == IoEventType::UpstreamRecv) {
+            if (ev.result > 0) return;
+            loop->close_conn(conn);
+            return;
+        }
         // Client Recv: drain upload body if early response. Don't re-arm —
         // submit_recv on epoll clobbers EPOLLOUT for backpressured sends.
         if (ev.type == IoEventType::Recv) {
@@ -724,8 +730,13 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     if (ev.type != IoEventType::Send) {
         if (ev.type == IoEventType::UpstreamSend) return;
-        // UpstreamRecv: data already in upstream_recv_buf. Keep it.
-        if (ev.type == IoEventType::UpstreamRecv) return;
+        // UpstreamRecv with data: keep in buffer.
+        // UpstreamRecv with error: close to avoid busy-loop.
+        if (ev.type == IoEventType::UpstreamRecv) {
+            if (ev.result > 0) return;
+            loop->close_conn(conn);
+            return;
+        }
         // Client Recv: drain upload body if early response. Don't re-arm.
         if (ev.type == IoEventType::Recv) {
             if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
@@ -946,19 +957,26 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    // Upstream send completed. Check if an early response was flagged
-    // while the send was in-flight — if so, handle it now.
-    if (conn.early_response_pending) {
-        forward_early_response<Loop>(loop, lp, conn);
-        return;
-    }
-
     // Check if request body is complete.
     bool body_done = false;
     if (conn.req_body_mode == BodyMode::ContentLength) {
         body_done = (conn.req_body_remaining == 0);
     } else if (conn.req_body_mode == BodyMode::Chunked) {
         body_done = (conn.req_chunk_parser.state == ChunkedParser::State::Complete);
+    }
+
+    // If body is done AND an early response is pending, the upload is fully
+    // synchronized — handle through the normal body_done path (preserves
+    // pipelined bytes) rather than forward_early_response (which forces close).
+    if (body_done && conn.early_response_pending) {
+        conn.early_response_pending = false;
+    }
+
+    // Upstream send completed. Check if an early response was flagged
+    // while the send was in-flight — if so, handle it now.
+    if (conn.early_response_pending) {
+        forward_early_response<Loop>(loop, lp, conn);
+        return;
     }
 
     if (body_done) {

@@ -1059,7 +1059,7 @@ TEST(type_guard, upstream_response_rejects_send) {
 }
 
 // on_proxy_response_sent expects Send — Recv should close
-TEST(type_guard, proxy_response_sent_rejects_recv) {
+TEST(type_guard, proxy_response_sent_rejects_wrong_type) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
@@ -1067,7 +1067,9 @@ TEST(type_guard, proxy_response_sent_rejects_recv) {
     REQUIRE(conn != nullptr);
     u32 cid = conn->id;
     conn->on_complete = &on_proxy_response_sent<SmallLoop>;
-    loop.dispatch(make_ev(cid, IoEventType::Recv, 50));
+    // Recv with data is now ignored (client upload during early response).
+    // Use UpstreamConnect as genuinely unexpected event type.
+    loop.dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
@@ -4854,7 +4856,7 @@ TEST(streaming, response_body_sent_wrong_type_closes) {
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->on_complete = &on_response_body_sent<SmallLoop>;
     u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
@@ -4898,7 +4900,7 @@ TEST(streaming, response_header_sent_wrong_type_closes) {
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->on_complete = &on_response_header_sent<SmallLoop>;
     u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
@@ -5181,7 +5183,7 @@ TEST(proxy, proxy_response_sent_wrong_type) {
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->on_complete = &on_proxy_response_sent<SmallLoop>;
     u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
@@ -6120,6 +6122,104 @@ TEST(early_response, client_data_in_recv_buf_not_lost) {
     // Should have forwarded 413 to client
     CHECK_EQ(c->resp_status, static_cast<u16>(413));
     CHECK_EQ(c->state, ConnState::Sending);
+}
+
+// P1a: Client Recv during proxy response send must not close connection.
+TEST(early_response, client_recv_during_response_send) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    // Upstream sends 413
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+
+    // Client still sending body (Recv with data) → must not close
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK(c->fd >= 0);  // still alive
+
+    // Complete the response send
+    u32 cid = c->id;
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    // Connection closes after send (Connection: close)
+}
+
+// P1b: Partial early response preserved when body_done resets upstream_recv_buf.
+TEST(early_response, partial_response_survives_body_done) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 60, 10);
+    REQUIRE(c != nullptr);
+    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+
+    // Partial 413 arrives (Incomplete)
+    static const char kPartial[] = "HTTP/1.1 413 Too";
+    u32 plen = sizeof(kPartial) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < plen; j++) dst[j] = static_cast<u8>(kPartial[j]);
+    c->upstream_recv_buf.commit(plen);
+    IoEvent ev1 = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(plen));
+    loop.backend.inject(ev1);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->upstream_recv_buf.len(), plen);
+
+    // Client sends remaining body → body_done becomes true
+    c->req_body_remaining = 50;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    c->req_body_remaining = 0;  // force body_done
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    // body_done path should NOT have cleared the partial response
+    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_GT(c->upstream_recv_buf.len(), 0u);
+}
+
+// P2b: EOF with partial early response data → 502 (not raw close).
+TEST(early_response, eof_with_partial_data_gives_502) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    // Write partial response into upstream_recv_buf
+    static const char kPartial[] = "HTTP/1.1 413 Too";
+    u32 plen = sizeof(kPartial) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < plen; j++) dst[j] = static_cast<u8>(kPartial[j]);
+    c->upstream_recv_buf.commit(plen);
+
+    // First UpstreamRecv with data (Incomplete → re-arm)
+    IoEvent ev1 = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(plen));
+    loop.backend.inject(ev1);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // EOF with partial data in buffer → should produce 502
+    IoEvent ev2 = make_ev(c->id, IoEventType::UpstreamRecv, 0);
+    loop.backend.inject(ev2);
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
 }
 
 // === Coverage: upstream pool free with open fd ===

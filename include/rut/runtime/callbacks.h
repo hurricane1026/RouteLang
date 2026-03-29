@@ -594,6 +594,12 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         // Stale UpstreamSend from body streaming interrupted by early response.
         if (ev.type == IoEventType::UpstreamSend) return;
+        // Client Recv: client may still be sending upload body. Ignore data.
+        if (ev.type == IoEventType::Recv) {
+            if (ev.result > 0) return;
+            loop->close_conn(conn);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -692,6 +698,12 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         // Stale UpstreamSend from body streaming interrupted by early response.
         if (ev.type == IoEventType::UpstreamSend) return;
+        // Client Recv: client may still be sending upload body. Ignore data.
+        if (ev.type == IoEventType::Recv) {
+            if (ev.result > 0) return;
+            loop->close_conn(conn);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -791,9 +803,16 @@ static inline bool handle_early_upstream_response(Loop* loop,
                                                   void* lp,
                                                   Connection& conn,
                                                   IoEvent ev) {
-    if (ev.result <= 0) {
-        // Upstream closed/error during body streaming.
+    if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        // Upstream closed/error with no buffered data.
         loop->close_conn(conn);
+        return true;
+    }
+    if (ev.result <= 0 && conn.upstream_recv_buf.len() > 0) {
+        // EOF with partial data — delegate to on_upstream_response which
+        // produces 502 for truncated headers (matching normal proxy path).
+        conn.upstream_start_us = monotonic_us();
+        on_upstream_response<Loop>(lp, conn, ev);
         return true;
     }
     // Parse the upstream response to determine what it is.
@@ -833,12 +852,10 @@ static inline bool handle_early_upstream_response(Loop* loop,
     // Non-1xx response (error like 413/401, or unexpected 2xx).
     // Stop body streaming, forward the response to client.
     //
-    // Don't pipeline_stash here: recv_buf may contain fresh body data from the
-    // same wait() batch whose req_initial_send_len doesn't correspond to the
-    // current buffer contents. The error response will typically close the
-    // connection (Connection: close). If keep-alive, the proxy_response_sent
-    // path handles any remaining recv_buf data naturally.
-    conn.recv_buf.reset();
+    // Don't reset recv_buf: it may contain client data from the same wait()
+    // batch (remaining upload or pipelined next request). on_upstream_response
+    // and on_proxy_response_sent handle recv_buf data naturally — it's either
+    // ignored or used for keep-alive pipeline recovery.
     conn.upstream_start_us = monotonic_us();
     on_upstream_response<Loop>(lp, conn, ev);
     return true;
@@ -879,7 +896,10 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         pipeline_stash(conn);
         conn.recv_buf.reset();
         conn.upstream_start_us = monotonic_us();
-        conn.upstream_recv_buf.reset();
+        // Don't reset upstream_recv_buf — it may hold a partial early response
+        // header that was buffered during body streaming (Incomplete parse).
+        // on_upstream_response will parse whatever is there.
+        if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
         conn.on_complete = &on_upstream_response<Loop>;
         loop->submit_recv_upstream(conn);
         return;
@@ -1261,6 +1281,13 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         // Stale UpstreamSend from body streaming interrupted by early response.
         if (ev.type == IoEventType::UpstreamSend) return;
+        // Client Recv: client may still be sending upload body after early
+        // response. Ignore data, close only on EOF/error.
+        if (ev.type == IoEventType::Recv) {
+            if (ev.result > 0) return;
+            loop->close_conn(conn);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }

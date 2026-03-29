@@ -546,6 +546,12 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::Send && ev.type != IoEventType::UpstreamSend) {
+        // Early upstream response during initial request send (epoll
+        // EPOLLIN|EPOLLOUT from backpressured add_send_upstream).
+        if (ev.type == IoEventType::UpstreamRecv) {
+            handle_early_upstream_recv<Loop>(loop, conn, ev, true);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -558,6 +564,12 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // Backends guarantee full send of submitted length. ev.result > 0
     // is sufficient — the send may be capped to body boundary (less
     // than recv_buf.len() when pipelined bytes are present).
+
+    // Check for early response flagged during initial send.
+    if (conn.early_response_pending) {
+        forward_early_response<Loop>(loop, lp, conn);
+        return;
+    }
 
     // Check if there's more request body to stream from the client.
     // For Content-Length: remaining > 0. For Chunked: always stream
@@ -871,18 +883,21 @@ static inline void handle_early_upstream_recv(Loop* loop,
     resp_parser.reset();
     ParseStatus ps =
         resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
+    // Re-arm upstream recv only when:
+    // - io_uring multishot terminated (upstream_recv_armed == false), AND
+    // - no upstream send in-flight (on epoll, submit_recv_upstream would
+    //   EPOLL_CTL_MOD with EPOLLIN, clobbering the send's EPOLLOUT).
+    // On epoll, upstream_recv_armed is always false, so send_in_flight
+    // is the controlling condition. On io_uring, send_in_flight is always
+    // false when called from on_request_body_recvd (no send submitted yet).
+    bool can_rearm = !conn.upstream_recv_armed && !send_in_flight;
     if (ps == ParseStatus::Incomplete) {
-        // Partial response header — wait for more. Re-arm only if the
-        // upstream recv is no longer armed (io_uring multishot terminated).
-        // On epoll with send_in_flight, EPOLLIN|EPOLLOUT is still active
-        // and submit_recv_upstream would clobber EPOLLOUT.
-        if (!conn.upstream_recv_armed) loop->submit_recv_upstream(conn);
+        if (can_rearm) loop->submit_recv_upstream(conn);
         return;
     }
     if (ps == ParseStatus::Complete && resp.status_code >= 100 && resp.status_code < 200 &&
         resp.status_code != 101) {
         // 1xx interim (e.g., 100 Continue): skip, continue body streaming.
-        // Preserve trailing bytes — origin may coalesce 1xx + final response.
         u32 interim_end = resp_parser.header_end;
         u32 total = conn.upstream_recv_buf.len();
         if (interim_end < total) {
@@ -896,7 +911,7 @@ static inline void handle_early_upstream_recv(Loop* loop,
             return;
         }
         conn.upstream_recv_buf.reset();
-        if (!conn.upstream_recv_armed) loop->submit_recv_upstream(conn);
+        if (can_rearm) loop->submit_recv_upstream(conn);
         return;
     }
     // Non-1xx response: flag pending. Don't transition yet — upstream send
@@ -1137,8 +1152,16 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             if (ev.result > 0) {
                 if (!conn.keep_alive) conn.recv_buf.reset();
                 loop->submit_recv(conn);  // re-arm if multishot terminated
+                return;
             }
-            return;
+            // EOF: tolerate half-close (client can still read response).
+            // -ENOBUFS: recv_buf full with pipelined data — close to
+            // prevent epoll level-triggered busy-loop.
+            if (ev.result < 0) {
+                loop->close_conn(conn);
+                return;
+            }
+            return;  // EOF: ignore
         }
         // Stale UpstreamSend from body streaming that was interrupted by
         // an early response. The send completed after we transitioned to

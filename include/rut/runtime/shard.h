@@ -35,8 +35,11 @@ inline u32 detect_cpu_count();
 // Thread safety: each Shard is single-threaded. Cross-shard communication
 // is lock-free (atomics, per-shard counters). Only stop() is called from
 // outside the shard's thread.
+//
+// Template parameter: EventLoopType — a concrete event loop type such as
+// EpollEventLoop, IoUringEventLoop, or the legacy EventLoop<Backend>.
 
-template <typename Backend>
+template <typename EventLoopType>
 struct Shard {
     static constexpr u32 kScratchArenaSize = 65536;
     u32 id = 0;
@@ -44,7 +47,7 @@ struct Shard {
     bool owns_listen_fd = false;  // if true, close on shutdown
 
     // EventLoop — mmap'd due to size (~130MB from Connection[16384])
-    EventLoop<Backend>* loop = nullptr;
+    EventLoopType* loop = nullptr;
 
     // Per-request scratch arena (reset after each request cycle)
     Arena scratch;
@@ -87,18 +90,18 @@ struct Shard {
 
         // mmap the EventLoop (too large for stack)
         void* mem = mmap(nullptr,
-                         sizeof(EventLoop<Backend>),
+                         sizeof(EventLoopType),
                          PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS,
                          -1,
                          0);
         if (mem == MAP_FAILED) return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
-        loop = new (mem) EventLoop<Backend>();
+        loop = new (mem) EventLoopType();
 
         auto loop_result = loop->init(shard_id, listen_fd, pool_prealloc);
         if (!loop_result) {
-            loop->~EventLoop();
-            munmap(loop, sizeof(EventLoop<Backend>));
+            loop->~EventLoopType();
+            munmap(loop, sizeof(EventLoopType));
             loop = nullptr;
             return loop_result;
         }
@@ -107,8 +110,8 @@ struct Shard {
         auto arena_result = scratch.init(kScratchArenaSize);
         if (!arena_result) {
             loop->shutdown();
-            loop->~EventLoop();
-            munmap(loop, sizeof(EventLoop<Backend>));
+            loop->~EventLoopType();
+            munmap(loop, sizeof(EventLoopType));
             loop = nullptr;
             return arena_result;
         }
@@ -123,8 +126,8 @@ struct Shard {
         if (up_mem == MAP_FAILED) {
             scratch.destroy();
             loop->shutdown();
-            loop->~EventLoop();
-            munmap(loop, sizeof(EventLoop<Backend>));
+            loop->~EventLoopType();
+            munmap(loop, sizeof(EventLoopType));
             loop = nullptr;
             return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
         }
@@ -276,8 +279,8 @@ struct Shard {
             if (loop->listen_fd < 0) listen_fd = -1;
             loop->access_log = nullptr;
             loop->shutdown();
-            loop->~EventLoop();
-            munmap(loop, sizeof(EventLoop<Backend>));
+            loop->~EventLoopType();
+            munmap(loop, sizeof(EventLoopType));
             loop = nullptr;
         }
         scratch.destroy();

@@ -1,6 +1,5 @@
 // Per-shard independent control system tests.
-#include "rut/runtime/epoll_backend.h"
-#include "rut/runtime/event_loop.h"
+#include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/shard_control.h"
@@ -245,7 +244,7 @@ TEST(shard_control, shard_init_wiring) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     auto rc = shard.init(0, lfd);
     REQUIRE(rc.has_value());
 
@@ -266,7 +265,7 @@ TEST(shard_control, shard_reload_config) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     auto rc = shard.init(0, lfd);
     REQUIRE(rc.has_value());
     CHECK(shard.active_config == nullptr);
@@ -307,7 +306,7 @@ TEST(shard_control, shard_swap_jit) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     auto rc = shard.init(0, lfd);
     REQUIRE(rc.has_value());
     CHECK(shard.jit_code == nullptr);
@@ -509,8 +508,8 @@ TEST(shard_control, stop_does_not_affect_other_shards) {
     REQUIRE(lfd2_result.has_value());
     i32 lfd2 = lfd2_result.value();
 
-    Shard<EpollBackend> shard1;
-    Shard<EpollBackend> shard2;
+    Shard<EpollEventLoop> shard1;
+    Shard<EpollEventLoop> shard2;
     REQUIRE(shard1.init(0, lfd1).has_value());
     REQUIRE(shard2.init(1, lfd2).has_value());
 
@@ -569,7 +568,7 @@ TEST(shard_control, command_processed_within_timer_tick) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     REQUIRE(shard.init(0, lfd).has_value());
     CHECK(shard.active_config == nullptr);
 
@@ -657,7 +656,7 @@ TEST(shard_control, poll_command_without_jit_ptr) {
 
 TEST(shard_control, reload_before_spawn_applies_directly) {
     // reload_config before spawn should set active_config directly.
-    Shard<EpollBackend> s;
+    Shard<EpollEventLoop> s;
     auto lfd_result = create_listen_socket(0);
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
@@ -673,7 +672,7 @@ TEST(shard_control, reload_before_spawn_applies_directly) {
 }
 
 TEST(shard_control, swap_jit_before_spawn_applies_directly) {
-    Shard<EpollBackend> s;
+    Shard<EpollEventLoop> s;
     auto lfd_result = create_listen_socket(0);
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
@@ -690,7 +689,7 @@ TEST(shard_control, swap_jit_before_spawn_applies_directly) {
 
 TEST(shard_control, reload_after_stop_applies_directly) {
     // Spawn, stop, join, then reload — should not hang.
-    Shard<EpollBackend> s;
+    Shard<EpollEventLoop> s;
     auto lfd_result = create_listen_socket(0);
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
@@ -718,7 +717,7 @@ TEST(shard_control, spawn_seeds_active_config_from_route_config) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollBackend> s;
+    Shard<EpollEventLoop> s;
     auto rc = s.init(0, lfd);
     REQUIRE(rc.has_value());
 
@@ -747,7 +746,7 @@ TEST(shard_control, reload_after_stop_before_join) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollBackend> s;
+    Shard<EpollEventLoop> s;
     REQUIRE(s.init(0, lfd).has_value());
     REQUIRE(s.spawn(false).has_value());
 
@@ -779,7 +778,7 @@ TEST(shard_control, join_clears_stale_pending_without_overwrite) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollBackend> s;
+    Shard<EpollEventLoop> s;
     REQUIRE(s.init(0, lfd).has_value());
     REQUIRE(s.spawn(false).has_value());
 
@@ -969,7 +968,7 @@ TEST(shard_control, swap_jit_after_stop_before_join) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     REQUIRE(shard.init(0, lfd).has_value());
     REQUIRE(shard.spawn(false).has_value());
 
@@ -1044,7 +1043,7 @@ TEST(shard_control, reload_after_join_applies_directly) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollBackend> s;
+    Shard<EpollEventLoop> s;
     REQUIRE(s.init(0, lfd).has_value());
     REQUIRE(s.spawn(false).has_value());
     s.stop();
@@ -1101,7 +1100,7 @@ TEST(shard_control, real_shard_simultaneous_config_and_jit) {
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
 
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     REQUIRE(shard.init(0, lfd).has_value());
     REQUIRE(shard.spawn(false).has_value());
 

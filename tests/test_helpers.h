@@ -5,7 +5,7 @@
 #include "mock_backend.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
-#include "rut/runtime/epoll_backend.h"
+#include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/route_table.h"
@@ -679,7 +679,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
 
 // ---- Real socket helpers ----
 
-using RealLoop = EventLoop<EpollBackend>;
+using RealLoop = EpollEventLoop;
 
 inline RealLoop* create_real_loop() {
     void* p =

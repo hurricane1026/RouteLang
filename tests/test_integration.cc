@@ -1,4 +1,5 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
+#include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/shard.h"
 #include "test.h"
@@ -644,7 +645,7 @@ TEST(uring, return_buffer_no_crash) {
 
 // Shard init + shutdown without spawning a thread
 TEST(shard, init_shutdown) {
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
@@ -658,7 +659,7 @@ TEST(shard, init_shutdown) {
 
 // Shard spawn + stop + join
 TEST(shard, spawn_stop_join) {
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
@@ -676,7 +677,7 @@ TEST(shard, spawn_stop_join) {
 
 // Shard handles requests while running
 TEST(shard, serves_requests) {
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     u16 port = get_port(lfd);
@@ -707,7 +708,7 @@ TEST(shard, two_shards_same_port) {
     i32 lfd2 = create_listen_socket(port).value_or(-1);
     REQUIRE(lfd2 >= 0);
 
-    Shard<EpollBackend> s1, s2;
+    Shard<EpollEventLoop> s1, s2;
     REQUIRE(s1.init(0, lfd1).has_value());
     REQUIRE(s2.init(1, lfd2).has_value());
     REQUIRE(s1.spawn(-1).has_value());
@@ -756,7 +757,7 @@ TEST(shard, ephemeral_port_two_shards) {
     REQUIRE(lfd2 >= 0);
     CHECK_EQ(get_port(lfd2), port);
 
-    Shard<EpollBackend> s1, s2;
+    Shard<EpollEventLoop> s1, s2;
     REQUIRE(s1.init(0, lfd1).has_value());
     REQUIRE(s2.init(1, lfd2).has_value());
     REQUIRE(s1.spawn(-1).has_value());
@@ -782,7 +783,7 @@ TEST(shard, ephemeral_port_two_shards) {
 
 // Shard with owns_listen_fd closes it on shutdown
 TEST(shard, owns_listen_fd) {
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
@@ -794,7 +795,7 @@ TEST(shard, owns_listen_fd) {
 
 // Shard has upstream pool after init
 TEST(shard, upstream_pool_initialized) {
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
@@ -814,7 +815,7 @@ TEST(shard, route_config_attached) {
     cfg.add_upstream("api", 0x7F000001, 8080);
     cfg.add_proxy("/api/", 0, 0);
 
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());

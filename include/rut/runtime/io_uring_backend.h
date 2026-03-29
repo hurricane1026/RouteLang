@@ -12,7 +12,8 @@
 
 namespace rut {
 
-struct Connection;  // forward declaration for wait() signature
+struct ConnectionBase;              // forward declaration for wait() signature
+using Connection = ConnectionBase;  // alias (matches connection.h)
 
 // Direct io_uring backend — no liburing dependency.
 // Uses raw syscalls for full control (~300 lines per DESIGN.md).

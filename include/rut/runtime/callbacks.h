@@ -594,19 +594,14 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         // Stale UpstreamSend from body streaming interrupted by early response.
         if (ev.type == IoEventType::UpstreamSend) return;
-        // Stale UpstreamRecv: upstream recv stays armed from body streaming and
-        // may deliver early response body data. Ignore (response is already
-        // being forwarded from upstream_recv_buf).
+        // UpstreamRecv: upstream may be faster than client — body data already
+        // appended to upstream_recv_buf by the backend. Don't discard.
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: client may still be sending upload body. Drain and
-        // re-arm to prevent recv_buf filling (16KB) → -ENOBUFS → premature close.
+        // Client Recv: drain upload body and re-arm. Ignore EOF — client
+        // may have done shutdown(SHUT_WR) but can still read the response.
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) {
-                conn.recv_buf.reset();
-                loop->submit_recv(conn);
-                return;
-            }
-            loop->close_conn(conn);
+            if (ev.result > 0) conn.recv_buf.reset();
+            loop->submit_recv(conn);
             return;
         }
         loop->close_conn(conn);
@@ -616,12 +611,11 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    // Both backends guarantee full sends (partial sends are retried
-    // internally in wait()). ev.result > 0 is sufficient — a short
-    // write never reaches callbacks.
 
     // More body to stream — recv next chunk from upstream.
-    conn.upstream_recv_buf.reset();
+    // Don't reset upstream_recv_buf if UpstreamRecv already delivered data
+    // while the client send was in progress.
+    if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
     conn.on_complete = &on_response_body_recvd<Loop>;
     loop->submit_recv_upstream(conn);
 }
@@ -705,18 +699,13 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::Send) {
-        // Stale UpstreamSend from body streaming interrupted by early response.
         if (ev.type == IoEventType::UpstreamSend) return;
-        // Stale UpstreamRecv: upstream recv armed from body streaming.
+        // UpstreamRecv: body data already in upstream_recv_buf. Don't discard.
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain and re-arm.
+        // Client Recv: drain upload body. Ignore EOF (half-close).
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) {
-                conn.recv_buf.reset();
-                loop->submit_recv(conn);
-                return;
-            }
-            loop->close_conn(conn);
+            if (ev.result > 0) conn.recv_buf.reset();
+            loop->submit_recv(conn);
             return;
         }
         loop->close_conn(conn);
@@ -799,7 +788,8 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // More body to stream — recv next chunk from upstream.
-    conn.upstream_recv_buf.reset();
+    // Don't reset if UpstreamRecv already delivered data during the send.
+    if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
     conn.on_complete = &on_response_body_recvd<Loop>;
     loop->submit_recv_upstream(conn);
 }
@@ -1326,18 +1316,12 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::Send) {
-        // Stale UpstreamSend from body streaming interrupted by early response.
         if (ev.type == IoEventType::UpstreamSend) return;
-        // Stale UpstreamRecv: upstream recv armed from body streaming.
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain and re-arm.
+        // Client Recv: drain upload body. Ignore EOF (half-close).
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) {
-                conn.recv_buf.reset();
-                loop->submit_recv(conn);
-                return;
-            }
-            loop->close_conn(conn);
+            if (ev.result > 0) conn.recv_buf.reset();
+            loop->submit_recv(conn);
             return;
         }
         loop->close_conn(conn);

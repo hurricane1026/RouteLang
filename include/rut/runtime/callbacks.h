@@ -631,9 +631,20 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     pipeline_stash(conn);
     conn.recv_buf.reset();  // clear after stash — pipelined bytes are in send_buf
     conn.upstream_start_us = monotonic_us();
-    conn.upstream_recv_buf.reset();
+    // Don't reset upstream_recv_buf — it may hold partial early response
+    // bytes from a fragmented UpstreamRecv during the initial send.
     conn.on_complete = &on_upstream_response<Loop>;
-    loop->submit_recv_upstream(conn);
+    if (conn.upstream_recv_buf.len() > 0) {
+        IoEvent synth = {conn.id,
+                         static_cast<i32>(conn.upstream_recv_buf.len()),
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0};
+        on_upstream_response<Loop>(lp, conn, synth);
+    } else {
+        loop->submit_recv_upstream(conn);
+    }
 }
 
 // --- Response body streaming callbacks ---
@@ -974,11 +985,18 @@ static inline void handle_early_upstream_recv(Loop* loop,
 template <typename Loop>
 static inline void forward_early_response(Loop* loop, void* lp, Connection& conn) {
     conn.early_response_pending = false;
-    // Discard unread client body bytes — they're upload data, not a pipelined
-    // next request. Feeding them into pipeline_dispatch would corrupt the
-    // session with spurious parse failures.
-    conn.recv_buf.reset();
-    conn.keep_alive = false;  // can't reuse: unread body on client side
+    // Check if there's unread upload body remaining on the client side.
+    // If so, recv_buf contains body bytes (not pipelined requests) and
+    // keep-alive is impossible (we can't distinguish body from pipeline).
+    // If body is done (no remaining), preserve recv_buf for pipelined data.
+    bool has_remaining_body =
+        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
+        (conn.req_body_mode == BodyMode::Chunked &&
+         conn.req_chunk_parser.state != ChunkedParser::State::Complete);
+    if (has_remaining_body) {
+        conn.recv_buf.reset();
+        conn.keep_alive = false;
+    }
     conn.upstream_start_us = monotonic_us();
     // Synthesize an UpstreamRecv event. Use result=0 (EOF) if the upstream
     // closed, so on_upstream_response produces 502 for truncated headers.

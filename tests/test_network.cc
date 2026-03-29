@@ -6426,6 +6426,91 @@ TEST(early_response, consume_upstream_sent_preserves_new_data) {
     CHECK_EQ(c->upstream_recv_buf.len(), 50u);
 }
 
+// Fragmented early response during initial send: partial bytes preserved.
+TEST(early_response, fragmented_during_initial_send_preserved) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->upstream_fd = 100;
+    c->on_complete = &on_upstream_connected<SmallLoop>;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    // In on_upstream_request_sent: partial UpstreamRecv (Incomplete)
+    static const char kPartial[] = "HTTP/1.1 413 Too";
+    u32 plen = sizeof(kPartial) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < plen; j++) dst[j] = static_cast<u8>(kPartial[j]);
+    c->upstream_recv_buf.commit(plen);
+    IoEvent ev1 = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(plen));
+    loop.backend.inject(ev1);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    // Partial bytes should NOT have been cleared by early_response_pending.
+    CHECK_EQ(c->upstream_recv_buf.len(), plen);
+    // Send completes (no more body — initial send covers all).
+    // The body was fully in the initial send, so more_req_body == false.
+    // upstream_recv_buf should be preserved, dispatched directly.
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, 100));
+    // Should be in on_upstream_response with partial data (Incomplete → re-arm)
+    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_GT(c->upstream_recv_buf.len(), 0u);
+}
+
+// Pipeline preserved when early response arrives after body is fully sent.
+TEST(early_response, pipeline_preserved_when_body_done) {
+    SmallLoop loop;
+    loop.setup();
+    // POST with body that fits entirely in initial buffer (no streaming needed)
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    // Write POST + full body + pipelined GET
+    static const char kReqs[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 rlen = sizeof(kReqs) - 1;
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kReqs[j]);
+    c->recv_buf.commit(rlen);
+    IoEvent rev = make_ev(c->id, IoEventType::Recv, static_cast<i32>(rlen));
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Switch to proxy
+    c->upstream_fd = 100;
+    c->on_complete = &on_upstream_connected<SmallLoop>;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+
+    // Initial send: request forwarded. Body is complete (CL:5, all in initial).
+    // Upstream sends early 200 while send is in-flight.
+    c->upstream_recv_buf.reset();
+    dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
+    c->upstream_recv_buf.commit(kMockHttpResponseLen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(kMockHttpResponseLen));
+    loop.backend.inject(ev);
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    // early_response_pending set (send in-flight)
+    CHECK(c->early_response_pending);
+
+    // Send completes. Body was fully sent, so body_done path should:
+    // - stash pipelined GET
+    // - dispatch 200 response directly
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, 100));
+    CHECK_EQ(c->resp_status, static_cast<u16>(200));
+    // keep_alive should be true (body was done, no unread upload)
+    CHECK(c->keep_alive);
+}
+
 // === Coverage: upstream pool free with open fd ===
 
 TEST(upstream_pool, free_closes_fd) {

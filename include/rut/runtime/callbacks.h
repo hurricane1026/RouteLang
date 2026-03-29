@@ -540,6 +540,21 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     loop->submit_send_upstream(conn, conn.recv_buf.data(), req_send_len);
 }
 
+// Prepare connection state for forwarding an early upstream response.
+// If there's unread upload body, discard recv_buf and force close.
+// If body is done, preserve recv_buf for pipelined data.
+static inline void prepare_early_response_state(Connection& conn) {
+    bool has_remaining_body =
+        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
+        (conn.req_body_mode == BodyMode::Chunked &&
+         conn.req_chunk_parser.state != ChunkedParser::State::Complete);
+    if (has_remaining_body) {
+        conn.recv_buf.reset();
+        conn.keep_alive = false;
+    }
+    conn.upstream_start_us = monotonic_us();
+}
+
 // Step: request forwarded to upstream, now wait for upstream response.
 template <typename Loop>
 void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
@@ -564,9 +579,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         if (conn.upstream_recv_buf.len() > 0) {
-            conn.recv_buf.reset();
-            conn.keep_alive = false;
-            conn.upstream_start_us = monotonic_us();
+            prepare_early_response_state(conn);
             conn.on_complete = &on_upstream_response<Loop>;
             IoEvent synth = {conn.id,
                              static_cast<i32>(conn.upstream_recv_buf.len()),
@@ -586,9 +599,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                 } while (nr < 0 && errno == EINTR);
                 if (nr > 0) {
                     conn.upstream_recv_buf.commit(static_cast<u32>(nr));
-                    conn.recv_buf.reset();
-                    conn.keep_alive = false;
-                    conn.upstream_start_us = monotonic_us();
+                    prepare_early_response_state(conn);
                     conn.on_complete = &on_upstream_response<Loop>;
                     IoEvent synth = {
                         conn.id, static_cast<i32>(nr), 0, 0, IoEventType::UpstreamRecv, 0};
@@ -985,19 +996,7 @@ static inline void handle_early_upstream_recv(Loop* loop,
 template <typename Loop>
 static inline void forward_early_response(Loop* loop, void* lp, Connection& conn) {
     conn.early_response_pending = false;
-    // Check if there's unread upload body remaining on the client side.
-    // If so, recv_buf contains body bytes (not pipelined requests) and
-    // keep-alive is impossible (we can't distinguish body from pipeline).
-    // If body is done (no remaining), preserve recv_buf for pipelined data.
-    bool has_remaining_body =
-        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
-        (conn.req_body_mode == BodyMode::Chunked &&
-         conn.req_chunk_parser.state != ChunkedParser::State::Complete);
-    if (has_remaining_body) {
-        conn.recv_buf.reset();
-        conn.keep_alive = false;
-    }
-    conn.upstream_start_us = monotonic_us();
+    prepare_early_response_state(conn);
     // Synthesize an UpstreamRecv event. Use result=0 (EOF) if the upstream
     // closed, so on_upstream_response produces 502 for truncated headers.
     // If upstream_recv_buf has a complete response, result>0 tells the parser
@@ -1040,9 +1039,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         }
         // 2. Data already in upstream_recv_buf from body streaming.
         if (conn.upstream_recv_buf.len() > 0) {
-            conn.recv_buf.reset();
-            conn.keep_alive = false;
-            conn.upstream_start_us = monotonic_us();
+            prepare_early_response_state(conn);
             conn.on_complete = &on_upstream_response<Loop>;
             IoEvent synth = {conn.id,
                              static_cast<i32>(conn.upstream_recv_buf.len()),
@@ -1053,10 +1050,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             on_upstream_response<Loop>(lp, conn, synth);
             return;
         }
-        // 3. Epoll only: pending_completions drain before EPOLLIN. Try a
-        //    non-blocking read to catch an early response the backend
-        //    hasn't delivered yet. Skip on io_uring: multishot recv is
-        //    already armed and sync recv would steal bytes from the CQE.
+        // 3. Epoll only: sync recv fallback.
         if (conn.upstream_fd >= 0 && !conn.upstream_recv_armed) {
             u32 avail = conn.upstream_recv_buf.write_avail();
             if (avail > 0) {
@@ -1066,9 +1060,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
                 } while (nr < 0 && errno == EINTR);
                 if (nr > 0) {
                     conn.upstream_recv_buf.commit(static_cast<u32>(nr));
-                    conn.recv_buf.reset();
-                    conn.keep_alive = false;
-                    conn.upstream_start_us = monotonic_us();
+                    prepare_early_response_state(conn);
                     conn.on_complete = &on_upstream_response<Loop>;
                     IoEvent synth = {
                         conn.id, static_cast<i32>(nr), 0, 0, IoEventType::UpstreamRecv, 0};

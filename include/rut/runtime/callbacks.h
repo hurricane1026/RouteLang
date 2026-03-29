@@ -557,13 +557,51 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (ev.result < 0) {
+        // Upstream send failed — try to recover an early response (same
+        // as on_request_body_sent: check flag, buffer, then sync recv).
+        if (conn.early_response_pending) {
+            forward_early_response<Loop>(loop, lp, conn);
+            return;
+        }
+        if (conn.upstream_recv_buf.len() > 0) {
+            conn.recv_buf.reset();
+            conn.keep_alive = false;
+            conn.upstream_start_us = monotonic_us();
+            conn.on_complete = &on_upstream_response<Loop>;
+            IoEvent synth = {conn.id,
+                             static_cast<i32>(conn.upstream_recv_buf.len()),
+                             0,
+                             0,
+                             IoEventType::UpstreamRecv,
+                             0};
+            on_upstream_response<Loop>(lp, conn, synth);
+            return;
+        }
+        if (conn.upstream_fd >= 0 && !conn.upstream_recv_armed) {
+            u32 avail = conn.upstream_recv_buf.write_avail();
+            if (avail > 0) {
+                ssize_t nr;
+                do {
+                    nr = recv(conn.upstream_fd, conn.upstream_recv_buf.write_ptr(), avail, 0);
+                } while (nr < 0 && errno == EINTR);
+                if (nr > 0) {
+                    conn.upstream_recv_buf.commit(static_cast<u32>(nr));
+                    conn.recv_buf.reset();
+                    conn.keep_alive = false;
+                    conn.upstream_start_us = monotonic_us();
+                    conn.on_complete = &on_upstream_response<Loop>;
+                    IoEvent synth = {
+                        conn.id, static_cast<i32>(nr), 0, 0, IoEventType::UpstreamRecv, 0};
+                    on_upstream_response<Loop>(lp, conn, synth);
+                    return;
+                }
+            }
+        }
         loop->close_conn(conn);
         return;
     }
 
     // Backends guarantee full send of submitted length. ev.result > 0
-    // is sufficient — the send may be capped to body boundary (less
-    // than recv_buf.len() when pipelined bytes are present).
 
     // Check for early response flagged during initial send.
     if (conn.early_response_pending) {
@@ -635,13 +673,19 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         // Brief epoll level-triggered re-wakes are bounded by Send latency.
         if (ev.type == IoEventType::UpstreamRecv) return;
         // Client Recv: drain upload body if early response, re-arm on data.
-        // Don't re-arm on EOF — avoids tight recv/rearm loop on half-close.
+        // EOF (half-close): tolerate. -ENOBUFS: recv_buf full, close to
+        // prevent repeated useless CQEs on io_uring.
         if (ev.type == IoEventType::Recv) {
             if (ev.result > 0) {
                 if (!conn.keep_alive) conn.recv_buf.reset();
                 loop->submit_recv(conn);
+                return;
             }
-            return;
+            if (ev.result < 0) {
+                loop->close_conn(conn);
+                return;
+            }
+            return;  // EOF: tolerate
         }
         loop->close_conn(conn);
         return;
@@ -746,13 +790,18 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         if (ev.type == IoEventType::UpstreamSend) return;
         // UpstreamRecv: data in buffer if > 0, -ENOBUFS if full. Ignore both.
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain and re-arm on data only (not EOF).
+        // Client Recv: drain, re-arm on data. Close on -ENOBUFS.
         if (ev.type == IoEventType::Recv) {
             if (ev.result > 0) {
                 if (!conn.keep_alive) conn.recv_buf.reset();
                 loop->submit_recv(conn);
+                return;
             }
-            return;
+            if (ev.result < 0) {
+                loop->close_conn(conn);
+                return;
+            }
+            return;  // EOF: tolerate
         }
         loop->close_conn(conn);
         return;
@@ -1462,13 +1511,18 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         if (ev.type == IoEventType::UpstreamSend) return;
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain and re-arm on data only (not EOF).
+        // Client Recv: drain, re-arm on data. Close on -ENOBUFS.
         if (ev.type == IoEventType::Recv) {
             if (ev.result > 0) {
                 if (!conn.keep_alive) conn.recv_buf.reset();
                 loop->submit_recv(conn);
+                return;
             }
-            return;
+            if (ev.result < 0) {
+                loop->close_conn(conn);
+                return;
+            }
+            return;  // EOF: tolerate
         }
         loop->close_conn(conn);
         return;

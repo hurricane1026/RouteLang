@@ -555,6 +555,7 @@ static inline void prepare_early_response_state(Connection& conn) {
         // Body done: stash pipelined bytes past the current request so
         // on_proxy_response_sent can recover them for the next request.
         pipeline_stash(conn);
+        conn.recv_buf.reset();
     }
     conn.upstream_start_us = monotonic_us();
 }

@@ -936,15 +936,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     } else if (resp.has_content_length) {
         conn.resp_body_mode = BodyMode::ContentLength;
         conn.resp_body_remaining = resp.content_length;
-    } else if (!resp.keep_alive) {
-        // EOF-delimited body: valid for HTTP/1.0 (default close) or
-        // explicit Connection: close. keep_alive is false in both cases.
-        conn.resp_body_mode = BodyMode::UntilClose;
-        conn.resp_body_remaining = 0;
     } else {
-        // No CL/TE: RFC 7230 says read until EOF (close-delimited).
-        // Even for HTTP/1.1, non-conformant origins may send bodies
-        // without framing. UntilClose prevents dropping such bodies.
+        // No CL/TE: read until EOF (close-delimited per RFC 7230).
+        // Covers both HTTP/1.0 (default close) and non-conformant HTTP/1.1
+        // origins that send bodies without framing.
         conn.resp_body_mode = BodyMode::UntilClose;
         conn.resp_body_remaining = 0;
     }

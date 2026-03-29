@@ -260,8 +260,9 @@ TEST(callback_metrics, requests_active_decremented_on_wrong_event) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
     CHECK_EQ(m.requests_active, 1u);
 
-    // Wrong event type during Send state
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+    // Recv during Send state is now ignored (pipelined data).
+    // Send a truly wrong event type (UpstreamConnect) to test close path.
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     CHECK_EQ(m.requests_active, 0u);
 }
 

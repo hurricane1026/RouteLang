@@ -622,10 +622,13 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         // buffer via consume_upstream_sent, then re-arm recv for more.
         // Brief epoll level-triggered re-wakes are bounded by Send latency.
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain upload body if early response. Don't re-arm —
-        // submit_recv on epoll clobbers EPOLLOUT for backpressured sends.
+        // Client Recv: drain upload body if early response, re-arm recv.
+        // On epoll this branch is unreachable (EPOLLOUT-only during send).
+        // On io_uring multishot may have terminated — must re-arm to keep
+        // draining upload bytes (otherwise close → TCP RST → response lost).
         if (ev.type == IoEventType::Recv) {
             if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
+            loop->submit_recv(conn);
             return;
         }
         loop->close_conn(conn);
@@ -731,9 +734,10 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         if (ev.type == IoEventType::UpstreamSend) return;
         // UpstreamRecv: data in buffer if > 0, -ENOBUFS if full. Ignore both.
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain upload body if early response. Don't re-arm.
+        // Client Recv: drain and re-arm (io_uring multishot may have terminated).
         if (ev.type == IoEventType::Recv) {
             if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
+            loop->submit_recv(conn);
             return;
         }
         loop->close_conn(conn);
@@ -964,10 +968,11 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             on_upstream_response<Loop>(lp, conn, synth);
             return;
         }
-        // 3. On epoll, pending_completions drain before EPOLLIN. Try a
+        // 3. Epoll only: pending_completions drain before EPOLLIN. Try a
         //    non-blocking read to catch an early response the backend
-        //    hasn't delivered yet.
-        if (conn.upstream_fd >= 0) {
+        //    hasn't delivered yet. Skip on io_uring: multishot recv is
+        //    already armed and sync recv would steal bytes from the CQE.
+        if (conn.upstream_fd >= 0 && !conn.upstream_recv_armed) {
             u32 avail = conn.upstream_recv_buf.write_avail();
             if (avail > 0) {
                 ssize_t nr;
@@ -1430,9 +1435,10 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         if (ev.type == IoEventType::UpstreamSend) return;
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain upload body if early response. Don't re-arm.
+        // Client Recv: drain and re-arm (io_uring multishot may have terminated).
         if (ev.type == IoEventType::Recv) {
             if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
+            loop->submit_recv(conn);
             return;
         }
         loop->close_conn(conn);

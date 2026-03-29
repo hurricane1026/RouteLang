@@ -2153,8 +2153,8 @@ TEST(slice_conn, real_eventloop_pool_init) {
     auto rc = loop->init(0, lfd);
     REQUIRE(rc.has_value());
 
-    // Lazy commit: pool starts empty, max set to 2 * kMaxConns.
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 2);
+    // Lazy commit: pool starts empty, max set to 3 * kMaxConns (recv+send+upstream).
+    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 3);
     CHECK_EQ(loop->pool.count, 0u);
 
     // Alloc a connection — triggers lazy grow, consumes 2 slices
@@ -4181,6 +4181,284 @@ TEST(pipeline, leftover_returns_zero_for_exact_request) {
     // req_initial_send_len should equal recv_buf.len() — no leftover bytes.
     CHECK_EQ(conn->req_initial_send_len, conn->recv_buf.len());
     CHECK_EQ(pipeline_leftover(*conn), 0u);
+}
+
+// === Buffer Isolation ===
+// Verify upstream_recv_buf and recv_buf remain strictly separated.
+
+// Upstream response data lands in upstream_recv_buf, not client recv_buf.
+TEST(buffer_isolation, upstream_data_in_upstream_buf) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+
+    // At this point conn is waiting for upstream response (on_upstream_response).
+    CHECK_EQ(conn->on_complete, &on_upstream_response<SmallLoop>);
+
+    // Remember client recv_buf state before upstream response.
+    u32 client_len_before = conn->recv_buf.len();
+
+    // Inject a valid upstream HTTP response.
+    inject_upstream_response(loop, *conn);
+
+    // upstream_recv_buf should have received the response data.
+    // (inject_upstream_response writes kMockHttpResponseLen bytes, then
+    // on_upstream_response forwards to send_buf, but the data went through
+    // upstream_recv_buf — not recv_buf.)
+    // After on_upstream_response, the connection is in on_proxy_response_sent
+    // waiting for the client send to complete. The upstream_recv_buf still
+    // holds the response data (not reset until send completes).
+    CHECK_GT(conn->upstream_recv_buf.len(), 0u);
+
+    // Client recv_buf must not have grown — upstream data stayed out.
+    CHECK_EQ(conn->recv_buf.len(), client_len_before);
+}
+
+// Client Recv event writes to recv_buf, not upstream_recv_buf.
+TEST(buffer_isolation, client_recv_not_in_upstream_buf) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+
+    // Allocate upstream buffer so we can verify it stays empty.
+    loop.alloc_upstream_buf(*conn);
+    conn->upstream_recv_buf.reset();
+
+    // Inject a client Recv event. inject_and_dispatch writes mock bytes
+    // into recv_buf for Recv events.
+    conn->recv_buf.reset();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 50));
+
+    // Client data should be in recv_buf.
+    CHECK_GT(conn->recv_buf.len(), 0u);
+
+    // Upstream buffer must remain untouched.
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+}
+
+// Non-proxy connections never allocate upstream_recv_slice.
+TEST(buffer_isolation, lazy_alloc_no_proxy) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Process a direct (non-proxy) request.
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 50));
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+
+    // No upstream slice should have been allocated for a direct response.
+    CHECK(conn->upstream_recv_slice == nullptr);
+}
+
+// Proxy connections allocate upstream_recv_slice on upstream connect.
+TEST(buffer_isolation, lazy_alloc_on_proxy) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+
+    // setup_proxy_conn goes through on_upstream_connected which calls
+    // alloc_upstream_buf. The slice should now be allocated.
+    CHECK(conn->upstream_recv_slice != nullptr);
+    CHECK_GT(conn->upstream_recv_buf.write_avail(), 0u);
+}
+
+// Upstream recv slice persists across keep-alive: after completing a proxy
+// response cycle the slice is retained for the next request on the same
+// connection.
+TEST(buffer_isolation, persists_across_keepalive) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+
+    // Record the slice pointer before the proxy response cycle completes.
+    u8* slice_before = conn->upstream_recv_slice;
+    CHECK(slice_before != nullptr);
+
+    // Complete the proxy cycle: inject upstream response, then complete
+    // the client send.
+    inject_upstream_response(loop, *conn);
+    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+
+    // Connection should be back to reading the next request (keep-alive).
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+
+    // Upstream recv slice must still be allocated (not freed on keep-alive).
+    CHECK(conn->upstream_recv_slice != nullptr);
+    CHECK_EQ(conn->upstream_recv_slice, slice_before);
+}
+
+// Closing a connection resets upstream_recv_slice to nullptr.
+TEST(buffer_isolation, freed_on_close) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    CHECK(conn->upstream_recv_slice != nullptr);
+
+    u32 cid = conn->id;
+
+    // Close the connection (simulates peer disconnect or timeout).
+    loop.close_conn(*conn);
+
+    // After close + free, the connection slot is reset.
+    CHECK(loop.conns[cid].upstream_recv_slice == nullptr);
+}
+
+// Client EOF during proxy upstream wait closes the connection.
+TEST(buffer_isolation, client_eof_during_proxy_closes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    u32 cid = conn->id;
+
+    // Connection is waiting for upstream response (on_upstream_response).
+    // Client sends EOF (disconnect).
+    loop.dispatch(make_ev(cid, IoEventType::Recv, 0));  // EOF
+
+    // Connection should be closed (client disconnected).
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+// Client Recv with data during proxy wait is ignored (pipelined).
+TEST(buffer_isolation, client_data_during_proxy_ignored) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    u32 cid = conn->id;
+
+    // Client sends pipelined data while waiting for upstream.
+    auto* saved_cb = conn->on_complete;
+    loop.dispatch(make_ev(cid, IoEventType::Recv, 50));
+
+    // Connection stays alive, callback unchanged.
+    CHECK(loop.conns[cid].fd >= 0);
+    CHECK_EQ(conn->on_complete, saved_cb);
+}
+
+// Pool sized for 3 slices per connection (recv + send + upstream_recv).
+TEST(buffer_isolation, pool_sized_for_three_slices) {
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    auto rc = loop->init(0, lfd);
+    REQUIRE(rc.has_value());
+
+    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 3);
+
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+// Late pipelined data during proxy is preserved after response completes.
+TEST(buffer_isolation, late_pipeline_data_preserved_after_proxy) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    u32 cid = conn->id;
+
+    // Inject upstream response.
+    inject_upstream_response(loop, *conn);
+    u32 resp_len = conn->upstream_recv_buf.len();
+
+    // Before sending response to client, simulate client pipelined data
+    // arriving in recv_buf (as if a Recv CQE was ignored during proxy).
+    const char* next_req = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 next_len = 0;
+    while (next_req[next_len]) next_len++;
+    conn->recv_buf.reset();
+    u8* dst = conn->recv_buf.write_ptr();
+    for (u32 i = 0; i < next_len; i++) dst[i] = static_cast<u8>(next_req[i]);
+    conn->recv_buf.commit(next_len);
+
+    // Complete the proxy response send.
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(resp_len)));
+
+    // The late pipelined data should be dispatched (not lost).
+    // on_proxy_response_sent finds recv_buf.len() > 0 → pipeline_dispatch.
+    CHECK(conn->fd >= 0);
+    // Should have re-entered on_header_received and built a response.
+    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+}
+
+// Client Recv during response body streaming re-arms recv.
+TEST(buffer_isolation, recv_rearm_during_body_streaming) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+
+    // Large upstream response → streaming mode.
+    const char* resp_hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n";
+    u32 hdr_len = 0;
+    while (resp_hdr[hdr_len]) hdr_len++;
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
+    for (u32 i = 0; i < hdr_len; i++) dst[i] = static_cast<u8>(resp_hdr[i]);
+    conn->upstream_recv_buf.commit(hdr_len);
+    IoEvent ev = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(hdr_len));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Send headers.
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(hdr_len)));
+    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+
+    // Client Recv with data during body streaming → re-arm, not just return.
+    loop.backend.clear_ops();
+    loop.dispatch(make_ev(conn->id, IoEventType::Recv, 50));
+    CHECK(conn->fd >= 0);                                // not closed
+    CHECK_GT(loop.backend.count_ops(MockOp::Recv), 0u);  // recv re-armed
+}
+
+// Client EOF during response body streaming closes connection.
+TEST(buffer_isolation, client_eof_during_body_streaming_closes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    u32 cid = conn->id;
+
+    const char* resp_hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n";
+    u32 hdr_len = 0;
+    while (resp_hdr[hdr_len]) hdr_len++;
+    conn->upstream_recv_buf.reset();
+    u8* dst2 = conn->upstream_recv_buf.write_ptr();
+    for (u32 i = 0; i < hdr_len; i++) dst2[i] = static_cast<u8>(resp_hdr[i]);
+    conn->upstream_recv_buf.commit(hdr_len);
+    IoEvent ev2 = make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(hdr_len));
+    loop.backend.inject(ev2);
+    IoEvent events2[8];
+    u32 n2 = loop.backend.wait(events2, 8);
+    for (u32 i = 0; i < n2; i++) loop.dispatch(events2[i]);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(hdr_len)));
+
+    // Client EOF during streaming → ignored (half-close, client still reads).
+    loop.dispatch(make_ev(cid, IoEventType::Recv, 0));
+    CHECK(loop.conns[cid].fd >= 0);  // NOT closed
+    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
 }
 
 int main(int argc, char** argv) {

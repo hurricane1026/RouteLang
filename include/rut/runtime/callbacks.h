@@ -576,6 +576,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
 
     // Stash pipelined bytes before waiting for upstream response.
     pipeline_stash(conn);
+    conn.recv_buf.reset();  // clear after stash — pipelined bytes are in send_buf
     conn.upstream_start_us = monotonic_us();
     conn.upstream_recv_buf.reset();
     conn.on_complete = &on_upstream_response<Loop>;
@@ -614,10 +615,15 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::UpstreamRecv) {
-        // Client Recv during response streaming: with separate buffers,
-        // client data goes to recv_buf (not upstream_recv_buf), so no
-        // cross-contamination. Just ignore and wait for upstream data.
-        if (ev.type == IoEventType::Recv) return;
+        // Client Recv during response streaming: data goes to recv_buf,
+        // not upstream_recv_buf. Ignore but re-arm if multishot terminated
+        // (io_uring dispatch may have cleared recv_armed on ev.more=0).
+        // Don't close on client EOF — may be half-close (SHUT_WR) while
+        // client still reads the response. Re-arm for data; ignore EOF.
+        if (ev.type == IoEventType::Recv) {
+            if (ev.result > 0) loop->submit_recv(conn);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -710,6 +716,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;
         }
+        loop->clear_upstream_fd(conn.id);
         conn.upstream_recv_armed = false;
         conn.upstream_send_armed = false;
 
@@ -718,7 +725,37 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
 
+        if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
+            // Both stash (early) and recv_buf (late) have data.
+            // Correct order: stash first, then late bytes.
+            u16 slen = conn.pipeline_stash_len;
+            u32 late_len = conn.recv_buf.len();
+            // Check combined size fits in one buffer slice.
+            if (static_cast<u32>(slen) + late_len > conn.recv_buf.capacity()) {
+                // Overflow: can't merge without truncation. Close.
+                conn.pipeline_stash_len = 0;
+                conn.send_buf.reset();
+                loop->close_conn(conn);
+                return;
+            }
+            conn.pipeline_stash_len = 0;
+            conn.upstream_recv_buf.reset();
+            conn.upstream_recv_buf.write(conn.recv_buf.data(), late_len);
+            conn.recv_buf.reset();
+            conn.recv_buf.write(conn.send_buf.data(), slen);
+            conn.recv_buf.write(conn.upstream_recv_buf.data(), late_len);
+            conn.upstream_recv_buf.reset();
+            conn.send_buf.reset();
+            conn.pipeline_depth++;
+            pipeline_dispatch<Loop>(loop, conn);
+            return;
+        }
         if (pipeline_recover(conn)) {
+            pipeline_dispatch<Loop>(loop, conn);
+            return;
+        }
+        if (conn.recv_buf.len() > 0) {
+            conn.pipeline_depth++;
             pipeline_dispatch<Loop>(loop, conn);
             return;
         }
@@ -767,6 +804,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     if (body_done) {
         // Request body fully forwarded — stash leftovers, wait for upstream response.
         pipeline_stash(conn);
+        conn.recv_buf.reset();
         conn.upstream_start_us = monotonic_us();
         conn.upstream_recv_buf.reset();
         conn.on_complete = &on_upstream_response<Loop>;
@@ -837,7 +875,16 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // Accept UpstreamRecv only — upstream data now goes to upstream_recv_buf,
     // so client Recv events are harmless (they go to recv_buf). Ignore them.
     if (ev.type != IoEventType::UpstreamRecv) {
-        if (ev.type == IoEventType::Recv) return;  // client data, ignore
+        // Client Recv with data: pipelined request, harmless (in recv_buf).
+        // Client Recv with EOF/error: client disconnected, close proxy.
+        if (ev.type == IoEventType::Recv) {
+            if (ev.result <= 0) {
+                loop->close_conn(conn);
+                return;
+            }
+            loop->submit_recv(conn);  // re-arm if multishot terminated
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -1158,10 +1205,41 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         ::close(conn.upstream_fd);
         conn.upstream_fd = -1;
     }
+    loop->clear_upstream_fd(conn.id);
     conn.upstream_recv_armed = false;
     conn.upstream_send_armed = false;
 
+    // Merge stashed + late-arriving pipelined data into recv_buf.
+    // pipeline_recover restores stash to recv_buf (resets it first).
+    // If recv_buf also has late data, append stash to it instead.
+    if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
+        // Both stash (early) and recv_buf (late): correct order is stash first.
+        u16 slen = conn.pipeline_stash_len;
+        u32 late_len = conn.recv_buf.len();
+        if (static_cast<u32>(slen) + late_len > conn.recv_buf.capacity()) {
+            conn.pipeline_stash_len = 0;
+            conn.send_buf.reset();
+            loop->close_conn(conn);
+            return;
+        }
+        conn.pipeline_stash_len = 0;
+        conn.upstream_recv_buf.reset();
+        conn.upstream_recv_buf.write(conn.recv_buf.data(), late_len);
+        conn.recv_buf.reset();
+        conn.recv_buf.write(conn.send_buf.data(), slen);
+        conn.recv_buf.write(conn.upstream_recv_buf.data(), late_len);
+        conn.upstream_recv_buf.reset();
+        conn.send_buf.reset();
+        conn.pipeline_depth++;
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
     if (pipeline_recover(conn)) {
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (conn.recv_buf.len() > 0) {
+        conn.pipeline_depth++;
         pipeline_dispatch<Loop>(loop, conn);
         return;
     }

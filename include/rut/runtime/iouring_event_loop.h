@@ -93,7 +93,8 @@ public:
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
         }
-        TRY_VOID(pool.init(kMaxConns * 2, pool_prealloc));
+        // 3 slices max per connection: recv + send + upstream_recv (lazy).
+        TRY_VOID(pool.init(kMaxConns * 3, pool_prealloc));
         auto be = backend.init(id, lfd);
         if (!be) {
             pool.destroy();
@@ -173,6 +174,9 @@ public:
 
     // Lazy-allocate upstream recv buffer for proxy connections.
     // Only called when a connection starts proxying — non-proxy connections
+    // No-op for io_uring (no fd_map to clear).
+    void clear_upstream_fd(u32 /*conn_id*/) {}
+
     // never pay the cost. Returns false if SlicePool is exhausted.
     bool alloc_upstream_buf(ConnectionBase& c) {
         if (c.upstream_recv_slice) return true;  // already allocated

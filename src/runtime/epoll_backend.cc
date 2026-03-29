@@ -37,7 +37,8 @@ core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
     timer_fd = -1;
     pending_count = 0;
     for (u32 i = 0; i < kMaxFdMap; i++) {
-        fd_map[i] = -1;
+        downstream_fd_map[i] = -1;
+        upstream_fd_map[i] = -1;
         send_state[i] = {nullptr, -1, 0, 0};
     }
 
@@ -82,7 +83,7 @@ void EpollBackend::add_accept() {
 }
 
 bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
-    if (conn_id < kMaxFdMap) fd_map[conn_id] = fd;
+    if (conn_id < kMaxFdMap) downstream_fd_map[conn_id] = fd;
     struct epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.u64 = encode_data(conn_id, IoEventType::Recv);
@@ -99,7 +100,7 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
 }
 
 bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
-    if (conn_id < kMaxFdMap) fd_map[conn_id] = fd;
+    if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = fd;
     struct epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.u64 = encode_data(conn_id, IoEventType::UpstreamRecv);
@@ -176,7 +177,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
 }
 
 bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len) {
-    if (conn_id < kMaxFdMap) fd_map[conn_id] = fd;
+    if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = fd;
     // Initiate non-blocking connect
     i32 rc = connect(fd, static_cast<const struct sockaddr*>(addr), addr_len);
     if (rc == 0) {
@@ -298,12 +299,14 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             }
         } else if (ep_events[i].events & EPOLLIN) {
             // Readiness → recv directly into Connection::recv_buf
-            i32 fd = (conn_id < kMaxFdMap) ? fd_map[conn_id] : -1;
+            // Use the correct fd map based on event type.
+            i32 fd = (conn_id < kMaxFdMap)
+                         ? ((type == IoEventType::UpstreamRecv) ? upstream_fd_map[conn_id]
+                                                                : downstream_fd_map[conn_id])
+                         : -1;
             if (fd < 0) continue;
-            // Append recv data into the appropriate recv buffer.
-            // UpstreamRecv → upstream_recv_buf; Recv → recv_buf.
-            // Buffer is NOT reset here — callback resets when it consumes data.
-            // This allows multi-packet requests to accumulate.
+            // Route recv data by event type: UpstreamRecv → upstream_recv_buf,
+            // Recv → recv_buf.
             i32 result = 0;
             if (conn_id < max_conns) {
                 auto& buf = (type == IoEventType::UpstreamRecv) ? conns[conn_id].upstream_recv_buf
@@ -340,7 +343,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 // Connect completed — check for errors
                 i32 err = 0;
                 socklen_t errlen = sizeof(err);
-                i32 cfd = (conn_id < kMaxFdMap) ? fd_map[conn_id] : -1;
+                i32 cfd = (conn_id < kMaxFdMap) ? upstream_fd_map[conn_id] : -1;
                 if (cfd >= 0) getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &errlen);
                 events[out].conn_id = conn_id;
                 events[out].type = IoEventType::UpstreamConnect;
@@ -354,14 +357,22 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 if (conn_id >= kMaxFdMap) continue;
                 auto& ss = send_state[conn_id];
                 if (ss.remaining == 0 || !ss.src || ss.fd < 0) {
-                    // No outstanding send — switch the fd that was registered
-                    // for EPOLLOUT back to EPOLLIN. Use fd_map (the client fd
-                    // for this conn_id) since ss.fd may be stale/cleared.
-                    i32 rfd = (conn_id < kMaxFdMap) ? fd_map[conn_id] : -1;
+                    // No outstanding send — switch the fd back to EPOLLIN.
+                    // Determine direction from fd maps to use correct type.
+                    i32 rfd = -1;
+                    IoEventType recv_type = IoEventType::Recv;
+                    if (conn_id < kMaxFdMap) {
+                        if (upstream_fd_map[conn_id] >= 0 && upstream_fd_map[conn_id] == ss.fd) {
+                            rfd = upstream_fd_map[conn_id];
+                            recv_type = IoEventType::UpstreamRecv;
+                        } else {
+                            rfd = downstream_fd_map[conn_id];
+                        }
+                    }
                     if (rfd >= 0) {
                         struct epoll_event rev;
                         rev.events = EPOLLIN;
-                        rev.data.u64 = encode_data(conn_id, IoEventType::Recv);
+                        rev.data.u64 = encode_data(conn_id, recv_type);
                         epoll_ctl(epoll_fd, EPOLL_CTL_MOD, rfd, &rev);
                     }
                     continue;
@@ -408,9 +419,13 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 i32 send_fd = ss.fd;
                 ss = {nullptr, -1, 0, 0};
                 if (send_fd >= 0) {
+                    // Re-register with correct type based on fd direction.
+                    IoEventType rt = IoEventType::Recv;
+                    if (conn_id < kMaxFdMap && upstream_fd_map[conn_id] == send_fd)
+                        rt = IoEventType::UpstreamRecv;
                     struct epoll_event rev;
                     rev.events = EPOLLIN;
-                    rev.data.u64 = encode_data(conn_id, IoEventType::Recv);
+                    rev.data.u64 = encode_data(conn_id, rt);
                     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, send_fd, &rev);
                 }
             }

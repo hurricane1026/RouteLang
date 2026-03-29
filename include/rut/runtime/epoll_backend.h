@@ -32,9 +32,11 @@ struct EpollBackend {
     i32 timer_fd = -1;
     i32 listen_fd = -1;
 
-    // conn_id → fd mapping (epoll data only stores conn_id, recv needs fd)
+    // conn_id → fd mappings. Separate maps for client and upstream so that
+    // proxy connections with both fds registered don't overwrite each other.
     static constexpr u32 kMaxFdMap = 16384;
-    i32 fd_map[kMaxFdMap];  // fd_map[conn_id] = fd
+    i32 downstream_fd_map[kMaxFdMap];  // downstream (client) fd per conn_id
+    i32 upstream_fd_map[kMaxFdMap];    // upstream (origin) fd per conn_id
 
     // Pending synthetic completion events (from immediate sends)
     IoEvent pending_completions[64];

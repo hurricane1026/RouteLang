@@ -401,7 +401,7 @@ TEST(partial_send, real_epollout_completion) {
     // to prevent indefinite hangs if EPOLLOUT doesn't fire immediately.
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
-    backend.fd_map[0] = fds[0];
+    backend.downstream_fd_map[0] = fds[0];
 
     TestConn tc;
     tc.init(0, fds[0]);
@@ -467,7 +467,7 @@ TEST(partial_send, socketpair_full_send) {
 
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
-    backend.fd_map[0] = fds[0];
+    backend.downstream_fd_map[0] = fds[0];
 
     TestConn tc;
     tc.init(0, fds[0]);
@@ -556,7 +556,7 @@ TEST(partial_send, epollout_no_pending_switches_to_epollin) {
 
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
-    backend.fd_map[0] = fds[0];
+    backend.downstream_fd_map[0] = fds[0];
 
     TestConn tc;
     tc.init(0, fds[0]);

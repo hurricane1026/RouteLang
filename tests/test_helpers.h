@@ -98,7 +98,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         backend.init(0, -1);
     }
 
-    // Lazy-allocate upstream recv buffer (mirrors real event loops).
+    void clear_upstream_fd(u32 /*conn_id*/) {}
+
     bool alloc_upstream_buf(ConnectionBase& c) {
         if (c.upstream_recv_slice) return true;
         u32 id = c.id;
@@ -384,7 +385,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                                std::memory_order_release);
     }
 
-    // Lazy-allocate upstream recv buffer (mirrors real event loops).
+    void clear_upstream_fd(u32 /*conn_id*/) {}
+
     bool alloc_upstream_buf(ConnectionBase& c) {
         if (c.upstream_recv_slice) return true;
         u32 id = c.id;
@@ -636,7 +638,8 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
                                std::memory_order_release);
     }
 
-    // Lazy-allocate upstream recv buffer (mirrors real event loops).
+    void clear_upstream_fd(u32 /*conn_id*/) {}
+
     bool alloc_upstream_buf(ConnectionBase& c) {
         if (c.upstream_recv_slice) return true;
         u32 id = c.id;

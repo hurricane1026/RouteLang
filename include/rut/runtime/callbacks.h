@@ -159,6 +159,9 @@ static inline void capture_request_metadata(Connection& conn) {
     conn.req_body_remaining = 0;
     conn.req_chunk_parser.reset();
     conn.req_malformed = false;
+    conn.req_header_end = 0;
+    conn.req_initial_send_len = 0;
+    conn.req_content_length = 0;
 
     const u8* data = conn.recv_buf.data();
     u32 len = conn.recv_buf.len();
@@ -226,6 +229,9 @@ static inline void capture_request_metadata(Connection& conn) {
             conn.req_initial_send_len = parser.header_end + body_in_initial;
         }
         // Chunked: already set above (parser.header_end + chunk_consumed).
+        // Fix req_size: use actual request boundary, not full recv_buf
+        // (which may include pipelined bytes from subsequent requests).
+        if (conn.req_initial_send_len > 0) conn.req_size = conn.req_initial_send_len;
         return;
     }
 
@@ -246,6 +252,73 @@ static inline void capture_request_metadata(Connection& conn) {
     if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;
     for (u32 i = 0; i < copy_len; i++) conn.req_path[i] = static_cast<char>(data[path_start + i]);
     conn.req_path[copy_len] = '\0';
+}
+
+// --- HTTP pipelining helpers ---
+
+// How many leftover bytes past the current request in recv_buf.
+static inline u32 pipeline_leftover(const Connection& conn) {
+    u32 req_end = conn.req_initial_send_len;
+    u32 buf_len = conn.recv_buf.len();
+    if (req_end == 0 || req_end >= buf_len) return 0;
+    return buf_len - req_end;
+}
+
+// Shift leftover bytes to recv_buf start. Returns true if data shifted.
+static inline bool pipeline_shift(Connection& conn) {
+    u32 leftover = pipeline_leftover(conn);
+    if (leftover == 0) return 0;
+    const u8* src = conn.recv_buf.data() + conn.req_initial_send_len;
+    conn.recv_buf.reset();
+    u8* dst = conn.recv_buf.write_ptr();
+    __builtin_memmove(dst, src, leftover);
+    conn.recv_buf.commit(leftover);
+    conn.pipeline_depth++;
+    return true;
+}
+
+// Re-enter header parsing with data already in recv_buf.
+template <typename Loop>
+static inline void pipeline_dispatch(Loop* loop, Connection& conn) {
+    conn.state = ConnState::ReadingHeader;
+    // Refresh keepalive timer — synthetic dispatch skips the normal
+    // EventLoop::dispatch() which calls timer.refresh().
+    loop->timer.refresh(&conn, loop->keepalive_timeout);
+    IoEvent synth = {conn.id, static_cast<i32>(conn.recv_buf.len()), 0, 0, IoEventType::Recv, 0};
+    on_header_received<Loop>(loop, conn, synth);
+}
+
+// Stash leftover bytes from recv_buf into send_buf (proxy path).
+static inline void pipeline_stash(Connection& conn) {
+    u32 leftover = pipeline_leftover(conn);
+    if (leftover == 0) {
+        conn.pipeline_stash_len = 0;
+        return;
+    }
+    // Reset send_buf BEFORE checking capacity (old response data may occupy it).
+    conn.send_buf.reset();
+    if (leftover > conn.send_buf.write_avail()) {
+        conn.pipeline_stash_len = 0;
+        return;
+    }
+    const u8* src = conn.recv_buf.data() + conn.req_initial_send_len;
+    conn.send_buf.write(src, leftover);
+    conn.pipeline_stash_len = static_cast<u16>(leftover);
+}
+
+// Recover stashed bytes from send_buf into recv_buf. Returns true if recovered.
+static inline bool pipeline_recover(Connection& conn) {
+    u16 stash_len = conn.pipeline_stash_len;
+    conn.pipeline_stash_len = 0;
+    if (stash_len == 0) return 0;
+    const u8* src = conn.send_buf.data();
+    conn.recv_buf.reset();
+    u8* dst = conn.recv_buf.write_ptr();
+    __builtin_memmove(dst, src, stash_len);
+    conn.recv_buf.commit(stash_len);
+    conn.send_buf.reset();
+    conn.pipeline_depth++;
+    return true;
 }
 
 static const char kResponse200[] =
@@ -326,8 +399,27 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // for upstream forwarding. Reset happens in on_response_sent / on_proxy_response_sent
     // when the cycle completes and we're about to read the next request.
 
-    conn.req_start_us = monotonic_us();
+    // Check if the buffer contains a complete request before proceeding.
+    // For pipelined re-entries, an incomplete request should wait for more
+    // data instead of getting a spurious default response.
+    if (conn.pipeline_depth > 0) {
+        HttpParser pre_parser;
+        ParsedRequest pre_req;
+        pre_parser.reset();
+        if (pre_parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &pre_req) ==
+            ParseStatus::Incomplete) {
+            // Keep pipeline_depth > 0 so subsequent recvs also check for
+            // Incomplete (multi-packet reassembly of the pipelined request).
+            conn.state = ConnState::ReadingHeader;
+            conn.on_complete = &on_header_received<Loop>;
+            loop->submit_recv(conn);
+            return;
+        }
+    }
+
     capture_request_metadata(conn);
+
+    conn.req_start_us = monotonic_us();
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
     conn.state = ConnState::Sending;
@@ -354,6 +446,10 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.type != IoEventType::Send) {
+        // Pipelined client Recv with data: bytes are in recv_buf,
+        // found by pipeline_shift after send completes.
+        // EOF/error Recv: close immediately (peer disconnected).
+        if (ev.type == IoEventType::Recv && ev.result > 0) return;
         loop->close_conn(conn);
         return;
     }
@@ -379,7 +475,12 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    // Request cycle complete — reset recv_buf before reading next request.
+    // Request cycle complete — check for pipelined data before re-arming recv.
+    if (pipeline_shift(conn)) {
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    conn.pipeline_depth = 0;
     conn.recv_buf.reset();
     conn.state = ConnState::ReadingHeader;
     conn.on_complete = &on_header_received<Loop>;
@@ -468,10 +569,8 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    // Original request forwarded — reset recv_buf for upstream response data.
-    // TODO(task4): if recv_buf had bytes past req_initial_send_len (pipelined
-    // request), they are discarded here. HTTP pipelining support should
-    // preserve them for the next keep-alive cycle.
+    // Stash pipelined bytes before resetting recv_buf for upstream response.
+    pipeline_stash(conn);
     conn.upstream_start_us = monotonic_us();
     conn.recv_buf.reset();
     conn.on_complete = &on_upstream_response<Loop>;
@@ -617,6 +716,11 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
 
+        if (pipeline_recover(conn)) {
+            pipeline_dispatch<Loop>(loop, conn);
+            return;
+        }
+        conn.pipeline_depth = 0;
         conn.recv_buf.reset();
         conn.state = ConnState::ReadingHeader;
         conn.on_complete = &on_header_received<Loop>;
@@ -659,7 +763,8 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (body_done) {
-        // Request body fully forwarded — now wait for upstream response.
+        // Request body fully forwarded — stash leftovers, wait for upstream response.
+        pipeline_stash(conn);
         conn.upstream_start_us = monotonic_us();
         conn.recv_buf.reset();
         conn.on_complete = &on_upstream_response<Loop>;
@@ -688,7 +793,6 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     }
 
     u32 data_len = conn.recv_buf.len();
-    conn.req_size += data_len;  // accumulate for access log
 
     // Track body consumption and compute how many bytes to forward.
     u32 send_len = data_len;
@@ -717,6 +821,8 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         send_len = pos;
     }
 
+    conn.req_size += send_len;             // accumulate actual body bytes (excludes pipelined)
+    conn.req_initial_send_len = send_len;  // for pipeline_leftover detection
     conn.on_complete = &on_request_body_sent<Loop>;
     loop->submit_send_upstream(conn, conn.recv_buf.data(), send_len);
 }
@@ -727,8 +833,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     // Accept both UpstreamRecv (io_uring multishot / epoll add_recv_upstream)
-    // and Recv (epoll fast-upstream: immediate connect or send completion
-    // re-registers the upstream fd as Recv before submit_recv_upstream runs).
+    // Accept UpstreamRecv and Recv (epoll fast-upstream: send completion
+    // re-registers upstream fd as Recv). A pipelined client Recv could be
+    // misinterpreted as upstream data — this is a known limitation until
+    // epoll uses UpstreamRecv for all upstream recv paths.
     if (ev.type != IoEventType::UpstreamRecv && ev.type != IoEventType::Recv) {
         loop->close_conn(conn);
         return;
@@ -1054,6 +1162,11 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.upstream_recv_armed = false;
     conn.upstream_send_armed = false;
 
+    if (pipeline_recover(conn)) {
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    conn.pipeline_depth = 0;
     conn.recv_buf.reset();
     conn.state = ConnState::ReadingHeader;
     conn.on_complete = &on_header_received<Loop>;

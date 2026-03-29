@@ -26,6 +26,7 @@ enum class ConnState : u8 {
 struct Connection {
     static constexpr u32 kMaxReqPathLen = 64;
     static constexpr u32 kMaxUpstreamNameLen = 24;
+    static constexpr u16 kMaxPipelineDepth = 16;
     // fp callback: what to do when the next I/O completes.
     // This IS the state — no enum switch needed.
     // Typed as void* to avoid circular dependency; cast in event_loop.h.
@@ -49,6 +50,10 @@ struct Connection {
     void* handler_ctx;
 
     bool keep_alive;
+
+    // HTTP pipelining state
+    u16 pipeline_depth;      // pipelined requests processed on this connection
+    u16 pipeline_stash_len;  // bytes of next request stashed in send_buf (proxy)
 
     // Body streaming state (proxy large body support)
     u32 req_header_end;        // offset past request headers (\r\n\r\n)
@@ -125,6 +130,8 @@ struct Connection {
         handler_state = 0;
         handler_ctx = nullptr;
         keep_alive = false;
+        pipeline_depth = 0;
+        pipeline_stash_len = 0;
         req_header_end = 0;
         req_content_length = 0;
         req_initial_send_len = 0;

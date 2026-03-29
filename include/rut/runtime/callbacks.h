@@ -551,6 +551,10 @@ static inline void prepare_early_response_state(Connection& conn) {
     if (has_remaining_body) {
         conn.recv_buf.reset();
         conn.keep_alive = false;
+    } else {
+        // Body done: stash pipelined bytes past the current request so
+        // on_proxy_response_sent can recover them for the next request.
+        pipeline_stash(conn);
     }
     conn.upstream_start_us = monotonic_us();
 }
@@ -623,6 +627,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // Backends guarantee full send of submitted length. ev.result > 0
 
     // Check for early response flagged during initial send.
+    // forward_early_response → prepare_early_response_state stashes pipelined bytes.
     if (conn.early_response_pending) {
         forward_early_response<Loop>(loop, lp, conn);
         return;

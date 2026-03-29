@@ -8,6 +8,7 @@ Checks: >
   misc-*,
   -misc-non-private-member-variables-in-classes,
   -misc-no-recursion,
+  -misc-use-anonymous-namespace,
   performance-*,
   readability-identifier-naming,
   readability-redundant-*,

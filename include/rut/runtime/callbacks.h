@@ -597,10 +597,11 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         // UpstreamRecv: upstream may be faster than client — body data already
         // appended to upstream_recv_buf by the backend. Don't discard.
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain upload body and re-arm. Ignore EOF — client
-        // may have done shutdown(SHUT_WR) but can still read the response.
+        // Client Recv during response send. If early response (keep_alive=false),
+        // this is unread upload body — drain it. Otherwise preserve for pipeline.
+        // Ignore EOF — client may have done shutdown(SHUT_WR).
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) conn.recv_buf.reset();
+            if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
             loop->submit_recv(conn);
             return;
         }
@@ -613,9 +614,7 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // More body to stream — recv next chunk from upstream.
-    // Don't reset upstream_recv_buf if UpstreamRecv already delivered data
-    // while the client send was in progress.
-    if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
+    conn.upstream_recv_buf.reset();
     conn.on_complete = &on_response_body_recvd<Loop>;
     loop->submit_recv_upstream(conn);
 }
@@ -700,11 +699,10 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     if (ev.type != IoEventType::Send) {
         if (ev.type == IoEventType::UpstreamSend) return;
-        // UpstreamRecv: body data already in upstream_recv_buf. Don't discard.
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain upload body. Ignore EOF (half-close).
+        // Client Recv: drain only if early response (keep_alive=false).
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) conn.recv_buf.reset();
+            if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
             loop->submit_recv(conn);
             return;
         }
@@ -788,8 +786,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // More body to stream — recv next chunk from upstream.
-    // Don't reset if UpstreamRecv already delivered data during the send.
-    if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
+    conn.upstream_recv_buf.reset();
     conn.on_complete = &on_response_body_recvd<Loop>;
     loop->submit_recv_upstream(conn);
 }
@@ -803,17 +800,15 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 // Helper: handle an UpstreamRecv event that arrives during request body streaming.
 // Handles: EOF/error → close/502, 1xx → skip and continue, non-1xx → flag pending.
 //
-// IMPORTANT: This must NOT call on_upstream_response directly because an
-// upstream send may still be in-flight. Epoll reports upstream send completions
-// as IoEventType::Send (not UpstreamSend), so transitioning to response
-// forwarding while a send is pending would cause the stale send completion
-// to be misinterpreted as the client-response send ack.
-//
-// Instead, non-1xx responses set early_response_pending = true. The caller
-// (on_request_body_sent body_done or more_body paths) checks this flag after
-// the upstream send settles and transitions to on_upstream_response then.
+// send_in_flight: if true, an upstream send is outstanding (called from
+// on_request_body_sent). Don't call submit_recv_upstream — on epoll, the
+// upstream fd already has EPOLLIN|EPOLLOUT from add_send_upstream, and
+// re-arming recv would clobber EPOLLOUT and stall the send.
 template <typename Loop>
-static inline void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev) {
+static inline void handle_early_upstream_recv(Loop* loop,
+                                              Connection& conn,
+                                              IoEvent ev,
+                                              bool send_in_flight) {
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
         // Upstream closed with no data — close immediately (no send in-flight
         // concern since the connection is dead anyway).
@@ -833,8 +828,10 @@ static inline void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEv
     ParseStatus ps =
         resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
     if (ps == ParseStatus::Incomplete) {
-        // Partial response header — re-arm and wait for more.
-        loop->submit_recv_upstream(conn);
+        // Partial response header — wait for more. Don't re-arm recv if a
+        // send is in-flight: epoll EPOLLIN|EPOLLOUT is already armed and
+        // submit_recv_upstream would clobber EPOLLOUT.
+        if (!send_in_flight) loop->submit_recv_upstream(conn);
         return;
     }
     if (ps == ParseStatus::Complete && resp.status_code >= 100 && resp.status_code < 200 &&
@@ -850,12 +847,11 @@ static inline void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEv
             u8* dst = conn.upstream_recv_buf.write_ptr();
             __builtin_memmove(dst, src, remaining);
             conn.upstream_recv_buf.commit(remaining);
-            // Re-enter: trailing data might be a full final response.
-            handle_early_upstream_recv<Loop>(loop, conn, ev);
+            handle_early_upstream_recv<Loop>(loop, conn, ev, send_in_flight);
             return;
         }
         conn.upstream_recv_buf.reset();
-        loop->submit_recv_upstream(conn);
+        if (!send_in_flight) loop->submit_recv_upstream(conn);
         return;
     }
     // Non-1xx response: flag pending. Don't transition yet — upstream send
@@ -901,7 +897,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         // Early upstream response arrived while upstream send is in-flight.
         // Don't transition yet — flag it and wait for the send to settle.
         if (ev.type == IoEventType::UpstreamRecv) {
-            handle_early_upstream_recv<Loop>(loop, conn, ev);
+            handle_early_upstream_recv<Loop>(loop, conn, ev, true);
             return;
         }
         loop->close_conn(conn);
@@ -957,7 +953,7 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         // No upstream send is in-flight here (we haven't submitted one yet),
         // so it's safe to transition immediately if non-1xx.
         if (ev.type == IoEventType::UpstreamRecv) {
-            handle_early_upstream_recv<Loop>(loop, conn, ev);
+            handle_early_upstream_recv<Loop>(loop, conn, ev, false);
             if (conn.early_response_pending) {
                 forward_early_response<Loop>(loop, lp, conn);
             }
@@ -1318,9 +1314,9 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         if (ev.type == IoEventType::UpstreamSend) return;
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain upload body. Ignore EOF (half-close).
+        // Client Recv: drain only if early response (keep_alive=false).
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) conn.recv_buf.reset();
+            if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
             loop->submit_recv(conn);
             return;
         }

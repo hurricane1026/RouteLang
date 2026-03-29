@@ -79,7 +79,8 @@ private:
 public:
     static constexpr u32 kMaxConns = 16384;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
-    SlicePool pool;  // per-shard buffer pool (2 slices per active connection)
+    SlicePool
+        pool;  // per-shard buffer pool (3 slices max per connection: recv + send + upstream_recv)
     Connection conns[kMaxConns];
     u32 free_stack[kMaxConns];
     u32 free_top;
@@ -137,7 +138,8 @@ public:
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
         }
-        TRY_VOID(pool.init(kMaxConns * 2, pool_prealloc));
+        // 3 slices max per connection: recv + send + upstream_recv (lazy).
+        TRY_VOID(pool.init(kMaxConns * 3, pool_prealloc));
         auto be = backend.init(id, lfd);
         if (!be) {
             pool.destroy();
@@ -232,6 +234,10 @@ public:
             pool.free(conns[cid].send_slice);
             conns[cid].send_slice = nullptr;
         }
+        if (conns[cid].upstream_recv_slice) {
+            pool.free(conns[cid].upstream_recv_slice);
+            conns[cid].upstream_recv_slice = nullptr;
+        }
         free_stack[free_top++] = cid;
         // Remove from pending_free (swap with last element).
         for (u32 i = 0; i < pending_free_count; i++) {
@@ -258,6 +264,10 @@ public:
                 if (conns[cid].send_slice) {
                     pool.free(conns[cid].send_slice);
                     conns[cid].send_slice = nullptr;
+                }
+                if (conns[cid].upstream_recv_slice) {
+                    pool.free(conns[cid].upstream_recv_slice);
+                    conns[cid].upstream_recv_slice = nullptr;
                 }
                 free_stack[free_top++] = cid;
             } else {
@@ -290,6 +300,22 @@ public:
             timerfd_settime(backend.timer_fd, 0, &wake, nullptr);
         }
     }
+
+    // Lazy-allocate upstream recv buffer for proxy connections.
+    // Only called when a connection starts proxying — non-proxy connections
+    // never pay the cost. Returns false if SlicePool is exhausted.
+    bool alloc_upstream_buf(ConnectionBase& c) {
+        if (c.upstream_recv_slice) return true;  // already allocated
+        u8* s = pool.alloc();
+        if (!s) return false;
+        c.upstream_recv_slice = s;
+        c.upstream_recv_buf.bind(s, SlicePool::kSliceSize);
+        return true;
+    }
+
+    // Clear upstream fd mapping (no-op for legacy template — epoll/iouring
+    // concrete loops handle their own fd maps).
+    void clear_upstream_fd(u32 /*conn_id*/) {}
 
     // Number of connections not yet fully reclaimed.
     // Includes pending_free slots: they're closed but still waiting for
@@ -330,6 +356,7 @@ public:
             if (c.pending_ops == 0) {
                 if (c.recv_slice) pool.free(c.recv_slice);
                 if (c.send_slice) pool.free(c.send_slice);
+                if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
                 c.reset();
                 free_stack[free_top++] = cid;
                 return;
@@ -338,10 +365,12 @@ public:
             // reaches 0 in reclaim_pending().
             u8* rs = c.recv_slice;
             u8* ss = c.send_slice;
+            u8* us = c.upstream_recv_slice;
             u32 ops = c.pending_ops;
             c.reset();
             conns[cid].recv_slice = rs;
             conns[cid].send_slice = ss;
+            conns[cid].upstream_recv_slice = us;
             conns[cid].pending_ops = ops;
             pending_free[pending_free_count++] = cid;
         } else {
@@ -349,6 +378,7 @@ public:
             // read/write returns. Return slices to pool immediately.
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
+            if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
             c.reset();
             free_stack[free_top++] = cid;
         }

@@ -6,6 +6,9 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/metrics.h"
 
+#include <errno.h>
+#include <sys/socket.h>
+
 namespace rut {
 
 // HTTP status codes used in callbacks.
@@ -939,11 +942,50 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     if (ev.result <= 0) {
-        // Upstream send failed, but an early response may be buffered.
-        // Forward it instead of just dropping the connection.
+        // Upstream send failed (EPIPE/ECONNRESET). The origin may have sent
+        // an early response (401/413) before closing. Check for it:
+        // 1. Already flagged from a previous UpstreamRecv.
         if (conn.early_response_pending) {
             forward_early_response<Loop>(loop, lp, conn);
             return;
+        }
+        // 2. Data already in upstream_recv_buf from body streaming.
+        if (conn.upstream_recv_buf.len() > 0) {
+            conn.recv_buf.reset();
+            conn.keep_alive = false;
+            conn.upstream_start_us = monotonic_us();
+            conn.on_complete = &on_upstream_response<Loop>;
+            IoEvent synth = {conn.id,
+                             static_cast<i32>(conn.upstream_recv_buf.len()),
+                             0,
+                             0,
+                             IoEventType::UpstreamRecv,
+                             0};
+            on_upstream_response<Loop>(lp, conn, synth);
+            return;
+        }
+        // 3. On epoll, pending_completions drain before EPOLLIN. Try a
+        //    non-blocking read to catch an early response the backend
+        //    hasn't delivered yet.
+        if (conn.upstream_fd >= 0) {
+            u32 avail = conn.upstream_recv_buf.write_avail();
+            if (avail > 0) {
+                ssize_t nr;
+                do {
+                    nr = recv(conn.upstream_fd, conn.upstream_recv_buf.write_ptr(), avail, 0);
+                } while (nr < 0 && errno == EINTR);
+                if (nr > 0) {
+                    conn.upstream_recv_buf.commit(static_cast<u32>(nr));
+                    conn.recv_buf.reset();
+                    conn.keep_alive = false;
+                    conn.upstream_start_us = monotonic_us();
+                    conn.on_complete = &on_upstream_response<Loop>;
+                    IoEvent synth = {
+                        conn.id, static_cast<i32>(nr), 0, 0, IoEventType::UpstreamRecv, 0};
+                    on_upstream_response<Loop>(lp, conn, synth);
+                    return;
+                }
+            }
         }
         loop->close_conn(conn);
         return;

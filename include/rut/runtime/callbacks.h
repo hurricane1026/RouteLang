@@ -594,9 +594,13 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         // Stale UpstreamSend from body streaming interrupted by early response.
         if (ev.type == IoEventType::UpstreamSend) return;
-        // Client Recv: client may still be sending upload body. Ignore data.
+        // Client Recv: client may still be sending upload body. Drain to
+        // prevent recv_buf from filling (16KB) → -ENOBUFS → premature close.
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) return;
+            if (ev.result > 0) {
+                conn.recv_buf.reset();
+                return;
+            }
             loop->close_conn(conn);
             return;
         }
@@ -698,9 +702,13 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         // Stale UpstreamSend from body streaming interrupted by early response.
         if (ev.type == IoEventType::UpstreamSend) return;
-        // Client Recv: client may still be sending upload body. Ignore data.
+        // Client Recv: client may still be sending upload body. Drain to
+        // prevent recv_buf from filling (16KB) → -ENOBUFS → premature close.
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) return;
+            if (ev.result > 0) {
+                conn.recv_buf.reset();
+                return;
+            }
             loop->close_conn(conn);
             return;
         }
@@ -1314,9 +1322,12 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         // Stale UpstreamSend from body streaming interrupted by early response.
         if (ev.type == IoEventType::UpstreamSend) return;
         // Client Recv: client may still be sending upload body after early
-        // response. Ignore data, close only on EOF/error.
+        // response. Drain to prevent recv_buf filling → -ENOBUFS → premature close.
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) return;
+            if (ev.result > 0) {
+                conn.recv_buf.reset();
+                return;
+            }
             loop->close_conn(conn);
             return;
         }

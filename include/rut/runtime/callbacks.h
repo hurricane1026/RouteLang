@@ -622,13 +622,13 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         // buffer via consume_upstream_sent, then re-arm recv for more.
         // Brief epoll level-triggered re-wakes are bounded by Send latency.
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain upload body if early response, re-arm recv.
-        // On epoll this branch is unreachable (EPOLLOUT-only during send).
-        // On io_uring multishot may have terminated — must re-arm to keep
-        // draining upload bytes (otherwise close → TCP RST → response lost).
+        // Client Recv: drain upload body if early response, re-arm on data.
+        // Don't re-arm on EOF — avoids tight recv/rearm loop on half-close.
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
-            loop->submit_recv(conn);
+            if (ev.result > 0) {
+                if (!conn.keep_alive) conn.recv_buf.reset();
+                loop->submit_recv(conn);
+            }
             return;
         }
         loop->close_conn(conn);
@@ -734,10 +734,12 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         if (ev.type == IoEventType::UpstreamSend) return;
         // UpstreamRecv: data in buffer if > 0, -ENOBUFS if full. Ignore both.
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain and re-arm (io_uring multishot may have terminated).
+        // Client Recv: drain and re-arm on data only (not EOF).
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
-            loop->submit_recv(conn);
+            if (ev.result > 0) {
+                if (!conn.keep_alive) conn.recv_buf.reset();
+                loop->submit_recv(conn);
+            }
             return;
         }
         loop->close_conn(conn);
@@ -1435,10 +1437,12 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         if (ev.type == IoEventType::UpstreamSend) return;
         if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain and re-arm (io_uring multishot may have terminated).
+        // Client Recv: drain and re-arm on data only (not EOF).
         if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0 && !conn.keep_alive) conn.recv_buf.reset();
-            loop->submit_recv(conn);
+            if (ev.result > 0) {
+                if (!conn.keep_alive) conn.recv_buf.reset();
+                loop->submit_recv(conn);
+            }
             return;
         }
         loop->close_conn(conn);

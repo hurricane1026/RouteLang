@@ -67,6 +67,7 @@ struct ConnectionBase {
     u32 resp_body_remaining;          // bytes left for Content-Length mode
     ChunkedParser resp_chunk_parser;  // for chunked mode end detection
     u32 resp_body_sent;               // total response body bytes sent (for access log)
+    u32 upstream_send_len;            // bytes from upstream_recv_buf in current client send
 
     // io_uring multishot recv tracking: true while the multishot SQE is
     // armed in the kernel (set on submit, cleared on final CQE without
@@ -152,6 +153,7 @@ struct ConnectionBase {
         resp_body_remaining = 0;
         resp_chunk_parser.reset();
         resp_body_sent = 0;
+        upstream_send_len = 0;
         recv_armed = false;
         send_armed = false;
         upstream_recv_armed = false;

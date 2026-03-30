@@ -60,6 +60,8 @@ template <typename Loop>
 void on_early_upstream_recvd(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void on_early_upstream_recvd_send_inflight(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
+void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev);
 
 // --- Implementations (header-only for inlining) ---
 
@@ -556,12 +558,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // Early UpstreamRecv is handled by on_early_upstream_recvd_send_inflight slot.
 
     if (ev.result < 0) {
-        // Upstream send failed — try to recover an early response (same
-        // as on_request_body_sent: check flag, buffer, then sync recv).
-        if (conn.early_response_pending) {
-            forward_early_response<Loop>(loop, lp, conn);
-            return;
-        }
+        // Upstream send failed — try to recover an early response.
+        // (If early_response was detected, on_upstream_send already
+        // switched to on_body_send_with_early_response — we won't be here.)
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
             conn.on_recv = nullptr;
@@ -608,13 +607,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // Backends guarantee full send of submitted length. ev.result > 0
-
-    // Check for early response flagged during initial send.
-    // forward_early_response → prepare_early_response_state stashes pipelined bytes.
-    if (conn.early_response_pending) {
-        forward_early_response<Loop>(loop, lp, conn);
-        return;
-    }
+    // (If early_response was detected, slot switched → we won't be here.)
 
     // Check if there's more request body to stream from the client.
     // For Content-Length: remaining > 0. For Chunked: always stream
@@ -887,11 +880,12 @@ static inline void handle_early_upstream_recv(Loop* loop,
         // Upstream closed with no data — close immediately (no send in-flight
         // concern since the connection is dead anyway).
         loop->close_conn(conn);
-        return;  // conn freed, early_response_pending irrelevant
+        return;  // conn freed
     }
     if (ev.result <= 0) {
-        // EOF with partial data — mark pending, on_upstream_response will 502.
-        conn.early_response_pending = true;
+        // EOF with partial data — switch slot so send completion forwards 502.
+        conn.on_upstream_send = &on_body_send_with_early_response<Loop>;
+        conn.on_upstream_recv = nullptr;
         return;
     }
     // Parse to determine what it is.
@@ -932,29 +926,36 @@ static inline void handle_early_upstream_recv(Loop* loop,
         if (can_rearm) loop->submit_recv_upstream(conn);
         return;
     }
-    // Non-1xx response: flag pending. Don't transition yet — upstream send
-    // may still be in-flight. on_request_body_sent will check and transition
-    // after the send settles.
-    conn.early_response_pending = true;
+    // Non-1xx response: switch upstream_send slot so the send completion
+    // callback forwards the buffered response. Clear upstream_recv — handled.
+    conn.on_upstream_send = &on_body_send_with_early_response<Loop>;
+    conn.on_upstream_recv = nullptr;
 }
 
-// Transition to forwarding a pending early upstream response.
-// Called after the in-flight upstream send has settled.
+// Upstream send completed (or failed) while an early response is buffered.
+// Slot: on_upstream_send (switched from on_request_body_sent by
+// handle_early_upstream_recv when a non-1xx response arrives).
 template <typename Loop>
-static inline void forward_early_response(Loop* loop, void* lp, Connection& conn) {
-    conn.early_response_pending = false;
+void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    // Send error is OK — the upstream already sent the response; the body
+    // write failure is expected (origin closed after rejecting the upload).
+    // Successful send is also OK — we just ignore the result.
+    (void)ev;
+
     prepare_early_response_state(conn);
-    // Synthesize an UpstreamRecv event. Use result=0 (EOF) if the upstream
-    // closed, so on_upstream_response produces 502 for truncated headers.
-    // If upstream_recv_buf has a complete response, result>0 tells the parser
-    // to proceed normally.
+    conn.on_recv = nullptr;
+    conn.on_upstream_recv = &on_upstream_response<Loop>;
+    conn.on_upstream_send = nullptr;
+
+    // Synthesize UpstreamRecv. Use result=0 (EOF) if headers are incomplete
+    // (upstream closed mid-header → on_upstream_response produces 502).
     HttpResponseParser probe;
     ParsedResponse probe_resp;
     probe_resp.reset();
     probe.reset();
     ParseStatus ps =
         probe.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &probe_resp);
-    // If parse is Incomplete, the upstream must have closed (EOF with partial data).
     i32 synth_result =
         (ps == ParseStatus::Incomplete) ? 0 : static_cast<i32>(conn.upstream_recv_buf.len());
     IoEvent synth = {conn.id, synth_result, 0, 0, IoEventType::UpstreamRecv, 0};
@@ -968,14 +969,9 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     // Slot: on_upstream_send. Early UpstreamRecv → on_early_upstream_recvd_send_inflight.
     if (ev.result <= 0) {
-        // Upstream send failed (EPIPE/ECONNRESET). The origin may have sent
-        // an early response (401/413) before closing. Check for it:
-        // 1. Already flagged from a previous UpstreamRecv.
-        if (conn.early_response_pending) {
-            forward_early_response<Loop>(loop, lp, conn);
-            return;
-        }
-        // 2. Data already in upstream_recv_buf from body streaming.
+        // Upstream send failed. If early_response was detected, on_upstream_send
+        // already switched to on_body_send_with_early_response — we won't be here.
+        // Try to recover from buffer or armed recv.
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
             conn.on_recv = nullptr;
@@ -1028,30 +1024,8 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         body_done = (conn.req_chunk_parser.state == ChunkedParser::State::Complete);
     }
 
-    // Upstream send completed. Check if an early response was flagged
-    // while the send was in-flight — if so, handle it now.
-    if (conn.early_response_pending) {
-        if (body_done) {
-            // Body done + early response buffered: stash pipeline data, then
-            // dispatch directly to on_upstream_response with buffered data.
-            conn.early_response_pending = false;
-            pipeline_stash(conn);
-            conn.recv_buf.reset();
-            conn.upstream_start_us = monotonic_us();
-            conn.on_recv = nullptr;
-            conn.on_upstream_recv = &on_upstream_response<Loop>;
-            IoEvent synth = {conn.id,
-                             static_cast<i32>(conn.upstream_recv_buf.len()),
-                             0,
-                             0,
-                             IoEventType::UpstreamRecv,
-                             0};
-            on_upstream_response<Loop>(lp, conn, synth);
-            return;
-        }
-        forward_early_response<Loop>(loop, lp, conn);
-        return;
-    }
+    // If early_response was detected, on_upstream_send switched to
+    // on_body_send_with_early_response — this callback won't be reached.
 
     if (body_done) {
         pipeline_stash(conn);
@@ -1091,8 +1065,10 @@ template <typename Loop>
 void on_early_upstream_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     handle_early_upstream_recv<Loop>(loop, conn, ev, false);
-    if (conn.early_response_pending) {
-        forward_early_response<Loop>(loop, lp, conn);
+    // No send in-flight: if a non-1xx response was detected (slot switched),
+    // forward immediately by invoking the new slot's callback.
+    if (conn.on_upstream_send == &on_body_send_with_early_response<Loop>) {
+        on_body_send_with_early_response<Loop>(lp, conn, ev);
     }
 }
 

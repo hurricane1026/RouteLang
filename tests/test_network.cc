@@ -5907,9 +5907,8 @@ TEST(early_response, during_body_send_wait) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
-    // Early response is deferred until upstream send completes
-    CHECK(c->early_response_pending);
-    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
+    // Early response deferred: slot switched to on_body_send_with_early_response
+    CHECK_EQ(c->on_upstream_send, &on_body_send_with_early_response<SmallLoop>);
 
     // Upstream send completion arrives → now forward the 413
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
@@ -5987,7 +5986,7 @@ TEST(early_response, deferred_until_send_completes) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     // Deferred — waiting for send to settle
-    CHECK(c->early_response_pending);
+    CHECK_EQ(c->on_upstream_send, &on_body_send_with_early_response<SmallLoop>);
     CHECK(c->fd >= 0);
 
     // UpstreamSend completion arrives → forward_early_response triggers
@@ -6295,8 +6294,8 @@ TEST(early_response, upstream_recv_during_initial_send) {
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-    // Should flag early_response_pending (send still in-flight).
-    CHECK(c->early_response_pending);
+    // Slot should switch to on_body_send_with_early_response (send still in-flight).
+    CHECK_EQ(c->on_upstream_send, &on_body_send_with_early_response<SmallLoop>);
     // Send completion → forward the 413.
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     CHECK_EQ(c->resp_status, static_cast<u16>(413));
@@ -6322,7 +6321,7 @@ TEST(early_response, body_done_with_pending_dispatches_directly) {
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-    CHECK(c->early_response_pending);
+    CHECK_EQ(c->on_upstream_send, &on_body_send_with_early_response<SmallLoop>);
     // body_remaining was set to 0 by on_request_body_recvd. Force body_done.
     c->req_body_remaining = 0;
     // Send completes: body_done + early_response → dispatch directly.
@@ -6458,7 +6457,7 @@ TEST(early_response, fragmented_during_initial_send_preserved) {
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-    // Partial bytes should NOT have been cleared by early_response_pending.
+    // Partial bytes preserved (slot switched, not cleared).
     CHECK_EQ(c->upstream_recv_buf.len(), plen);
     // Send completes (no more body — initial send covers all).
     // The body was fully in the initial send, so more_req_body == false.
@@ -6508,8 +6507,8 @@ TEST(early_response, pipeline_preserved_when_body_done) {
     loop.backend.inject(ev);
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-    // early_response_pending set (send in-flight)
-    CHECK(c->early_response_pending);
+    // on_upstream_send switched to on_body_send_with_early_response
+    CHECK_EQ(c->on_upstream_send, &on_body_send_with_early_response<SmallLoop>);
 
     // Send completes. Body was fully sent, so body_done path should:
     // - stash pipelined GET

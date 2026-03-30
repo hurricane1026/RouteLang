@@ -78,9 +78,6 @@ public:
                 // null = data already in upstream_recv_buf
                 break;
             case IoEventType::UpstreamSend:
-                if (conn.on_upstream_send) conn.on_upstream_send(&self(), conn, ev);
-                // null = stale completion, ignore
-                break;
             case IoEventType::UpstreamConnect:
                 if (conn.on_upstream_send) conn.on_upstream_send(&self(), conn, ev);
                 break;

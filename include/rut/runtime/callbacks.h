@@ -448,8 +448,13 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     if (ev.type != IoEventType::Send) {
         // Pipelined client Recv with data: bytes are in recv_buf,
         // found by pipeline_shift after send completes.
-        // EOF/error Recv: close immediately (peer disconnected).
-        if (ev.type == IoEventType::Recv && ev.result > 0) return;
+        // EOF: tolerate half-close (client can still read response).
+        // -ENOBUFS: close to prevent busy-loop.
+        if (ev.type == IoEventType::Recv) {
+            if (ev.result >= 0) return;
+            loop->close_conn(conn);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }

@@ -7254,6 +7254,21 @@ TEST(dispatch, null_upstream_recv_ignored) {
     CHECK(c->fd >= 0);
 }
 
+TEST(dispatch, null_upstream_recv_enobufs_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    // Process request so on_send is set (dispatch guard active)
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_upstream_recv = nullptr;
+    u32 cid = c->id;
+    // -ENOBUFS on null upstream_recv → close (prevent hot-loop)
+    loop.dispatch(make_ev(cid, IoEventType::UpstreamRecv, -105));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
 TEST(dispatch, null_upstream_send_ignored) {
     SmallLoop loop;
     loop.setup();

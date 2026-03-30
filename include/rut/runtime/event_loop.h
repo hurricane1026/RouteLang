@@ -74,8 +74,13 @@ public:
                 if (conn.on_send) conn.on_send(&self(), conn, ev);
                 break;
             case IoEventType::UpstreamRecv:
-                if (conn.on_upstream_recv) conn.on_upstream_recv(&self(), conn, ev);
-                // null = data already in upstream_recv_buf
+                if (conn.on_upstream_recv) {
+                    conn.on_upstream_recv(&self(), conn, ev);
+                } else if (ev.result < 0) {
+                    // -ENOBUFS: upstream_recv_buf full, close to prevent hot-loop.
+                    self().close_conn(conn);
+                }
+                // null + result >= 0: data in upstream_recv_buf, safely ignored.
                 break;
             case IoEventType::UpstreamSend:
             case IoEventType::UpstreamConnect:

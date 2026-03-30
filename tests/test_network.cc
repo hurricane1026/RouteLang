@@ -6875,6 +6875,360 @@ TEST(legacy_loop, alloc_upstream_buf) {
     CHECK(c.upstream_recv_slice != nullptr);
 }
 
+// ==========================================================================
+// Exhaustive dispatch tests: verify per-event-type slot isolation and
+// centralized null-slot handling.
+// ==========================================================================
+
+// --- Part 1: handle_unhandled_recv (null on_recv) ---
+// Tests the centralized Recv tolerance in dispatch_event.
+
+TEST(dispatch, null_recv_data_keepalive_preserves_buf) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    // Process request so on_send is set
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_recv = nullptr;
+    c->keep_alive = true;
+    // Write data then dispatch → handle_unhandled_recv preserves buf
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    dst[0] = 'A';
+    c->recv_buf.commit(1);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK(c->fd >= 0);
+    CHECK_GT(c->recv_buf.len(), 0u);  // preserved for pipeline
+}
+
+TEST(dispatch, null_recv_data_no_keepalive_drains_buf) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    // Process request so on_send is set (dispatch guard needs at least one slot)
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_recv = nullptr;
+    c->keep_alive = false;
+    // Write data then dispatch directly → handle_unhandled_recv → reset.
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < 50; j++) dst[j] = static_cast<u8>(j);
+    c->recv_buf.commit(50);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK(c->fd >= 0);
+    CHECK_EQ(c->recv_buf.len(), 0u);  // drained
+}
+
+TEST(dispatch, null_recv_eof_tolerates_halfclose) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_recv = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 0));  // EOF
+    CHECK(c->fd >= 0);                                    // tolerated
+}
+
+TEST(dispatch, null_recv_enobufs_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    // Process request so slots are active
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_recv = nullptr;
+    u32 cid = c->id;
+    loop.dispatch(make_ev(cid, IoEventType::Recv, -105));  // -ENOBUFS
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+// --- Part 2: null upstream slots (ignored) ---
+
+TEST(dispatch, null_upstream_recv_ignored) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->on_upstream_recv = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 100));
+    CHECK(c->fd >= 0);
+}
+
+TEST(dispatch, null_upstream_send_ignored) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->on_upstream_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
+    CHECK(c->fd >= 0);
+}
+
+TEST(dispatch, null_send_ignored) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->on_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::Send, 100));
+    CHECK(c->fd >= 0);
+}
+
+TEST(dispatch, null_upstream_connect_ignored) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->on_upstream_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    CHECK(c->fd >= 0);
+}
+
+// --- Part 3: Slot isolation — each event type only reaches its slot ---
+// For every callback, dispatch a non-matching event type and verify
+// the callback is NOT invoked (connection stays alive, state unchanged).
+
+// Helper: a callback that sets a flag when invoked.
+static bool g_callback_invoked = false;
+template <typename Loop>
+void test_sentinel_callback(void*, Connection&, IoEvent) {
+    g_callback_invoked = true;
+}
+
+// on_recv slot: should NOT receive Send, UpstreamRecv, UpstreamSend.
+TEST(dispatch_isolation, recv_slot_ignores_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_recv = &test_sentinel_callback<SmallLoop>;
+    c->on_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::Send, 100));
+    CHECK(!g_callback_invoked);
+}
+
+TEST(dispatch_isolation, recv_slot_ignores_upstream_recv) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_recv = &test_sentinel_callback<SmallLoop>;
+    c->on_upstream_recv = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 100));
+    CHECK(!g_callback_invoked);
+}
+
+TEST(dispatch_isolation, recv_slot_ignores_upstream_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_recv = &test_sentinel_callback<SmallLoop>;
+    c->on_upstream_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
+    CHECK(!g_callback_invoked);
+}
+
+// on_send slot: should NOT receive Recv, UpstreamRecv, UpstreamSend.
+TEST(dispatch_isolation, send_slot_ignores_recv) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_send = &test_sentinel_callback<SmallLoop>;
+    c->on_recv = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK(!g_callback_invoked);
+}
+
+TEST(dispatch_isolation, send_slot_ignores_upstream_recv) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_send = &test_sentinel_callback<SmallLoop>;
+    c->on_upstream_recv = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 100));
+    CHECK(!g_callback_invoked);
+}
+
+TEST(dispatch_isolation, send_slot_ignores_upstream_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_send = &test_sentinel_callback<SmallLoop>;
+    c->on_upstream_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
+    CHECK(!g_callback_invoked);
+}
+
+// on_upstream_recv slot: should NOT receive Recv, Send, UpstreamSend.
+TEST(dispatch_isolation, upstream_recv_slot_ignores_recv) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_upstream_recv = &test_sentinel_callback<SmallLoop>;
+    c->on_recv = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK(!g_callback_invoked);
+}
+
+TEST(dispatch_isolation, upstream_recv_slot_ignores_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_upstream_recv = &test_sentinel_callback<SmallLoop>;
+    c->on_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::Send, 100));
+    CHECK(!g_callback_invoked);
+}
+
+TEST(dispatch_isolation, upstream_recv_slot_ignores_upstream_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_upstream_recv = &test_sentinel_callback<SmallLoop>;
+    c->on_upstream_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
+    CHECK(!g_callback_invoked);
+}
+
+// on_upstream_send slot: should NOT receive Recv, Send, UpstreamRecv.
+TEST(dispatch_isolation, upstream_send_slot_ignores_recv) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_upstream_send = &test_sentinel_callback<SmallLoop>;
+    c->on_recv = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK(!g_callback_invoked);
+}
+
+TEST(dispatch_isolation, upstream_send_slot_ignores_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_upstream_send = &test_sentinel_callback<SmallLoop>;
+    c->on_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::Send, 100));
+    CHECK(!g_callback_invoked);
+}
+
+TEST(dispatch_isolation, upstream_send_slot_ignores_upstream_recv) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_upstream_send = &test_sentinel_callback<SmallLoop>;
+    c->on_upstream_recv = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 100));
+    CHECK(!g_callback_invoked);
+}
+
+// UpstreamConnect routes to on_upstream_send slot.
+TEST(dispatch_isolation, upstream_connect_routes_to_upstream_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_upstream_send = &test_sentinel_callback<SmallLoop>;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    CHECK(g_callback_invoked);
+}
+
+// --- Part 4: Positive routing — each event reaches its correct slot ---
+
+TEST(dispatch_isolation, recv_reaches_recv_slot) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_recv = &test_sentinel_callback<SmallLoop>;
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK(g_callback_invoked);
+}
+
+TEST(dispatch_isolation, send_reaches_send_slot) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_send = &test_sentinel_callback<SmallLoop>;
+    loop.dispatch(make_ev(c->id, IoEventType::Send, 100));
+    CHECK(g_callback_invoked);
+}
+
+TEST(dispatch_isolation, upstream_recv_reaches_upstream_recv_slot) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_upstream_recv = &test_sentinel_callback<SmallLoop>;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 100));
+    CHECK(g_callback_invoked);
+}
+
+TEST(dispatch_isolation, upstream_send_reaches_upstream_send_slot) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    g_callback_invoked = false;
+    c->on_upstream_send = &test_sentinel_callback<SmallLoop>;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
+    CHECK(g_callback_invoked);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

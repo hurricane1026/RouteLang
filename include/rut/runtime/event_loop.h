@@ -57,6 +57,77 @@ public:
         self().submit_send_upstream_impl(c, buf, len);
     }
     void submit_recv_upstream(Connection& c) { self().submit_recv_upstream_impl(c); }
+
+    // Per-event-type dispatch: route to typed slot, fallback to on_complete.
+    // Called from each concrete EventLoop's dispatch() after timer refresh.
+    // Centralizes all "unexpected event" handling in one place.
+    void dispatch_event(Connection& conn, const IoEvent& ev) {
+        // Try per-type slot first.
+        ConnectionBase::Callback handler = nullptr;
+        switch (ev.type) {
+            case IoEventType::Recv:
+                handler = conn.on_recv;
+                break;
+            case IoEventType::Send:
+                handler = conn.on_send;
+                break;
+            case IoEventType::UpstreamRecv:
+                handler = conn.on_upstream_recv;
+                break;
+            case IoEventType::UpstreamSend:
+                handler = conn.on_upstream_send;
+                break;
+            case IoEventType::UpstreamConnect:
+                handler = conn.on_upstream_send;
+                break;
+            default:
+                break;
+        }
+        if (handler) {
+            handler(&self(), conn, ev);
+            return;
+        }
+        // Fallback to legacy on_complete during migration.
+        if (conn.on_complete) {
+            conn.on_complete(&self(), conn, ev);
+            return;
+        }
+        // Fully migrated: null slot = centralized handling.
+        switch (ev.type) {
+            case IoEventType::Recv:
+                handle_unhandled_recv(conn, ev);
+                break;
+            case IoEventType::UpstreamRecv:
+                // null = ignore (data already in upstream_recv_buf)
+                break;
+            case IoEventType::UpstreamSend:
+                // null = ignore (stale completion)
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Handle client Recv when no on_recv handler is set.
+    // Centralizes drain/EOF/ENOBUFS logic — written once, correct everywhere.
+    void handle_unhandled_recv(Connection& conn, const IoEvent& ev) {
+        // If on_complete is set (legacy path), forward to it.
+        if (conn.on_complete) {
+            conn.on_complete(&self(), conn, ev);
+            return;
+        }
+        // Per-type slot mode: centralized tolerance.
+        if (ev.result > 0) {
+            if (!conn.keep_alive) conn.recv_buf.reset();
+            if (!conn.recv_armed) self().submit_recv(conn);
+            return;
+        }
+        if (ev.result < 0) {
+            self().close_conn(conn);  // -ENOBUFS: prevent busy-loop
+            return;
+        }
+        // EOF: tolerate half-close
+    }
 };
 
 template <typename Backend>
@@ -521,9 +592,10 @@ public:
                     if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
                 }
             }
-            if (conn.on_complete) {
+            if (conn.on_complete || conn.on_recv || conn.on_send || conn.on_upstream_recv ||
+                conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
-                conn.on_complete(this, conn, ev);
+                this->dispatch_event(conn, ev);
             } else if constexpr (Backend::kAsyncIo) {
                 // Stale CQE for a closed connection. If all ops are now
                 // complete, reclaim the slot immediately so a later Accept

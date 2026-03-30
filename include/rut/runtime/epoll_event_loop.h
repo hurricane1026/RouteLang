@@ -273,9 +273,10 @@ public:
         }
         if (ev.conn_id < kMaxConns) {
             auto& conn = conns[ev.conn_id];
-            if (conn.on_complete) {
+            if (conn.on_complete || conn.on_recv || conn.on_send || conn.on_upstream_recv ||
+                conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
-                conn.on_complete(this, conn, ev);
+                this->dispatch_event(conn, ev);
             }
         }
     }

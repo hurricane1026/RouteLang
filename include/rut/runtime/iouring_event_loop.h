@@ -383,9 +383,10 @@ public:
                 if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
                 if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
             }
-            if (conn.on_complete) {
+            if (conn.on_complete || conn.on_recv || conn.on_send || conn.on_upstream_recv ||
+                conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
-                conn.on_complete(this, conn, ev);
+                this->dispatch_event(conn, ev);
             } else {
                 // Stale CQE for a closed connection.
                 if (conn.pending_ops == 0) {

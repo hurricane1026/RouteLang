@@ -403,7 +403,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             // Keep pipeline_depth > 0 so subsequent recvs also check for
             // Incomplete (multi-packet reassembly of the pipelined request).
             conn.state = ConnState::ReadingHeader;
-            conn.on_recv = &on_header_received<Loop>;
+            conn.set_slots(&on_header_received<Loop>, nullptr, nullptr, nullptr);
             loop->submit_recv(conn);
             return;
         }
@@ -436,8 +436,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    // Slot: on_send. Send complete — clear slot.
-    conn.on_send = nullptr;
+    // Send complete — clear all slots (will set on_recv for keep-alive below).
+    conn.set_slots(nullptr, nullptr, nullptr, nullptr);
 
     if (ev.result < 0) {
         loop->close_conn(conn);
@@ -746,7 +746,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     // Forward upstream body data to client (capped to body boundary).
     conn.upstream_send_len = send_len;
-    conn.on_send = &on_response_body_sent<Loop>;
+    conn.set_slots(nullptr, &on_response_body_sent<Loop>, nullptr, nullptr);
     conn.state = ConnState::Sending;
     loop->submit_send(conn, conn.upstream_recv_buf.data(), send_len);
 }
@@ -764,7 +764,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    conn.on_send = nullptr;  // send complete
+    conn.set_slots(nullptr, nullptr, nullptr, nullptr);  // send complete, decide next below
     u32 remaining = consume_upstream_sent(conn);
 
     // Check if body is complete.
@@ -833,18 +833,14 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.pipeline_depth = 0;
         conn.recv_buf.reset();
         conn.state = ConnState::ReadingHeader;
-        conn.on_recv = &on_header_received<Loop>;
-        conn.on_send = nullptr;
-        conn.on_upstream_recv = nullptr;
-        conn.on_upstream_send = nullptr;
+        conn.set_slots(&on_header_received<Loop>, nullptr, nullptr, nullptr);
         loop->submit_recv(conn);
         return;
     }
 
     // More body to stream.
-    conn.on_upstream_recv = &on_response_body_recvd<Loop>;
+    conn.set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
     if (remaining > 0) {
-        // Data already available — dispatch directly.
         IoEvent synth = {conn.id, static_cast<i32>(remaining), 0, 0, IoEventType::UpstreamRecv, 0};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
@@ -1040,8 +1036,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     // More body to stream — recv next chunk from client.
     conn.recv_buf.reset();
-    conn.on_recv = &on_request_body_recvd<Loop>;
-    conn.on_upstream_recv = &on_early_upstream_recvd<Loop>;
+    conn.set_slots(&on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
     loop->submit_recv(conn);
     loop->submit_recv_upstream(conn);
 }
@@ -1109,8 +1104,10 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     conn.req_size += send_len;
     conn.req_initial_send_len = send_len;
-    conn.on_upstream_send = &on_request_body_sent<Loop>;
-    conn.on_upstream_recv = &on_early_upstream_recvd_send_inflight<Loop>;
+    conn.set_slots(nullptr,
+                   nullptr,
+                   &on_early_upstream_recvd_send_inflight<Loop>,
+                   &on_request_body_sent<Loop>);
     loop->submit_send_upstream(conn, conn.recv_buf.data(), send_len);
 }
 
@@ -1168,7 +1165,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
-        conn.on_send = &on_response_sent<Loop>;
+        conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
         conn.state = ConnState::Sending;
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
@@ -1268,7 +1265,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
                 conn.keep_alive = false;
                 conn.resp_status = kStatusBadGateway;
-                conn.on_send = &on_response_sent<Loop>;
+                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
                 conn.state = ConnState::Sending;
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
@@ -1353,9 +1350,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                                         conn.resp_body_remaining == 0) ||
                                        (conn.resp_body_mode == BodyMode::Chunked && chunked_done);
                 if (!drain_body_done) {
-                    conn.on_send = &on_response_header_sent<Loop>;
+                    conn.set_slots(nullptr, &on_response_header_sent<Loop>, nullptr, nullptr);
                 } else {
-                    conn.on_send = &on_response_sent<Loop>;
+                    conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
                 }
                 conn.state = ConnState::Sending;
                 // Sending from send_buf (rebuilt with Connection: close), not
@@ -1398,14 +1395,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     // Clear upstream slots before sending — the response is being forwarded,
     // no more upstream events should reach callbacks during the send.
-    conn.on_upstream_recv = nullptr;
-    conn.on_upstream_send = nullptr;
-
     if (body_complete) {
-        conn.on_send = &on_proxy_response_sent<Loop>;
+        conn.set_slots(nullptr, &on_proxy_response_sent<Loop>, nullptr, nullptr);
         loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
     } else {
-        conn.on_send = &on_response_header_sent<Loop>;
+        conn.set_slots(nullptr, &on_response_header_sent<Loop>, nullptr, nullptr);
         loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
     }
 }
@@ -1414,15 +1408,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    conn.on_send = nullptr;  // send complete
+    conn.set_slots(nullptr, nullptr, nullptr, nullptr);  // send complete
 
     if (ev.result < 0) {
         loop->close_conn(conn);
         return;
     }
-
-    // Backends guarantee full send of submitted length. The submitted
-    // length may be less than recv_buf.len() (trimmed for HEAD/204/CL cap).
 
     // Record metrics + access log only after send is confirmed successful.
     on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
@@ -1485,10 +1476,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.pipeline_depth = 0;
     conn.recv_buf.reset();
     conn.state = ConnState::ReadingHeader;
-    conn.on_recv = &on_header_received<Loop>;
-    conn.on_send = nullptr;
-    conn.on_upstream_recv = nullptr;
-    conn.on_upstream_send = nullptr;
+    conn.set_slots(&on_header_received<Loop>, nullptr, nullptr, nullptr);
     loop->submit_recv(conn);
 }
 

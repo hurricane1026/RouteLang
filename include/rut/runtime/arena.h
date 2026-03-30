@@ -9,41 +9,98 @@
 
 namespace rut {
 
-// Arena — bump allocator with block chaining. Zero stdlib, no malloc, no new.
+// Forward declaration — only needed by SlicePoolBackend.
+struct SlicePool;
+
+// ── Block Backends ─────────────────────────────────────────────────
+// Arena is parameterized on a backend that controls where blocks come
+// from. Two backends:
+//   MmapBackend      — mmap/munmap, variable-size blocks. For compiler.
+//   SlicePoolBackend — borrows 16KB slices from SlicePool. For runtime hot path.
+
+struct MmapBackend {
+    u64 default_block_size = 4096;
+
+    core::Expected<void, Error> init(u64 block_size) {
+        default_block_size = block_size < 256 ? 256 : block_size;
+        return {};
+    }
+
+    // Acquire a block of at least `needed` bytes. Returns raw ptr + actual size.
+    // The caller embeds a Block header at the start.
+    u8* acquire(u64 needed, u64* out_size) {
+        u64 size = default_block_size > needed ? default_block_size : needed;
+        // Page-align
+        if (size > static_cast<u64>(-1) - 4095) return nullptr;
+        size = (size + 4095) & ~static_cast<u64>(4095);
+        void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return nullptr;
+        *out_size = size;
+        return static_cast<u8*>(p);
+    }
+
+    void release(u8* ptr, u64 size) { munmap(ptr, size); }
+};
+
+struct SlicePoolBackend {
+    SlicePool* pool = nullptr;
+
+    core::Expected<void, Error> init(SlicePool* p) {
+        pool = p;
+        return {};
+    }
+
+    // Acquire a 16KB slice from the pool. `needed` must fit in one slice.
+    u8* acquire(u64 needed, u64* out_size);
+    void release(u8* ptr, u64 size);
+};
+
+// ── Arena<Backend> ─────────────────────────────────────────────────
+// Bump allocator with block chaining. Zero stdlib, no malloc, no new.
 //
 // Pure bump allocation. No destructors, no cleanup, no ownership tracking.
 // Objects allocated from Arena must be trivially destructible, or the caller
 // is responsible for calling destructors manually before reset/destroy.
 //
-// Block memory comes from mmap/munmap. No malloc/free anywhere.
+// Block memory comes from the Backend (mmap or SlicePool).
 //
-// Typical usage: per-request temporaries.
-//   Arena arena;
-//   arena.init(4096);
+// Usage (runtime):
+//   Arena<SlicePoolBackend> arena;
+//   arena.init(&shard_pool);
 //   auto* hdr = arena.alloc_t<Header>();
-//   auto* params = arena.alloc_array<Param>(n);
-//   ... process request ...
-//   arena.reset();  // instant, reuses first block
+//   arena.reset();  // returns extra slices to pool
+//
+// Usage (compiler):
+//   Arena<MmapBackend> arena;
+//   arena.init(4096);
+//   auto* node = arena.alloc_t<AstNode>();
+//   arena.destroy();  // munmap all blocks
 
+template <typename Backend>
 struct Arena {
     struct Block {
         Block* prev;
-        u64 size;  // total mmap'd size (including this header)
+        u64 size;  // total block size (including this header)
         u64 used;  // bytes allocated after header
 
-        u8* data() { return reinterpret_cast<u8*>(this) + ((sizeof(Block) + 15) & ~u64(15)); }
-        u64 capacity() const { return size - ((sizeof(Block) + 15) & ~u64(15)); }
+        static constexpr u64 kHeaderSize = (sizeof(Block) + 15) & ~u64(15);
+        u8* data() { return reinterpret_cast<u8*>(this) + kHeaderSize; }
+        u64 capacity() const { return size - kHeaderSize; }
         u64 remaining() const { return capacity() - used; }
     };
 
     Block* current = nullptr;
-    u64 block_size = 0;
+    Backend backend{};
     u64 total_allocated = 0;
 
-    core::Expected<void, Error> init(u64 initial_block_size) {
-        block_size = initial_block_size < 256 ? 256 : initial_block_size;
+    // Initialize with backend-specific args (forwarded to Backend::init).
+    template <typename... Args>
+    core::Expected<void, Error> init(Args&&... args) {
         total_allocated = 0;
-        current = alloc_block(block_size, nullptr);
+        current = nullptr;
+        auto r = backend.init(static_cast<Args&&>(args)...);
+        if (!r) return r;
+        current = alloc_block(Block::kHeaderSize, nullptr);
         if (!current) return core::make_unexpected(Error::from_errno(Error::Source::Arena));
         return {};
     }
@@ -51,7 +108,6 @@ struct Arena {
     // Bump allocate, 8-byte aligned.
     void* alloc(u64 size) {
         if (!current) return nullptr;
-        // Overflow check: size + 7 must not wrap
         if (size > static_cast<u64>(-1) - 7) return nullptr;
         size = (size + 7) & ~static_cast<u64>(7);
         if (current->remaining() >= size) {
@@ -59,13 +115,12 @@ struct Arena {
             current->used += size;
             return p;
         }
-        // Use aligned header size, matching Block::data() offset
-        constexpr u64 kHdr = (sizeof(Block) + 15) & ~static_cast<u64>(15);
-        if (size > static_cast<u64>(-1) - kHdr) return nullptr;
-        u64 needed = size + kHdr;
-        u64 new_size = block_size > needed ? block_size : needed;
-        Block* b = alloc_block(new_size, current);
-        if (!b) return nullptr;
+        if (size > static_cast<u64>(-1) - Block::kHeaderSize) return nullptr;
+        Block* b = alloc_block(Block::kHeaderSize + size, current);
+        if (!b || b->capacity() < size) {
+            if (b) backend.release(reinterpret_cast<u8*>(b), b->size);
+            return nullptr;
+        }
         current = b;
         void* p = current->data() + current->used;
         current->used += size;
@@ -94,25 +149,22 @@ struct Arena {
     // Free all blocks except first, reset pointer. O(blocks).
     void reset() {
         if (!current) return;
-        Block* b = current;
-        while (b->prev) {
-            Block* prev = b->prev;
-            u64 sz = b->size;
-            munmap(b, sz);
+        while (current->prev) {
+            Block* prev = current->prev;
+            u64 sz = current->size;
+            backend.release(reinterpret_cast<u8*>(current), sz);
             total_allocated -= sz;
-            b = prev;
+            current = prev;
         }
-        b->used = 0;
-        current = b;
+        current->used = 0;
     }
 
     // Free everything.
     void destroy() {
-        Block* b = current;
-        while (b) {
-            Block* prev = b->prev;
-            munmap(b, b->size);
-            b = prev;
+        while (current) {
+            Block* prev = current->prev;
+            backend.release(reinterpret_cast<u8*>(current), current->size);
+            current = prev;
         }
         current = nullptr;
         total_allocated = 0;
@@ -127,26 +179,24 @@ struct Arena {
     u64 space_allocated() const { return total_allocated; }
 
 private:
-    static u64 page_align(u64 size) {
-        if (size > static_cast<u64>(-1) - 4095) return 0;  // overflow guard
-        return (size + 4095) & ~static_cast<u64>(4095);
-    }
-
-    Block* alloc_block(u64 size, Block* prev) {
-        size = page_align(size);
-        if (size == 0) {
-            errno = ENOMEM;  // overflow in page_align
-            return nullptr;
-        }
-        void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (p == MAP_FAILED) return nullptr;
-        auto* b = static_cast<Block*>(p);
+    Block* alloc_block(u64 needed, Block* prev) {
+        u64 actual_size = 0;
+        u8* mem = backend.acquire(needed, &actual_size);
+        if (!mem) return nullptr;
+        auto* b = reinterpret_cast<Block*>(mem);
         b->prev = prev;
-        b->size = size;
+        b->size = actual_size;
         b->used = 0;
-        total_allocated += size;
+        total_allocated += actual_size;
         return b;
     }
 };
+
+// ── Type Aliases ───────────────────────────────────────────────────
+// MmapArena  — compiler/offline use (mmap-backed, variable-size blocks)
+// SliceArena — runtime hot path (SlicePool-backed, 16KB fixed blocks)
+
+using MmapArena = Arena<MmapBackend>;
+using SliceArena = Arena<SlicePoolBackend>;
 
 }  // namespace rut

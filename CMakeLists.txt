@@ -34,6 +34,12 @@ set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
 
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
 
+# LLVM — required for JIT compilation (ORC JIT via C API).
+# Only the rue_jit library links LLVM; rue_runtime stays LLVM-free.
+find_package(LLVM REQUIRED CONFIG)
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+
 # Project include paths
 include_directories(include)
 

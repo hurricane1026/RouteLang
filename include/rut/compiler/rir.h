@@ -355,8 +355,8 @@ struct Module {
     u32 func_count;
     u32 func_cap;
 
-    // Arena that owns all IR memory.
-    Arena* arena;
+    // Arena that owns all IR memory (mmap-backed, compiler use).
+    MmapArena* arena;
 };
 
 }  // namespace rir

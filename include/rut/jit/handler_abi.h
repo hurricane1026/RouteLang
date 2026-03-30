@@ -1,0 +1,142 @@
+#pragma once
+
+#include "rut/common/types.h"
+
+namespace rut {
+namespace jit {
+
+// ── Handler Action ─────────────────────────────────────────────────
+// What the runtime should do after a JIT handler returns.
+
+enum class HandlerAction : u8 {
+    ReturnStatus = 0,  // Send HTTP response with status_code
+    Proxy = 1,         // Forward request to upstream_id
+    Yield = 2,         // Suspend: initiate I/O, resume at next_state
+};
+
+// ── Yield Kind ─────────────────────────────────────────────────────
+// Which I/O operation a Yield requests.
+
+enum class YieldKind : u8 {
+    HttpGet = 0,
+    HttpPost = 1,
+    Proxy = 2,
+    Extern = 3,
+};
+
+// ── Handler Result ─────────────────────────────────────────────────
+// Returned by every JIT handler call as a raw u64. Packed bit layout
+// (little-endian byte order):
+//
+//   byte 0:   action       (HandlerAction)
+//   byte 1-2: status_code  (u16, for ReturnStatus)
+//   byte 3-4: upstream_id  (u16, for Proxy)
+//   byte 5-6: next_state   (u16, for Yield)
+//   byte 7:   yield_kind   (YieldKind)
+//
+// IMPORTANT: We use u64 as the function return type (not a struct)
+// because clang uses sret (hidden pointer) for packed structs even
+// when they fit in a register. Returning u64 guarantees the value
+// goes in RAX, matching the LLVM IR `ret i64`.
+
+struct HandlerResult {
+    HandlerAction action;
+    u16 status_code;
+    u16 upstream_id;
+    u16 next_state;
+    YieldKind yield_kind;
+
+    // Pack into u64 for return from JIT.
+    u64 pack() const {
+        u64 v = 0;
+        v |= static_cast<u64>(action);
+        v |= static_cast<u64>(status_code) << 8;
+        v |= static_cast<u64>(upstream_id) << 24;
+        v |= static_cast<u64>(next_state) << 40;
+        v |= static_cast<u64>(yield_kind) << 56;
+        return v;
+    }
+
+    // Unpack from u64 returned by JIT.
+    static HandlerResult unpack(u64 v) {
+        HandlerResult r;
+        r.action = static_cast<HandlerAction>(v & 0xFF);
+        r.status_code = static_cast<u16>((v >> 8) & 0xFFFF);
+        r.upstream_id = static_cast<u16>((v >> 24) & 0xFFFF);
+        r.next_state = static_cast<u16>((v >> 40) & 0xFFFF);
+        r.yield_kind = static_cast<YieldKind>((v >> 56) & 0xFF);
+        return r;
+    }
+
+    static HandlerResult make_status(u16 code) {
+        return {HandlerAction::ReturnStatus, code, 0, 0, YieldKind::HttpGet};
+    }
+
+    static HandlerResult make_proxy(u16 upstream) {
+        return {HandlerAction::Proxy, 0, upstream, 0, YieldKind::HttpGet};
+    }
+
+    static HandlerResult make_yield(u16 state, YieldKind kind) {
+        return {HandlerAction::Yield, 0, 0, state, kind};
+    }
+};
+
+// ── Handler Context ────────────────────────────────────────────────
+// Per-request mutable context, allocated from the scratch Arena.
+// Holds the state machine index and live-across-yield values.
+//
+// Layout: [HandlerCtx header] [slot_0] [slot_1] ... [slot_N]
+// Each slot is 8-byte aligned. The number and types of slots are
+// determined at compile time by the state-splitting pass.
+
+struct HandlerCtx {
+    u16 state;        // current state machine state
+    u16 handler_idx;  // index into CompiledHandlers::handlers[]
+    u32 slot_count;   // number of 8-byte slots following this header
+
+    // Access slot storage (8-byte aligned, immediately after header).
+    u8* slots() { return reinterpret_cast<u8*>(this + 1); }
+    const u8* slots() const { return reinterpret_cast<const u8*>(this + 1); }
+
+    // Typed slot access.
+    template <typename T>
+    T load_slot(u32 idx) const {
+        static_assert(sizeof(T) <= 8, "Slot values must be <= 8 bytes");
+        T val{};
+        const u8* src = slots() + idx * 8;
+        __builtin_memcpy(&val, src, sizeof(T));
+        return val;
+    }
+
+    template <typename T>
+    void store_slot(u32 idx, T val) {
+        static_assert(sizeof(T) <= 8, "Slot values must be <= 8 bytes");
+        u8* dst = slots() + idx * 8;
+        u64 zero = 0;
+        __builtin_memcpy(dst, &zero, 8);
+        __builtin_memcpy(dst, &val, sizeof(T));
+    }
+};
+
+static_assert(sizeof(HandlerCtx) == 8, "HandlerCtx header must be 8 bytes");
+
+// ── Handler Function Pointer ───────────────────────────────────────
+// JIT-compiled handlers return u64 (not a struct) to guarantee
+// RAX return on x86-64. Use HandlerResult::unpack() to interpret.
+//
+// Parameters:
+//   conn      — the connection being processed (read peer_addr, etc.)
+//   ctx       — per-request context with state + yield slots
+//   req_data  — raw request bytes (recv_buf content)
+//   req_len   — request buffer length
+//   arena     — scratch arena for temporary allocations
+
+using HandlerFn = u64 (*)(void* conn,  // opaque: Connection* at runtime
+                          HandlerCtx* ctx,
+                          const u8* req_data,
+                          u32 req_len,
+                          void* arena  // opaque: SliceArena* at runtime
+);
+
+}  // namespace jit
+}  // namespace rut

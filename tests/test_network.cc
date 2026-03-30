@@ -1123,27 +1123,27 @@ TEST(copilot4, init_returns_success) {
     CHECK(loop.backend.init(0, -1).has_value());
 }
 
-// Arena init returns Expected on failure.
+// MmapArena init returns Expected on failure.
 // Verify success returns has_value().
 TEST(copilot4, arena_init_returns_success) {
-    Arena a;
+    MmapArena a;
     CHECK(a.init(4096).has_value());
     a.destroy();
 }
 
-// Arena init with absurdly large size should fail gracefully.
+// MmapArena init with absurdly large size should fail gracefully.
 // mmap of near-max u64 will fail → should return error.
 TEST(copilot4, arena_init_huge_fails) {
-    Arena a;
+    MmapArena a;
     auto rc = a.init(static_cast<u64>(-1));  // ~18 exabytes
     CHECK(!rc);
     // Should carry a real errno code
     CHECK(rc.error().code > 0);
 }
 
-// Arena alloc overflow protection
+// MmapArena alloc overflow protection
 TEST(copilot4, arena_alloc_overflow_returns_null) {
-    Arena a;
+    MmapArena a;
     REQUIRE(a.init(4096).has_value());
     // size close to u64 max → overflow in (size+7) alignment
     void* p = a.alloc(static_cast<u64>(-1));

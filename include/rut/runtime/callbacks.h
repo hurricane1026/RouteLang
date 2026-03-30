@@ -521,6 +521,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
         conn.keep_alive = false;  // Connection: close — don't loop back
         conn.resp_status = kStatusBadGateway;
+        conn.on_send = &on_response_sent<Loop>;
         conn.on_complete = &on_response_sent<Loop>;
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
@@ -545,6 +546,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     u32 req_send_len =
         conn.req_initial_send_len > 0 ? conn.req_initial_send_len : conn.recv_buf.len();
     if (req_send_len > conn.recv_buf.len()) req_send_len = conn.recv_buf.len();
+    conn.on_upstream_send = &on_upstream_request_sent<Loop>;
     conn.on_complete = &on_upstream_request_sent<Loop>;
     loop->submit_send_upstream(conn, conn.recv_buf.data(), req_send_len);
 }
@@ -596,6 +598,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         }
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
+            conn.on_upstream_recv = &on_upstream_response<Loop>;
             conn.on_complete = &on_upstream_response<Loop>;
             IoEvent synth = {conn.id,
                              static_cast<i32>(conn.upstream_recv_buf.len()),
@@ -609,6 +612,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         // 3. io_uring: upstream recv still armed — wait for CQE.
         if (conn.upstream_recv_armed) {
             prepare_early_response_state(conn);
+            conn.on_upstream_recv = &on_upstream_response<Loop>;
             conn.on_complete = &on_upstream_response<Loop>;
             loop->submit_recv_upstream(conn);
             return;
@@ -624,6 +628,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                 if (nr > 0) {
                     conn.upstream_recv_buf.commit(static_cast<u32>(nr));
                     prepare_early_response_state(conn);
+                    conn.on_upstream_recv = &on_upstream_response<Loop>;
                     conn.on_complete = &on_upstream_response<Loop>;
                     IoEvent synth = {
                         conn.id, static_cast<i32>(nr), 0, 0, IoEventType::UpstreamRecv, 0};
@@ -657,6 +662,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         // Also arm upstream recv to detect early error responses
         // (401/413) before body is fully sent.
         conn.recv_buf.reset();
+        conn.on_recv = &on_request_body_recvd<Loop>;
         conn.on_complete = &on_request_body_recvd<Loop>;
         loop->submit_recv(conn);
         loop->submit_recv_upstream(conn);
@@ -665,10 +671,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
 
     // Stash pipelined bytes before waiting for upstream response.
     pipeline_stash(conn);
-    conn.recv_buf.reset();  // clear after stash — pipelined bytes are in send_buf
+    conn.recv_buf.reset();
     conn.upstream_start_us = monotonic_us();
-    // Don't reset upstream_recv_buf — it may hold partial early response
-    // bytes from a fragmented UpstreamRecv during the initial send.
+    conn.on_upstream_recv = &on_upstream_response<Loop>;
     conn.on_complete = &on_upstream_response<Loop>;
     if (conn.upstream_recv_buf.len() > 0) {
         IoEvent synth = {conn.id,
@@ -745,6 +750,7 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
 
     // Consume sent bytes, preserving any data UpstreamRecv appended during send.
     u32 remaining = consume_upstream_sent(conn);
+    conn.on_upstream_recv = &on_response_body_recvd<Loop>;
     conn.on_complete = &on_response_body_recvd<Loop>;
     if (remaining > 0) {
         // Data already available — dispatch directly without re-arming recv.
@@ -825,6 +831,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     // Forward upstream body data to client (capped to body boundary).
     conn.upstream_send_len = send_len;
+    conn.on_send = &on_response_body_sent<Loop>;
     conn.on_complete = &on_response_body_sent<Loop>;
     conn.state = ConnState::Sending;
     loop->submit_send(conn, conn.upstream_recv_buf.data(), send_len);
@@ -939,6 +946,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // More body to stream.
+    conn.on_upstream_recv = &on_response_body_recvd<Loop>;
     conn.on_complete = &on_response_body_recvd<Loop>;
     if (remaining > 0) {
         // Data already available — dispatch directly.
@@ -1071,6 +1079,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         // 2. Data already in upstream_recv_buf from body streaming.
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
+            conn.on_upstream_recv = &on_upstream_response<Loop>;
             conn.on_complete = &on_upstream_response<Loop>;
             IoEvent synth = {conn.id,
                              static_cast<i32>(conn.upstream_recv_buf.len()),
@@ -1081,12 +1090,12 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             on_upstream_response<Loop>(lp, conn, synth);
             return;
         }
-        // 3. io_uring: upstream recv is still armed — the CQE hasn't arrived
-        //    yet. Transition to on_upstream_response to wait for it.
+        // 3. io_uring: upstream recv is still armed.
         if (conn.upstream_recv_armed) {
             prepare_early_response_state(conn);
+            conn.on_upstream_recv = &on_upstream_response<Loop>;
             conn.on_complete = &on_upstream_response<Loop>;
-            loop->submit_recv_upstream(conn);  // no-op if already armed
+            loop->submit_recv_upstream(conn);
             return;
         }
         // 4. Epoll only: sync recv fallback.
@@ -1100,6 +1109,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
                 if (nr > 0) {
                     conn.upstream_recv_buf.commit(static_cast<u32>(nr));
                     prepare_early_response_state(conn);
+                    conn.on_upstream_recv = &on_upstream_response<Loop>;
                     conn.on_complete = &on_upstream_response<Loop>;
                     IoEvent synth = {
                         conn.id, static_cast<i32>(nr), 0, 0, IoEventType::UpstreamRecv, 0};
@@ -1129,8 +1139,8 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             pipeline_stash(conn);
             conn.recv_buf.reset();
             conn.upstream_start_us = monotonic_us();
+            conn.on_upstream_recv = &on_upstream_response<Loop>;
             conn.on_complete = &on_upstream_response<Loop>;
-            // Data already in upstream_recv_buf — dispatch directly.
             IoEvent synth = {conn.id,
                              static_cast<i32>(conn.upstream_recv_buf.len()),
                              0,
@@ -1145,11 +1155,11 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (body_done) {
-        // Request body fully forwarded — stash leftovers, wait for upstream response.
         pipeline_stash(conn);
         conn.recv_buf.reset();
         conn.upstream_start_us = monotonic_us();
         if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
+        conn.on_upstream_recv = &on_upstream_response<Loop>;
         conn.on_complete = &on_upstream_response<Loop>;
         // If upstream_recv_buf has data (partial early response from body streaming),
         // dispatch directly instead of re-arming.
@@ -1168,8 +1178,8 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // More body to stream — recv next chunk from client.
-    // Also arm upstream recv to detect early error responses (413/401).
     conn.recv_buf.reset();
+    conn.on_recv = &on_request_body_recvd<Loop>;
     conn.on_complete = &on_request_body_recvd<Loop>;
     loop->submit_recv(conn);
     loop->submit_recv_upstream(conn);
@@ -1228,8 +1238,9 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         send_len = pos;
     }
 
-    conn.req_size += send_len;             // accumulate actual body bytes (excludes pipelined)
-    conn.req_initial_send_len = send_len;  // for pipeline_leftover detection
+    conn.req_size += send_len;
+    conn.req_initial_send_len = send_len;
+    conn.on_upstream_send = &on_request_body_sent<Loop>;
     conn.on_complete = &on_request_body_sent<Loop>;
     loop->submit_send_upstream(conn, conn.recv_buf.data(), send_len);
 }
@@ -1315,6 +1326,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
+        conn.on_send = &on_response_sent<Loop>;
         conn.on_complete = &on_response_sent<Loop>;
         conn.state = ConnState::Sending;
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
@@ -1415,6 +1427,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
                 conn.keep_alive = false;
                 conn.resp_status = kStatusBadGateway;
+                conn.on_send = &on_response_sent<Loop>;
                 conn.on_complete = &on_response_sent<Loop>;
                 conn.state = ConnState::Sending;
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
@@ -1500,8 +1513,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                                         conn.resp_body_remaining == 0) ||
                                        (conn.resp_body_mode == BodyMode::Chunked && chunked_done);
                 if (!drain_body_done) {
+                    conn.on_send = &on_response_header_sent<Loop>;
                     conn.on_complete = &on_response_header_sent<Loop>;
                 } else {
+                    conn.on_send = &on_response_sent<Loop>;
                     conn.on_complete = &on_response_sent<Loop>;
                 }
                 conn.state = ConnState::Sending;
@@ -1544,9 +1559,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     conn.state = ConnState::Sending;
 
     if (body_complete) {
+        conn.on_send = &on_proxy_response_sent<Loop>;
         conn.on_complete = &on_proxy_response_sent<Loop>;
         loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
     } else {
+        conn.on_send = &on_response_header_sent<Loop>;
         conn.on_complete = &on_response_header_sent<Loop>;
         loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
     }

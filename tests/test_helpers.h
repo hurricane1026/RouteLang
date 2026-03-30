@@ -198,7 +198,6 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
             c->fd = ev.result;
             c->state = ConnState::ReadingHeader;
             c->on_recv = &on_header_received<SmallLoop>;
-            c->on_complete = &on_header_received<SmallLoop>;
             timer.add(c, keepalive_timeout);
             this->submit_recv(*c);
             return;
@@ -209,8 +208,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         }
         if (ev.conn_id < kMaxConns) {
             auto& conn = conns[ev.conn_id];
-            if (conn.on_complete || conn.on_recv || conn.on_send || conn.on_upstream_recv ||
-                conn.on_upstream_send) {
+            if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
             }
@@ -539,7 +537,6 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             c->fd = ev.result;
             c->state = ConnState::ReadingHeader;
             c->on_recv = &on_header_received<AsyncSmallLoop>;
-            c->on_complete = &on_header_received<AsyncSmallLoop>;
             timer.add(c, keepalive_timeout);
             this->submit_recv(*c);
             return;
@@ -558,8 +555,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                 if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
                 if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
             }
-            if (conn.on_complete || conn.on_recv || conn.on_send || conn.on_upstream_recv ||
-                conn.on_upstream_send) {
+            if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
             } else {

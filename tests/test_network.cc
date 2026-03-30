@@ -18,7 +18,7 @@ TEST(accept, basic) {
     CHECK_EQ(loop.free_top, SmallLoop::kMaxConns - 2);
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    CHECK_EQ(c->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_header_received<SmallLoop>);
     CHECK_EQ(c->state, ConnState::ReadingHeader);
     CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 2u);
 }
@@ -49,7 +49,7 @@ TEST(recv, then_send) {
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     CHECK_EQ(c->state, ConnState::Sending);
-    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     // recv_buf preserved until on_response_sent (allows proxy to read it)
     CHECK_EQ(c->recv_buf.len(), 100u);
     CHECK_GT(c->send_buf.len(), 0u);
@@ -67,7 +67,7 @@ TEST(recv, eof) {
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 0));
     CHECK_EQ(loop.conns[cid].fd, -1);
-    CHECK(loop.conns[cid].on_complete == nullptr);
+    CHECK(loop.conns[cid].on_recv == nullptr && loop.conns[cid].on_send == nullptr);
 }
 
 TEST(recv, error_connreset) {
@@ -90,12 +90,12 @@ TEST(send, keepalive_loop) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     loop.backend.clear_ops();
     loop.inject_and_dispatch(
         make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
     CHECK_EQ(c->state, ConnState::ReadingHeader);
-    CHECK_EQ(c->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_header_received<SmallLoop>);
     CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
 }
 
@@ -121,10 +121,10 @@ TEST(cycle, three_requests_then_eof) {
     REQUIRE(c != nullptr);
     for (int i = 0; i < 3; i++) {
         loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-        CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+        CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
         loop.inject_and_dispatch(
             make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
-        CHECK_EQ(c->on_complete, &on_header_received<SmallLoop>);
+        CHECK_EQ(c->on_recv, &on_header_received<SmallLoop>);
     }
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 0));
     CHECK_EQ(c->fd, -1);
@@ -342,7 +342,7 @@ TEST(pool, reset_clears_fields) {
     Connection* c = loop.alloc_conn();
     REQUIRE(c != nullptr);
     c->fd = 42;
-    c->on_complete = &on_header_received<SmallLoop>;
+    c->on_recv = &on_header_received<SmallLoop>;
     c->state = ConnState::Sending;
     // Write some data into recv_buf
     const u8 data[] = "hello";
@@ -352,7 +352,7 @@ TEST(pool, reset_clears_fields) {
     loop.free_conn(*c);
     // After free, connection is fully reset (sync backend frees immediately).
     CHECK_EQ(loop.conns[cid].fd, -1);
-    CHECK(loop.conns[cid].on_complete == nullptr);
+    CHECK(loop.conns[cid].on_recv == nullptr && loop.conns[cid].on_send == nullptr);
     CHECK_EQ(loop.conns[cid].state, ConnState::Idle);
     CHECK_EQ(loop.conns[cid].keep_alive, false);
     CHECK_EQ(loop.conns[cid].recv_slice, nullptr);
@@ -473,7 +473,7 @@ TEST(copilot, recv_after_send_keepalive_works) {
 
     // recv → triggers send
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 
     // send completes → callback calls submit_recv
     loop.backend.clear_ops();
@@ -482,7 +482,7 @@ TEST(copilot, recv_after_send_keepalive_works) {
 
     // The submit_recv call must have succeeded (add_recv recorded)
     CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
-    CHECK_EQ(c->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_header_received<SmallLoop>);
 
     // Do it again — second cycle
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
@@ -522,7 +522,7 @@ TEST(proxy, full_cycle) {
 
     // Switch to proxy mode
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
 
@@ -530,7 +530,7 @@ TEST(proxy, full_cycle) {
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
     CHECK_EQ(conn->state, ConnState::Proxying);
-    CHECK_EQ(conn->on_complete, &on_upstream_request_sent<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_send, &on_upstream_request_sent<SmallLoop>);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     // Verify send went to upstream_fd (100), not client fd (42)
     auto* send_op = loop.backend.last_op(MockOp::Send);
@@ -539,22 +539,22 @@ TEST(proxy, full_cycle) {
 
     // Request sent to upstream → wait for response
     loop.backend.clear_ops();
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
-    CHECK_EQ(conn->on_complete, &on_upstream_response<SmallLoop>);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 100));
+    CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<SmallLoop>);
     CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
 
     // Upstream response → forward to client (inject valid HTTP response)
     loop.backend.clear_ops();
     inject_upstream_response(loop, *conn);
     CHECK_EQ(conn->state, ConnState::Sending);
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
 
     // Response sent to client → back to reading (keep-alive)
     loop.inject_and_dispatch(
         make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
 }
 
 // Upstream connect fails → 502 Bad Gateway
@@ -566,12 +566,12 @@ TEST(proxy, connect_fail_502) {
     REQUIRE(conn != nullptr);
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
 
     // Connect fails
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -111));
     // Should send 502 to client
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
     CHECK_GT(conn->send_buf.len(), 0u);
     // Verify "502" in send buffer
     bool has_502 = false;
@@ -602,10 +602,10 @@ TEST(proxy, upstream_send_error) {
     u32 cid = conn->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
 
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -32));  // EPIPE
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, -32));  // EPIPE
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
@@ -619,10 +619,10 @@ TEST(proxy, upstream_eof) {
     u32 cid = conn->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
 
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 100));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, 100));
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 0));  // EOF
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
@@ -637,10 +637,10 @@ TEST(proxy, client_send_error) {
     u32 cid = conn->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
 
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 100));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, 100));
     inject_upstream_response(loop, *conn);
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -32));  // client EPIPE
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -657,11 +657,11 @@ TEST(proxy, keepalive_two_cycles) {
     for (int cycle = 0; cycle < 2; cycle++) {
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
         conn->upstream_fd = 100 + cycle;
-        conn->on_complete = &on_upstream_connected<SmallLoop>;
+        conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
         conn->state = ConnState::Proxying;
         loop.submit_connect(*conn, nullptr, 0);
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
-        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 100));
         inject_upstream_response(loop, *conn);
         loop.inject_and_dispatch(
             make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
@@ -773,7 +773,7 @@ TEST(recv_buf, proxy_forwards_recv_data) {
 
     // Switch to proxy mode
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
 
@@ -804,9 +804,9 @@ TEST(recv_buf, buffer_state_through_proxy_cycle) {
 
     // proxy flow
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 100));
 
     // upstream response → upstream_recv_buf gets new data (valid HTTP response)
     inject_upstream_response(loop, *conn);
@@ -934,7 +934,7 @@ TEST(recv_semantic, proxy_recv_buf_lifetime) {
 
     // Switch to proxy mode and connect upstream
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
 
     // Upstream connect succeeds → forwards recv_buf to upstream
@@ -942,13 +942,13 @@ TEST(recv_semantic, proxy_recv_buf_lifetime) {
 
     // Upstream request sent → on_upstream_request_sent resets upstream_recv_buf for response.
     // recv_buf retains original request data (not touched).
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 100));
     CHECK_EQ(conn->upstream_recv_buf.len(), 0u);  // reset by on_upstream_request_sent
 
     // Upstream response received → data goes into upstream_recv_buf (valid HTTP response)
     inject_upstream_response(loop, *conn);
     // on_upstream_response does NOT reset upstream_recv_buf (send still in progress)
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 
     // Proxy response sent → on_proxy_response_sent resets upstream_recv_buf and recv_buf.
     loop.inject_and_dispatch(
@@ -990,16 +990,15 @@ TEST(recv_semantic, reset_clears_both_buffers) {
 // === Callback type guard: close on unexpected event type ===
 
 // on_header_received expects Recv — Send event should close
-TEST(type_guard, header_recv_rejects_send) {
+TEST(type_guard, header_recv_ignores_wrong_type) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    u32 cid = c->id;
-    // Dispatch a Send event while expecting Recv → close
-    loop.dispatch(make_ev(cid, IoEventType::Send, 100));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    // UpstreamSend goes to on_upstream_send (null) → ignored by dispatch.
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
+    CHECK(c->fd >= 0);
 }
 
 // on_response_sent expects Send — Recv event should close
@@ -1011,38 +1010,37 @@ TEST(type_guard, response_sent_rejects_recv) {
     REQUIRE(c != nullptr);
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     // Dispatch a Recv event while expecting Send → ignored (pipelined data).
     loop.dispatch(make_ev(cid, IoEventType::Recv, 50));
     CHECK(loop.conns[cid].fd >= 0);  // not closed — bytes buffered for pipeline
 }
 
 // on_upstream_connected expects UpstreamConnect — Recv should close
-TEST(type_guard, upstream_connected_rejects_recv) {
+TEST(type_guard, upstream_connected_ignores_wrong_type) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
-    u32 cid = conn->id;
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
-    // Dispatch Recv instead of UpstreamConnect → close
-    loop.dispatch(make_ev(cid, IoEventType::Recv, 50));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    // Recv goes to on_recv (on_header_received), not on_upstream_send.
+    loop.dispatch(make_ev(conn->id, IoEventType::Recv, 50));
+    CHECK(conn->fd >= 0);
 }
 
 // on_upstream_request_sent expects Send — Recv should close
-TEST(type_guard, upstream_request_sent_rejects_recv) {
+TEST(type_guard, upstream_request_sent_ignores_wrong_type) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
-    u32 cid = conn->id;
-    conn->on_complete = &on_upstream_request_sent<SmallLoop>;
-    loop.dispatch(make_ev(cid, IoEventType::Recv, 50));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    conn->on_upstream_send = &on_upstream_request_sent<SmallLoop>;
+    // Recv goes to on_recv, not on_upstream_send.
+    loop.dispatch(make_ev(conn->id, IoEventType::Recv, 50));
+    CHECK(conn->fd >= 0);
 }
 
 // on_upstream_response expects UpstreamRecv — Send should close
@@ -1053,24 +1051,24 @@ TEST(type_guard, upstream_response_rejects_send) {
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
     u32 cid = conn->id;
-    conn->on_complete = &on_upstream_response<SmallLoop>;
+    conn->on_upstream_recv = &on_upstream_response<SmallLoop>;
+    // Send goes to on_send slot (null) → ignored by dispatch.
+    // Connection stays alive — wrong event types never reach callbacks.
     loop.dispatch(make_ev(cid, IoEventType::Send, 50));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 // on_proxy_response_sent expects Send — Recv should close
-TEST(type_guard, proxy_response_sent_rejects_wrong_type) {
+TEST(type_guard, proxy_response_sent_ignores_wrong_type) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
-    u32 cid = conn->id;
-    conn->on_complete = &on_proxy_response_sent<SmallLoop>;
-    // Recv with data is now ignored (client upload during early response).
-    // Use UpstreamConnect as genuinely unexpected event type.
-    loop.dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    conn->on_send = &on_proxy_response_sent<SmallLoop>;
+    // UpstreamRecv goes to on_upstream_recv (null) → ignored.
+    loop.dispatch(make_ev(conn->id, IoEventType::UpstreamRecv, 50));
+    CHECK(conn->fd >= 0);
 }
 
 // === Timer tick overflow clamp ===
@@ -1235,7 +1233,7 @@ TEST(partial_send, immediate_full_send) {
 
     // Recv triggers response
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 
     // Mock send completion with full byte count
     loop.backend.clear_ops();
@@ -1243,7 +1241,7 @@ TEST(partial_send, immediate_full_send) {
         make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
     // Should go back to reading (keep-alive)
     CHECK_EQ(c->state, ConnState::ReadingHeader);
-    CHECK_EQ(c->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_header_received<SmallLoop>);
 }
 
 // Verify that send_buf.data() pointer passed to backend matches buffer content
@@ -1359,13 +1357,13 @@ TEST(copilot5, mock_10_keepalive_cycles) {
     for (int i = 0; i < 10; i++) {
         loop.backend.clear_ops();
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
-        CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+        CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
         CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
 
         loop.backend.clear_ops();
         loop.inject_and_dispatch(
             make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
-        CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+        CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
         CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
     }
     CHECK_EQ(conn->fd, 42);  // still alive
@@ -1380,7 +1378,7 @@ TEST(copilot5, add_send_immediate_success) {
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 50));
-    // After recv, callback sets on_complete=on_response_sent and calls submit_send.
+    // After recv, callback sets on_send=on_response_sent and calls submit_send.
     // MockBackend should have a Send op.
     auto* op = loop.backend.last_op(MockOp::Send);
     CHECK(op != nullptr);
@@ -2316,8 +2314,11 @@ TEST(async_reclaim, pending_ops_decrements_on_dispatch) {
     c->state = ConnState::ReadingHeader;
     loop.submit_recv(*c);
     CHECK_EQ(c->pending_ops, 1u);
-    // Clear on_complete so dispatch only does CQE accounting, not callbacks.
-    c->on_complete = nullptr;
+    // Clear slots so dispatch only does CQE accounting, not callbacks.
+    c->on_recv = nullptr;
+    c->on_send = nullptr;
+    c->on_upstream_recv = nullptr;
+    c->on_upstream_send = nullptr;
     // Dispatch a recv CQE with more=0 (final).
     loop.dispatch(make_ev_more(c->id, IoEventType::Recv, 50, 0));
     CHECK_EQ(c->pending_ops, 0u);
@@ -2332,8 +2333,11 @@ TEST(async_reclaim, pending_ops_no_decrement_on_more) {
     c->state = ConnState::ReadingHeader;
     loop.submit_recv(*c);
     CHECK_EQ(c->pending_ops, 1u);
-    // Clear on_complete so dispatch only does CQE accounting.
-    c->on_complete = nullptr;
+    // Clear slots so dispatch only does CQE accounting.
+    c->on_recv = nullptr;
+    c->on_send = nullptr;
+    c->on_upstream_recv = nullptr;
+    c->on_upstream_send = nullptr;
     // Dispatch a recv CQE with more=1 (multishot intermediate).
     loop.dispatch(make_ev_more(c->id, IoEventType::Recv, 50, 1));
     CHECK_EQ(c->pending_ops, 1u);
@@ -2441,8 +2445,11 @@ TEST(async_reclaim, upstream_recv_armed_independent) {
     CHECK_EQ(c->recv_armed, true);
     CHECK_EQ(c->upstream_recv_armed, true);
     CHECK_EQ(c->pending_ops, 2u);
-    // Clear on_complete so dispatch only does CQE accounting.
-    c->on_complete = nullptr;
+    // Clear slots so dispatch only does CQE accounting.
+    c->on_recv = nullptr;
+    c->on_send = nullptr;
+    c->on_upstream_recv = nullptr;
+    c->on_upstream_send = nullptr;
     // Dispatch final upstream recv CQE (more=0).
     IoEvent ev = make_ev_more(c->id, IoEventType::UpstreamRecv, 100, 0);
     loop.dispatch(ev);
@@ -2536,7 +2543,7 @@ static Connection* setup_proxy_conn(SmallLoop& loop) {
 
     // Switch to proxy mode.
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
 
@@ -2545,7 +2552,7 @@ static Connection* setup_proxy_conn(SmallLoop& loop) {
 
     // Request sent to upstream (send result = recv_buf.len()).
     loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->recv_buf.len())));
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(conn->recv_buf.len())));
 
     // Now conn is waiting for upstream response (on_upstream_response).
     return conn;
@@ -2574,13 +2581,13 @@ static Connection* setup_proxy_conn_head(SmallLoop& loop) {
 
     // Switch to proxy mode.
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
 
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->recv_buf.len())));
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(conn->recv_buf.len())));
 
     return conn;
 }
@@ -2619,7 +2626,7 @@ TEST(streaming, large_content_length) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // Should be in streaming mode (not on_proxy_response_sent).
-    CHECK_EQ(conn->on_complete, &on_response_header_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_header_sent<SmallLoop>);
     CHECK_EQ(conn->resp_body_mode, BodyMode::ContentLength);
 
     // Simulate send completion of the initial headers+body.
@@ -2627,7 +2634,7 @@ TEST(streaming, large_content_length) {
     loop.inject_and_dispatch(
         make_ev(conn->id, IoEventType::Send, static_cast<i32>(hdr_len + initial_body)));
     // Should now be waiting for more upstream body data.
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // Track remaining body.
     u32 body_sent = initial_body;
@@ -2644,7 +2651,7 @@ TEST(streaming, large_content_length) {
         inject_custom_recv(loop, *conn, IoEventType::UpstreamRecv, body_chunk, chunk);
 
         // Should have forwarded to client.
-        CHECK_EQ(conn->on_complete, &on_response_body_sent<SmallLoop>);
+        CHECK_EQ(conn->on_send, &on_response_body_sent<SmallLoop>);
 
         // Simulate send completion.
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(chunk)));
@@ -2652,13 +2659,13 @@ TEST(streaming, large_content_length) {
 
         if (body_sent < total_body) {
             // More body to stream.
-            CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+            CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
         }
     }
 
     // Body complete — should be back to reading next request (keep-alive).
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
 }
 
 // Chunked response body streaming.
@@ -2688,12 +2695,12 @@ TEST(streaming, chunked_response) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // Should be streaming (headers sent, waiting for send completion).
-    CHECK_EQ(conn->on_complete, &on_response_header_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_header_sent<SmallLoop>);
     CHECK_EQ(conn->resp_body_mode, BodyMode::Chunked);
 
     // Send completion of headers.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(hdr_len)));
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // First chunk: "A\r\n0123456789\r\n" (10 bytes of data).
     const char* chunk1 = "A\r\n0123456789\r\n";
@@ -2701,26 +2708,26 @@ TEST(streaming, chunked_response) {
     while (chunk1[chunk1_len]) chunk1_len++;
     inject_custom_recv(
         loop, *conn, IoEventType::UpstreamRecv, reinterpret_cast<const u8*>(chunk1), chunk1_len);
-    CHECK_EQ(conn->on_complete, &on_response_body_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_body_sent<SmallLoop>);
 
     // Send completion.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(chunk1_len)));
     // Not done yet — recv more.
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // Final chunk: "0\r\n\r\n".
     const char* chunk_end = "0\r\n\r\n";
     u32 end_len = 5;
     inject_custom_recv(
         loop, *conn, IoEventType::UpstreamRecv, reinterpret_cast<const u8*>(chunk_end), end_len);
-    CHECK_EQ(conn->on_complete, &on_response_body_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_body_sent<SmallLoop>);
 
     // Send completion of final chunk.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(end_len)));
 
     // Body complete — back to keep-alive.
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
 }
 
 // 204 No Content — no body regardless of headers.
@@ -2748,7 +2755,7 @@ TEST(streaming, no_body_204) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // No body — should go directly to on_proxy_response_sent (single-buffer path).
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
     CHECK_EQ(conn->resp_body_mode, BodyMode::None);
 }
 
@@ -2779,7 +2786,7 @@ TEST(streaming, head_no_body) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // HEAD response: no body, single-buffer path.
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
     CHECK_EQ(conn->resp_body_mode, BodyMode::None);
 }
 
@@ -2794,7 +2801,7 @@ TEST(streaming, small_body_no_streaming) {
     inject_upstream_response(loop, *conn);
 
     // Should use single-buffer path (on_proxy_response_sent).
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
     CHECK_EQ(conn->resp_body_mode, BodyMode::ContentLength);
     CHECK_EQ(conn->resp_body_remaining, 0u);
 }
@@ -2826,22 +2833,22 @@ TEST(streaming, until_close) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // UntilClose: streaming mode since body end is unknown.
-    CHECK_EQ(conn->on_complete, &on_response_header_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_header_sent<SmallLoop>);
     CHECK_EQ(conn->resp_body_mode, BodyMode::UntilClose);
 
     // Send headers.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(hdr_len)));
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // First body chunk.
     u8 body[100];
     for (u32 i = 0; i < 100; i++) body[i] = static_cast<u8>(i);
     inject_custom_recv(loop, *conn, IoEventType::UpstreamRecv, body, 100);
-    CHECK_EQ(conn->on_complete, &on_response_body_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_body_sent<SmallLoop>);
 
     // Send completion.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // EOF from upstream — signals end of UntilClose body.
     // recv_buf was already reset by on_response_body_sent callback.
@@ -2888,7 +2895,7 @@ TEST(streaming, chunked_over_content_length) {
     CHECK_EQ(conn->resp_body_mode, BodyMode::Chunked);
     // The entire chunked body (5\r\nhello\r\n0\r\n\r\n) was in the initial recv,
     // so the body is complete — should go to single-buffer path.
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 }
 
 // HEAD response with trailing bytes after headers — only headers forwarded.
@@ -2931,7 +2938,7 @@ TEST(streaming, no_body_head_strips_trailing_bytes) {
 
     // HEAD request — body mode must be None.
     CHECK_EQ(conn->resp_body_mode, BodyMode::None);
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 
     // The send should contain only headers, not "GARBAGE".
     auto* send_op = loop.backend.last_op(MockOp::Send);
@@ -2979,7 +2986,7 @@ TEST(streaming, content_length_excess_bytes_trimmed) {
     // Body is complete (5 bytes <= initial body).
     CHECK_EQ(conn->resp_body_mode, BodyMode::ContentLength);
     CHECK_EQ(conn->resp_body_remaining, 0u);
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 
     // Send must be headers + 5 body bytes only (not the extra bytes).
     auto* send_op = loop.backend.last_op(MockOp::Send);
@@ -3030,7 +3037,7 @@ TEST(streaming, request_body_content_length_multi_chunk) {
 
     // Switch to proxy mode.
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
 
@@ -3039,10 +3046,10 @@ TEST(streaming, request_body_content_length_multi_chunk) {
 
     // Request sent to upstream (initial headers + partial body).
     loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->recv_buf.len())));
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(conn->recv_buf.len())));
 
     // More body needed — should be waiting for client body.
-    CHECK_EQ(conn->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_request_body_recvd<SmallLoop>);
 
     // Stream remaining body from client in chunks.
     u32 body_sent = initial_body;
@@ -3057,20 +3064,21 @@ TEST(streaming, request_body_content_length_multi_chunk) {
         inject_custom_recv(loop, *conn, IoEventType::Recv, body_chunk, chunk);
 
         // Should have forwarded to upstream.
-        CHECK_EQ(conn->on_complete, &on_request_body_sent<SmallLoop>);
+        CHECK_EQ(conn->on_upstream_send, &on_request_body_sent<SmallLoop>);
 
         // Simulate upstream send completion.
-        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(chunk)));
+        loop.inject_and_dispatch(
+            make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(chunk)));
         body_sent += chunk;
 
         if (body_sent < total_body) {
             // More body to stream.
-            CHECK_EQ(conn->on_complete, &on_request_body_recvd<SmallLoop>);
+            CHECK_EQ(conn->on_recv, &on_request_body_recvd<SmallLoop>);
         }
     }
 
     // Request body complete — should transition to waiting for upstream response.
-    CHECK_EQ(conn->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<SmallLoop>);
 }
 
 // After a chunked request completes, keep-alive resets req_body_mode to None.
@@ -3110,12 +3118,12 @@ TEST(streaming, keep_alive_after_chunked_request_no_stale_state) {
 
     // The default handler sends a response directly (not proxy mode).
     // Simulate send completion to cycle back to keep-alive.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
     loop.inject_and_dispatch(
         make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
 
     // Should be back to reading next request.
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
 
     // Second request: GET with no body.
@@ -3168,21 +3176,21 @@ TEST(streaming, http10_until_close) {
     // HTTP/1.0 with no body-length indicator → UntilClose.
     CHECK_EQ(conn->resp_body_mode, BodyMode::UntilClose);
     // Should enter streaming mode (body end unknown).
-    CHECK_EQ(conn->on_complete, &on_response_header_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_header_sent<SmallLoop>);
 
     // Send headers.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // Body chunk.
     u8 body[64];
     for (u32 i = 0; i < 64; i++) body[i] = static_cast<u8>('A');
     inject_custom_recv(loop, *conn, IoEventType::UpstreamRecv, body, 64);
-    CHECK_EQ(conn->on_complete, &on_response_body_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_body_sent<SmallLoop>);
 
     // Send completion.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 64));
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // EOF from upstream → body complete, connection closed.
     IoEvent eof_ev = make_ev(conn->id, IoEventType::UpstreamRecv, 0);
@@ -3226,7 +3234,7 @@ TEST(streaming, keepalive_no_cl_no_body) {
     // HTTP/1.1 with no CL/TE → UntilClose (RFC 7230: read until EOF).
     CHECK_EQ(conn->resp_body_mode, BodyMode::UntilClose);
     // UntilClose enters streaming path.
-    CHECK_EQ(conn->on_complete, &on_response_header_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_header_sent<SmallLoop>);
 }
 
 // POST with Content-Length: 5 and body "helloEXTRA" — initial upstream send
@@ -3277,7 +3285,7 @@ TEST(streaming, request_cl_initial_send_capped) {
 
     // Switch to proxy mode and connect upstream.
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
 
@@ -3338,7 +3346,7 @@ TEST(streaming, request_no_body_get_caps_at_headers) {
 
     // Switch to proxy mode and connect upstream.
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
 
@@ -3386,12 +3394,12 @@ TEST(streaming, upstream_armed_cleared_after_body_complete) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     CHECK_EQ(conn->resp_body_mode, BodyMode::ContentLength);
-    CHECK_EQ(conn->on_complete, &on_response_header_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_header_sent<SmallLoop>);
 
     // Send completion of initial headers+body.
     loop.inject_and_dispatch(
         make_ev(conn->id, IoEventType::Send, static_cast<i32>(hdr_len + initial_body)));
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // Stream remaining body in chunks.
     u32 body_sent = initial_body;
@@ -3403,7 +3411,7 @@ TEST(streaming, upstream_armed_cleared_after_body_complete) {
         u8 body_chunk[SmallLoop::kBufSize];
         for (u32 i = 0; i < chunk; i++) body_chunk[i] = static_cast<u8>(i & 0xFF);
         inject_custom_recv(loop, *conn, IoEventType::UpstreamRecv, body_chunk, chunk);
-        CHECK_EQ(conn->on_complete, &on_response_body_sent<SmallLoop>);
+        CHECK_EQ(conn->on_send, &on_response_body_sent<SmallLoop>);
 
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(chunk)));
         body_sent += chunk;
@@ -3411,7 +3419,7 @@ TEST(streaming, upstream_armed_cleared_after_body_complete) {
 
     // Body complete — back to keep-alive.
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
     // Key assertion: upstream_recv_armed must be cleared after body completes.
     CHECK_EQ(conn->upstream_recv_armed, false);
     CHECK_EQ(conn->upstream_fd, -1);
@@ -3433,11 +3441,11 @@ TEST(streaming, upstream_armed_cleared_after_body_complete) {
     for (u32 i = 0; i < n2; i++) loop.dispatch(events2[i]);
 
     // Default handler sends a response — verify cycle works.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
 
     // Now switch to proxy mode for the second request.
     conn->upstream_fd = 200;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
 
@@ -3446,10 +3454,10 @@ TEST(streaming, upstream_armed_cleared_after_body_complete) {
 
     // Request sent to upstream — send completion.
     loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->recv_buf.len())));
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(conn->recv_buf.len())));
 
     // Now waiting for upstream response — upstream_recv_armed should be set.
-    CHECK_EQ(conn->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<SmallLoop>);
 }
 
 // A POST with Transfer-Encoding: chunked and malformed chunk size ("XY\r\n")
@@ -3490,7 +3498,7 @@ TEST(streaming, malformed_chunked_request_rejected) {
 
     // Switch to proxy mode and connect upstream.
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
 
@@ -3532,11 +3540,11 @@ TEST(streaming, response_body_sent_trimmed_not_closed) {
 
     CHECK_EQ(conn->resp_body_mode, BodyMode::ContentLength);
     // Headers-only response goes through streaming path (send headers first).
-    CHECK_EQ(conn->on_complete, &on_response_header_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_header_sent<SmallLoop>);
 
     // Send completion of headers.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(hdr_len)));
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // Upstream sends 10 bytes, but CL remaining is only 5.
     u8 body[10];
@@ -3544,7 +3552,7 @@ TEST(streaming, response_body_sent_trimmed_not_closed) {
     inject_custom_recv(loop, *conn, IoEventType::UpstreamRecv, body, 10);
 
     // on_response_body_recvd should trim to 5 bytes and set on_response_body_sent.
-    CHECK_EQ(conn->on_complete, &on_response_body_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_body_sent<SmallLoop>);
     CHECK_EQ(conn->resp_body_remaining, 0u);
 
     // Send completion with the trimmed length (5 bytes).
@@ -3553,7 +3561,7 @@ TEST(streaming, response_body_sent_trimmed_not_closed) {
     // Body complete (CL satisfied) — should transition to keep-alive, NOT close.
     CHECK(conn->fd != -1);
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
 }
 
 // 1xx Continue is skipped; final 200 response is forwarded.
@@ -3589,7 +3597,7 @@ TEST(streaming, skip_1xx_continue_then_200) {
     CHECK_EQ(conn->resp_status, static_cast<u16>(200));
     CHECK_EQ(conn->resp_body_mode, BodyMode::ContentLength);
     // Small body fits in initial recv — single-buffer path.
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 }
 
 // 101 Switching Protocols is NOT skipped as an interim 1xx.
@@ -3648,7 +3656,7 @@ TEST(streaming, status_205_no_body) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     CHECK_EQ(conn->resp_body_mode, BodyMode::None);
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 }
 
 // During response body streaming, a client Recv event should be ignored.
@@ -3677,11 +3685,11 @@ TEST(streaming, response_body_ignores_client_recv) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
-    CHECK_EQ(conn->on_complete, &on_response_header_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_header_sent<SmallLoop>);
 
     // Send headers completion → now waiting for body recv from upstream.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(hdr_len)));
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // Inject a client Recv event (wrong type — should be UpstreamRecv).
     // With separate buffers, client data goes to recv_buf (harmless),
@@ -3691,7 +3699,7 @@ TEST(streaming, response_body_ignores_client_recv) {
 
     // Connection stays alive, still waiting for upstream body.
     CHECK(conn->fd >= 0);
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 }
 
 // After streaming completes and connection returns to ReadingHeader,
@@ -3704,13 +3712,13 @@ TEST(streaming, stale_upstream_recv_ignored_in_header_reading) {
 
     // Small response that completes immediately.
     inject_upstream_response(loop, *conn);
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 
     // Send completion → back to ReadingHeader (keep-alive).
     loop.inject_and_dispatch(
         make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
 
     // Inject a stale UpstreamRecv (wrong type for on_header_received).
     // on_header_received purges recv_buf and re-arms client recv (does not close).
@@ -3718,7 +3726,7 @@ TEST(streaming, stale_upstream_recv_ignored_in_header_reading) {
 
     // Connection stays alive — stale UpstreamRecv is silently ignored.
     CHECK(conn->fd >= 0);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
 }
 
 // Chunked response that completes in initial buffer — excess bytes past
@@ -3761,7 +3769,7 @@ TEST(streaming, chunked_response_initial_buffer_capped) {
 
     CHECK_EQ(conn->resp_body_mode, BodyMode::Chunked);
     // Entire chunked body done in initial buffer — single-buffer path.
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 
     // The send must NOT include "EXTRA" — only headers + chunked body.
     // Chunked body: "5\r\nhello\r\n0\r\n\r\n" = 15 bytes.
@@ -3809,11 +3817,11 @@ TEST(streaming, proxy_keepalive_two_requests) {
 
     // Proxy setup.
     conn->upstream_fd = 100;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, 100));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 100));
 
     // Upstream response.
     inject_upstream_response(loop, *conn);
@@ -3827,7 +3835,7 @@ TEST(streaming, proxy_keepalive_two_requests) {
     // Second request cycle — should work.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
     conn->upstream_fd = 200;
-    conn->on_complete = &on_upstream_connected<SmallLoop>;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
@@ -3869,7 +3877,7 @@ TEST(pipeline, two_gets_direct_response) {
 
     // First request should be processed and response sent.
     // on_header_received fires, sends kResponse200, callback = on_response_sent.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
 
     // Complete the first send.
     u32 send_len = conn->send_buf.len();
@@ -3879,7 +3887,7 @@ TEST(pipeline, two_gets_direct_response) {
     // Pipeline: second request should be dispatched immediately (no new recv).
     // After on_response_sent, pipeline_shift finds leftover bytes and re-enters
     // on_header_received. The second response is now being sent.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
     CHECK_EQ(conn->pipeline_depth, 1u);
 
     // Complete the second send.
@@ -3889,7 +3897,7 @@ TEST(pipeline, two_gets_direct_response) {
 
     // Pipeline drained — back to ReadingHeader, submit_recv issued.
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
     CHECK_EQ(conn->pipeline_depth, 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
 }
@@ -3912,7 +3920,7 @@ TEST(pipeline, post_cl_then_get) {
     inject_raw_recv(loop, *conn, data, total_len);
 
     // First request (POST) should be processed.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
 
     // Complete the first send.
     u32 send_len = conn->send_buf.len();
@@ -3920,7 +3928,7 @@ TEST(pipeline, post_cl_then_get) {
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
 
     // Pipeline: GET should be dispatched immediately.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
     CHECK_EQ(conn->pipeline_depth, 1u);
 
     // Complete the second send.
@@ -3960,7 +3968,7 @@ TEST(pipeline, depth_limit_respected) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // First request processed, waiting for send completion.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
 
     // Process sends for requests 1-16 (each send triggers pipeline dispatch of the next).
     // Send 1 completes → pipeline dispatches request 2 (depth 0→1).
@@ -3973,7 +3981,7 @@ TEST(pipeline, depth_limit_respected) {
     }
 
     // After 16 sends, request 17 is being sent (depth = 16).
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
     CHECK_EQ(conn->pipeline_depth, 16u);
 
     // Complete request 17's send. pipeline_shift returns false (depth >= max).
@@ -3982,7 +3990,7 @@ TEST(pipeline, depth_limit_respected) {
 
     // Pipeline drained — falls through to normal recv re-arm.
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
     CHECK_EQ(conn->pipeline_depth, 0u);
 }
 
@@ -4004,7 +4012,7 @@ TEST(pipeline, incomplete_second_request) {
     inject_raw_recv(loop, *conn, data, total_len);
 
     // First request processed.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
 
     // Complete the send.
     u32 send_len = conn->send_buf.len();
@@ -4018,7 +4026,7 @@ TEST(pipeline, incomplete_second_request) {
     // pipeline_depth stays > 0 so subsequent recvs continue the Incomplete check.
     CHECK_GT(conn->pipeline_depth, 0u);
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
     CHECK_EQ(conn->recv_buf.len(), 20u);  // leftover preserved
 }
 
@@ -4076,7 +4084,7 @@ TEST(pipeline, proxy_stash_and_recover) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // First request got a direct response. Complete its send.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
 
     // Instead of completing normally, hijack to proxy mode.
     // This is complex; let's use a simpler approach: manually test stash/recover.
@@ -4146,7 +4154,7 @@ TEST(pipeline, no_pipeline_resets_depth) {
     inject_raw_recv(loop, *conn, single, single_len);
 
     // Request processed.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
     CHECK_EQ(conn->pipeline_depth, 0u);
 
     // Complete send — no leftover, pipeline_shift returns false.
@@ -4156,7 +4164,7 @@ TEST(pipeline, no_pipeline_resets_depth) {
 
     // pipeline_depth reset to 0 in the submit_recv fallthrough path.
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
     CHECK_EQ(conn->pipeline_depth, 0u);
     CHECK_GE(loop.backend.count_ops(MockOp::Recv), 1u);
 }
@@ -4196,7 +4204,7 @@ TEST(buffer_isolation, upstream_data_in_upstream_buf) {
     REQUIRE(conn != nullptr);
 
     // At this point conn is waiting for upstream response (on_upstream_response).
-    CHECK_EQ(conn->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<SmallLoop>);
 
     // Remember client recv_buf state before upstream response.
     u32 client_len_before = conn->recv_buf.len();
@@ -4250,7 +4258,7 @@ TEST(buffer_isolation, lazy_alloc_no_proxy) {
 
     // Process a direct (non-proxy) request.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 50));
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
 
     // No upstream slice should have been allocated for a direct response.
     CHECK(conn->upstream_recv_slice == nullptr);
@@ -4285,13 +4293,13 @@ TEST(buffer_isolation, persists_across_keepalive) {
     // Complete the proxy cycle: inject upstream response, then complete
     // the client send.
     inject_upstream_response(loop, *conn);
-    CHECK_EQ(conn->on_complete, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
     loop.inject_and_dispatch(
         make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
 
     // Connection should be back to reading the next request (keep-alive).
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
-    CHECK_EQ(conn->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
 
     // Upstream recv slice must still be allocated (not freed on keep-alive).
     CHECK(conn->upstream_recv_slice != nullptr);
@@ -4340,12 +4348,12 @@ TEST(buffer_isolation, client_data_during_proxy_ignored) {
     u32 cid = conn->id;
 
     // Client sends pipelined data while waiting for upstream.
-    auto* saved_cb = conn->on_complete;
+    auto* saved_recv = conn->on_upstream_recv;
     loop.dispatch(make_ev(cid, IoEventType::Recv, 50));
 
-    // Connection stays alive, callback unchanged.
+    // Connection stays alive, upstream_recv callback unchanged.
     CHECK(loop.conns[cid].fd >= 0);
-    CHECK_EQ(conn->on_complete, saved_cb);
+    CHECK_EQ(conn->on_upstream_recv, saved_recv);
 }
 
 // Pool sized for 3 slices per connection (recv + send + upstream_recv).
@@ -4394,7 +4402,7 @@ TEST(buffer_isolation, late_pipeline_data_preserved_after_proxy) {
     // on_proxy_response_sent finds recv_buf.len() > 0 → pipeline_dispatch.
     CHECK(conn->fd >= 0);
     // Should have re-entered on_header_received and built a response.
-    CHECK_EQ(conn->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
 }
 
 // Client Recv during response body streaming re-arms recv.
@@ -4423,7 +4431,7 @@ TEST(buffer_isolation, recv_rearm_during_body_streaming) {
 
     // Send headers.
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(hdr_len)));
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 
     // Client Recv with data during body streaming → re-arm, not just return.
     loop.backend.clear_ops();
@@ -4460,7 +4468,7 @@ TEST(buffer_isolation, client_eof_during_body_streaming_closes) {
     // Client EOF during streaming → ignored (half-close, client still reads).
     loop.dispatch(make_ev(cid, IoEventType::Recv, 0));
     CHECK(loop.conns[cid].fd >= 0);  // NOT closed
-    CHECK_EQ(conn->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 }
 
 // === Coverage: drain paths ===
@@ -4496,7 +4504,7 @@ TEST(drain, proxy_response_sent_closes) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     inject_upstream_response(loop, *c);
@@ -4518,7 +4526,7 @@ TEST(drain, response_header_rewrite_keepalive) {
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     // Set up proxy path
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
 
@@ -4552,7 +4560,7 @@ TEST(drain, response_inject_connection_close_header) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
 
@@ -4639,7 +4647,7 @@ TEST(streaming, request_body_cl_multi_chunk_send_recv) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // Should be sending response (default route, no proxy)
-    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
 TEST(streaming, request_body_sent_error_closes) {
@@ -4650,13 +4658,13 @@ TEST(streaming, request_body_sent_error_closes) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
 
     // Set up body streaming
     c->req_body_mode = BodyMode::ContentLength;
     c->req_body_remaining = 100;
-    c->on_complete = &on_request_body_sent<SmallLoop>;
+    c->on_upstream_send = &on_request_body_sent<SmallLoop>;
 
     // Send error → close
     u32 cid = c->id;
@@ -4671,10 +4679,11 @@ TEST(streaming, request_body_sent_wrong_type_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_request_body_sent<SmallLoop>;
-    u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    c->on_upstream_send = &on_request_body_sent<SmallLoop>;
+    // Recv goes to on_recv slot (on_header_received), not on_upstream_send.
+    // With slot dispatch, wrong events never reach the callback.
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK(c->fd >= 0);
 }
 
 TEST(streaming, request_body_recvd_error_closes) {
@@ -4685,7 +4694,7 @@ TEST(streaming, request_body_recvd_error_closes) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_request_body_recvd<SmallLoop>;
+    c->on_recv = &on_request_body_recvd<SmallLoop>;
     c->req_body_mode = BodyMode::ContentLength;
     c->req_body_remaining = 50;
     u32 cid = c->id;
@@ -4701,7 +4710,7 @@ TEST(streaming, request_body_recvd_eof_closes) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_request_body_recvd<SmallLoop>;
+    c->on_recv = &on_request_body_recvd<SmallLoop>;
     c->req_body_mode = BodyMode::ContentLength;
     c->req_body_remaining = 50;
     u32 cid = c->id;
@@ -4716,7 +4725,7 @@ TEST(streaming, request_body_recvd_wrong_type_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_request_body_recvd<SmallLoop>;
+    c->on_recv = &on_request_body_recvd<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 100));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -4733,9 +4742,9 @@ TEST(streaming, request_body_sent_body_done_cl) {
     loop.alloc_upstream_buf(*c);
     c->req_body_mode = BodyMode::ContentLength;
     c->req_body_remaining = 0;  // body done
-    c->on_complete = &on_request_body_sent<SmallLoop>;
+    c->on_upstream_send = &on_request_body_sent<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
 }
 
 TEST(streaming, request_body_recvd_cl_forwards) {
@@ -4748,10 +4757,10 @@ TEST(streaming, request_body_recvd_cl_forwards) {
     c->upstream_fd = 100;
     c->req_body_mode = BodyMode::ContentLength;
     c->req_body_remaining = 50;
-    c->on_complete = &on_request_body_recvd<SmallLoop>;
+    c->on_recv = &on_request_body_recvd<SmallLoop>;
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
     CHECK_EQ(c->req_body_remaining, 0u);
 }
 
@@ -4769,11 +4778,11 @@ TEST(streaming, response_body_recvd_cl_partial) {
     c->resp_body_mode = BodyMode::ContentLength;
     c->resp_body_remaining = 500;
     c->resp_body_sent = 0;
-    c->on_complete = &on_response_body_recvd<SmallLoop>;
+    c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
     c->state = ConnState::Proxying;
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 200));
-    CHECK_EQ(c->on_complete, &on_response_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_body_sent<SmallLoop>);
     CHECK_EQ(c->resp_body_remaining, 300u);
 }
 
@@ -4789,7 +4798,7 @@ TEST(streaming, response_body_recvd_until_close_eof) {
     c->resp_body_mode = BodyMode::UntilClose;
     c->resp_body_sent = 200;
     c->resp_status = 200;
-    c->on_complete = &on_response_body_recvd<SmallLoop>;
+    c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
     c->req_start_us = monotonic_us();
     u32 cid = c->id;
     // EOF on upstream → body done for UntilClose
@@ -4808,7 +4817,7 @@ TEST(streaming, response_body_recvd_cl_premature_eof) {
     loop.alloc_upstream_buf(*c);
     c->resp_body_mode = BodyMode::ContentLength;
     c->resp_body_remaining = 500;  // still expecting more
-    c->on_complete = &on_response_body_recvd<SmallLoop>;
+    c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 0));
     CHECK_EQ(loop.conns[cid].fd, -1);  // closed (premature EOF)
@@ -4828,9 +4837,9 @@ TEST(streaming, response_body_sent_cl_done) {
     c->resp_body_sent = 200;
     c->resp_status = 200;
     c->req_start_us = monotonic_us();
-    c->on_complete = &on_response_body_sent<SmallLoop>;
+    c->on_send = &on_response_body_sent<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, 200));
-    CHECK_EQ(c->on_complete, &on_header_received<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_header_received<SmallLoop>);
     CHECK_EQ(c->state, ConnState::ReadingHeader);
 }
 
@@ -4841,7 +4850,7 @@ TEST(streaming, response_body_sent_error_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_response_body_sent<SmallLoop>;
+    c->on_send = &on_response_body_sent<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -1));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -4854,10 +4863,10 @@ TEST(streaming, response_body_sent_wrong_type_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_response_body_sent<SmallLoop>;
+    c->on_send = &on_response_body_sent<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 TEST(streaming, response_body_sent_more_to_stream) {
@@ -4872,10 +4881,10 @@ TEST(streaming, response_body_sent_more_to_stream) {
     c->resp_body_mode = BodyMode::ContentLength;
     c->resp_body_remaining = 300;  // more to come
     c->resp_body_sent = 100;
-    c->on_complete = &on_response_body_sent<SmallLoop>;
+    c->on_send = &on_response_body_sent<SmallLoop>;
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, 100));
-    CHECK_EQ(c->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 }
 
 TEST(streaming, response_header_sent_error_closes) {
@@ -4885,7 +4894,7 @@ TEST(streaming, response_header_sent_error_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_response_header_sent<SmallLoop>;
+    c->on_send = &on_response_header_sent<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -1));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -4898,10 +4907,10 @@ TEST(streaming, response_header_sent_wrong_type_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_response_header_sent<SmallLoop>;
+    c->on_send = &on_response_header_sent<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 TEST(streaming, response_header_sent_transitions_to_body_recv) {
@@ -4913,10 +4922,10 @@ TEST(streaming, response_header_sent_transitions_to_body_recv) {
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
     loop.alloc_upstream_buf(*c);
-    c->on_complete = &on_response_header_sent<SmallLoop>;
+    c->on_send = &on_response_header_sent<SmallLoop>;
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, 200));
-    CHECK_EQ(c->on_complete, &on_response_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 }
 
 // === Coverage: upstream response edge cases ===
@@ -4929,7 +4938,7 @@ TEST(streaming, upstream_response_malformed_502) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
 
@@ -4946,7 +4955,7 @@ TEST(streaming, upstream_response_malformed_502) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     // Should send 502
     CHECK_EQ(c->resp_status, kStatusBadGateway);
-    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
 TEST(streaming, upstream_response_eof_no_data_closes) {
@@ -4957,7 +4966,7 @@ TEST(streaming, upstream_response_eof_no_data_closes) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     u32 cid = c->id;
@@ -4974,7 +4983,7 @@ TEST(streaming, upstream_response_incomplete_waits) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
 
@@ -4991,7 +5000,7 @@ TEST(streaming, upstream_response_incomplete_waits) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     // Should still be waiting for more upstream data
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
 }
 
 TEST(streaming, upstream_response_client_recv_during_proxy) {
@@ -5002,14 +5011,14 @@ TEST(streaming, upstream_response_client_recv_during_proxy) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     // Client Recv while waiting for upstream → harmless, re-arm
     loop.backend.clear_ops();
     loop.dispatch(make_ev(c->id, IoEventType::Recv, 50));
     CHECK(c->fd >= 0);  // not closed
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
 }
 
 TEST(streaming, upstream_response_client_eof_during_proxy) {
@@ -5020,7 +5029,7 @@ TEST(streaming, upstream_response_client_eof_during_proxy) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     u32 cid = c->id;
@@ -5037,7 +5046,7 @@ TEST(streaming, upstream_connected_malformed_request_closes) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     c->req_malformed = true;  // malformed request
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
@@ -5052,7 +5061,7 @@ TEST(streaming, upstream_connected_alloc_fail_closes) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     // Force alloc failure by corrupting the id
     u32 cid = c->id;
     c->id = SmallLoop::kMaxConns + 1;  // out of range → alloc_upstream_buf fails
@@ -5155,7 +5164,7 @@ TEST(recv, unexpected_send_in_header_closes) {
     u32 cid = c->id;
     // Send event in ReadingHeader → close
     loop.dispatch(make_ev(cid, IoEventType::Send, 100));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 // === Coverage: proxy_response_sent edge cases ===
@@ -5167,7 +5176,7 @@ TEST(proxy, proxy_response_sent_send_error) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_proxy_response_sent<SmallLoop>;
+    c->on_send = &on_proxy_response_sent<SmallLoop>;
     c->req_start_us = monotonic_us();
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -1));
@@ -5181,10 +5190,10 @@ TEST(proxy, proxy_response_sent_wrong_type) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_proxy_response_sent<SmallLoop>;
+    c->on_send = &on_proxy_response_sent<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 // === Coverage: upstream_request_sent edge cases ===
@@ -5197,7 +5206,7 @@ TEST(proxy, upstream_request_sent_error) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_request_sent<SmallLoop>;
+    c->on_upstream_send = &on_upstream_request_sent<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, -1));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -5210,10 +5219,10 @@ TEST(proxy, upstream_request_sent_wrong_type) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_upstream_request_sent<SmallLoop>;
+    c->on_upstream_send = &on_upstream_request_sent<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 // === Coverage: upstream connected wrong event type ===
@@ -5226,10 +5235,10 @@ TEST(proxy, upstream_connected_wrong_type) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 // === Coverage: response_body_recvd wrong type ===
@@ -5241,7 +5250,7 @@ TEST(streaming, response_body_recvd_wrong_type_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_response_body_recvd<SmallLoop>;
+    c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 100));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -5410,7 +5419,7 @@ TEST(drain, inject_close_header_no_body) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
 
@@ -5438,7 +5447,7 @@ TEST(drain, inject_close_header_cl_body) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
 
@@ -5470,7 +5479,7 @@ TEST(drain, inject_close_header_streaming_body) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
 
@@ -5492,7 +5501,7 @@ TEST(drain, inject_close_header_streaming_body) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     CHECK_EQ(c->keep_alive, false);
     // Should use on_response_header_sent (streaming) since body not complete
-    CHECK_EQ(c->on_complete, &on_response_header_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_header_sent<SmallLoop>);
 }
 
 // === Coverage: request body streaming via proxy ===
@@ -5537,7 +5546,7 @@ static Connection* setup_proxy_post_cl(SmallLoop& loop, u32 body_total, u32 body
 
     // Switch to proxy
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     c->state = ConnState::Proxying;
     loop.submit_connect(*c, nullptr, 0);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
@@ -5551,21 +5560,21 @@ TEST(streaming, request_body_cl_multi_pass_proxy) {
     auto* c = setup_proxy_post_cl(loop, 100, 10);
     REQUIRE(c != nullptr);
     // After connect, initial request was sent to upstream
-    CHECK_EQ(c->on_complete, &on_upstream_request_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, &on_upstream_request_sent<SmallLoop>);
     // Simulate upstream send complete — should start body streaming
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
     CHECK_GT(c->req_body_remaining, 0u);
 
     // Client sends more body data
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
 
     // Upstream ack'd the send — still more body
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
     if (c->req_body_remaining > 0) {
-        CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+        CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
     }
 }
 
@@ -5582,11 +5591,11 @@ TEST(streaming, request_body_sent_chunked_not_done_continues) {
     c->req_chunk_parser.reset();
     // Chunk parser NOT complete → more body to stream
     c->req_body_remaining = 0;
-    c->on_complete = &on_request_body_sent<SmallLoop>;
+    c->on_upstream_send = &on_request_body_sent<SmallLoop>;
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
     // Should continue reading more body from client
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
 }
 
 TEST(streaming, response_body_sent_drain_closes) {
@@ -5603,7 +5612,7 @@ TEST(streaming, response_body_sent_drain_closes) {
     c->resp_body_sent = 200;
     c->resp_status = 200;
     c->req_start_us = monotonic_us();
-    c->on_complete = &on_response_body_sent<SmallLoop>;
+    c->on_send = &on_response_body_sent<SmallLoop>;
     loop.draining = true;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 200));
@@ -5630,7 +5639,7 @@ TEST(streaming, 1xx_continue_no_remaining_data) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     // Should re-arm for final response
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
 }
 
 // === Coverage: incomplete HTTP with fallback path parsing ===
@@ -5776,7 +5785,7 @@ static Connection* setup_body_streaming_proxy(SmallLoop& loop,
 
     // Switch to proxy
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     c->state = ConnState::Proxying;
     loop.submit_connect(*c, nullptr, 0);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
@@ -5791,7 +5800,7 @@ TEST(early_response, 413_during_body_recvd) {
     loop.setup();
     auto* c = setup_body_streaming_proxy(loop, 200, 10);
     REQUIRE(c != nullptr);
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
     CHECK_GT(c->req_body_remaining, 0u);
 
     // Upstream sends 413 while we're waiting for client body
@@ -5850,7 +5859,7 @@ TEST(early_response, 100_continue_skipped) {
     loop.setup();
     auto* c = setup_body_streaming_proxy(loop, 200, 10);
     REQUIRE(c != nullptr);
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
 
     // Upstream sends 100 Continue — should be skipped, body streaming continues
     static const char kResp100[] = "HTTP/1.1 100 Continue\r\n\r\n";
@@ -5867,7 +5876,7 @@ TEST(early_response, 100_continue_skipped) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // Should still be in body streaming mode (100 Continue skipped)
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
     CHECK(c->fd >= 0);
 }
 
@@ -5879,7 +5888,7 @@ TEST(early_response, during_body_send_wait) {
 
     // Simulate: client sends more body data → now in on_request_body_sent
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
 
     // While waiting for upstream send ack, upstream sends 413
     static const char kResp413[] =
@@ -5900,7 +5909,7 @@ TEST(early_response, during_body_send_wait) {
 
     // Early response is deferred until upstream send completes
     CHECK(c->early_response_pending);
-    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
 
     // Upstream send completion arrives → now forward the 413
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
@@ -5945,7 +5954,7 @@ TEST(early_response, incomplete_response_waits) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // Should still be waiting (incomplete response, re-armed upstream recv)
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
     CHECK(c->fd >= 0);
 }
 
@@ -5959,7 +5968,7 @@ TEST(early_response, deferred_until_send_completes) {
 
     // Client sends body chunk → on_request_body_sent waiting for upstream send ack
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
 
     // Upstream sends 413 BEFORE the UpstreamSend completion arrives
     static const char kResp413[] =
@@ -6042,7 +6051,7 @@ TEST(early_response, 100_continue_with_partial_trailing) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // 100 skipped, partial 200 remains → should still be in body streaming, waiting
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
     CHECK(c->fd >= 0);
     // upstream_recv_buf should contain the partial "HTTP/1.1 200 OK\r\n"
     CHECK_GT(c->upstream_recv_buf.len(), 0u);
@@ -6054,7 +6063,7 @@ TEST(early_response, fragmented_413_across_two_reads) {
     loop.setup();
     auto* c = setup_body_streaming_proxy(loop, 200, 10);
     REQUIRE(c != nullptr);
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
 
     // First UpstreamRecv: partial 413 header (Incomplete)
     static const char kPart1[] = "HTTP/1.1 413 Request";
@@ -6069,15 +6078,15 @@ TEST(early_response, fragmented_413_across_two_reads) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     // Still in body streaming (Incomplete response)
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
     // Partial bytes must be preserved in upstream_recv_buf
     CHECK_EQ(c->upstream_recv_buf.len(), p1len);
 
     // Simulate: client sends more body → upstream send → back to body_recvd
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 30));
-    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 30));
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
     // Partial bytes must STILL be in upstream_recv_buf (not reset)
     CHECK_EQ(c->upstream_recv_buf.len(), p1len);
 
@@ -6173,7 +6182,7 @@ TEST(early_response, partial_response_survives_body_done) {
     loop.setup();
     auto* c = setup_body_streaming_proxy(loop, 60, 10);
     REQUIRE(c != nullptr);
-    CHECK_EQ(c->on_complete, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
 
     // Partial 413 arrives (Incomplete)
     static const char kPartial[] = "HTTP/1.1 413 Too";
@@ -6192,11 +6201,11 @@ TEST(early_response, partial_response_survives_body_done) {
     // Client sends remaining body → body_done becomes true
     c->req_body_remaining = 50;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
     c->req_body_remaining = 0;  // force body_done
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
     // body_done path should NOT have cleared the partial response
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
     CHECK_GT(c->upstream_recv_buf.len(), 0u);
 }
 
@@ -6241,7 +6250,7 @@ TEST(early_response, initial_send_error_with_buffered_413) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     // Now in on_upstream_request_sent, waiting for Send completion.
     // Simulate: upstream sends 413 into upstream_recv_buf, then send fails.
@@ -6255,7 +6264,7 @@ TEST(early_response, initial_send_error_with_buffered_413) {
     for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
     c->upstream_recv_buf.commit(rlen);
     // Send fails (EPIPE) — should recover the buffered 413, not close.
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, -32));  // -EPIPE
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));  // -EPIPE
     CHECK_EQ(c->resp_status, static_cast<u16>(413));
     CHECK_EQ(c->state, ConnState::Sending);
 }
@@ -6269,7 +6278,7 @@ TEST(early_response, upstream_recv_during_initial_send) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     // In on_upstream_request_sent, UpstreamRecv arrives with 413.
     static const char kResp413[] =
@@ -6289,7 +6298,7 @@ TEST(early_response, upstream_recv_during_initial_send) {
     // Should flag early_response_pending (send still in-flight).
     CHECK(c->early_response_pending);
     // Send completion → forward the 413.
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, 100));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     CHECK_EQ(c->resp_status, static_cast<u16>(413));
 }
 
@@ -6302,7 +6311,7 @@ TEST(early_response, body_done_with_pending_dispatches_directly) {
     // Client sends remaining body (all of it)
     c->req_body_remaining = 50;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
     // Upstream sends 200 OK while send is in-flight
     c->upstream_recv_buf.reset();
     u8* dst = c->upstream_recv_buf.write_ptr();
@@ -6366,7 +6375,7 @@ TEST(early_response, client_recv_drained_during_body_streaming) {
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
     CHECK_EQ(c->keep_alive, false);
     // In on_response_header_sent, client Recv with data → drain + re-arm.
-    c->on_complete = &on_response_header_sent<SmallLoop>;
+    c->on_send = &on_response_header_sent<SmallLoop>;
     loop.dispatch(make_ev(c->id, IoEventType::Recv, 100));
     // recv_buf should have been drained (keep_alive=false)
     CHECK_EQ(c->recv_buf.len(), 0u);
@@ -6385,7 +6394,7 @@ TEST(early_response, client_eof_tolerated_in_upstream_response) {
     // Client sends last chunk → on_request_body_sent → body_done → on_upstream_response
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
     // Client EOF (half-close) while waiting for upstream response → tolerated
     loop.dispatch(make_ev(c->id, IoEventType::Recv, 0));
     CHECK(c->fd >= 0);
@@ -6435,7 +6444,7 @@ TEST(early_response, fragmented_during_initial_send_preserved) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     // In on_upstream_request_sent: partial UpstreamRecv (Incomplete)
     static const char kPartial[] = "HTTP/1.1 413 Too";
@@ -6454,9 +6463,9 @@ TEST(early_response, fragmented_during_initial_send_preserved) {
     // Send completes (no more body — initial send covers all).
     // The body was fully in the initial send, so more_req_body == false.
     // upstream_recv_buf should be preserved, dispatched directly.
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, 100));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     // Should be in on_upstream_response with partial data (Incomplete → re-arm)
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
     CHECK_GT(c->upstream_recv_buf.len(), 0u);
 }
 
@@ -6486,7 +6495,7 @@ TEST(early_response, pipeline_preserved_when_body_done) {
 
     // Switch to proxy
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
 
     // Initial send: request forwarded. Body is complete (CL:5, all in initial).
@@ -6505,7 +6514,7 @@ TEST(early_response, pipeline_preserved_when_body_done) {
     // Send completes. Body was fully sent, so body_done path should:
     // - stash pipelined GET
     // - dispatch 200 response directly
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, 100));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     CHECK_EQ(c->resp_status, static_cast<u16>(200));
     // keep_alive should be true (body was done, no unread upload)
     CHECK(c->keep_alive);
@@ -6563,7 +6572,7 @@ TEST(early_response, recv_buf_cleared_after_stash) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     // Switch to proxy, connect, send
     c->upstream_fd = 100;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
     // Simulate early response during initial send
     c->upstream_recv_buf.reset();
@@ -6591,7 +6600,7 @@ TEST(early_response, response_sent_tolerates_client_eof) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     // Client half-close (EOF) during response send → tolerated
     loop.dispatch(make_ev(c->id, IoEventType::Recv, 0));
     CHECK(c->fd >= 0);
@@ -6605,7 +6614,7 @@ TEST(early_response, response_sent_closes_on_enobufs) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     u32 cid = c->id;
     loop.dispatch(make_ev(cid, IoEventType::Recv, -105));  // -ENOBUFS
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -6631,7 +6640,7 @@ TEST(early_response, response_header_sent_ignores_upstream_send) {
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
     CHECK_EQ(c->keep_alive, false);
     // Set callback to on_response_header_sent (after initial send)
-    c->on_complete = &on_response_header_sent<SmallLoop>;
+    c->on_send = &on_response_header_sent<SmallLoop>;
     // Stale UpstreamSend → ignored
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
     CHECK(c->fd >= 0);
@@ -6645,7 +6654,7 @@ TEST(early_response, response_header_sent_ignores_upstream_recv) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_response_header_sent<SmallLoop>;
+    c->on_send = &on_response_header_sent<SmallLoop>;
     // UpstreamRecv → ignored (data in buffer for consume)
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 50));
     CHECK(c->fd >= 0);
@@ -6659,7 +6668,7 @@ TEST(early_response, response_header_sent_enobufs_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_response_header_sent<SmallLoop>;
+    c->on_send = &on_response_header_sent<SmallLoop>;
     u32 cid = c->id;
     loop.dispatch(make_ev(cid, IoEventType::Recv, -105));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -6673,7 +6682,7 @@ TEST(early_response, response_body_sent_ignores_upstream_recv) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_response_body_sent<SmallLoop>;
+    c->on_send = &on_response_body_sent<SmallLoop>;
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 50));
     CHECK(c->fd >= 0);
 }
@@ -6686,7 +6695,7 @@ TEST(early_response, response_body_sent_enobufs_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_response_body_sent<SmallLoop>;
+    c->on_send = &on_response_body_sent<SmallLoop>;
     u32 cid = c->id;
     loop.dispatch(make_ev(cid, IoEventType::Recv, -105));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -6700,7 +6709,7 @@ TEST(early_response, proxy_response_sent_ignores_upstream_recv) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_proxy_response_sent<SmallLoop>;
+    c->on_send = &on_proxy_response_sent<SmallLoop>;
     c->req_start_us = monotonic_us();
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 50));
     CHECK(c->fd >= 0);
@@ -6714,7 +6723,7 @@ TEST(early_response, proxy_response_sent_tolerates_eof) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_proxy_response_sent<SmallLoop>;
+    c->on_send = &on_proxy_response_sent<SmallLoop>;
     loop.dispatch(make_ev(c->id, IoEventType::Recv, 0));
     CHECK(c->fd >= 0);
 }
@@ -6727,7 +6736,7 @@ TEST(early_response, proxy_response_sent_enobufs_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->on_complete = &on_proxy_response_sent<SmallLoop>;
+    c->on_send = &on_proxy_response_sent<SmallLoop>;
     u32 cid = c->id;
     loop.dispatch(make_ev(cid, IoEventType::Recv, -105));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -6741,13 +6750,13 @@ TEST(early_response, send_error_waits_for_armed_recv) {
     REQUIRE(c != nullptr);
     // Client sends body → on_request_body_sent
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
     // Simulate io_uring: upstream_recv_armed = true (multishot still active)
     c->upstream_recv_armed = true;
     // Upstream send fails (EPIPE)
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
     // Should have transitioned to on_upstream_response (waiting for CQE)
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
     CHECK(c->fd >= 0);
 }
 
@@ -6761,7 +6770,7 @@ TEST(early_response, upstream_response_enobufs_closes) {
     c->req_body_remaining = 0;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
     u32 cid = c->id;
     loop.dispatch(make_ev(cid, IoEventType::Recv, -105));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -6787,7 +6796,8 @@ TEST(early_response, response_body_recvd_drains_upload) {
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
     CHECK_EQ(c->keep_alive, false);
     // After initial headers sent → on_response_header_sent → on_response_body_recvd
-    c->on_complete = &on_response_body_recvd<SmallLoop>;
+    c->on_recv = nullptr;  // dispatch handles drain via handle_unhandled_recv
+    c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
     c->resp_body_mode = BodyMode::ContentLength;
     c->resp_body_remaining = 4000;
     // Client Recv with data while in on_response_body_recvd + keep_alive=false
@@ -6810,11 +6820,11 @@ TEST(early_response, upstream_response_ignores_stale_send) {
     c->req_body_remaining = 0;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
     // Stale UpstreamSend → ignored
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     CHECK(c->fd >= 0);
-    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
 }
 
 // consume_upstream_sent: normal case (no extra data).

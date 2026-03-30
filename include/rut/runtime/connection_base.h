@@ -30,16 +30,11 @@ struct ConnectionBase {
     // Event callback type — void* loop to avoid circular dependency.
     using Callback = void (*)(void* loop, ConnectionBase& conn, IoEvent ev);
 
-    // Legacy single callback — dispatches ALL event types.
-    // Being replaced by per-event-type slots below (Step 1 of migration).
-    Callback on_complete;
-
     // Per-event-type callback slots (Seastar-inspired).
-    // Each slot receives ONLY its designated event type.
-    // Dispatch layer routes events to the correct slot and handles
-    // null slots centrally (drain/ignore/close). This eliminates the
-    // need for event-type guard code inside callbacks.
-    // Currently unused — will replace on_complete in Step 2.
+    // Each slot receives ONLY its designated event type. The dispatch
+    // layer routes events to the correct slot and handles null slots
+    // centrally (drain/ignore/close). No event-type guard code needed
+    // inside callbacks.
     Callback on_recv;           // IoEventType::Recv only
     Callback on_send;           // IoEventType::Send only
     Callback on_upstream_recv;  // IoEventType::UpstreamRecv only
@@ -139,7 +134,6 @@ struct ConnectionBase {
     Buffer upstream_recv_buf;
 
     void reset() {
-        on_complete = nullptr;
         on_recv = nullptr;
         on_send = nullptr;
         on_upstream_recv = nullptr;

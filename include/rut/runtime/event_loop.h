@@ -58,51 +58,31 @@ public:
     }
     void submit_recv_upstream(Connection& c) { self().submit_recv_upstream_impl(c); }
 
-    // Per-event-type dispatch: route to typed slot, fallback to on_complete.
+    // Per-event-type dispatch: route to typed slot.
     // Called from each concrete EventLoop's dispatch() after timer refresh.
     // Centralizes all "unexpected event" handling in one place.
     void dispatch_event(Connection& conn, const IoEvent& ev) {
-        // During migration: on_complete takes priority (backward compatible).
-        // Fully migrated callbacks set on_complete = nullptr and use slots.
-        if (conn.on_complete) {
-            conn.on_complete(&self(), conn, ev);
-            return;
-        }
-        // Per-type slot dispatch (fully migrated path).
-        ConnectionBase::Callback handler = nullptr;
         switch (ev.type) {
             case IoEventType::Recv:
-                handler = conn.on_recv;
+                if (conn.on_recv) {
+                    conn.on_recv(&self(), conn, ev);
+                } else {
+                    handle_unhandled_recv(conn, ev);
+                }
                 break;
             case IoEventType::Send:
-                handler = conn.on_send;
+                if (conn.on_send) conn.on_send(&self(), conn, ev);
                 break;
             case IoEventType::UpstreamRecv:
-                handler = conn.on_upstream_recv;
+                if (conn.on_upstream_recv) conn.on_upstream_recv(&self(), conn, ev);
+                // null = data already in upstream_recv_buf
                 break;
             case IoEventType::UpstreamSend:
-                handler = conn.on_upstream_send;
+                if (conn.on_upstream_send) conn.on_upstream_send(&self(), conn, ev);
+                // null = stale completion, ignore
                 break;
             case IoEventType::UpstreamConnect:
-                handler = conn.on_upstream_send;
-                break;
-            default:
-                break;
-        }
-        if (handler) {
-            handler(&self(), conn, ev);
-            return;
-        }
-        // Null slot = centralized handling.
-        switch (ev.type) {
-            case IoEventType::Recv:
-                handle_unhandled_recv(conn, ev);
-                break;
-            case IoEventType::UpstreamRecv:
-                // null = ignore (data already in upstream_recv_buf)
-                break;
-            case IoEventType::UpstreamSend:
-                // null = ignore (stale completion)
+                if (conn.on_upstream_send) conn.on_upstream_send(&self(), conn, ev);
                 break;
             default:
                 break;
@@ -112,12 +92,6 @@ public:
     // Handle client Recv when no on_recv handler is set.
     // Centralizes drain/EOF/ENOBUFS logic — written once, correct everywhere.
     void handle_unhandled_recv(Connection& conn, const IoEvent& ev) {
-        // If on_complete is set (legacy path), forward to it.
-        if (conn.on_complete) {
-            conn.on_complete(&self(), conn, ev);
-            return;
-        }
-        // Per-type slot mode: centralized tolerance.
         if (ev.result > 0) {
             if (!conn.keep_alive) conn.recv_buf.reset();
             if (!conn.recv_armed) self().submit_recv(conn);
@@ -593,8 +567,7 @@ public:
                     if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
                 }
             }
-            if (conn.on_complete || conn.on_recv || conn.on_send || conn.on_upstream_recv ||
-                conn.on_upstream_send) {
+            if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
             } else if constexpr (Backend::kAsyncIo) {
@@ -646,7 +619,6 @@ private:
         // During drain: mark new connections for close after first response.
         c->keep_alive = !draining_.load(std::memory_order_relaxed);
         c->on_recv = &on_header_received<Self>;
-        c->on_complete = &on_header_received<Self>;
         timer.add(c, keepalive_timeout);
         if (metrics) metrics->on_accept();
         this->submit_recv(*c);
@@ -673,7 +645,6 @@ private:
             c->state = ConnState::ReadingHeader;
             c->keep_alive = !draining_.load(std::memory_order_relaxed);
             c->on_recv = &on_header_received<Self>;
-            c->on_complete = &on_header_received<Self>;
             timer.add(c, keepalive_timeout);
             if (metrics) metrics->on_accept();
             this->submit_recv(*c);

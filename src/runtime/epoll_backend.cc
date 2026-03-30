@@ -102,7 +102,7 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
     if (nw == static_cast<ssize_t>(len)) {
         if (pending_count < 64) {
             pending_completions[pending_count].conn_id = conn_id;
-            pending_completions[pending_count].type = IoEventType::Send;
+            pending_completions[pending_count].type = IoEventType::UpstreamSend;
             pending_completions[pending_count].result = static_cast<i32>(nw);
             pending_completions[pending_count].buf_id = 0;
             pending_completions[pending_count].has_buf = 0;
@@ -114,7 +114,7 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
     if (nw < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
         if (pending_count < 64) {
             pending_completions[pending_count].conn_id = conn_id;
-            pending_completions[pending_count].type = IoEventType::Send;
+            pending_completions[pending_count].type = IoEventType::UpstreamSend;
             pending_completions[pending_count].result = -errno;
             pending_completions[pending_count].buf_id = 0;
             pending_completions[pending_count].has_buf = 0;
@@ -149,7 +149,7 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
         }
         if (pending_count >= 64) pending_count = 63;
         pending_completions[pending_count].conn_id = conn_id;
-        pending_completions[pending_count].type = IoEventType::Send;
+        pending_completions[pending_count].type = IoEventType::UpstreamSend;
         pending_completions[pending_count].result = -err;
         pending_completions[pending_count].buf_id = 0;
         pending_completions[pending_count].has_buf = 0;
@@ -464,9 +464,10 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         eagain = true;
                         break;
                     } else {
-                        // Error or nw==0 — emit error completion (nw==0 treated as EPIPE)
+                        // Error or nw==0 — emit error completion
+                        bool is_up = conn_id < kMaxFdMap && upstream_fd_map[conn_id] == ss.fd;
                         events[out].conn_id = conn_id;
-                        events[out].type = IoEventType::Send;
+                        events[out].type = is_up ? IoEventType::UpstreamSend : IoEventType::Send;
                         events[out].result = (nw < 0) ? -errno : -EPIPE;
                         events[out].buf_id = 0;
                         events[out].has_buf = 0;
@@ -475,11 +476,11 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         break;
                     }
                 }
-                if (eagain) continue;  // no event, retry on next EPOLLOUT
+                if (eagain) continue;
                 if (!done) {
-                    // All bytes sent — emit completion with total byte count
+                    bool is_up = conn_id < kMaxFdMap && upstream_fd_map[conn_id] == ss.fd;
                     events[out].conn_id = conn_id;
-                    events[out].type = IoEventType::Send;
+                    events[out].type = is_up ? IoEventType::UpstreamSend : IoEventType::Send;
                     events[out].result = static_cast<i32>(ss.offset);
                     events[out].buf_id = 0;
                     events[out].has_buf = 0;

@@ -1,0 +1,56 @@
+#pragma once
+
+#include "rut/common/types.h"
+
+// Runtime helper functions callable from JIT'd code.
+// All use extern "C" linkage with rut_helper_ prefix to avoid
+// C++ name mangling. The JIT engine registers these via a custom
+// DefinitionGenerator so they're resolved on first use.
+//
+// These functions bridge the gap between JIT'd code (which operates
+// on raw pointers and primitives) and the runtime's parsed request
+// data. JIT'd code passes raw request bytes; helpers parse as needed.
+
+extern "C" {
+
+// ── Request Access ─────────────────────────────────────────────────
+
+// Extract request path from raw HTTP request.
+// Sets *out_ptr and *out_len to the path string (points into req_data).
+void rut_helper_req_path(const rut::u8* req_data,
+                         rut::u32 req_len,
+                         const char** out_ptr,
+                         rut::u32* out_len);
+
+// Extract HTTP method from raw request. Returns HttpMethod enum value.
+rut::u8 rut_helper_req_method(const rut::u8* req_data, rut::u32 req_len);
+
+// Look up a request header by name (case-insensitive).
+// Returns Optional(Str): *out_has_value = 1 if found, 0 if not.
+// If found, *out_ptr / *out_len point into req_data.
+void rut_helper_req_header(const rut::u8* req_data,
+                           rut::u32 req_len,
+                           const char* name,
+                           rut::u32 name_len,
+                           rut::u8* out_has_value,
+                           const char** out_ptr,
+                           rut::u32* out_len);
+
+// Get remote address from Connection. Returns IPv4 in network order.
+rut::u32 rut_helper_req_remote_addr(void* conn);
+
+// ── String Operations ──────────────────────────────────────────────
+
+// Check if string s has prefix pfx. Returns 1 (true) or 0 (false).
+rut::u8 rut_helper_str_has_prefix(const char* s, rut::u32 s_len, const char* pfx, rut::u32 pfx_len);
+
+// Trim prefix from string. If s starts with pfx, out = remainder.
+// Otherwise out = s unchanged.
+void rut_helper_str_trim_prefix(const char* s,
+                                rut::u32 s_len,
+                                const char* pfx,
+                                rut::u32 pfx_len,
+                                const char** out_ptr,
+                                rut::u32* out_len);
+
+}  // extern "C"

@@ -77,6 +77,7 @@ target_compile_options(zstd_compress PRIVATE
 # Runtime library
 add_library(rue_runtime STATIC
     placement_new.cc
+    runtime/arena.cc
     runtime/shard.cc
     runtime/io_uring_backend.cc
     runtime/epoll_backend.cc
@@ -116,9 +117,37 @@ target_include_directories(rue_compiler PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
 
+# JIT library — LLVM ORC JIT integration via C API.
+# Only this library links LLVM. rue_runtime stays LLVM-free so shard
+# threads never transitively depend on LLVM headers or libraries.
+add_library(rue_jit STATIC
+    jit/jit_engine.cc
+    jit/codegen.cc
+    jit/runtime_helpers.cc
+)
+
+target_include_directories(rue_jit PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+
+# LLVM on this system is a single shared lib (-lLLVM-N).
+# llvm_map_components_to_libnames resolves to the shared lib automatically.
+llvm_map_components_to_libnames(LLVM_LIBS core orcjit native support)
+target_link_libraries(rue_jit ${LLVM_LIBS})
+
+# JIT .cc files may need LLVM definitions that conflict with -fno-rtti.
+# The LLVM C API is pure C so no RTTI issues, but LLVM's cmake may add
+# -fno-rtti to definitions. Add LLVM definitions selectively.
+target_compile_definitions(rue_jit PRIVATE ${LLVM_DEFINITIONS})
+
+# rue_jit also links rue_runtime for runtime_helpers (uses HttpParser, Connection)
+target_link_libraries(rue_jit rue_runtime)
+
 # Main executable
 add_executable(rue main.cc)
 target_link_libraries(rue
     rue_runtime
     rue_compiler
+    rue_jit
 )

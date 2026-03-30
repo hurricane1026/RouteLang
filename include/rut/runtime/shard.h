@@ -50,7 +50,7 @@ struct Shard {
     EventLoopType* loop = nullptr;
 
     // Per-request scratch arena (reset after each request cycle)
-    Arena scratch;
+    MmapArena scratch;
 
     // Upstream connection pool (per-shard, mmap'd due to size)
     UpstreamPool* upstream = nullptr;

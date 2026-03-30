@@ -26,9 +26,9 @@ static Str lit(const char* s) {
 // For void Expected results.
 #define VOK(expr) REQUIRE(static_cast<bool>(expr))
 
-// Arena-backed module initialization.
+// MmapArena-backed module initialization.
 struct TestContext {
-    Arena arena;
+    MmapArena arena;
     Module mod;
 
     bool init() {

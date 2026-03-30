@@ -7,7 +7,8 @@
 
 namespace rut {
 
-struct Connection;  // forward declaration for wait() signature
+struct ConnectionBase;              // forward declaration for wait() signature
+using Connection = ConnectionBase;  // alias (matches connection.h)
 
 // Mock I/O backend for unit testing.
 // Records all submitted operations, lets tests inject completions.

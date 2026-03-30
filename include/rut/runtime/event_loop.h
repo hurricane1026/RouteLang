@@ -57,6 +57,59 @@ public:
         self().submit_send_upstream_impl(c, buf, len);
     }
     void submit_recv_upstream(Connection& c) { self().submit_recv_upstream_impl(c); }
+
+    // Per-event-type dispatch: route to typed slot.
+    // Called from each concrete EventLoop's dispatch() after timer refresh.
+    // Centralizes all "unexpected event" handling in one place.
+    void dispatch_event(Connection& conn, const IoEvent& ev) {
+        switch (ev.type) {
+            case IoEventType::Recv:
+                if (conn.on_recv) {
+                    conn.on_recv(&self(), conn, ev);
+                } else {
+                    handle_unhandled_recv(conn, ev);
+                }
+                break;
+            case IoEventType::Send:
+                if (conn.on_send) conn.on_send(&self(), conn, ev);
+                break;
+            case IoEventType::UpstreamRecv:
+                if (conn.on_upstream_recv) {
+                    conn.on_upstream_recv(&self(), conn, ev);
+                } else if (ev.result < 0) {
+                    // -ENOBUFS: upstream_recv_buf full, close to prevent hot-loop.
+                    self().close_conn(conn);
+                }
+                // null + result >= 0: data in upstream_recv_buf, safely ignored.
+                break;
+            case IoEventType::UpstreamSend:
+            case IoEventType::UpstreamConnect:
+                if (conn.on_upstream_send) conn.on_upstream_send(&self(), conn, ev);
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Handle client Recv when no on_recv handler is set.
+    // Centralizes drain/EOF/ENOBUFS logic — written once, correct everywhere.
+    void handle_unhandled_recv(Connection& conn, const IoEvent& ev) {
+        if (ev.result > 0) {
+            if (!conn.keep_alive) conn.recv_buf.reset();
+            // Re-arm only when io_uring multishot terminated (!recv_armed).
+            // On epoll, recv_armed is always false but EPOLLIN is already
+            // armed via EPOLLIN|EPOLLOUT from add_send — calling submit_recv
+            // would EPOLL_CTL_MOD to EPOLLIN only, dropping EPOLLOUT and
+            // stalling backpressured sends. Check on_send to guard.
+            if (!conn.recv_armed && !conn.on_send) self().submit_recv(conn);
+            return;
+        }
+        if (ev.result < 0) {
+            self().close_conn(conn);  // -ENOBUFS: prevent busy-loop
+            return;
+        }
+        // EOF: tolerate half-close
+    }
 };
 
 template <typename Backend>
@@ -79,7 +132,8 @@ private:
 public:
     static constexpr u32 kMaxConns = 16384;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
-    SlicePool pool;  // per-shard buffer pool (2 slices per active connection)
+    SlicePool
+        pool;  // per-shard buffer pool (3 slices max per connection: recv + send + upstream_recv)
     Connection conns[kMaxConns];
     u32 free_stack[kMaxConns];
     u32 free_top;
@@ -137,7 +191,8 @@ public:
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
         }
-        TRY_VOID(pool.init(kMaxConns * 2, pool_prealloc));
+        // 3 slices max per connection: recv + send + upstream_recv (lazy).
+        TRY_VOID(pool.init(kMaxConns * 3, pool_prealloc));
         auto be = backend.init(id, lfd);
         if (!be) {
             pool.destroy();
@@ -232,6 +287,10 @@ public:
             pool.free(conns[cid].send_slice);
             conns[cid].send_slice = nullptr;
         }
+        if (conns[cid].upstream_recv_slice) {
+            pool.free(conns[cid].upstream_recv_slice);
+            conns[cid].upstream_recv_slice = nullptr;
+        }
         free_stack[free_top++] = cid;
         // Remove from pending_free (swap with last element).
         for (u32 i = 0; i < pending_free_count; i++) {
@@ -258,6 +317,10 @@ public:
                 if (conns[cid].send_slice) {
                     pool.free(conns[cid].send_slice);
                     conns[cid].send_slice = nullptr;
+                }
+                if (conns[cid].upstream_recv_slice) {
+                    pool.free(conns[cid].upstream_recv_slice);
+                    conns[cid].upstream_recv_slice = nullptr;
                 }
                 free_stack[free_top++] = cid;
             } else {
@@ -290,6 +353,22 @@ public:
             timerfd_settime(backend.timer_fd, 0, &wake, nullptr);
         }
     }
+
+    // Lazy-allocate upstream recv buffer for proxy connections.
+    // Only called when a connection starts proxying — non-proxy connections
+    // never pay the cost. Returns false if SlicePool is exhausted.
+    bool alloc_upstream_buf(ConnectionBase& c) {
+        if (c.upstream_recv_slice) return true;  // already allocated
+        u8* s = pool.alloc();
+        if (!s) return false;
+        c.upstream_recv_slice = s;
+        c.upstream_recv_buf.bind(s, SlicePool::kSliceSize);
+        return true;
+    }
+
+    // Clear upstream fd mapping (no-op for legacy template — epoll/iouring
+    // concrete loops handle their own fd maps).
+    void clear_upstream_fd(u32 /*conn_id*/) {}
 
     // Number of connections not yet fully reclaimed.
     // Includes pending_free slots: they're closed but still waiting for
@@ -330,6 +409,7 @@ public:
             if (c.pending_ops == 0) {
                 if (c.recv_slice) pool.free(c.recv_slice);
                 if (c.send_slice) pool.free(c.send_slice);
+                if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
                 c.reset();
                 free_stack[free_top++] = cid;
                 return;
@@ -338,10 +418,12 @@ public:
             // reaches 0 in reclaim_pending().
             u8* rs = c.recv_slice;
             u8* ss = c.send_slice;
+            u8* us = c.upstream_recv_slice;
             u32 ops = c.pending_ops;
             c.reset();
             conns[cid].recv_slice = rs;
             conns[cid].send_slice = ss;
+            conns[cid].upstream_recv_slice = us;
             conns[cid].pending_ops = ops;
             pending_free[pending_free_count++] = cid;
         } else {
@@ -349,6 +431,7 @@ public:
             // read/write returns. Return slices to pool immediately.
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
+            if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
             c.reset();
             free_stack[free_top++] = cid;
         }
@@ -491,9 +574,9 @@ public:
                     if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
                 }
             }
-            if (conn.on_complete) {
+            if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
-                conn.on_complete(this, conn, ev);
+                this->dispatch_event(conn, ev);
             } else if constexpr (Backend::kAsyncIo) {
                 // Stale CQE for a closed connection. If all ops are now
                 // complete, reclaim the slot immediately so a later Accept
@@ -542,7 +625,7 @@ private:
         c->state = ConnState::ReadingHeader;
         // During drain: mark new connections for close after first response.
         c->keep_alive = !draining_.load(std::memory_order_relaxed);
-        c->on_complete = &on_header_received<Self>;
+        c->on_recv = &on_header_received<Self>;
         timer.add(c, keepalive_timeout);
         if (metrics) metrics->on_accept();
         this->submit_recv(*c);
@@ -568,7 +651,7 @@ private:
             }
             c->state = ConnState::ReadingHeader;
             c->keep_alive = !draining_.load(std::memory_order_relaxed);
-            c->on_complete = &on_header_received<Self>;
+            c->on_recv = &on_header_received<Self>;
             timer.add(c, keepalive_timeout);
             if (metrics) metrics->on_accept();
             this->submit_recv(*c);

@@ -260,9 +260,10 @@ TEST(callback_metrics, requests_active_decremented_on_wrong_event) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
     CHECK_EQ(m.requests_active, 1u);
 
-    // Wrong event type during Send state
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-    CHECK_EQ(m.requests_active, 0u);
+    // With slot dispatch, misrouted events are ignored (null slot).
+    // UpstreamConnect → on_upstream_send (null) → ignored, conn stays alive.
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
+    CHECK_EQ(m.requests_active, 1u);  // still active
 }
 
 // === Proxy callback tests ===
@@ -276,7 +277,7 @@ static void setup_proxy_conn(SmallLoop& loop, Connection*& c, u32& cid) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
     // Now manually set up for proxy: wire to upstream_connected callback
     c->upstream_fd = 99;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
 }
 
 TEST(proxy_callback, upstream_connect_success) {
@@ -314,7 +315,7 @@ TEST(proxy_callback, upstream_connect_fail_502) {
     CHECK(!c->keep_alive);
 }
 
-TEST(proxy_callback, upstream_connect_wrong_event) {
+TEST(proxy_callback, upstream_connect_wrong_event_ignored) {
     SmallLoop loop;
     loop.setup();
     ShardMetrics m;
@@ -325,10 +326,9 @@ TEST(proxy_callback, upstream_connect_wrong_event) {
     u32 cid = 0;
     setup_proxy_conn(loop, c, cid);
 
-    // Wrong event type → close
+    // With slot dispatch, Recv EOF → handle_unhandled_recv → tolerate
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 0));
-    CHECK_EQ(loop.conns[cid].fd, -1);
-    CHECK_EQ(m.requests_active, 0u);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 TEST(proxy_callback, upstream_request_sent_success) {
@@ -341,7 +341,7 @@ TEST(proxy_callback, upstream_request_sent_success) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     // Now at on_upstream_request_sent. Simulate full send of recv_buf.
     u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(req_len)));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, static_cast<i32>(req_len)));
     // Should now be waiting for upstream response (recv on upstream)
     CHECK(loop.backend.count_ops(MockOp::Recv) > 0);
 }
@@ -355,7 +355,7 @@ TEST(proxy_callback, upstream_request_sent_error) {
     setup_proxy_conn(loop, c, cid);
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     // Send error
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -1));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, -1));
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
@@ -368,7 +368,7 @@ TEST(proxy_callback, upstream_request_sent_any_positive_succeeds) {
     u32 cid = 0;
     setup_proxy_conn(loop, c, cid);
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, 1));
     // Should proceed to upstream response phase, not close.
     CHECK(loop.conns[cid].fd >= 0);
 }
@@ -381,9 +381,9 @@ TEST(proxy_callback, upstream_request_sent_wrong_event) {
     u32 cid = 0;
     setup_proxy_conn(loop, c, cid);
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    // Wrong event type
+    // With slot dispatch, Recv → on_recv (null) → handle_unhandled_recv → tolerate
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 1));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 // Helper: advance proxy conn to the upstream-response stage
@@ -391,7 +391,7 @@ static void advance_to_upstream_response(SmallLoop& loop, Connection*& c, u32& c
     setup_proxy_conn(loop, c, cid);
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(req_len)));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, static_cast<i32>(req_len)));
     // recv_buf was reset by on_upstream_request_sent, ready for upstream response
 }
 
@@ -420,7 +420,7 @@ TEST(proxy_callback, upstream_response_error) {
     advance_to_upstream_response(loop, c, cid);
 
     // Upstream recv error
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, -1));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, -1));
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
@@ -432,8 +432,9 @@ TEST(proxy_callback, upstream_response_wrong_event) {
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
 
+    // With slots, Send → on_send (null) → ignored
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 TEST(proxy_callback, proxy_response_sent_success) {
@@ -448,7 +449,7 @@ TEST(proxy_callback, proxy_response_sent_success) {
     advance_to_upstream_response(loop, c, cid);
     inject_upstream_response(loop, *c);
     // Now at on_proxy_response_sent, send the proxied response to client
-    u32 resp_len = c->recv_buf.len();
+    u32 resp_len = c->upstream_recv_buf.len();
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(resp_len)));
     // Should have completed the request cycle
     CHECK_EQ(m.requests_total, 1u);
@@ -490,9 +491,9 @@ TEST(proxy_callback, proxy_response_sent_wrong_event) {
     u32 cid = 0;
     advance_to_upstream_response(loop, c, cid);
     inject_upstream_response(loop, *c);
-    // Wrong event type
+    // With slots, Recv → on_recv (null) → handle_unhandled_recv → tolerate
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 1));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK(loop.conns[cid].fd >= 0);
 }
 
 TEST(proxy_callback, proxy_response_sent_draining_closes) {

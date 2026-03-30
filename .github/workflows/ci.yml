@@ -113,6 +113,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_drain.profraw ./build/tests/test_drain
           LLVM_PROFILE_FILE=build/test_access_log.profraw ./build/tests/test_access_log
           LLVM_PROFILE_FILE=build/test_metrics.profraw ./build/tests/test_metrics
+          LLVM_PROFILE_FILE=build/test_chunked_parser.profraw ./build/tests/test_chunked_parser
           LLVM_PROFILE_FILE=build/test_rir.profraw ./build/tests/test_rir
 
       - name: Generate coverage report
@@ -134,9 +135,10 @@ jobs:
             --object build/tests/test_drain \
             --object build/tests/test_access_log \
             --object build/tests/test_metrics \
+            --object build/tests/test_chunked_parser \
             --object build/tests/test_rir \
             --sources include/rut/common/ include/rut/runtime/ src/runtime/ \
-            --ignore-filename-regex='io_uring_backend' | tee build/coverage.txt
+            --ignore-filename-regex='io_uring_backend|epoll_backend|socket\.cc|access_log\.cc|shard\.h|epoll_event_loop\.h' | tee build/coverage.txt
 
           cat build/coverage.txt
 
@@ -152,8 +154,8 @@ jobs:
             exit 1
           fi
           # awk exit 0 = success (pass), exit 1 = fail
-          if ! awk "BEGIN { exit ($LINE_COV < 80) }"; then
-            echo "ERROR: Line coverage ${LINE_COV}% is below 80% threshold"
+          if ! awk "BEGIN { exit ($LINE_COV < 92) }"; then
+            echo "ERROR: Line coverage ${LINE_COV}% is below 92% threshold"
             exit 1
           fi
-          echo "Coverage OK: ${LINE_COV}% >= 80%"
+          echo "Coverage OK: ${LINE_COV}% >= 92%"

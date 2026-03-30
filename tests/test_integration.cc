@@ -1,4 +1,5 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
+#include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/shard.h"
 #include "test.h"
@@ -400,7 +401,7 @@ TEST(partial_send, real_epollout_completion) {
     // to prevent indefinite hangs if EPOLLOUT doesn't fire immediately.
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
-    backend.fd_map[0] = fds[0];
+    backend.downstream_fd_map[0] = fds[0];
 
     TestConn tc;
     tc.init(0, fds[0]);
@@ -466,7 +467,7 @@ TEST(partial_send, socketpair_full_send) {
 
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
-    backend.fd_map[0] = fds[0];
+    backend.downstream_fd_map[0] = fds[0];
 
     TestConn tc;
     tc.init(0, fds[0]);
@@ -555,7 +556,7 @@ TEST(partial_send, epollout_no_pending_switches_to_epollin) {
 
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
-    backend.fd_map[0] = fds[0];
+    backend.downstream_fd_map[0] = fds[0];
 
     TestConn tc;
     tc.init(0, fds[0]);
@@ -644,7 +645,7 @@ TEST(uring, return_buffer_no_crash) {
 
 // Shard init + shutdown without spawning a thread
 TEST(shard, init_shutdown) {
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
@@ -658,7 +659,7 @@ TEST(shard, init_shutdown) {
 
 // Shard spawn + stop + join
 TEST(shard, spawn_stop_join) {
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
@@ -676,7 +677,7 @@ TEST(shard, spawn_stop_join) {
 
 // Shard handles requests while running
 TEST(shard, serves_requests) {
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     u16 port = get_port(lfd);
@@ -707,7 +708,7 @@ TEST(shard, two_shards_same_port) {
     i32 lfd2 = create_listen_socket(port).value_or(-1);
     REQUIRE(lfd2 >= 0);
 
-    Shard<EpollBackend> s1, s2;
+    Shard<EpollEventLoop> s1, s2;
     REQUIRE(s1.init(0, lfd1).has_value());
     REQUIRE(s2.init(1, lfd2).has_value());
     REQUIRE(s1.spawn(-1).has_value());
@@ -756,7 +757,7 @@ TEST(shard, ephemeral_port_two_shards) {
     REQUIRE(lfd2 >= 0);
     CHECK_EQ(get_port(lfd2), port);
 
-    Shard<EpollBackend> s1, s2;
+    Shard<EpollEventLoop> s1, s2;
     REQUIRE(s1.init(0, lfd1).has_value());
     REQUIRE(s2.init(1, lfd2).has_value());
     REQUIRE(s1.spawn(-1).has_value());
@@ -782,7 +783,7 @@ TEST(shard, ephemeral_port_two_shards) {
 
 // Shard with owns_listen_fd closes it on shutdown
 TEST(shard, owns_listen_fd) {
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
@@ -794,7 +795,7 @@ TEST(shard, owns_listen_fd) {
 
 // Shard has upstream pool after init
 TEST(shard, upstream_pool_initialized) {
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
@@ -814,7 +815,7 @@ TEST(shard, route_config_attached) {
     cfg.add_upstream("api", 0x7F000001, 8080);
     cfg.add_proxy("/api/", 0, 0);
 
-    Shard<EpollBackend> shard;
+    Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
@@ -901,6 +902,194 @@ TEST(copilot6, real_loop_keepalive_timeout) {
     loop->shutdown();
     close(fd);
     destroy_real_loop(loop);
+}
+
+// === Epoll event loop: drain, metrics, epoch ===
+
+TEST(epoll_drain, drain_closes_idle_connections) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(loop->init(0, lfd).has_value());
+    CHECK(!loop->is_draining());
+    loop->drain(1);  // 1-second drain period
+    CHECK(loop->is_draining());
+    loop->stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_drain, drain_with_active_connections) {
+    TestServer srv;
+    REQUIRE(srv.setup(50));
+    // Connect and send request
+    i32 c = connect_to(srv.port);
+    REQUIRE(c >= 0);
+    send_all(c, HTTP_REQ, HTTP_REQ_LEN);
+    char buf[4096];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(n > 0);
+    // After response, connection is keep-alive. Now drain.
+    srv.loop->drain(1);
+    CHECK(srv.loop->is_draining());
+    close(c);
+    srv.teardown();
+}
+
+TEST(epoll_metrics, accept_and_request_counted) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(loop->init(0, lfd).has_value());
+    ShardMetrics metrics{};
+    loop->metrics = &metrics;
+    u16 port = get_port(lfd);
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
+    usleep(10000);
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, HTTP_REQ, HTTP_REQ_LEN);
+    char buf[4096];
+    recv_timeout(c, buf, sizeof(buf), 2000);
+    close(c);
+    lt.stop();
+    CHECK_GT(metrics.connections_total, 0u);
+    CHECK_GT(metrics.requests_total, 0u);
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_epoch, epoch_increments_on_request) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(loop->init(0, lfd).has_value());
+    ShardEpoch epoch{};
+    epoch.epoch.store(0, std::memory_order_relaxed);
+    loop->epoch = &epoch;
+    u16 port = get_port(lfd);
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
+    usleep(10000);
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, HTTP_REQ, HTTP_REQ_LEN);
+    char buf[4096];
+    recv_timeout(c, buf, sizeof(buf), 2000);
+    close(c);
+    lt.stop();
+    // Epoch should have advanced (enter + leave = +2 per request)
+    CHECK_GT(epoch.epoch.load(std::memory_order_relaxed), 0u);
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_command, config_swap_via_control) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(loop->init(0, lfd).has_value());
+    ShardControlBlock ctrl{};
+    RouteConfig cfg{};
+    const RouteConfig* cfg_ptr = nullptr;
+    loop->control = &ctrl;
+    loop->config_ptr = &cfg_ptr;
+    ctrl.pending_config.store(&cfg, std::memory_order_relaxed);
+    loop->poll_command();
+    CHECK_EQ(cfg_ptr, &cfg);
+    // JIT swap
+    void* fake_jit = reinterpret_cast<void*>(0x1234);
+    void* jit_ptr = nullptr;
+    loop->jit_code_ptr = &jit_ptr;
+    ctrl.pending_jit.store(fake_jit, std::memory_order_relaxed);
+    loop->poll_command();
+    CHECK_EQ(jit_ptr, fake_jit);
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+// === Shard lifecycle ===
+
+TEST(shard, init_and_shutdown) {
+    // Test Shard init with real event loop type
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    Shard<EpollEventLoop> shard;
+    auto res = shard.init(0, lfd);
+    CHECK(res.has_value());
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, metrics_wired) {
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    Shard<EpollEventLoop> shard;
+    auto res = shard.init(0, lfd);
+    REQUIRE(res.has_value());
+    CHECK(shard.loop->metrics != nullptr);
+    CHECK_EQ(shard.loop->metrics->connections_total, 0u);
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(epoll_drain, drain_completes_naturally) {
+    // Start loop, connect a client, drain, let it complete
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(loop->init(0, lfd).has_value());
+    u16 port = get_port(lfd);
+
+    // Start loop in thread with enough iterations to complete drain
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+    usleep(10000);
+
+    // Connect and send a request (creates active connection)
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, HTTP_REQ, HTTP_REQ_LEN);
+    char buf[4096];
+    recv_timeout(c, buf, sizeof(buf), 2000);
+
+    // Start drain with 1-second period
+    loop->drain(1);
+    CHECK(loop->is_draining());
+
+    // Close client to allow drain to complete (no active connections)
+    close(c);
+    usleep(500000);  // wait for drain
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(shard, access_log_init) {
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    Shard<EpollEventLoop> shard;
+    auto res = shard.init(0, lfd);
+    REQUIRE(res.has_value());
+    // Access log is lazily allocated
+    CHECK(shard.loop->access_log == nullptr);
+    auto log_res = shard.init_access_log();
+    CHECK(log_res.has_value());
+    CHECK(shard.loop->access_log != nullptr);
+    shard.shutdown();
+    close(lfd);
 }
 
 int main(int argc, char** argv) {

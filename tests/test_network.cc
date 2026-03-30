@@ -6582,10 +6582,9 @@ TEST(early_response, recv_buf_cleared_after_stash) {
     loop.backend.inject(ev);
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-    // Send completes → early response forwarded
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, 100));
+    // Upstream send completes → early response forwarded
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     // recv_buf should be cleared (stashed to send_buf, then cleared)
-    // It should NOT contain the original /first request
     CHECK_EQ(c->recv_buf.len(), 0u);
 }
 

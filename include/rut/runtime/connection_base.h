@@ -40,6 +40,20 @@ struct ConnectionBase {
     Callback on_upstream_recv;  // IoEventType::UpstreamRecv only
     Callback on_upstream_send;  // IoEventType::UpstreamSend + UpstreamConnect
 
+    // Set all 4 slots atomically. Full state transitions MUST use this
+    // to prevent stale callbacks in slots that aren't explicitly changed.
+    void set_slots(Callback recv, Callback send, Callback up_recv, Callback up_send) {
+        on_recv = recv;
+        on_send = send;
+        on_upstream_recv = up_recv;
+        on_upstream_send = up_send;
+    }
+
+    // Check if any slot is active (for dispatch guard).
+    bool has_active_slot() const {
+        return on_recv || on_send || on_upstream_recv || on_upstream_send;
+    }
+
     i32 fd;
     u32 id;
     ConnState state;  // for debugging/metrics only

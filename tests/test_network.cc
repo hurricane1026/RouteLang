@@ -6874,6 +6874,174 @@ TEST(legacy_loop, alloc_upstream_buf) {
     CHECK(c.upstream_recv_slice != nullptr);
 }
 
+// === Slot state machine tests: on_body_send_with_early_response ===
+
+// Send error during early response → still forwards buffered 413.
+TEST(slot_state, body_send_error_still_forwards_early_response) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    // Inject 413 into upstream_recv_buf
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+    // Client sends body chunk → on_request_body_sent
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    // UpstreamRecv during send → slot switches
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+    CHECK_EQ(c->on_upstream_send, &on_body_send_with_early_response<SmallLoop>);
+    // Send FAILS (EPIPE) → on_body_send_with_early_response still forwards 413
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+}
+
+// EOF with partial upstream headers → immediate 502 (no send in-flight).
+TEST(slot_state, eof_partial_headers_immediate_502) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    // Write partial upstream response
+    static const char kPartial[] = "HTTP/1.1 413 Too";
+    u32 plen = sizeof(kPartial) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < plen; j++) dst[j] = static_cast<u8>(kPartial[j]);
+    c->upstream_recv_buf.commit(plen);
+    // UpstreamRecv with data (Incomplete → re-arm)
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(plen)));
+    // UpstreamRecv EOF → no send in-flight, forwards immediately → 502
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+}
+
+// on_early_upstream_recvd (no send in-flight) → immediate forward.
+TEST(slot_state, early_upstream_recvd_immediate_forward) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_early_upstream_recvd<SmallLoop>);
+    // Inject 413 via UpstreamRecv — no send in-flight, forwards immediately
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    // Should have forwarded immediately (not deferred)
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+}
+
+// Slot cleanup after early response forwarded.
+TEST(slot_state, slots_cleaned_after_early_response) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    // Trigger early 413 via UpstreamRecv (no send in-flight → immediate)
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+    // After forwarding: on_upstream_recv should be on_upstream_response (parsing),
+    // on_upstream_send should be nullptr (cleared by on_body_send_with_early_response)
+    CHECK_EQ(c->on_upstream_send, nullptr);
+}
+
+// on_early_upstream_recvd_send_inflight only flags, doesn't forward.
+TEST(slot_state, send_inflight_defers_until_send_completes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    // Client sends body → on_request_body_sent waiting for UpstreamSend
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_early_upstream_recvd_send_inflight<SmallLoop>);
+    // UpstreamRecv 413 during send → slot switches, but response NOT forwarded yet
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+    // Slot switched but response not yet forwarded (no resp_status change)
+    CHECK_EQ(c->on_upstream_send, &on_body_send_with_early_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, nullptr);
+    CHECK_NE(c->resp_status, static_cast<u16>(413));
+    // UpstreamSend completion → now forwards
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+}
+
+// Verify initial send phase also sets on_upstream_recv for early response detection.
+TEST(slot_state, initial_send_has_early_response_slot) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->upstream_fd = 100;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    // After connect → on_upstream_request_sent in on_upstream_send
+    // on_upstream_recv should be set for early response detection
+    CHECK_EQ(c->on_upstream_send, &on_upstream_request_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, &on_early_upstream_recvd_send_inflight<SmallLoop>);
+}
+
+// Dispatch isolation: non-UpstreamSend events don't reach on_body_send_with_early_response.
+TEST(slot_state, early_response_callback_only_gets_upstream_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_upstream_send = &on_body_send_with_early_response<SmallLoop>;
+    c->on_upstream_recv = nullptr;
+    c->on_recv = nullptr;
+    c->on_send = nullptr;
+    // Recv → handle_unhandled_recv (on_recv null)
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK(c->fd >= 0);
+    // UpstreamRecv → null slot, ignored
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 50));
+    CHECK(c->fd >= 0);
+    // Send → null slot, ignored
+    loop.dispatch(make_ev(c->id, IoEventType::Send, 50));
+    CHECK(c->fd >= 0);
+}
+
 // ==========================================================================
 // Exhaustive dispatch tests: verify per-event-type slot isolation and
 // centralized null-slot handling.

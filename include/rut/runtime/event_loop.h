@@ -57,6 +57,59 @@ public:
         self().submit_send_upstream_impl(c, buf, len);
     }
     void submit_recv_upstream(Connection& c) { self().submit_recv_upstream_impl(c); }
+
+    // Per-event-type dispatch: route to typed slot.
+    // Called from each concrete EventLoop's dispatch() after timer refresh.
+    // Centralizes all "unexpected event" handling in one place.
+    void dispatch_event(Connection& conn, const IoEvent& ev) {
+        switch (ev.type) {
+            case IoEventType::Recv:
+                if (conn.on_recv) {
+                    conn.on_recv(&self(), conn, ev);
+                } else {
+                    handle_unhandled_recv(conn, ev);
+                }
+                break;
+            case IoEventType::Send:
+                if (conn.on_send) conn.on_send(&self(), conn, ev);
+                break;
+            case IoEventType::UpstreamRecv:
+                if (conn.on_upstream_recv) {
+                    conn.on_upstream_recv(&self(), conn, ev);
+                } else if (ev.result < 0) {
+                    // -ENOBUFS: upstream_recv_buf full, close to prevent hot-loop.
+                    self().close_conn(conn);
+                }
+                // null + result >= 0: data in upstream_recv_buf, safely ignored.
+                break;
+            case IoEventType::UpstreamSend:
+            case IoEventType::UpstreamConnect:
+                if (conn.on_upstream_send) conn.on_upstream_send(&self(), conn, ev);
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Handle client Recv when no on_recv handler is set.
+    // Centralizes drain/EOF/ENOBUFS logic — written once, correct everywhere.
+    void handle_unhandled_recv(Connection& conn, const IoEvent& ev) {
+        if (ev.result > 0) {
+            if (!conn.keep_alive) conn.recv_buf.reset();
+            // Re-arm only when io_uring multishot terminated (!recv_armed).
+            // On epoll, recv_armed is always false but EPOLLIN is already
+            // armed via EPOLLIN|EPOLLOUT from add_send — calling submit_recv
+            // would EPOLL_CTL_MOD to EPOLLIN only, dropping EPOLLOUT and
+            // stalling backpressured sends. Check on_send to guard.
+            if (!conn.recv_armed && !conn.on_send) self().submit_recv(conn);
+            return;
+        }
+        if (ev.result < 0) {
+            self().close_conn(conn);  // -ENOBUFS: prevent busy-loop
+            return;
+        }
+        // EOF: tolerate half-close
+    }
 };
 
 template <typename Backend>
@@ -521,9 +574,9 @@ public:
                     if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
                 }
             }
-            if (conn.on_complete) {
+            if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
-                conn.on_complete(this, conn, ev);
+                this->dispatch_event(conn, ev);
             } else if constexpr (Backend::kAsyncIo) {
                 // Stale CQE for a closed connection. If all ops are now
                 // complete, reclaim the slot immediately so a later Accept
@@ -572,7 +625,7 @@ private:
         c->state = ConnState::ReadingHeader;
         // During drain: mark new connections for close after first response.
         c->keep_alive = !draining_.load(std::memory_order_relaxed);
-        c->on_complete = &on_header_received<Self>;
+        c->on_recv = &on_header_received<Self>;
         timer.add(c, keepalive_timeout);
         if (metrics) metrics->on_accept();
         this->submit_recv(*c);
@@ -598,7 +651,7 @@ private:
             }
             c->state = ConnState::ReadingHeader;
             c->keep_alive = !draining_.load(std::memory_order_relaxed);
-            c->on_complete = &on_header_received<Self>;
+            c->on_recv = &on_header_received<Self>;
             timer.add(c, keepalive_timeout);
             if (metrics) metrics->on_accept();
             this->submit_recv(*c);

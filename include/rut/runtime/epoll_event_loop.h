@@ -273,9 +273,9 @@ public:
         }
         if (ev.conn_id < kMaxConns) {
             auto& conn = conns[ev.conn_id];
-            if (conn.on_complete) {
+            if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
-                conn.on_complete(this, conn, ev);
+                this->dispatch_event(conn, ev);
             }
         }
     }
@@ -299,7 +299,7 @@ private:
         }
         c->state = ConnState::ReadingHeader;
         c->keep_alive = !draining_.load(std::memory_order_relaxed);
-        c->on_complete = &on_header_received<Self>;
+        c->on_recv = &on_header_received<Self>;
         timer.add(c, keepalive_timeout);
         if (metrics) metrics->on_accept();
         this->submit_recv(*c);

@@ -235,11 +235,12 @@ TEST(drain_proxy, upstream_response_rewrites_connection_header) {
 
     // Wire to proxy: upstream connect
     c->upstream_fd = 99;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     // Forward request to upstream
     rut::u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<rut::i32>(req_len)));
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
 
     // Now inject upstream response with Connection: keep-alive header
     // Manually write HTTP response into upstream_recv_buf
@@ -287,10 +288,11 @@ TEST(drain_proxy, upstream_response_rewrites_lowercase_connection_header) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
 
     c->upstream_fd = 99;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     rut::u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<rut::i32>(req_len)));
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
 
     c->upstream_recv_buf.reset();
     const char* resp = "HTTP/1.1 200 OK\r\nconnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK";
@@ -333,10 +335,11 @@ TEST(drain_proxy, upstream_response_injects_close_when_missing) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
 
     c->upstream_fd = 99;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     rut::u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<rut::i32>(req_len)));
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
 
     // Upstream response WITHOUT Connection header
     c->upstream_recv_buf.reset();
@@ -354,7 +357,7 @@ TEST(drain_proxy, upstream_response_injects_close_when_missing) {
     for (rut::u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     // Should have been routed through send_buf with Connection: close injected
-    // The on_complete should now be on_response_sent (rebuilt in send_buf path)
+    // The on_send should now be on_response_sent (rebuilt in send_buf path)
     CHECK(!c->keep_alive);
 }
 
@@ -369,10 +372,11 @@ TEST(drain_proxy, upstream_status_parsed) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
 
     c->upstream_fd = 99;
-    c->on_complete = &on_upstream_connected<SmallLoop>;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
     rut::u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<rut::i32>(req_len)));
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
 
     // Upstream 404 response
     c->upstream_recv_buf.reset();

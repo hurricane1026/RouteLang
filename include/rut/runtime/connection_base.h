@@ -27,10 +27,32 @@ struct ConnectionBase {
     static constexpr u32 kMaxReqPathLen = 64;
     static constexpr u32 kMaxUpstreamNameLen = 24;
     static constexpr u16 kMaxPipelineDepth = 16;
-    // fp callback: what to do when the next I/O completes.
-    // This IS the state — no enum switch needed.
-    // Typed as void* to avoid circular dependency; cast in event_loop.h.
-    void (*on_complete)(void* loop, ConnectionBase& conn, IoEvent ev);
+    // Event callback type — void* loop to avoid circular dependency.
+    using Callback = void (*)(void* loop, ConnectionBase& conn, IoEvent ev);
+
+    // Per-event-type callback slots (Seastar-inspired).
+    // Each slot receives ONLY its designated event type. The dispatch
+    // layer routes events to the correct slot and handles null slots
+    // centrally (drain/ignore/close). No event-type guard code needed
+    // inside callbacks.
+    Callback on_recv;           // IoEventType::Recv only
+    Callback on_send;           // IoEventType::Send only
+    Callback on_upstream_recv;  // IoEventType::UpstreamRecv only
+    Callback on_upstream_send;  // IoEventType::UpstreamSend + UpstreamConnect
+
+    // Set all 4 slots atomically. Full state transitions MUST use this
+    // to prevent stale callbacks in slots that aren't explicitly changed.
+    void set_slots(Callback recv, Callback send, Callback up_recv, Callback up_send) {
+        on_recv = recv;
+        on_send = send;
+        on_upstream_recv = up_recv;
+        on_upstream_send = up_send;
+    }
+
+    // Check if any slot is active (for dispatch guard).
+    bool has_active_slot() const {
+        return on_recv || on_send || on_upstream_recv || on_upstream_send;
+    }
 
     i32 fd;
     u32 id;
@@ -67,6 +89,7 @@ struct ConnectionBase {
     u32 resp_body_remaining;          // bytes left for Content-Length mode
     ChunkedParser resp_chunk_parser;  // for chunked mode end detection
     u32 resp_body_sent;               // total response body bytes sent (for access log)
+    u32 upstream_send_len;            // bytes from upstream_recv_buf in current client send
 
     // io_uring multishot recv tracking: true while the multishot SQE is
     // armed in the kernel (set on submit, cleared on final CQE without
@@ -124,7 +147,10 @@ struct ConnectionBase {
     Buffer upstream_recv_buf;
 
     void reset() {
-        on_complete = nullptr;
+        on_recv = nullptr;
+        on_send = nullptr;
+        on_upstream_recv = nullptr;
+        on_upstream_send = nullptr;
         fd = -1;
         id = 0;
         state = ConnState::Idle;
@@ -151,6 +177,7 @@ struct ConnectionBase {
         resp_body_remaining = 0;
         resp_chunk_parser.reset();
         resp_body_sent = 0;
+        upstream_send_len = 0;
         recv_armed = false;
         send_armed = false;
         upstream_recv_armed = false;

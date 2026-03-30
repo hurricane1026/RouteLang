@@ -96,7 +96,66 @@ bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
 }
 
 bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
-    return add_send(fd, conn_id, buf, len);
+    // Try immediate send first (same as add_send).
+    ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
+
+    if (nw == static_cast<ssize_t>(len)) {
+        if (pending_count < 64) {
+            pending_completions[pending_count].conn_id = conn_id;
+            pending_completions[pending_count].type = IoEventType::UpstreamSend;
+            pending_completions[pending_count].result = static_cast<i32>(nw);
+            pending_completions[pending_count].buf_id = 0;
+            pending_completions[pending_count].has_buf = 0;
+            pending_count++;
+        }
+        return true;
+    }
+
+    if (nw < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        if (pending_count < 64) {
+            pending_completions[pending_count].conn_id = conn_id;
+            pending_completions[pending_count].type = IoEventType::UpstreamSend;
+            pending_completions[pending_count].result = -errno;
+            pending_completions[pending_count].buf_id = 0;
+            pending_completions[pending_count].has_buf = 0;
+            pending_count++;
+        }
+        return true;
+    }
+
+    // Partial send or EAGAIN: register for EPOLLOUT but ALSO keep EPOLLIN
+    // so early upstream responses (413/401) are still detected during
+    // backpressured body forwarding. Use UpstreamRecv as the encoded type
+    // so that EPOLLIN events hit the correct (upstream) fd map and buffer.
+    // EPOLLOUT is handled by checking send_state in the wait() loop.
+    u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
+    if (conn_id < kMaxFdMap) {
+        send_state[conn_id].src = buf;
+        send_state[conn_id].fd = fd;
+        send_state[conn_id].offset = sent;
+        send_state[conn_id].remaining = len - sent;
+    }
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.u64 = encode_data(conn_id, IoEventType::UpstreamRecv);
+    i32 rc = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+    if (rc < 0 && errno == ENOENT) {
+        rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    }
+    if (rc < 0) {
+        i32 err = errno;
+        if (conn_id < kMaxFdMap) {
+            send_state[conn_id] = {nullptr, -1, 0, 0};
+        }
+        if (pending_count >= 64) pending_count = 63;
+        pending_completions[pending_count].conn_id = conn_id;
+        pending_completions[pending_count].type = IoEventType::UpstreamSend;
+        pending_completions[pending_count].result = -err;
+        pending_completions[pending_count].buf_id = 0;
+        pending_completions[pending_count].has_buf = 0;
+        pending_count++;
+    }
+    return true;
 }
 
 bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
@@ -141,9 +200,9 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     }
 
     // Partial send or EAGAIN: track remaining bytes, register for EPOLLOUT.
-    // wait() will complete the send on writability and emit the real byte count.
-    // Store the original source pointer and fd — the source may be recv_buf (proxy),
-    // not always send_buf, and fd may be upstream_fd.
+    // Keep EPOLLIN armed so client Recv events are still delivered during
+    // backpressured sends (needed to drain upload body for early responses
+    // and to detect client disconnect). wait() handles both events.
     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
     if (conn_id < kMaxFdMap) {
         send_state[conn_id].src = buf;
@@ -152,7 +211,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
         send_state[conn_id].remaining = len - sent;
     }
     struct epoll_event ev;
-    ev.events = EPOLLOUT;
+    ev.events = EPOLLIN | EPOLLOUT;
     ev.data.u64 = encode_data(conn_id, IoEventType::Send);
     i32 rc = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
     if (rc < 0 && errno == ENOENT) {
@@ -299,18 +358,22 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             }
         } else if (ep_events[i].events & EPOLLIN) {
             // Readiness → recv directly into Connection::recv_buf
-            // Use the correct fd map based on event type.
+            // If the encoded type is Send (EPOLLIN|EPOLLOUT during partial send),
+            // this is a Recv event on the same fd — override the type.
+            IoEventType recv_type = type;
+            if (type == IoEventType::Send) recv_type = IoEventType::Recv;
             i32 fd = (conn_id < kMaxFdMap)
-                         ? ((type == IoEventType::UpstreamRecv) ? upstream_fd_map[conn_id]
-                                                                : downstream_fd_map[conn_id])
+                         ? ((recv_type == IoEventType::UpstreamRecv) ? upstream_fd_map[conn_id]
+                                                                     : downstream_fd_map[conn_id])
                          : -1;
             if (fd < 0) continue;
             // Route recv data by event type: UpstreamRecv → upstream_recv_buf,
             // Recv → recv_buf.
             i32 result = 0;
             if (conn_id < max_conns) {
-                auto& buf = (type == IoEventType::UpstreamRecv) ? conns[conn_id].upstream_recv_buf
-                                                                : conns[conn_id].recv_buf;
+                auto& buf = (recv_type == IoEventType::UpstreamRecv)
+                                ? conns[conn_id].upstream_recv_buf
+                                : conns[conn_id].recv_buf;
                 u32 avail = buf.write_avail();
                 if (avail > 0) {
                     ssize_t nr;
@@ -332,13 +395,20 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 result = -EINVAL;  // invalid conn_id
             }
             events[out].conn_id = conn_id;
-            events[out].type = type;  // Recv or UpstreamRecv
+            events[out].type = recv_type;  // Recv or UpstreamRecv
             events[out].result = result;
             events[out].buf_id = 0;
             events[out].has_buf = 0;
             events[out].more = 0;
             out++;
+            // If both EPOLLIN and EPOLLOUT fired (upstream recv + send on same fd),
+            // also process the pending partial send. Fall through to EPOLLOUT handling.
+            if ((ep_events[i].events & EPOLLOUT) && conn_id < kMaxFdMap &&
+                send_state[conn_id].remaining > 0 && out < max_events) {
+                goto handle_epollout;
+            }
         } else if (ep_events[i].events & EPOLLOUT) {
+        handle_epollout:
             if (type == IoEventType::UpstreamConnect) {
                 // Connect completed — check for errors
                 i32 err = 0;
@@ -394,9 +464,10 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         eagain = true;
                         break;
                     } else {
-                        // Error or nw==0 — emit error completion (nw==0 treated as EPIPE)
+                        // Error or nw==0 — emit error completion
+                        bool is_up = conn_id < kMaxFdMap && upstream_fd_map[conn_id] == ss.fd;
                         events[out].conn_id = conn_id;
-                        events[out].type = IoEventType::Send;
+                        events[out].type = is_up ? IoEventType::UpstreamSend : IoEventType::Send;
                         events[out].result = (nw < 0) ? -errno : -EPIPE;
                         events[out].buf_id = 0;
                         events[out].has_buf = 0;
@@ -405,11 +476,11 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         break;
                     }
                 }
-                if (eagain) continue;  // no event, retry on next EPOLLOUT
+                if (eagain) continue;
                 if (!done) {
-                    // All bytes sent — emit completion with total byte count
+                    bool is_up = conn_id < kMaxFdMap && upstream_fd_map[conn_id] == ss.fd;
                     events[out].conn_id = conn_id;
-                    events[out].type = IoEventType::Send;
+                    events[out].type = is_up ? IoEventType::UpstreamSend : IoEventType::Send;
                     events[out].result = static_cast<i32>(ss.offset);
                     events[out].buf_id = 0;
                     events[out].has_buf = 0;

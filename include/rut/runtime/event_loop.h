@@ -62,7 +62,13 @@ public:
     // Called from each concrete EventLoop's dispatch() after timer refresh.
     // Centralizes all "unexpected event" handling in one place.
     void dispatch_event(Connection& conn, const IoEvent& ev) {
-        // Try per-type slot first.
+        // During migration: on_complete takes priority (backward compatible).
+        // Fully migrated callbacks set on_complete = nullptr and use slots.
+        if (conn.on_complete) {
+            conn.on_complete(&self(), conn, ev);
+            return;
+        }
+        // Per-type slot dispatch (fully migrated path).
         ConnectionBase::Callback handler = nullptr;
         switch (ev.type) {
             case IoEventType::Recv:
@@ -87,12 +93,7 @@ public:
             handler(&self(), conn, ev);
             return;
         }
-        // Fallback to legacy on_complete during migration.
-        if (conn.on_complete) {
-            conn.on_complete(&self(), conn, ev);
-            return;
-        }
-        // Fully migrated: null slot = centralized handling.
+        // Null slot = centralized handling.
         switch (ev.type) {
             case IoEventType::Recv:
                 handle_unhandled_recv(conn, ev);
@@ -644,6 +645,7 @@ private:
         c->state = ConnState::ReadingHeader;
         // During drain: mark new connections for close after first response.
         c->keep_alive = !draining_.load(std::memory_order_relaxed);
+        c->on_recv = &on_header_received<Self>;
         c->on_complete = &on_header_received<Self>;
         timer.add(c, keepalive_timeout);
         if (metrics) metrics->on_accept();
@@ -670,6 +672,7 @@ private:
             }
             c->state = ConnState::ReadingHeader;
             c->keep_alive = !draining_.load(std::memory_order_relaxed);
+            c->on_recv = &on_header_received<Self>;
             c->on_complete = &on_header_received<Self>;
             timer.add(c, keepalive_timeout);
             if (metrics) metrics->on_accept();

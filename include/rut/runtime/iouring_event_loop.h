@@ -425,6 +425,7 @@ private:
         }
         c->state = ConnState::ReadingHeader;
         c->keep_alive = !draining_.load(std::memory_order_relaxed);
+        c->on_recv = &on_header_received<Self>;
         c->on_complete = &on_header_received<Self>;
         timer.add(c, keepalive_timeout);
         if (metrics) metrics->on_accept();
@@ -448,6 +449,7 @@ private:
             }
             c->state = ConnState::ReadingHeader;
             c->keep_alive = !draining_.load(std::memory_order_relaxed);
+            c->on_recv = &on_header_received<Self>;
             c->on_complete = &on_header_received<Self>;
             timer.add(c, keepalive_timeout);
             if (metrics) metrics->on_accept();

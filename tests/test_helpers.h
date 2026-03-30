@@ -197,6 +197,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
             if (!c) return;
             c->fd = ev.result;
             c->state = ConnState::ReadingHeader;
+            c->on_recv = &on_header_received<SmallLoop>;
             c->on_complete = &on_header_received<SmallLoop>;
             timer.add(c, keepalive_timeout);
             this->submit_recv(*c);
@@ -537,6 +538,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             if (!c) return;
             c->fd = ev.result;
             c->state = ConnState::ReadingHeader;
+            c->on_recv = &on_header_received<AsyncSmallLoop>;
             c->on_complete = &on_header_received<AsyncSmallLoop>;
             timer.add(c, keepalive_timeout);
             this->submit_recv(*c);

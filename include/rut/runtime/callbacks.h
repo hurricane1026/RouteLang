@@ -379,11 +379,8 @@ template <typename Loop>
 void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    // Guard: unexpected event type.
+    // Guard: unexpected event type (legacy, removed when fully migrated to slots).
     if (ev.type != IoEventType::Recv) {
-        // Stale UpstreamRecv/Send CQEs from a previous proxy request.
-        // With separate buffers, UpstreamRecv data goes to upstream_recv_buf
-        // (not recv_buf), so no purge needed — just ignore.
         if (ev.type == IoEventType::UpstreamRecv) return;
         if (ev.type == IoEventType::UpstreamSend) return;
         loop->close_conn(conn);
@@ -411,6 +408,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             // Keep pipeline_depth > 0 so subsequent recvs also check for
             // Incomplete (multi-packet reassembly of the pipelined request).
             conn.state = ConnState::ReadingHeader;
+            conn.on_recv = &on_header_received<Loop>;
             conn.on_complete = &on_header_received<Loop>;
             loop->submit_recv(conn);
             return;
@@ -437,6 +435,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200), sizeof(kResponse200) - 1);
     }
 
+    conn.on_recv = nullptr;
+    conn.on_send = &on_response_sent<Loop>;
     conn.on_complete = &on_response_sent<Loop>;
     loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
 }
@@ -488,6 +488,10 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.pipeline_depth = 0;
     conn.recv_buf.reset();
     conn.state = ConnState::ReadingHeader;
+    conn.on_recv = &on_header_received<Loop>;
+    conn.on_send = nullptr;
+    conn.on_upstream_recv = nullptr;
+    conn.on_upstream_send = nullptr;
     conn.on_complete = &on_header_received<Loop>;
     loop->submit_recv(conn);
 }
@@ -925,6 +929,10 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.pipeline_depth = 0;
         conn.recv_buf.reset();
         conn.state = ConnState::ReadingHeader;
+        conn.on_recv = &on_header_received<Loop>;
+        conn.on_send = nullptr;
+        conn.on_upstream_recv = nullptr;
+        conn.on_upstream_send = nullptr;
         conn.on_complete = &on_header_received<Loop>;
         loop->submit_recv(conn);
         return;
@@ -1638,6 +1646,10 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.pipeline_depth = 0;
     conn.recv_buf.reset();
     conn.state = ConnState::ReadingHeader;
+    conn.on_recv = &on_header_received<Loop>;
+    conn.on_send = nullptr;
+    conn.on_upstream_recv = nullptr;
+    conn.on_upstream_send = nullptr;
     conn.on_complete = &on_header_received<Loop>;
     loop->submit_recv(conn);
 }

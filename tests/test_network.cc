@@ -7521,6 +7521,277 @@ TEST(dispatch_isolation, upstream_send_reaches_upstream_send_slot) {
     CHECK(g_callback_invoked);
 }
 
+// ==========================================================================
+// State transition exhaustive tests: verify all 4 slot values after
+// each reachable state transition.
+// ==========================================================================
+
+// Helper: verify all 4 slots match expected values.
+#define CHECK_SLOTS(c, r, s, ur, us)           \
+    do {                                       \
+        CHECK_EQ((c)->on_recv, (r));           \
+        CHECK_EQ((c)->on_send, (s));           \
+        CHECK_EQ((c)->on_upstream_recv, (ur)); \
+        CHECK_EQ((c)->on_upstream_send, (us)); \
+    } while (0)
+
+// State 1: Accept → ReadingHeader {on_recv=header, rest=null}
+TEST(state_transition, accept_to_reading_header) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
+}
+
+// State 2: Recv → SendingResponse {on_send=response_sent, rest=null}
+TEST(state_transition, header_received_to_sending_response) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK_SLOTS(c, nullptr, &on_response_sent<SmallLoop>, nullptr, nullptr);
+}
+
+// State 3: Send complete → all null (before keep-alive decision)
+TEST(state_transition, response_sent_clears_all) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    // Capture send_buf.len before dispatch (response_sent validates it)
+    u32 slen = c->send_buf.len();
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(slen)));
+    // After keep-alive → back to ReadingHeader
+    CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
+}
+
+// State 4: UpstreamConnect → {recv=null, send=null, up_recv=early_inflight, up_send=req_sent}
+TEST(state_transition, connected_to_initial_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->upstream_fd = 100;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    CHECK_SLOTS(c,
+                nullptr,
+                nullptr,
+                &on_early_upstream_recvd_send_inflight<SmallLoop>,
+                &on_upstream_request_sent<SmallLoop>);
+}
+
+// State 5: Initial send complete (no body) → {up_recv=upstream_response}
+TEST(state_transition, initial_send_to_upstream_response) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    CHECK_SLOTS(c, nullptr, nullptr, &on_upstream_response<SmallLoop>, nullptr);
+}
+
+// State 6: Body streaming entry → {recv=body_recvd, up_recv=early}
+TEST(state_transition, more_body_to_body_streaming) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    CHECK_SLOTS(c,
+                &on_request_body_recvd<SmallLoop>,
+                nullptr,
+                &on_early_upstream_recvd<SmallLoop>,
+                nullptr);
+}
+
+// State 7: Body chunk recv → send to upstream {up_recv=early_inflight, up_send=body_sent}
+TEST(state_transition, body_recvd_to_body_sent) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK_SLOTS(c,
+                nullptr,
+                nullptr,
+                &on_early_upstream_recvd_send_inflight<SmallLoop>,
+                &on_request_body_sent<SmallLoop>);
+}
+
+// State 8: Body send complete (more body) → back to streaming
+TEST(state_transition, body_sent_more_body) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    CHECK_SLOTS(c,
+                &on_request_body_recvd<SmallLoop>,
+                nullptr,
+                &on_early_upstream_recvd<SmallLoop>,
+                nullptr);
+}
+
+// State 9: Upstream response parsed, body complete → send to client
+TEST(state_transition, upstream_response_body_complete) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    inject_upstream_response(loop, *c);
+    CHECK_SLOTS(c, nullptr, &on_proxy_response_sent<SmallLoop>, nullptr, nullptr);
+}
+
+// State 10: Upstream response, body incomplete → stream to client
+TEST(state_transition, upstream_response_body_incomplete) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
+    c->upstream_recv_buf.commit(rlen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_SLOTS(c, nullptr, &on_response_header_sent<SmallLoop>, nullptr, nullptr);
+}
+
+// State 11: Header sent → wait for body {up_recv=body_recvd}
+TEST(state_transition, header_sent_to_body_recv) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
+    c->upstream_recv_buf.commit(rlen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    // Send headers
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(rlen)));
+    CHECK_SLOTS(c, nullptr, nullptr, &on_response_body_recvd<SmallLoop>, nullptr);
+}
+
+// State 12: Body recvd → send chunk {on_send=body_sent}
+TEST(state_transition, body_recvd_to_send_chunk) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n"
+        "data";
+    u32 rlen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
+    c->upstream_recv_buf.commit(rlen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(rlen)));
+    // Now in on_response_body_recvd, recv body data
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 500));
+    CHECK_SLOTS(c, nullptr, &on_response_body_sent<SmallLoop>, nullptr, nullptr);
+}
+
+// State 13: Early response → slot switches to on_body_send_with_early_response
+TEST(state_transition, early_response_slot_switch) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    // on_upstream_send = on_request_body_sent, on_upstream_recv = early_inflight
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n\r\n";
+    u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+    CHECK_SLOTS(c, nullptr, nullptr, nullptr, &on_body_send_with_early_response<SmallLoop>);
+}
+
+// State 14: 502 response → {on_send=response_sent, rest=null}
+TEST(state_transition, upstream_502_clears_all) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    // Inject malformed response (not starting with HTTP/)
+    static const char kBad[] = "XHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    u32 blen = sizeof(kBad) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < blen; j++) dst[j] = static_cast<u8>(kBad[j]);
+    c->upstream_recv_buf.commit(blen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(blen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_SLOTS(c, nullptr, &on_response_sent<SmallLoop>, nullptr, nullptr);
+}
+
+// State 15: Connect failure 502 → {on_send=response_sent, rest=null}
+TEST(state_transition, connect_failure_clears_all) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->upstream_fd = 100;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, -111));
+    CHECK_SLOTS(c, nullptr, &on_response_sent<SmallLoop>, nullptr, nullptr);
+}
+
+// State 16: Proxy response sent → keep-alive → ReadingHeader
+TEST(state_transition, proxy_keepalive_to_reading_header) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    inject_upstream_response(loop, *c);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

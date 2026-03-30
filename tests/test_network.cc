@@ -7269,6 +7269,18 @@ TEST(dispatch, null_upstream_recv_enobufs_closes) {
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
+TEST(dispatch, null_upstream_recv_eof_ignored) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_upstream_recv = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 0));  // EOF
+    CHECK(c->fd >= 0);                                            // ignored
+}
+
 TEST(dispatch, null_upstream_send_ignored) {
     SmallLoop loop;
     loop.setup();
@@ -7280,6 +7292,28 @@ TEST(dispatch, null_upstream_send_ignored) {
     CHECK(c->fd >= 0);
 }
 
+TEST(dispatch, null_upstream_send_eof_ignored) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->on_upstream_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 0));
+    CHECK(c->fd >= 0);
+}
+
+TEST(dispatch, null_upstream_send_error_ignored) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->on_upstream_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
+    CHECK(c->fd >= 0);  // stale completion, always ignored
+}
+
 TEST(dispatch, null_send_ignored) {
     SmallLoop loop;
     loop.setup();
@@ -7289,6 +7323,28 @@ TEST(dispatch, null_send_ignored) {
     c->on_send = nullptr;
     loop.dispatch(make_ev(c->id, IoEventType::Send, 100));
     CHECK(c->fd >= 0);
+}
+
+TEST(dispatch, null_send_eof_ignored) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->on_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::Send, 0));
+    CHECK(c->fd >= 0);
+}
+
+TEST(dispatch, null_send_error_ignored) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->on_send = nullptr;
+    loop.dispatch(make_ev(c->id, IoEventType::Send, -32));
+    CHECK(c->fd >= 0);  // stale completion, ignored
 }
 
 TEST(dispatch, null_upstream_connect_ignored) {

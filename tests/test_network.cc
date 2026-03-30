@@ -7042,6 +7042,132 @@ TEST(slot_state, early_response_callback_only_gets_upstream_send) {
     CHECK(c->fd >= 0);
 }
 
+// === Slot transition hygiene tests ===
+
+// P1a: handle_unhandled_recv must NOT re-arm when on_send is set (epoll EPOLLOUT).
+TEST(slot_hygiene, no_recv_rearm_during_pending_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    // on_send is now set (on_response_sent). Simulate null on_recv.
+    c->on_recv = nullptr;
+    loop.backend.clear_ops();
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK(c->fd >= 0);
+    // submit_recv must NOT have been called (would clobber EPOLLOUT)
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+}
+
+// After send completes, on_send is cleared → recv CAN be re-armed.
+TEST(slot_hygiene, recv_rearm_after_send_completes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    // Complete the send → on_send cleared by on_response_sent
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(c->on_send, nullptr);
+    // on_send is null after completion. Set on_recv to null but keep
+    // on_upstream_send as dummy so dispatch guard passes.
+    c->on_recv = nullptr;
+    c->on_upstream_send = &on_header_received<SmallLoop>;  // dummy
+    loop.backend.clear_ops();
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK(c->fd >= 0);
+    CHECK_GT(loop.backend.count_ops(MockOp::Recv), 0u);
+}
+
+// P1b: upstream slots cleared before sending complete proxy response.
+TEST(slot_hygiene, upstream_slots_cleared_on_proxy_response_send) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    // Inject upstream response
+    inject_upstream_response(loop, *c);
+    // After on_upstream_response parses: on_send is set, upstream slots cleared
+    CHECK_EQ(c->on_upstream_recv, nullptr);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+    CHECK(c->on_send != nullptr);
+}
+
+// P2: upstream slots cleared on connect failure.
+TEST(slot_hygiene, upstream_slots_cleared_on_connect_failure) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->upstream_fd = 100;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    // Connect fails
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, -111));
+    // Upstream slots must be cleared (prevent re-entrancy)
+    CHECK_EQ(c->on_upstream_send, nullptr);
+    CHECK_EQ(c->on_upstream_recv, nullptr);
+    // Should be sending 502
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+}
+
+// on_send cleared after each send-completion callback.
+TEST(slot_hygiene, on_send_cleared_after_response_sent) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK(c->on_send != nullptr);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(c->on_send, nullptr);
+}
+
+TEST(slot_hygiene, on_send_cleared_after_proxy_response_sent) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    inject_upstream_response(loop, *c);
+    CHECK(c->on_send != nullptr);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    CHECK_EQ(c->on_send, nullptr);
+}
+
+TEST(slot_hygiene, on_send_cleared_after_response_header_sent) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    // Large response → streaming (on_response_header_sent)
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n";
+    u32 rlen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
+    c->upstream_recv_buf.commit(rlen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->on_send, &on_response_header_sent<SmallLoop>);
+    // Send headers → on_send cleared
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(rlen)));
+    CHECK_EQ(c->on_send, nullptr);
+}
+
 // ==========================================================================
 // Exhaustive dispatch tests: verify per-event-type slot isolation and
 // centralized null-slot handling.

@@ -91,7 +91,12 @@ public:
     void handle_unhandled_recv(Connection& conn, const IoEvent& ev) {
         if (ev.result > 0) {
             if (!conn.keep_alive) conn.recv_buf.reset();
-            if (!conn.recv_armed) self().submit_recv(conn);
+            // Re-arm only when io_uring multishot terminated (!recv_armed).
+            // On epoll, recv_armed is always false but EPOLLIN is already
+            // armed via EPOLLIN|EPOLLOUT from add_send — calling submit_recv
+            // would EPOLL_CTL_MOD to EPOLLIN only, dropping EPOLLOUT and
+            // stalling backpressured sends. Check on_send to guard.
+            if (!conn.recv_armed && !conn.on_send) self().submit_recv(conn);
             return;
         }
         if (ev.result < 0) {

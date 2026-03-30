@@ -437,8 +437,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-
-    // Slot: on_send. dispatch_event guarantees ev.type == Send.
+    // Slot: on_send. Send complete — clear slot.
+    conn.on_send = nullptr;
 
     if (ev.result < 0) {
         loop->close_conn(conn);
@@ -496,9 +496,11 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             "Bad Gateway";
         conn.send_buf.reset();
         conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
-        conn.keep_alive = false;  // Connection: close — don't loop back
+        conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
         conn.on_send = &on_response_sent<Loop>;
+        conn.on_upstream_send = nullptr;  // prevent re-entrancy from stale EPOLLOUT
+        conn.on_upstream_recv = nullptr;
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
@@ -683,6 +685,8 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    // Send complete — clear on_send so handle_unhandled_recv can re-arm.
+    conn.on_send = nullptr;
     // Consume sent bytes, preserving any data UpstreamRecv appended during send.
     u32 remaining = consume_upstream_sent(conn);
     conn.on_upstream_recv = &on_response_body_recvd<Loop>;
@@ -770,7 +774,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    // Consume sent bytes, preserving any data UpstreamRecv appended during send.
+    conn.on_send = nullptr;  // send complete
     u32 remaining = consume_upstream_sent(conn);
 
     // Check if body is complete.
@@ -1408,6 +1412,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     conn.upstream_send_len = initial_send_len;
     conn.state = ConnState::Sending;
 
+    // Clear upstream slots before sending — the response is being forwarded,
+    // no more upstream events should reach callbacks during the send.
+    conn.on_upstream_recv = nullptr;
+    conn.on_upstream_send = nullptr;
+
     if (body_complete) {
         conn.on_send = &on_proxy_response_sent<Loop>;
         loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
@@ -1421,9 +1430,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-
-    // Slot: on_send. UpstreamRecv/UpstreamSend → null slots (ignored).
-    // Client Recv → handle_unhandled_recv.
+    conn.on_send = nullptr;  // send complete
 
     if (ev.result < 0) {
         loop->close_conn(conn);

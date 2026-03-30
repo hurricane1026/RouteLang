@@ -27,10 +27,23 @@ struct ConnectionBase {
     static constexpr u32 kMaxReqPathLen = 64;
     static constexpr u32 kMaxUpstreamNameLen = 24;
     static constexpr u16 kMaxPipelineDepth = 16;
-    // fp callback: what to do when the next I/O completes.
-    // This IS the state — no enum switch needed.
-    // Typed as void* to avoid circular dependency; cast in event_loop.h.
-    void (*on_complete)(void* loop, ConnectionBase& conn, IoEvent ev);
+    // Event callback type — void* loop to avoid circular dependency.
+    using Callback = void (*)(void* loop, ConnectionBase& conn, IoEvent ev);
+
+    // Legacy single callback — dispatches ALL event types.
+    // Being replaced by per-event-type slots below (Step 1 of migration).
+    Callback on_complete;
+
+    // Per-event-type callback slots (Seastar-inspired).
+    // Each slot receives ONLY its designated event type.
+    // Dispatch layer routes events to the correct slot and handles
+    // null slots centrally (drain/ignore/close). This eliminates the
+    // need for event-type guard code inside callbacks.
+    // Currently unused — will replace on_complete in Step 2.
+    Callback on_recv;           // IoEventType::Recv only
+    Callback on_send;           // IoEventType::Send only
+    Callback on_upstream_recv;  // IoEventType::UpstreamRecv only
+    Callback on_upstream_send;  // IoEventType::UpstreamSend + UpstreamConnect
 
     i32 fd;
     u32 id;
@@ -127,6 +140,10 @@ struct ConnectionBase {
 
     void reset() {
         on_complete = nullptr;
+        on_recv = nullptr;
+        on_send = nullptr;
+        on_upstream_recv = nullptr;
+        on_upstream_send = nullptr;
         fd = -1;
         id = 0;
         state = ConnState::Idle;

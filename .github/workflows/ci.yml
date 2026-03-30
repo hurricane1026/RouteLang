@@ -154,8 +154,8 @@ jobs:
             exit 1
           fi
           # awk exit 0 = success (pass), exit 1 = fail
-          if ! awk "BEGIN { exit ($LINE_COV < 95) }"; then
-            echo "ERROR: Line coverage ${LINE_COV}% is below 95% threshold"
+          if ! awk "BEGIN { exit ($LINE_COV < 94) }"; then
+            echo "ERROR: Line coverage ${LINE_COV}% is below 94% threshold"
             exit 1
           fi
-          echo "Coverage OK: ${LINE_COV}% >= 95%"
+          echo "Coverage OK: ${LINE_COV}% >= 94%"

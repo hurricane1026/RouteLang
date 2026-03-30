@@ -378,14 +378,7 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
 template <typename Loop>
 void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-
-    // Guard: unexpected event type (legacy, removed when fully migrated to slots).
-    if (ev.type != IoEventType::Recv) {
-        if (ev.type == IoEventType::UpstreamRecv) return;
-        if (ev.type == IoEventType::UpstreamSend) return;
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_recv. dispatch_event guarantees ev.type == Recv.
 
     if (ev.result <= 0) {
         loop->close_conn(conn);
@@ -443,19 +436,7 @@ template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::Send) {
-        // Pipelined client Recv with data: bytes are in recv_buf,
-        // found by pipeline_shift after send completes.
-        // EOF: tolerate half-close (client can still read response).
-        // -ENOBUFS: close to prevent busy-loop.
-        if (ev.type == IoEventType::Recv) {
-            if (ev.result >= 0) return;
-            loop->close_conn(conn);
-            return;
-        }
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_send. dispatch_event guarantees ev.type == Send.
 
     if (ev.result < 0) {
         loop->close_conn(conn);
@@ -501,10 +482,7 @@ template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::UpstreamConnect) {
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_upstream_send. dispatch routes UpstreamConnect here.
 
     if (ev.result < 0) {
         // Upstream connect failed → 502
@@ -574,16 +552,8 @@ template <typename Loop>
 void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::Send && ev.type != IoEventType::UpstreamSend) {
-        // Early upstream response during initial request send (epoll
-        // EPOLLIN|EPOLLOUT from backpressured add_send_upstream).
-        if (ev.type == IoEventType::UpstreamRecv) {
-            handle_early_upstream_recv<Loop>(loop, conn, ev, true);
-            return;
-        }
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_upstream_send. Receives UpstreamSend (and epoll Send for upstream).
+    // Early UpstreamRecv is handled by on_early_upstream_recvd_send_inflight slot.
 
     if (ev.result < 0) {
         // Upstream send failed — try to recover an early response (same
@@ -712,32 +682,9 @@ template <typename Loop>
 void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::Send) {
-        if (ev.type == IoEventType::UpstreamSend) return;
-        // UpstreamRecv: data appended to upstream_recv_buf if result > 0.
-        // -ENOBUFS (buffer full): ignore — Send completion will drain the
-        // buffer via consume_upstream_sent, then re-arm recv for more.
-        // Brief epoll level-triggered re-wakes are bounded by Send latency.
-        if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain upload body if early response. Only re-arm
-        // via submit_recv when io_uring multishot terminated (!recv_armed).
-        // On epoll, EPOLLIN|EPOLLOUT is already set — calling submit_recv
-        // would EPOLL_CTL_MOD to EPOLLIN only, dropping the send's EPOLLOUT.
-        if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) {
-                if (!conn.keep_alive) conn.recv_buf.reset();
-                if (!conn.recv_armed) loop->submit_recv(conn);
-                return;
-            }
-            if (ev.result < 0) {
-                loop->close_conn(conn);
-                return;
-            }
-            return;  // EOF: tolerate
-        }
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_send. UpstreamRecv/UpstreamSend → null slots (ignored).
+    // Client Recv → handle_unhandled_recv (drain/EOF/ENOBUFS).
+
     if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
@@ -760,20 +707,7 @@ template <typename Loop>
 void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::UpstreamRecv) {
-        // Client Recv during response streaming: data goes to recv_buf.
-        // If early response (keep_alive=false), drain upload body to prevent
-        // recv_buf filling → -ENOBUFS → premature close. Re-arm on data.
-        if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) {
-                if (!conn.keep_alive) conn.recv_buf.reset();
-                loop->submit_recv(conn);
-            }
-            return;
-        }
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_upstream_recv. Client Recv → handle_unhandled_recv.
 
     if (ev.result <= 0) {
         // EOF or error from upstream.
@@ -835,26 +769,9 @@ template <typename Loop>
 void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::Send) {
-        if (ev.type == IoEventType::UpstreamSend) return;
-        // UpstreamRecv: data in buffer if > 0, -ENOBUFS if full. Ignore both.
-        if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain, re-arm only if io_uring multishot terminated.
-        if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) {
-                if (!conn.keep_alive) conn.recv_buf.reset();
-                if (!conn.recv_armed) loop->submit_recv(conn);
-                return;
-            }
-            if (ev.result < 0) {
-                loop->close_conn(conn);
-                return;
-            }
-            return;  // EOF: tolerate
-        }
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_send. UpstreamRecv/UpstreamSend → null slots (ignored).
+    // Client Recv → handle_unhandled_recv.
+
     if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
@@ -1049,16 +966,7 @@ template <typename Loop>
 void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::Send && ev.type != IoEventType::UpstreamSend) {
-        // Early upstream response arrived while upstream send is in-flight.
-        // Don't transition yet — flag it and wait for the send to settle.
-        if (ev.type == IoEventType::UpstreamRecv) {
-            handle_early_upstream_recv<Loop>(loop, conn, ev, true);
-            return;
-        }
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_upstream_send. Early UpstreamRecv → on_early_upstream_recvd_send_inflight.
     if (ev.result <= 0) {
         // Upstream send failed (EPIPE/ECONNRESET). The origin may have sent
         // an early response (401/413) before closing. Check for it:
@@ -1199,20 +1107,8 @@ template <typename Loop>
 void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::Recv) {
-        // Early upstream response during body streaming (413/401/100 Continue).
-        // No upstream send is in-flight here (we haven't submitted one yet),
-        // so it's safe to transition immediately if non-1xx.
-        if (ev.type == IoEventType::UpstreamRecv) {
-            handle_early_upstream_recv<Loop>(loop, conn, ev, false);
-            if (conn.early_response_pending) {
-                forward_early_response<Loop>(loop, lp, conn);
-            }
-            return;
-        }
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_recv. Early UpstreamRecv → on_early_upstream_recvd slot.
+
     if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
@@ -1259,35 +1155,8 @@ template <typename Loop>
 void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    // Accept UpstreamRecv only — upstream data now goes to upstream_recv_buf,
-    // so client Recv events are harmless (they go to recv_buf). Ignore them.
-    if (ev.type != IoEventType::UpstreamRecv) {
-        // Client Recv: if early response (keep_alive=false), drain upload body
-        // to prevent recv_buf filling → -ENOBUFS → premature close.
-        // If normal proxy, preserve pipelined data in recv_buf.
-        // Don't close on EOF — client may have half-closed (SHUT_WR).
-        if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) {
-                if (!conn.keep_alive) conn.recv_buf.reset();
-                loop->submit_recv(conn);  // re-arm if multishot terminated
-                return;
-            }
-            // EOF: tolerate half-close (client can still read response).
-            // -ENOBUFS: recv_buf full with pipelined data — close to
-            // prevent epoll level-triggered busy-loop.
-            if (ev.result < 0) {
-                loop->close_conn(conn);
-                return;
-            }
-            return;  // EOF: ignore
-        }
-        // Stale UpstreamSend from body streaming that was interrupted by
-        // an early response. The send completed after we transitioned to
-        // response forwarding — harmlessly ignore it.
-        if (ev.type == IoEventType::UpstreamSend) return;
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_upstream_recv. Client Recv → handle_unhandled_recv.
+    // UpstreamSend → null slot (ignored).
 
     if (conn.upstream_start_us != 0) {
         conn.upstream_us = static_cast<u32>(monotonic_us() - conn.upstream_start_us);
@@ -1577,25 +1446,8 @@ template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
-    if (ev.type != IoEventType::Send) {
-        if (ev.type == IoEventType::UpstreamSend) return;
-        if (ev.type == IoEventType::UpstreamRecv) return;
-        // Client Recv: drain, re-arm only if io_uring multishot terminated.
-        if (ev.type == IoEventType::Recv) {
-            if (ev.result > 0) {
-                if (!conn.keep_alive) conn.recv_buf.reset();
-                if (!conn.recv_armed) loop->submit_recv(conn);
-                return;
-            }
-            if (ev.result < 0) {
-                loop->close_conn(conn);
-                return;
-            }
-            return;  // EOF: tolerate
-        }
-        loop->close_conn(conn);
-        return;
-    }
+    // Slot: on_send. UpstreamRecv/UpstreamSend → null slots (ignored).
+    // Client Recv → handle_unhandled_recv.
 
     if (ev.result < 0) {
         loop->close_conn(conn);

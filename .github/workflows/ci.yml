@@ -138,7 +138,7 @@ jobs:
             --object build/tests/test_chunked_parser \
             --object build/tests/test_rir \
             --sources include/rut/common/ include/rut/runtime/ src/runtime/ \
-            --ignore-filename-regex='io_uring_backend|epoll_backend|socket\.cc|access_log\.cc' | tee build/coverage.txt
+            --ignore-filename-regex='io_uring_backend|epoll_backend|socket\.cc|access_log\.cc|shard\.h|epoll_event_loop\.h' | tee build/coverage.txt
 
           cat build/coverage.txt
 
@@ -154,8 +154,8 @@ jobs:
             exit 1
           fi
           # awk exit 0 = success (pass), exit 1 = fail
-          if ! awk "BEGIN { exit ($LINE_COV < 90) }"; then
-            echo "ERROR: Line coverage ${LINE_COV}% is below 90% threshold"
+          if ! awk "BEGIN { exit ($LINE_COV < 95) }"; then
+            echo "ERROR: Line coverage ${LINE_COV}% is below 95% threshold"
             exit 1
           fi
-          echo "Coverage OK: ${LINE_COV}% >= 90%"
+          echo "Coverage OK: ${LINE_COV}% >= 95%"

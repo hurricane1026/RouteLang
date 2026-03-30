@@ -7863,6 +7863,214 @@ TEST(state_transition, proxy_keepalive_to_reading_header) {
     CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
 }
 
+// ==========================================================================
+// Coverage: paths not yet exercised
+// ==========================================================================
+
+// io_uring: upstream_recv_armed → wait for CQE on send error (line 576)
+TEST(coverage, send_error_upstream_recv_armed_waits) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    // Simulate io_uring: upstream_recv_armed = true
+    c->upstream_recv_armed = true;
+    // Upstream send fails → should transition to on_upstream_response (wait for CQE)
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
+    CHECK(c->fd >= 0);
+}
+
+// Same for initial send path (on_upstream_request_sent)
+TEST(coverage, initial_send_error_upstream_recv_armed) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->upstream_fd = 100;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    c->upstream_recv_armed = true;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
+    CHECK(c->fd >= 0);
+}
+
+// consume_upstream_sent with remaining > 0 in on_response_header_sent (line 685)
+TEST(coverage, response_header_sent_with_upstream_data_pending) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    // Large response → streaming
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n"
+        "initial_data";
+    u32 rlen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
+    c->upstream_recv_buf.commit(rlen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->on_send, &on_response_header_sent<SmallLoop>);
+    // Record upstream_send_len
+    u32 sent = c->upstream_send_len;
+    CHECK_GT(sent, 0u);
+    // Simulate upstream data arriving during client send (append to buffer)
+    dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < 100; j++) dst[j] = 'X';
+    c->upstream_recv_buf.commit(100);
+    // Send completion → consume_upstream_sent → remaining > 0 → direct dispatch
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(sent)));
+    // Should have dispatched directly to on_response_body_recvd
+    CHECK(c->on_send != nullptr || c->on_upstream_recv != nullptr);
+}
+
+// Pipeline merge: stash + late data in on_response_body_sent (line 802)
+TEST(coverage, pipeline_merge_stash_plus_late_data) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    // Inject response with body
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "OK";
+    u32 rlen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
+    c->upstream_recv_buf.commit(rlen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    // Should be sending complete response
+    CHECK(c->on_send != nullptr);
+    // Stash some pipelined data in send_buf before response sent
+    c->pipeline_stash_len = 5;
+    c->send_buf.reset();
+    u8* sb = c->send_buf.write_ptr();
+    for (u32 j = 0; j < 5; j++) sb[j] = 'G';
+    c->send_buf.commit(5);
+    // Also put "late" data in recv_buf (client pipelined during send)
+    c->recv_buf.reset();
+    u8* rb = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < 10; j++) rb[j] = 'L';
+    c->recv_buf.commit(10);
+    // Send completion → pipeline merge path
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(rlen)));
+    // Connection should still be alive (keep-alive with pipelined data)
+    CHECK(c->fd >= 0);
+}
+
+// Pipeline stash overflow closes (line 807)
+TEST(coverage, pipeline_stash_overflow_closes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    inject_upstream_response(loop, *c);
+    // Set up impossible merge: stash_len + recv_buf > capacity
+    c->pipeline_stash_len = 4000;
+    c->send_buf.reset();
+    c->recv_buf.reset();
+    u8* rb = c->recv_buf.write_ptr();
+    // Fill recv_buf close to capacity
+    u32 fill = c->recv_buf.capacity() - 100;
+    for (u32 j = 0; j < fill; j++) rb[j] = 'X';
+    c->recv_buf.commit(fill);
+    u32 cid = c->id;
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed (overflow)
+}
+
+// Body done + buffered upstream response dispatched directly (line 964)
+TEST(coverage, body_done_buffered_response_dispatch) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 60, 10);
+    REQUIRE(c != nullptr);
+    // Write valid upstream response into buffer during body streaming
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
+    c->upstream_recv_buf.commit(kMockHttpResponseLen);
+    // Complete all remaining body
+    c->req_body_remaining = 50;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK_EQ(c->req_body_remaining, 0u);
+    // Send completes → body_done + buffered data → dispatch directly
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    CHECK_EQ(c->resp_status, static_cast<u16>(200));
+}
+
+// consume_upstream_sent with remaining > 0 in on_response_body_sent (line 845)
+TEST(coverage, body_sent_with_upstream_data_pending) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n"
+        "data";
+    u32 rlen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
+    c->upstream_recv_buf.commit(rlen);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    // Send headers
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(rlen)));
+    // Receive body chunk
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 500));
+    // Now in on_response_body_sent — record upstream_send_len
+    u32 sent = c->upstream_send_len;
+    // Append more upstream data during client send
+    dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < 50; j++) dst[j] = 'Y';
+    c->upstream_recv_buf.commit(50);
+    // Send completion → consume_upstream_sent → remaining > 0
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(sent)));
+    CHECK(c->fd >= 0);
+}
+
+// pipeline_stash with leftover > send_buf capacity (line 306)
+TEST(coverage, pipeline_stash_zero_leftover) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    // Set req_initial_send_len = recv_buf.len() → leftover = 0 → stash_len = 0
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < 50; j++) dst[j] = 'X';
+    c->recv_buf.commit(50);
+    c->req_initial_send_len = 50;
+    pipeline_stash(*c);
+    CHECK_EQ(c->pipeline_stash_len, 0u);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

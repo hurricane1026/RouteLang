@@ -6581,6 +6581,261 @@ TEST(early_response, recv_buf_cleared_after_stash) {
     CHECK_EQ(c->recv_buf.len(), 0u);
 }
 
+// === Coverage: recent early-response edge cases ===
+
+// on_response_sent tolerates client EOF (half-close) during direct response.
+TEST(early_response, response_sent_tolerates_client_eof) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    // Client half-close (EOF) during response send → tolerated
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 0));
+    CHECK(c->fd >= 0);
+}
+
+// on_response_sent closes on client Recv -ENOBUFS (prevent busy-loop).
+TEST(early_response, response_sent_closes_on_enobufs) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK_EQ(c->on_complete, &on_response_sent<SmallLoop>);
+    u32 cid = c->id;
+    loop.dispatch(make_ev(cid, IoEventType::Recv, -105));  // -ENOBUFS
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+// on_response_header_sent: UpstreamSend ignored (stale from body streaming).
+TEST(early_response, response_header_sent_ignores_upstream_send) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    // Trigger early 413 with body (needs streaming → on_response_header_sent)
+    static const char kResp[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 5000\r\n"
+        "\r\n"
+        "start";
+    u32 rlen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
+    c->upstream_recv_buf.commit(rlen);
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+    CHECK_EQ(c->keep_alive, false);
+    // Set callback to on_response_header_sent (after initial send)
+    c->on_complete = &on_response_header_sent<SmallLoop>;
+    // Stale UpstreamSend → ignored
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    CHECK(c->fd >= 0);
+}
+
+// on_response_header_sent: UpstreamRecv ignored (data in buffer).
+TEST(early_response, response_header_sent_ignores_upstream_recv) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_complete = &on_response_header_sent<SmallLoop>;
+    // UpstreamRecv → ignored (data in buffer for consume)
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 50));
+    CHECK(c->fd >= 0);
+}
+
+// on_response_header_sent: Recv -ENOBUFS closes.
+TEST(early_response, response_header_sent_enobufs_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_complete = &on_response_header_sent<SmallLoop>;
+    u32 cid = c->id;
+    loop.dispatch(make_ev(cid, IoEventType::Recv, -105));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+// on_response_body_sent: UpstreamRecv ignored.
+TEST(early_response, response_body_sent_ignores_upstream_recv) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_complete = &on_response_body_sent<SmallLoop>;
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 50));
+    CHECK(c->fd >= 0);
+}
+
+// on_response_body_sent: Recv -ENOBUFS closes.
+TEST(early_response, response_body_sent_enobufs_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_complete = &on_response_body_sent<SmallLoop>;
+    u32 cid = c->id;
+    loop.dispatch(make_ev(cid, IoEventType::Recv, -105));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+// on_proxy_response_sent: UpstreamRecv ignored.
+TEST(early_response, proxy_response_sent_ignores_upstream_recv) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_complete = &on_proxy_response_sent<SmallLoop>;
+    c->req_start_us = monotonic_us();
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 50));
+    CHECK(c->fd >= 0);
+}
+
+// on_proxy_response_sent: Recv EOF tolerated.
+TEST(early_response, proxy_response_sent_tolerates_eof) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_complete = &on_proxy_response_sent<SmallLoop>;
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 0));
+    CHECK(c->fd >= 0);
+}
+
+// on_proxy_response_sent: Recv -ENOBUFS closes.
+TEST(early_response, proxy_response_sent_enobufs_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->on_complete = &on_proxy_response_sent<SmallLoop>;
+    u32 cid = c->id;
+    loop.dispatch(make_ev(cid, IoEventType::Recv, -105));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+// send error with upstream_recv_armed → wait for CQE (io_uring path).
+TEST(early_response, send_error_waits_for_armed_recv) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    // Client sends body → on_request_body_sent
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK_EQ(c->on_complete, &on_request_body_sent<SmallLoop>);
+    // Simulate io_uring: upstream_recv_armed = true (multishot still active)
+    c->upstream_recv_armed = true;
+    // Upstream send fails (EPIPE)
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
+    // Should have transitioned to on_upstream_response (waiting for CQE)
+    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    CHECK(c->fd >= 0);
+}
+
+// on_upstream_response: client Recv -ENOBUFS closes.
+TEST(early_response, upstream_response_enobufs_closes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    // Get to on_upstream_response
+    c->req_body_remaining = 0;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    u32 cid = c->id;
+    loop.dispatch(make_ev(cid, IoEventType::Recv, -105));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+// on_response_body_recvd: drain upload with keep_alive=false.
+TEST(early_response, response_body_recvd_drains_upload) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    // Trigger early 413 → sets keep_alive=false, enters response body streaming
+    static const char kResp[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 5000\r\n"
+        "\r\n"
+        "start";
+    u32 rlen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
+    c->upstream_recv_buf.commit(rlen);
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+    CHECK_EQ(c->keep_alive, false);
+    // After initial headers sent → on_response_header_sent → on_response_body_recvd
+    c->on_complete = &on_response_body_recvd<SmallLoop>;
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 4000;
+    // Client Recv with data while in on_response_body_recvd + keep_alive=false
+    // → should drain recv_buf
+    c->recv_buf.reset();
+    u8* rdst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < 100; j++) rdst[j] = 'X';
+    c->recv_buf.commit(100);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    CHECK_EQ(c->recv_buf.len(), 0u);  // drained
+    CHECK(c->fd >= 0);
+}
+
+// on_upstream_response: stale UpstreamSend ignored.
+TEST(early_response, upstream_response_ignores_stale_send) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    c->req_body_remaining = 0;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+    // Stale UpstreamSend → ignored
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
+    CHECK(c->fd >= 0);
+    CHECK_EQ(c->on_complete, &on_upstream_response<SmallLoop>);
+}
+
+// consume_upstream_sent: normal case (no extra data).
+TEST(early_response, consume_upstream_sent_normal) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    loop.alloc_upstream_buf(*c);
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < 200; j++) dst[j] = 'A';
+    c->upstream_recv_buf.commit(200);
+    c->upstream_send_len = 200;
+    u32 remaining = consume_upstream_sent(*c);
+    CHECK_EQ(remaining, 0u);
+    CHECK_EQ(c->upstream_recv_buf.len(), 0u);
+}
+
 // === Coverage: upstream pool free with open fd ===
 
 TEST(upstream_pool, free_closes_fd) {

@@ -141,10 +141,14 @@ jobs:
             --object build/tests/test_metrics \
             --object build/tests/test_chunked_parser \
             --object build/tests/test_rir \
-            --object build/tests/test_traffic_capture \
-            --object build/tests/test_traffic_replay \
             --sources include/rut/common/ include/rut/runtime/ src/runtime/ \
             --ignore-filename-regex='io_uring_backend|epoll_backend|socket\.cc|access_log\.cc|shard\.h|epoll_event_loop\.h|iouring_event_loop\.h|sim_engine\.h|traffic_capture\.h|traffic_replay\.h' | tee build/coverage.txt
+          # Note: test_traffic_capture, test_traffic_replay, test_sim, and
+          # test_shard_control are excluded from the coverage report because
+          # they instantiate callbacks.h templates for SmallLoop/EpollEventLoop
+          # with proxy body streaming paths that require real upstream connections.
+          # These template instantiations add ~250 uncoverable lines to
+          # callbacks.h. The tests still run above for correctness validation.
 
           cat build/coverage.txt
 

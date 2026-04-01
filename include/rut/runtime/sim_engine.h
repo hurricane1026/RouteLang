@@ -100,6 +100,14 @@ inline void sim_extract_request_info(const CaptureEntry& entry, SimResult& resul
     result.path[path_len] = '\0';
 }
 
+// Elapsed microseconds between two CLOCK_MONOTONIC timespecs.
+inline u32 elapsed_us(const struct timespec& t0, const struct timespec& t1) {
+    u64 sec_diff = static_cast<u64>(t1.tv_sec - t0.tv_sec);
+    i64 nsec_diff = t1.tv_nsec - t0.tv_nsec;
+    u64 total_us = sec_diff * 1000000ULL + static_cast<u64>(nsec_diff) / 1000ULL;
+    return static_cast<u32>(total_us);
+}
+
 // Simulate one captured request via loopback TCP.
 // server_port: port where the real Shard is listening.
 // Returns SimResult with status comparison + latency.
@@ -150,9 +158,7 @@ inline SimResult sim_one(u16 server_port, const CaptureEntry& entry) {
 
     // Measure latency: end
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    u64 elapsed_ns = static_cast<u64>(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
-                     static_cast<u64>(t1.tv_nsec - t0.tv_nsec);
-    result.latency_us = static_cast<u32>(elapsed_ns / 1000);
+    result.latency_us = elapsed_us(t0, t1);
 
     close(fd);
 

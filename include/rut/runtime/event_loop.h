@@ -116,9 +116,10 @@ public:
     // Enable or disable traffic capture. Handles lazy region allocation
     // and backfilling capture_buf on existing active connections.
     // ring = nullptr → disable. ring = valid pointer → enable.
-    void set_capture(CaptureRing* ring) {
+    // Returns true on success. Returns false if mmap fails (capture stays disabled).
+    bool set_capture(CaptureRing* ring) {
         capture_ring = ring;
-        if (!ring) return;
+        if (!ring) return true;
         // Lazy-allocate capture region on first enable (one mmap, ~1μs).
         if (!capture_region_) {
             void* region = mmap(nullptr,
@@ -129,7 +130,7 @@ public:
                                 0);
             if (region == MAP_FAILED) {
                 capture_ring = nullptr;  // alloc failed, disable
-                return;
+                return false;
             }
             capture_region_ = static_cast<u8*>(region);
         }
@@ -139,6 +140,7 @@ public:
                 conns[i].capture_buf =
                     capture_region_ + static_cast<u64>(i) * 8192u;
         }
+        return true;
     }
 
     // Per-shard metrics. Set by Shard before run(). Null = no metrics.

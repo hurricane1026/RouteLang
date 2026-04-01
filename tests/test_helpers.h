@@ -53,13 +53,14 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     u8 capture_storage[kMaxConns][CaptureEntry::kMaxHeaderLen];
 
     // Enable or disable traffic capture with backfill (mirrors EventLoop::set_capture).
-    void set_capture(CaptureRing* ring) {
+    bool set_capture(CaptureRing* ring) {
         capture_ring = ring;
-        if (!ring) return;
+        if (!ring) return true;
         for (u32 i = 0; i < kMaxConns; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
                 conns[i].capture_buf = capture_storage[i];
         }
+        return true;
     }
 
     bool is_draining() const { return draining; }

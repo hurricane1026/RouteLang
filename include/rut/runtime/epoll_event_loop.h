@@ -64,7 +64,9 @@ public:
             void* region = mmap(nullptr,
                                 static_cast<u64>(kMaxConns) * kCaptureSliceSize,
                                 PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                                MAP_PRIVATE | MAP_ANONYMOUS,
+                                -1,
+                                0);
             if (region == MAP_FAILED) {
                 capture_ring = nullptr;
                 return false;
@@ -73,8 +75,7 @@ public:
         }
         for (u32 i = 0; i < kMaxConns; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf =
-                    capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
+                conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
         }
         return true;
     }
@@ -153,8 +154,10 @@ public:
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;
         auto* cap = control->pending_capture.exchange(nullptr, std::memory_order_acq_rel);
-        if (cap == kCaptureDisable) set_capture(nullptr);
-        else if (cap) set_capture(cap);
+        if (cap == kCaptureDisable)
+            set_capture(nullptr);
+        else if (cap)
+            set_capture(cap);
     }
 
     void epoch_enter() {
@@ -228,8 +231,7 @@ public:
         conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
-            conns[id].capture_buf =
-                capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
+            conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
         return &conns[id];
     }
 

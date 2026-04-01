@@ -44,7 +44,10 @@ struct ReplayReader {
     // Open a capture file. Returns 0 on success, -1 on error.
     // Closes any previously open fd to prevent leaks on re-open.
     i32 open(const char* path) {
-        if (fd >= 0) { ::close(fd); fd = -1; }
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
         fd = ::open(path, O_RDONLY);
         if (fd < 0) return -1;
 
@@ -143,12 +146,17 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
-    // Step 4: Complete send
+    // Step 4: Complete send (proxy routes don't populate send_buf — treat as not replayable)
     u32 send_len = conn->send_buf.len();
-    if (send_len > 0) {
-        IoEvent send_ev = {conn->id, static_cast<i32>(send_len), 0, 0, IoEventType::Send, 0};
-        loop.inject_and_dispatch(send_ev);
+    if (send_len == 0) {
+        // Proxy route initiated upstream connect instead of generating a response.
+        // Close and report as not replayed (replay only validates static routes).
+        IoEvent eof_ev = {conn->id, 0, 0, 0, IoEventType::Recv, 0};
+        loop.inject_and_dispatch(eof_ev);
+        return result;
     }
+    IoEvent send_ev = {conn->id, static_cast<i32>(send_len), 0, 0, IoEventType::Send, 0};
+    loop.inject_and_dispatch(send_ev);
 
     result.actual_status = conn->resp_status;
     result.status_match = (result.expected_status == result.actual_status);

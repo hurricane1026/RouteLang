@@ -7,9 +7,9 @@
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/metrics.h"
-#include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/shard_control.h"
+#include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
 
 #include <pthread.h>
@@ -177,8 +177,12 @@ struct Shard {
 
     CaptureRing* enable_capture() {
         if (capture_ring) return capture_ring;
-        void* ring_mem = mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* ring_mem = mmap(nullptr,
+                              sizeof(CaptureRing),
+                              PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS,
+                              -1,
+                              0);
         if (ring_mem == MAP_FAILED) return nullptr;
         capture_ring = new (ring_mem) CaptureRing();
         capture_ring->init();

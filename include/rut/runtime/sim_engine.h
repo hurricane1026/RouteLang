@@ -107,8 +107,7 @@ inline u32 elapsed_us(const struct timespec& t0, const struct timespec& t1) {
         nsec_diff += 1000000000LL;
     }
     if (sec_diff < 0) return 0;
-    u64 total_us =
-        static_cast<u64>(sec_diff) * 1000000ULL + static_cast<u64>(nsec_diff) / 1000ULL;
+    u64 total_us = static_cast<u64>(sec_diff) * 1000000ULL + static_cast<u64>(nsec_diff) / 1000ULL;
     return static_cast<u32>(total_us);
 }
 
@@ -140,12 +139,17 @@ inline SimResult sim_one(u16 server_port, const CaptureEntry& entry) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    // Send raw headers
+    // Send raw headers (retry on EINTR)
     const u8* p = entry.raw_headers;
     u32 remaining = entry.raw_header_len;
     while (remaining > 0) {
         ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
-        if (n <= 0) {
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return result;
+        }
+        if (n == 0) {
             close(fd);
             return result;
         }
@@ -153,15 +157,17 @@ inline SimResult sim_one(u16 server_port, const CaptureEntry& entry) {
         remaining -= static_cast<u32>(n);
     }
 
-    // Recv response (enough to parse status line)
+    // Recv response (retry on EINTR)
     char resp[4096];
-    // Set a read timeout to avoid hanging
     struct timeval tv;
     tv.tv_sec = 2;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    ssize_t resp_len = recv(fd, resp, sizeof(resp), 0);
+    ssize_t resp_len;
+    do {
+        resp_len = recv(fd, resp, sizeof(resp), 0);
+    } while (resp_len < 0 && errno == EINTR);
 
     // Measure latency: end
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -173,6 +179,10 @@ inline SimResult sim_one(u16 server_port, const CaptureEntry& entry) {
 
     // Parse status code from "HTTP/1.1 NNN ..."
     if (resp[0] != 'H' || resp[8] != ' ') return result;
+    // Validate digits
+    if (resp[9] < '0' || resp[9] > '9' || resp[10] < '0' || resp[10] > '9' || resp[11] < '0' ||
+        resp[11] > '9')
+        return result;
     u16 code = static_cast<u16>((resp[9] - '0') * 100 + (resp[10] - '0') * 10 + (resp[11] - '0'));
 
     result.actual_status = code;

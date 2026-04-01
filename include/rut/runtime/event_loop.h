@@ -181,8 +181,7 @@ public:
         }
         for (u32 i = 0; i < kMaxConns; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf =
-                    capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
+                conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
         }
         return true;
     }
@@ -438,8 +437,7 @@ public:
         conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
-            conns[id].capture_buf =
-                capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
+            conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
         return &conns[id];
     }
 

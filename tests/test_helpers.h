@@ -90,8 +90,10 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;
         auto* cap = control->pending_capture.exchange(nullptr, std::memory_order_acq_rel);
-        if (cap == kCaptureDisable) set_capture(nullptr);
-        else if (cap) set_capture(cap);
+        if (cap == kCaptureDisable)
+            set_capture(nullptr);
+        else if (cap)
+            set_capture(cap);
     }
 
     void setup() {

@@ -5,8 +5,8 @@
 
 namespace rut {
 
-struct RouteConfig;   // forward declare
-struct CaptureRing;   // forward declare
+struct RouteConfig;  // forward declare
+struct CaptureRing;  // forward declare
 
 // Sentinel: "disable capture". Distinct from nullptr ("no pending change").
 static inline CaptureRing* kCaptureDisable = reinterpret_cast<CaptureRing*>(1);

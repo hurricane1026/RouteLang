@@ -561,7 +561,7 @@ TEST(replay_gap, format_static_response_wire_format) {
         {200, "OK", 2, 2},
         {404, "Not Found", 9, 9},
         {500, "Internal Server Error", 21, 21},
-        {204, "No Content", 10, 0},   // no body per HTTP spec
+        {204, "No Content", 10, 0},  // no body per HTTP spec
         {301, "Moved Permanently", 17, 17},
     };
 

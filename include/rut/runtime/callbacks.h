@@ -361,22 +361,38 @@ static inline void capture_stage_headers(Connection& conn) {
 
 static inline const char* status_reason(u16 code) {
     switch (code) {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 429: return "Too Many Requests";
-        case 500: return "Internal Server Error";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        default: return "Unknown";
+        case 200:
+            return "OK";
+        case 201:
+            return "Created";
+        case 204:
+            return "No Content";
+        case 301:
+            return "Moved Permanently";
+        case 302:
+            return "Found";
+        case 304:
+            return "Not Modified";
+        case 400:
+            return "Bad Request";
+        case 401:
+            return "Unauthorized";
+        case 403:
+            return "Forbidden";
+        case 404:
+            return "Not Found";
+        case 405:
+            return "Method Not Allowed";
+        case 429:
+            return "Too Many Requests";
+        case 500:
+            return "Internal Server Error";
+        case 502:
+            return "Bad Gateway";
+        case 503:
+            return "Service Unavailable";
+        default:
+            return "Unknown";
     }
 }
 
@@ -455,9 +471,7 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
     // Write traffic capture entry (if enabled).
     if (loop->capture_ring && conn.capture_buf && conn.capture_header_len > 0) {
         CaptureEntry cap;
-        __builtin_memset(&cap, 0,
-                         static_cast<u64>(reinterpret_cast<u8*>(&cap.raw_headers) -
-                                          reinterpret_cast<u8*>(&cap)));
+        __builtin_memset(&cap, 0, sizeof(cap));
         cap.timestamp_us = realtime_us();
         cap.req_content_length = conn.req_content_length;
         cap.resp_content_length = resp_size;
@@ -527,7 +541,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     if (config) {
         route = config->match(
             reinterpret_cast<const u8*>(conn.req_path),
-            [&]() -> u32 { u32 n = 0; while (conn.req_path[n]) n++; return n; }(),
+            [&]() -> u32 {
+                u32 n = 0;
+                while (conn.req_path[n]) n++;
+                return n;
+            }(),
             conn.recv_buf.data() ? conn.recv_buf.data()[0] : 0);
     }
 
@@ -542,6 +560,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
         i32 ufd = UpstreamPool::create_socket();
         if (ufd < 0) {
+            conn.state = ConnState::Sending;
             conn.resp_status = kStatusBadGateway;
             format_static_response(conn, 502, false);
             conn.keep_alive = false;

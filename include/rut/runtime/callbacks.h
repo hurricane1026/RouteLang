@@ -14,6 +14,11 @@
 
 namespace rut {
 
+// Verify capture slice size constants match the authoritative CaptureEntry::kMaxHeaderLen.
+// These are defined separately in each EventLoop type to avoid circular includes.
+static_assert(CaptureEntry::kMaxHeaderLen == 8192,
+              "Update kCaptureSliceSize in all EventLoop types if this changes");
+
 // HTTP status codes used in callbacks.
 static constexpr u16 kStatusOK = 200;
 static constexpr u16 kStatusBadGateway = 502;

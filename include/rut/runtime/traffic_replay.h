@@ -98,16 +98,23 @@ struct ReplayReader {
     }
 };
 
-// Replay one captured entry through an event loop.
+// Replay one captured entry through a mock/injectable event loop.
 //
-// Template on Loop so it works with SmallLoop (tests) and real EventLoop.
-// The loop must have a free connection slot and a dispatch mechanism.
+// Designed for SmallLoop and other test loops that expose:
+//   - loop.backend.inject(ev): inject synthetic I/O events
+//   - loop.backend.wait(events, max): drain pending events
+//   - loop.conns[]: indexable connection array with fd, recv_buf, resp_status
+//   - loop.dispatch(ev): route events to callback slots
+//
+// NOT suitable for production event loops (EpollEventLoop, IoUringEventLoop)
+// which drive I/O from real kernel events. Use sim_one() for production-path
+// replay via loopback TCP.
 //
 // Steps:
 //   1. Inject Accept → allocate connection
 //   2. Write raw_headers into recv_buf
 //   3. Dispatch Recv → triggers on_header_received → route decision → response
-//   4. Dispatch Send → triggers on_request_complete
+//   4. Dispatch Send → triggers on_request_complete (skipped for proxy routes)
 //   5. Read resp_status from connection
 //   6. Close connection (inject EOF)
 //

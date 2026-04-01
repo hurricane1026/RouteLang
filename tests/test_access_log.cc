@@ -565,6 +565,138 @@ TEST(zstd, stop_completes_frame_under_backpressure) {
     // The existing compressed_output_is_smaller test covers decompression validity.
 }
 
+// === SPSC stress tests ===
+
+struct AccessLogProducerCtx {
+    AccessLogRing* ring;
+    u32 count;        // total entries to push
+    u32 pushed;       // entries successfully pushed
+    u32 dropped;      // entries dropped (ring full)
+};
+
+static void* access_log_producer(void* arg) {
+    auto* ctx = static_cast<AccessLogProducerCtx*>(arg);
+    ctx->pushed = 0;
+    ctx->dropped = 0;
+    for (u32 i = 0; i < ctx->count; i++) {
+        AccessLogEntry entry{};
+        entry.status = static_cast<u16>(i & 0xFFFF);
+        entry.duration_us = i;
+        entry.shard_id = 0;
+        if (ctx->ring->push(entry))
+            ctx->pushed++;
+        else
+            ctx->dropped++;
+    }
+    return nullptr;
+}
+
+struct AccessLogConsumerCtx {
+    AccessLogRing* ring;
+    u32 consumed;
+    u32 last_duration;  // track ordering
+    bool order_ok;
+    bool stop;
+};
+
+static void* access_log_consumer(void* arg) {
+    auto* ctx = static_cast<AccessLogConsumerCtx*>(arg);
+    ctx->consumed = 0;
+    ctx->last_duration = 0;
+    ctx->order_ok = true;
+    AccessLogEntry entry{};
+    while (!ctx->stop || ctx->ring->available() > 0) {
+        if (ctx->ring->pop(entry)) {
+            // Verify monotonic ordering (duration_us == sequence number)
+            if (entry.duration_us < ctx->last_duration) ctx->order_ok = false;
+            ctx->last_duration = entry.duration_us;
+            ctx->consumed++;
+        }
+    }
+    return nullptr;
+}
+
+// Dual-thread SPSC: producer pushes N entries, consumer pops concurrently.
+// Verify: no loss (pushed == consumed + dropped), FIFO order preserved.
+TEST(ring_stress, spsc_concurrent) {
+    // mmap the ring (too large for stack)
+    auto* ring = static_cast<AccessLogRing*>(
+        mmap(nullptr, sizeof(AccessLogRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    AccessLogProducerCtx prod{ring, 100000, 0, 0};
+    AccessLogConsumerCtx cons{ring, 0, 0, true, false};
+
+    pthread_t prod_thread, cons_thread;
+    pthread_create(&cons_thread, nullptr, access_log_consumer, &cons);
+    pthread_create(&prod_thread, nullptr, access_log_producer, &prod);
+
+    pthread_join(prod_thread, nullptr);
+    // Producer done — let consumer drain remaining
+    cons.stop = true;
+    pthread_join(cons_thread, nullptr);
+
+    // Conservation: pushed = consumed + remaining in ring
+    u32 remaining = ring->available();
+    CHECK_EQ(prod.pushed, cons.consumed + remaining);
+    // Total: pushed + dropped = count
+    CHECK_EQ(prod.pushed + prod.dropped, prod.count);
+    // Order preserved
+    CHECK(cons.order_ok);
+
+    munmap(ring, sizeof(AccessLogRing));
+}
+
+// Same test but consumer is slower (simulates flusher I/O latency).
+// This stresses the "ring full → drop" path.
+TEST(ring_stress, spsc_backpressure) {
+    auto* ring = static_cast<AccessLogRing*>(
+        mmap(nullptr, sizeof(AccessLogRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    // Producer sends 10x capacity, consumer pops in batches with delays
+    AccessLogProducerCtx prod{ring, AccessLogRing::kCapacity * 10, 0, 0};
+
+    pthread_t prod_thread;
+    pthread_create(&prod_thread, nullptr, access_log_producer, &prod);
+
+    // Consumer: pop in small batches, let producer overflow
+    u32 consumed = 0;
+    u32 last_dur = 0;
+    bool order_ok = true;
+    AccessLogEntry entry{};
+    for (u32 batch = 0; batch < 100; batch++) {
+        // Pop up to 64 entries per batch
+        for (u32 j = 0; j < 64; j++) {
+            if (ring->pop(entry)) {
+                if (entry.duration_us < last_dur) order_ok = false;
+                last_dur = entry.duration_us;
+                consumed++;
+            }
+        }
+    }
+
+    pthread_join(prod_thread, nullptr);
+
+    // Drain remaining
+    while (ring->pop(entry)) {
+        if (entry.duration_us < last_dur) order_ok = false;
+        last_dur = entry.duration_us;
+        consumed++;
+    }
+
+    CHECK(order_ok);
+    CHECK_EQ(prod.pushed + prod.dropped, prod.count);
+    CHECK_EQ(prod.pushed, consumed);  // everything pushed was consumed
+    CHECK_GT(prod.dropped, 0u);  // some were dropped (backpressure)
+
+    munmap(ring, sizeof(AccessLogRing));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

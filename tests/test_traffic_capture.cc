@@ -5,6 +5,7 @@
 #include "test_helpers.h"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -1565,6 +1566,200 @@ TEST(capture_e2e, large_header_near_limit) {
     CHECK_GT(cap.raw_header_len, 100);   // captured something substantial
     CHECK(cap.raw_header_len <= total);   // not more than sent
     CHECK_EQ(cap.flags & kCaptureFlagTruncated, 0);  // not truncated (under 8KB)
+
+    munmap(ring, sizeof(CaptureRing));
+}
+
+// ============================================================
+// SPSC stress tests
+// ============================================================
+
+struct CaptureProducerCtx {
+    CaptureRing* ring;
+    u32 count;
+    u32 pushed;
+    u32 dropped;
+};
+
+static void* capture_producer(void* arg) {
+    auto* ctx = static_cast<CaptureProducerCtx*>(arg);
+    ctx->pushed = 0;
+    ctx->dropped = 0;
+    for (u32 i = 0; i < ctx->count; i++) {
+        CaptureEntry entry{};
+        entry.resp_status = static_cast<u16>(i & 0xFFFF);
+        entry.req_content_length = i;  // use as sequence number
+        entry.raw_header_len = 10;
+        // Write a recognizable pattern into raw_headers
+        for (u32 j = 0; j < 10; j++)
+            entry.raw_headers[j] = static_cast<u8>((i + j) & 0xFF);
+        if (ctx->ring->push(entry))
+            ctx->pushed++;
+        else
+            ctx->dropped++;
+    }
+    return nullptr;
+}
+
+struct CaptureConsumerCtx {
+    CaptureRing* ring;
+    u32 consumed;
+    u32 last_seq;
+    bool order_ok;
+    bool data_ok;
+    bool stop;
+};
+
+static void* capture_consumer(void* arg) {
+    auto* ctx = static_cast<CaptureConsumerCtx*>(arg);
+    ctx->consumed = 0;
+    ctx->last_seq = 0;
+    ctx->order_ok = true;
+    ctx->data_ok = true;
+    CaptureEntry entry{};
+    while (!ctx->stop || ctx->ring->available() > 0) {
+        if (ctx->ring->pop(entry)) {
+            u32 seq = entry.req_content_length;
+            // Verify monotonic ordering
+            if (seq < ctx->last_seq) ctx->order_ok = false;
+            ctx->last_seq = seq;
+            // Verify data integrity
+            for (u32 j = 0; j < 10; j++) {
+                if (entry.raw_headers[j] != static_cast<u8>((seq + j) & 0xFF))
+                    ctx->data_ok = false;
+            }
+            ctx->consumed++;
+        }
+    }
+    return nullptr;
+}
+
+// Dual-thread SPSC: verify no loss, no reorder, no data corruption.
+TEST(capture_stress, spsc_concurrent) {
+    auto* ring = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    CaptureProducerCtx prod{ring, 50000, 0, 0};
+    CaptureConsumerCtx cons{ring, 0, 0, true, true, false};
+
+    pthread_t prod_thread, cons_thread;
+    pthread_create(&cons_thread, nullptr, capture_consumer, &cons);
+    pthread_create(&prod_thread, nullptr, capture_producer, &prod);
+
+    pthread_join(prod_thread, nullptr);
+    cons.stop = true;
+    pthread_join(cons_thread, nullptr);
+
+    u32 remaining = ring->available();
+    CHECK_EQ(prod.pushed, cons.consumed + remaining);
+    CHECK_EQ(prod.pushed + prod.dropped, prod.count);
+    CHECK(cons.order_ok);
+    CHECK(cons.data_ok);
+
+    munmap(ring, sizeof(CaptureRing));
+}
+
+// Backpressure: producer overwhelms consumer, verify drops + ordering.
+TEST(capture_stress, spsc_backpressure) {
+    auto* ring = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    CaptureProducerCtx prod{ring, CaptureRing::kCapacity * 5, 0, 0};
+
+    pthread_t prod_thread;
+    pthread_create(&prod_thread, nullptr, capture_producer, &prod);
+
+    u32 consumed = 0;
+    u32 last_seq = 0;
+    bool order_ok = true;
+    bool data_ok = true;
+    CaptureEntry entry{};
+
+    // Slow consumer: pop in small batches
+    for (u32 batch = 0; batch < 50; batch++) {
+        for (u32 j = 0; j < 32; j++) {
+            if (ring->pop(entry)) {
+                u32 seq = entry.req_content_length;
+                if (seq < last_seq) order_ok = false;
+                last_seq = seq;
+                for (u32 k = 0; k < 10; k++) {
+                    if (entry.raw_headers[k] != static_cast<u8>((seq + k) & 0xFF))
+                        data_ok = false;
+                }
+                consumed++;
+            }
+        }
+    }
+
+    pthread_join(prod_thread, nullptr);
+
+    // Drain
+    while (ring->pop(entry)) {
+        u32 seq = entry.req_content_length;
+        if (seq < last_seq) order_ok = false;
+        last_seq = seq;
+        consumed++;
+    }
+
+    CHECK(order_ok);
+    CHECK(data_ok);
+    CHECK_EQ(prod.pushed + prod.dropped, prod.count);
+    CHECK_EQ(prod.pushed, consumed);
+    CHECK_GT(prod.dropped, 0u);
+
+    munmap(ring, sizeof(CaptureRing));
+}
+
+// Rapid enable/disable toggle with concurrent requests on SmallLoop.
+// Verifies no crash, no corruption under rapid state changes.
+TEST(capture_stress, rapid_toggle) {
+    auto* ring = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    SmallLoop loop;
+    loop.setup();
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // 200 requests with capture toggling every 3 requests
+    u32 total_captured = 0;
+    for (u32 i = 0; i < 200; i++) {
+        if (i % 3 == 0) {
+            if (loop.capture_ring)
+                loop.set_capture(nullptr);
+            else
+                loop.set_capture(ring);
+        }
+
+        bool was_on = (loop.capture_ring != nullptr);
+        send_request(loop, *conn, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        if (was_on) total_captured++;
+    }
+
+    // Ring entries should match expected count (capped at capacity)
+    u32 ring_count = ring->available();
+    u32 expected = total_captured < CaptureRing::kCapacity
+                       ? total_captured
+                       : CaptureRing::kCapacity;
+    CHECK_EQ(ring_count, expected);
+
+    // Verify all entries in ring are valid (status 200, non-zero header_len)
+    CaptureEntry cap{};
+    while (ring->pop(cap)) {
+        CHECK_EQ(cap.resp_status, 200);
+        CHECK_GT(cap.raw_header_len, 0);
+    }
 
     munmap(ring, sizeof(CaptureRing));
 }

@@ -100,7 +100,7 @@ add_test(NAME test_drain COMMAND test_drain)
 set_tests_properties(test_drain PROPERTIES LABELS "unit")
 
 add_executable(test_access_log test_access_log.cc)
-target_link_libraries(test_access_log rue_runtime)
+target_link_libraries(test_access_log rue_runtime Threads::Threads)
 target_include_directories(test_access_log PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -130,7 +130,7 @@ add_test(NAME test_shard_control COMMAND test_shard_control)
 set_tests_properties(test_shard_control PROPERTIES LABELS "unit")
 
 add_executable(test_traffic_capture test_traffic_capture.cc)
-target_link_libraries(test_traffic_capture rue_runtime)
+target_link_libraries(test_traffic_capture rue_runtime Threads::Threads)
 target_include_directories(test_traffic_capture PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing

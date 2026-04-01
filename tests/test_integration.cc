@@ -2,8 +2,12 @@
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/shard.h"
+#include "rut/runtime/tls.h"
 #include "test.h"
 #include "test_helpers.h"
+
+#include <openssl/ssl.h>
+#include <stdlib.h>
 
 // Helper: Connection with local buffer storage (for tests that use raw backends).
 static constexpr u32 kTestBufSize = 4096;
@@ -23,6 +27,125 @@ struct TestConn {
         conn.send_buf.bind(send_storage, kTestBufSize);
     }
 };
+
+static const char kTestCertPem[] = R"(-----BEGIN CERTIFICATE-----
+MIIDCTCCAfGgAwIBAgIUV3bWh2n8VuB0S9B7iXRm/ALvk0gwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDQwMTE1MTIyN1oXDTI2MDQw
+MjE1MTIyN1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAskukbS5awVDfLmJRaRCbgJnPcMlmXjT8riE2P1pR/Rz4
+ri54ue+vNTK5oRrtSGB13z9yZOnIyIVf+nb3HN+GsVIy++lksk0yWJTZyuEHlFZE
+sdaOQjTUYea7o43bhSzFIaXi52NIxNIHGOAOSKvdjFzJmAAtkK9FLrz3HjYoHxuu
+mlSoPRJwa7tREgXceRTTPmfAEUSBkfnsxYz0IiU4+stmv5zjeRoRMGlnYT9EPoGU
+JzgWT4CCJNx95taW6ZQq+3Q8Q/XY/NObEPvUpgo8Bm9fXVlMGix+6DS6kSxK7Qh4
+SFvQddriQwLZAs84BAtZ0f0IUDwYAZTQ8mP9eyA4TQIDAQABo1MwUTAdBgNVHQ4E
+FgQUzzhFroszJLtXxRHDa6jeZZyqJy4wHwYDVR0jBBgwFoAUzzhFroszJLtXxRHD
+a6jeZZyqJy4wDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAXbCo
+zwEV+Q1n22DOhMrFkKS7H7ZvOTDqmSI1+DtMHcwt+OPO35Az1bJgnqZd3TJv8ytG
+SckPo+kvgCHRIuiyiR/p2extD6x6VYnfXdF3rWxMxC28xlfRB4KKTRnle4LydlbR
+bj77tlgFd4eCcyr8Di/Jnsu0KTaTaJZqzqS47xYRr2CtW/p73USExwhKT0Tnk9tW
+cnNRFXbC3hK8TOLMtF4zxzpLeAfK4IqP8sZhyuwvaks3MPbht3WxG6YQYf0MdC26
+gNsAt3xPpqw0JxZTEIRV40iAnvQ9TQacuwQE/PN7/8jiVBPqEpYVBiHVXA+jgYss
+gZpx2i7c/4TljnWrrg==
+-----END CERTIFICATE-----
+)";
+
+static const char kTestKeyPem[] = R"(-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCyS6RtLlrBUN8u
+YlFpEJuAmc9wyWZeNPyuITY/WlH9HPiuLni57681MrmhGu1IYHXfP3Jk6cjIhV/6
+dvcc34axUjL76WSyTTJYlNnK4QeUVkSx1o5CNNRh5rujjduFLMUhpeLnY0jE0gcY
+4A5Iq92MXMmYAC2Qr0UuvPceNigfG66aVKg9EnBru1ESBdx5FNM+Z8ARRIGR+ezF
+jPQiJTj6y2a/nON5GhEwaWdhP0Q+gZQnOBZPgIIk3H3m1pbplCr7dDxD9dj805sQ
++9SmCjwGb19dWUwaLH7oNLqRLErtCHhIW9B12uJDAtkCzzgEC1nR/QhQPBgBlNDy
+Y/17IDhNAgMBAAECggEAJo8L0g3olC62eYxLQW7VRnBdJ63yrNSGQe1OU1Cn8xa5
+JEhKFSIkENv1v8T4RIMR8tRAm9jgcpc/nMXuJskjksUtYAQHYjUmOniEimb0seyf
+Qhud2+0bcknJUjN7Yld+kYqT4gk7g09NuCA6jpZWnUSy12PQdt4k1tkIk3jQX/uK
+5Gzjp6eVC+oRedCwzYKlQhU12XhgBC2f1M3eqD07b1j9BpigjLa8K+wZh8Hthjr7
+tbPTgyOGlvhPkPGJPa2xk9T9+6B/cX2J0ooKGuIyW1IcL5rtKncTNZuCP8ze7IAn
+tRfbP4CE7rLvXKDe73RB3N4AhwgxTRGnuQrRAGGWkQKBgQDdq1IbMn+OYVA+hMJ3
+X2m/1LXcNQg7x3UzvUGhgvCYEBHJ3xougnJ0MH2UOMU2JYA/5MSzYTqxXE0uaBlg
+8U0qjA1Gwarr8jEzZfbN4RzufshZpiC2mgIHp1ZQLFg0S7n51xGscA5o8aHH4gjF
+AlYY4iOcKlLJT2nBjmZHAe4W3QKBgQDN6KbI1d0uxNqpphBtANxbsrrdGzWxlv5V
+2quFzuVzJn6GTV+IW3WPfIASNz918qsFIDDL2aP3E0s/PAiYNfOvaYa06EklQqVF
+bNxwJmYOzdjkVTfSCuWyBRxRPJaXc7Yxulh0Dwz/bP1YLK2xoH+SVPo61UqSIYbl
+hyOu6Su4MQKBgBeu6DTTrmEt8H7dfFF4tjmypkOCvwB0DQecHtj8vmvgu6XP2mJB
+uazESYZ+kkN4uj0ZWhK4PqcYb36XzK5Y2Z/EGt8GbhaLZ8pQCJByjr7EeO9rGm+o
+ALOEo2opcrsTpCkXW2ILDt8Tge9zLPCvkTdTYe6bbwDnJSty5WaMxD1ZAoGAUOZo
+qR3Fwjtbwi3Z5EnjSi/l1Tt8lCLEGM1KeM86PUzRh0jdEQEGJnL/CqkkSN4oLWJh
+aaZAErJE7TpUEiGYdcHbSDa/jmEp+CX2UiX0ETr1TXjh7qeTaacyYgSREj5HRjB1
+0lubervCqiMbt19c4Ax9KCJnIxUDIClBbtZz8/ECgYBXZduc7mfJi7jlNWEoS6D5
+Lc7h+C2n33p4Cg9NMeysB13vsxe0aPrDY0PI1Su9qRK1j3C/TZeLZIQiQqXsWiep
+Yq4u2YfSYRx8Eu33gIU7g+hylVXQElEbFHKAdjvESt5PDKwArtgybbNdUZIEakxc
+vA8OzIXZ3awxryXhlCUrFw==
+-----END PRIVATE KEY-----
+)";
+
+struct TempFile {
+    char path[64];
+    bool valid = false;
+
+    bool write_all(const char* tmpl, const char* content) {
+        u32 i = 0;
+        for (; tmpl[i] && i + 1 < sizeof(path); i++) path[i] = tmpl[i];
+        path[i] = '\0';
+
+        i32 fd = mkstemp(path);
+        if (fd < 0) return false;
+
+        u32 len = 0;
+        while (content[len]) len++;
+        bool ok = true;
+        u32 written = 0;
+        while (written < len) {
+            ssize_t n = write(fd, content + written, len - written);
+            if (n > 0) {
+                written += static_cast<u32>(n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        close(fd);
+        if (!ok) {
+            unlink(path);
+            path[0] = '\0';
+            return false;
+        }
+        valid = true;
+        return true;
+    }
+
+    void cleanup() {
+        if (!valid) return;
+        unlink(path);
+        valid = false;
+        path[0] = '\0';
+    }
+};
+
+static bool ssl_write_all(SSL* ssl, const char* data, u32 len) {
+    u32 sent = 0;
+    while (sent < len) {
+        i32 n = SSL_write(ssl, data + sent, static_cast<i32>(len - sent));
+        if (n <= 0) return false;
+        sent += static_cast<u32>(n);
+    }
+    return true;
+}
+
+static void set_socket_timeouts(i32 fd, i32 secs) {
+    struct timeval tv;
+    tv.tv_sec = secs;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static SSL_CTX* create_test_client_ctx() {
+    SSL_CTX* client_ctx = SSL_CTX_new(TLS_client_method());
+    if (client_ctx) SSL_CTX_set_verify(client_ctx, SSL_VERIFY_NONE, nullptr);
+    return client_ctx;
+}
 
 // === Socket Setup (libuv: test-tcp-bind-error, test-tcp-flags, test-tcp-reuseport) ===
 
@@ -698,6 +821,182 @@ TEST(shard, serves_requests) {
     shard.join();
     shard.shutdown();
     close(lfd);
+}
+
+TEST(shard, serves_https_requests) {
+    TempFile cert_file;
+    TempFile key_file;
+    REQUIRE(cert_file.write_all("/tmp/rut-cert-XXXXXX", kTestCertPem));
+    REQUIRE(key_file.write_all("/tmp/rut-key-XXXXXX", kTestKeyPem));
+
+    auto tls_ctx = create_tls_server_context(cert_file.path, key_file.path);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+    REQUIRE(ssl_write_all(ssl, HTTP_REQ, HTTP_REQ_LEN));
+
+    char buf[4096];
+    i32 n = SSL_read(ssl, buf, sizeof(buf));
+    CHECK(n > 0);
+    if (n > 0) CHECK(has_200(buf, n));
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+    cert_file.cleanup();
+    key_file.cleanup();
+}
+
+TEST(tls, rejects_invalid_private_key_file) {
+    TempFile cert_file;
+    TempFile invalid_key_file;
+    REQUIRE(cert_file.write_all("/tmp/rut-cert-XXXXXX", kTestCertPem));
+    REQUIRE(invalid_key_file.write_all("/tmp/rut-key-XXXXXX", kTestCertPem));
+
+    auto tls_ctx = create_tls_server_context(cert_file.path, invalid_key_file.path);
+    CHECK(!tls_ctx.has_value());
+
+    cert_file.cleanup();
+    invalid_key_file.cleanup();
+}
+
+TEST(shard, serves_https_keepalive_requests) {
+    TempFile cert_file;
+    TempFile key_file;
+    REQUIRE(cert_file.write_all("/tmp/rut-cert-XXXXXX", kTestCertPem));
+    REQUIRE(key_file.write_all("/tmp/rut-key-XXXXXX", kTestKeyPem));
+
+    auto tls_ctx = create_tls_server_context(cert_file.path, key_file.path);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+
+    for (int i = 0; i < 3; i++) {
+        REQUIRE(ssl_write_all(ssl, HTTP_REQ, HTTP_REQ_LEN));
+        char buf[4096];
+        i32 n = SSL_read(ssl, buf, sizeof(buf));
+        CHECK(n > 0);
+        if (n > 0) CHECK(has_200(buf, n));
+    }
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+    cert_file.cleanup();
+    key_file.cleanup();
+}
+
+TEST(shard, recovers_after_failed_tls_handshake) {
+    TempFile cert_file;
+    TempFile key_file;
+    REQUIRE(cert_file.write_all("/tmp/rut-cert-XXXXXX", kTestCertPem));
+    REQUIRE(key_file.write_all("/tmp/rut-key-XXXXXX", kTestKeyPem));
+
+    auto tls_ctx = create_tls_server_context(cert_file.path, key_file.path);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+
+    usleep(50000);
+
+    i32 bad = connect_to(port);
+    REQUIRE(bad >= 0);
+    set_socket_timeouts(bad, 1);
+    REQUIRE(send_all(bad, HTTP_REQ, HTTP_REQ_LEN));
+    char drain[64];
+    recv_timeout(bad, drain, sizeof(drain), 200);
+    close(bad);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+    REQUIRE(ssl_write_all(ssl, HTTP_REQ, HTTP_REQ_LEN));
+
+    char buf[4096];
+    i32 n = SSL_read(ssl, buf, sizeof(buf));
+    CHECK(n > 0);
+    if (n > 0) CHECK(has_200(buf, n));
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+    cert_file.cleanup();
+    key_file.cleanup();
 }
 
 // Two shards on same port (SO_REUSEPORT)

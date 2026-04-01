@@ -14,6 +14,7 @@
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
+#include "rut/runtime/tls.h"
 #include "rut/runtime/timer_wheel.h"
 #include <atomic>
 
@@ -50,6 +51,7 @@ public:
 
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
     i32 listen_fd = -1;
+    TlsServerContext* tls_server = nullptr;
 
     AccessLogRing* access_log = nullptr;
 
@@ -250,6 +252,10 @@ public:
     void submit_recv_impl(Connection& c) { backend.add_recv(c.fd, c.id); }
 
     void submit_send_impl(Connection& c, const u8* buf, u32 len) {
+        if (c.tls_active) {
+            backend.add_send_tls(c, buf, len);
+            return;
+        }
         backend.add_send(c.fd, c.id, buf, len);
     }
 
@@ -271,12 +277,19 @@ public:
             ::close(c.fd);
             c.fd = -1;
         }
+        if (c.tls_active && c.tls) {
+            destroy_tls_server_ssl(c.tls);
+            c.tls = nullptr;
+            c.tls_active = false;
+            c.tls_handshake_complete = false;
+        }
         if (c.upstream_fd >= 0) {
             ::close(c.upstream_fd);
             c.upstream_fd = -1;
         }
         // Clear upstream fd map to prevent stale fd matching after reuse.
         if (c.id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[c.id] = -1;
+        if (c.id < EpollBackend::kMaxFdMap) backend.downstream_fd_map[c.id] = -1;
         if (metrics) {
             if (c.req_start_us != 0) {
                 if (metrics->requests_active > 0) metrics->requests_active--;
@@ -338,6 +351,18 @@ private:
         if (::getpeername(c->fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0 &&
             peer.sin_family == AF_INET) {
             c->peer_addr = peer.sin_addr.s_addr;
+        }
+        if (tls_server) {
+            auto tls_result = create_tls_server_ssl(tls_server, c->fd);
+            if (!tls_result) {
+                ::close(c->fd);
+                c->fd = -1;
+                this->free_conn(*c);
+                return;
+            }
+            c->tls_active = true;
+            c->tls_handshake_complete = false;
+            c->tls = tls_result.value();
         }
         c->state = ConnState::ReadingHeader;
         c->keep_alive = !draining_.load(std::memory_order_relaxed);

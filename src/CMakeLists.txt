@@ -2,6 +2,22 @@
 set(SIMD_ARCH "auto" CACHE STRING "SIMD architecture: auto, scalar, sse2, avx2, avx512, neon, sve")
 set_property(CACHE SIMD_ARCH PROPERTY STRINGS auto scalar sse2 avx2 avx512 neon sve)
 
+set(BUILD_TESTING OFF)
+add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/boringssl
+    ${CMAKE_CURRENT_BINARY_DIR}/third_party/boringssl
+    EXCLUDE_FROM_ALL
+)
+foreach(BORINGSSL_TARGET fipsmodule crypto ssl decrepit pki)
+    if(TARGET ${BORINGSSL_TARGET})
+        target_compile_options(${BORINGSSL_TARGET} PRIVATE
+            -Wno-error
+            -Wno-error=pedantic
+            -Wno-error=unused-parameter
+            -Wno-pedantic
+        )
+    endif()
+endforeach()
+
 if(SIMD_ARCH STREQUAL "auto")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         set(SIMD_ARCH "neon")
@@ -35,6 +51,8 @@ elseif(SIMD_ARCH STREQUAL "scalar")
 else()
     message(FATAL_ERROR "Unknown SIMD_ARCH '${SIMD_ARCH}'. Valid options: auto, scalar, sse2, avx2, avx512, neon, sve")
 endif()
+
+find_package(Threads REQUIRED)
 
 # zstd — vendored, compress only, stripped strategies (fast + doubleFast only).
 # Excludes greedy/lazy/btlazy2/btopt/btultra to keep binary small (~120KB vs ~400KB).
@@ -84,6 +102,7 @@ add_library(rue_runtime STATIC
     runtime/epoll_backend.cc
     runtime/timer_wheel.cc
     runtime/socket.cc
+    runtime/tls.cc
     runtime/http_parser.cc
     runtime/chunked_parser.cc
     runtime/access_log.cc
@@ -94,7 +113,12 @@ add_library(rue_runtime STATIC
 target_include_directories(rue_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
-target_link_libraries(rue_runtime zstd_compress)
+target_link_libraries(rue_runtime
+    zstd_compress
+    ssl
+    crypto
+    Threads::Threads
+)
 
 # SIMD source needs to find simd.h and char_tables.h via "simd.h" include
 target_include_directories(rue_runtime PRIVATE

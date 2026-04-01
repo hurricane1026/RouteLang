@@ -2,8 +2,8 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"  // realtime_us()
-
 #include <atomic>
+
 #include <unistd.h>
 
 namespace rut {
@@ -20,17 +20,17 @@ struct CaptureEntry {
     static constexpr u32 kMaxHeaderLen = 8192;
 
     // --- Metadata (64 bytes) ---
-    u64 timestamp_us;        // 8  — realtime_us() at capture
-    u32 req_content_length;  // 4  — request body size (not captured)
-    u32 resp_content_length; // 4  — response body size
-    u16 resp_status;         // 2  — HTTP response status code
-    u16 raw_header_len;      // 2  — actual bytes in raw_headers[]
-    u8 method;               // 1  — LogHttpMethod enum
-    u8 shard_id;             // 1  — which shard captured this
-    u8 flags;                // 1  — reserved (truncated, etc.)
-    u8 _pad;                 // 1  — alignment
-    char upstream_name[32];  // 32 — upstream target name (null-terminated)
-    u8 _reserved[8];         // 8  — future use
+    u64 timestamp_us;         // 8  — realtime_us() at capture
+    u32 req_content_length;   // 4  — request body size (not captured)
+    u32 resp_content_length;  // 4  — response body size
+    u16 resp_status;          // 2  — HTTP response status code
+    u16 raw_header_len;       // 2  — actual bytes in raw_headers[]
+    u8 method;                // 1  — LogHttpMethod enum
+    u8 shard_id;              // 1  — which shard captured this
+    u8 flags;                 // 1  — reserved (truncated, etc.)
+    u8 _pad;                  // 1  — alignment
+    char upstream_name[32];   // 32 — upstream target name (null-terminated)
+    u8 _reserved[8];          // 8  — future use
     // Total metadata: 64 bytes
 
     // --- Raw request headers (method line + headers + \r\n\r\n) ---
@@ -45,12 +45,12 @@ static constexpr u8 kCaptureFlagTruncated = 0x01;  // headers exceeded 8KB, trun
 // Binary file header for capture files.
 // Written once at the start of the file, entry_count updated on close.
 struct CaptureFileHeader {
-    char magic[8];       // "RUTCAP01"
-    u32 version;         // 1
-    u32 flags;           // reserved
-    u64 entry_count;     // total entries written (updated on close)
-    u32 entry_size;      // sizeof(CaptureEntry), for forward compat
-    u8 _reserved[36];    // pad to 64 bytes
+    char magic[8];     // "RUTCAP01"
+    u32 version;       // 1
+    u32 flags;         // reserved
+    u64 entry_count;   // total entries written (updated on close)
+    u32 entry_size;    // sizeof(CaptureEntry), for forward compat
+    u8 _reserved[36];  // pad to 64 bytes
 };
 
 static_assert(sizeof(CaptureFileHeader) == 64, "CaptureFileHeader must be 64 bytes");
@@ -58,9 +58,14 @@ static_assert(sizeof(CaptureFileHeader) == 64, "CaptureFileHeader must be 64 byt
 inline void capture_file_header_init(CaptureFileHeader* hdr) {
     __builtin_memset(hdr, 0, sizeof(*hdr));
     // "RUTCAP01"
-    hdr->magic[0] = 'R'; hdr->magic[1] = 'U'; hdr->magic[2] = 'T';
-    hdr->magic[3] = 'C'; hdr->magic[4] = 'A'; hdr->magic[5] = 'P';
-    hdr->magic[6] = '0'; hdr->magic[7] = '1';
+    hdr->magic[0] = 'R';
+    hdr->magic[1] = 'U';
+    hdr->magic[2] = 'T';
+    hdr->magic[3] = 'C';
+    hdr->magic[4] = 'A';
+    hdr->magic[5] = 'P';
+    hdr->magic[6] = '0';
+    hdr->magic[7] = '1';
     hdr->version = 1;
     hdr->entry_size = sizeof(CaptureEntry);
 }
@@ -68,8 +73,7 @@ inline void capture_file_header_init(CaptureFileHeader* hdr) {
 inline bool capture_file_header_valid(const CaptureFileHeader* hdr) {
     return hdr->magic[0] == 'R' && hdr->magic[1] == 'U' && hdr->magic[2] == 'T' &&
            hdr->magic[3] == 'C' && hdr->magic[4] == 'A' && hdr->magic[5] == 'P' &&
-           hdr->magic[6] == '0' && hdr->magic[7] == '1' &&
-           hdr->version == 1 &&
+           hdr->magic[6] == '0' && hdr->magic[7] == '1' && hdr->version == 1 &&
            hdr->entry_size == sizeof(CaptureEntry);
 }
 

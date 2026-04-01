@@ -569,9 +569,9 @@ TEST(zstd, stop_completes_frame_under_backpressure) {
 
 struct AccessLogProducerCtx {
     AccessLogRing* ring;
-    u32 count;        // total entries to push
-    u32 pushed;       // entries successfully pushed
-    u32 dropped;      // entries dropped (ring full)
+    u32 count;    // total entries to push
+    u32 pushed;   // entries successfully pushed
+    u32 dropped;  // entries dropped (ring full)
 };
 
 static void* access_log_producer(void* arg) {
@@ -620,9 +620,12 @@ static void* access_log_consumer(void* arg) {
 // Verify: no loss (pushed == consumed + dropped), FIFO order preserved.
 TEST(ring_stress, spsc_concurrent) {
     // mmap the ring (too large for stack)
-    auto* ring = static_cast<AccessLogRing*>(
-        mmap(nullptr, sizeof(AccessLogRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<AccessLogRing*>(mmap(nullptr,
+                                                  sizeof(AccessLogRing),
+                                                  PROT_READ | PROT_WRITE,
+                                                  MAP_PRIVATE | MAP_ANONYMOUS,
+                                                  -1,
+                                                  0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -652,9 +655,12 @@ TEST(ring_stress, spsc_concurrent) {
 // Same test but consumer is slower (simulates flusher I/O latency).
 // This stresses the "ring full → drop" path.
 TEST(ring_stress, spsc_backpressure) {
-    auto* ring = static_cast<AccessLogRing*>(
-        mmap(nullptr, sizeof(AccessLogRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<AccessLogRing*>(mmap(nullptr,
+                                                  sizeof(AccessLogRing),
+                                                  PROT_READ | PROT_WRITE,
+                                                  MAP_PRIVATE | MAP_ANONYMOUS,
+                                                  -1,
+                                                  0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -692,7 +698,7 @@ TEST(ring_stress, spsc_backpressure) {
     CHECK(order_ok);
     CHECK_EQ(prod.pushed + prod.dropped, prod.count);
     CHECK_EQ(prod.pushed, consumed);  // everything pushed was consumed
-    CHECK_GT(prod.dropped, 0u);  // some were dropped (backpressure)
+    CHECK_GT(prod.dropped, 0u);       // some were dropped (backpressure)
 
     munmap(ring, sizeof(AccessLogRing));
 }

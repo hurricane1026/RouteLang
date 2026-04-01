@@ -12,19 +12,19 @@ namespace rut {
 
 // Result of replaying one captured request against a live event loop.
 struct ReplayResult {
-    u16 expected_status;   // from capture file
-    u16 actual_status;     // from replay
-    bool status_match;     // expected == actual
-    bool replayed;         // false if injection failed (e.g., no free conn)
+    u16 expected_status;  // from capture file
+    u16 actual_status;    // from replay
+    bool status_match;    // expected == actual
+    bool replayed;        // false if injection failed (e.g., no free conn)
 };
 
 // Summary of a full replay session.
 struct ReplaySummary {
-    u32 total;             // entries in capture file
-    u32 replayed;          // successfully injected
-    u32 matched;           // status matched
-    u32 mismatched;        // status didn't match
-    u32 failed;            // injection failures
+    u32 total;       // entries in capture file
+    u32 replayed;    // successfully injected
+    u32 matched;     // status matched
+    u32 mismatched;  // status didn't match
+    u32 failed;      // injection failures
 };
 
 // Read a capture file sequentially. Manages fd and header validation.
@@ -49,7 +49,11 @@ struct ReplayReader {
         u32 remaining = sizeof(header);
         while (remaining > 0) {
             ssize_t n = ::read(fd, p, remaining);
-            if (n <= 0) { ::close(fd); fd = -1; return -1; }
+            if (n <= 0) {
+                ::close(fd);
+                fd = -1;
+                return -1;
+            }
             p += n;
             remaining -= static_cast<u32>(n);
         }
@@ -75,7 +79,10 @@ struct ReplayReader {
     u64 entry_count() const { return header.entry_count; }
 
     void close() {
-        if (fd >= 0) { ::close(fd); fd = -1; }
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
     }
 };
 
@@ -108,15 +115,17 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
 
     Connection* conn = nullptr;
     for (u32 i = 0; i < Loop::kMaxConns; i++) {
-        if (loop.conns[i].fd == fake_fd) { conn = &loop.conns[i]; break; }
+        if (loop.conns[i].fd == fake_fd) {
+            conn = &loop.conns[i];
+            break;
+        }
     }
     if (!conn) return result;
 
     // Step 2: Write raw headers into recv_buf
     conn->recv_buf.reset();
     u32 hdr_len = entry.raw_header_len;
-    if (hdr_len > conn->recv_buf.write_avail())
-        hdr_len = conn->recv_buf.write_avail();
+    if (hdr_len > conn->recv_buf.write_avail()) hdr_len = conn->recv_buf.write_avail();
     conn->recv_buf.write(entry.raw_headers, hdr_len);
 
     // Step 3: Dispatch Recv (don't use inject_and_dispatch — it overwrites recv_buf)

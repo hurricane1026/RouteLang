@@ -120,8 +120,8 @@ TEST(replay_one, basic_200) {
     SmallLoop loop;
     loop.setup();
 
-    CaptureEntry entry = make_captured_request(
-        "GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n", 200);
+    CaptureEntry entry =
+        make_captured_request("GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n", 200);
 
     ReplayResult result = replay_one(loop, entry, 42);
     CHECK(result.replayed);
@@ -135,8 +135,7 @@ TEST(replay_one, status_mismatch) {
     loop.setup();
 
     // Captured entry says 404, but current config returns 200
-    CaptureEntry entry = make_captured_request(
-        "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 404);
+    CaptureEntry entry = make_captured_request("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 404);
 
     ReplayResult result = replay_one(loop, entry, 42);
     CHECK(result.replayed);
@@ -175,8 +174,7 @@ TEST(replay_file, full_roundtrip) {
         "GET /4 HTTP/1.1\r\nHost: x\r\n\r\n",
         "GET /5 HTTP/1.1\r\nHost: x\r\n\r\n",
     };
-    for (u32 i = 0; i < 5; i++)
-        entries[i] = make_captured_request(reqs[i], 200);
+    for (u32 i = 0; i < 5; i++) entries[i] = make_captured_request(reqs[i], 200);
 
     TempCapture tmp;
     REQUIRE(tmp.create(entries, 5));
@@ -246,9 +244,8 @@ TEST(replay_file, empty_capture) {
 
 TEST(replay_e2e, capture_then_replay) {
     // Step 1: Capture traffic from a live loop
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -337,8 +334,7 @@ TEST(route, static_200) {
     RoutedLoop rl;
     rl.setup(&cfg);
 
-    CaptureEntry entry = make_captured_request(
-        "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    CaptureEntry entry = make_captured_request("GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200);
     ReplayResult result = replay_one(rl.loop, entry, 42);
     CHECK(result.replayed);
     CHECK_EQ(result.actual_status, 200);
@@ -352,8 +348,7 @@ TEST(route, static_404) {
     RoutedLoop rl;
     rl.setup(&cfg);
 
-    CaptureEntry entry = make_captured_request(
-        "GET /anything HTTP/1.1\r\nHost: x\r\n\r\n", 404);
+    CaptureEntry entry = make_captured_request("GET /anything HTTP/1.1\r\nHost: x\r\n\r\n", 404);
     ReplayResult result = replay_one(rl.loop, entry, 42);
     CHECK(result.replayed);
     CHECK_EQ(result.actual_status, 404);
@@ -368,8 +363,7 @@ TEST(route, no_match_default_200) {
     RoutedLoop rl;
     rl.setup(&cfg);
 
-    CaptureEntry entry = make_captured_request(
-        "GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    CaptureEntry entry = make_captured_request("GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 200);
     ReplayResult result = replay_one(rl.loop, entry, 42);
     CHECK(result.replayed);
     CHECK_EQ(result.actual_status, 200);  // default
@@ -384,15 +378,14 @@ TEST(route, method_filtering) {
     rl.setup(&cfg);
 
     // GET /admin → matches second rule → 200
-    CaptureEntry get_entry = make_captured_request(
-        "GET /admin HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    CaptureEntry get_entry = make_captured_request("GET /admin HTTP/1.1\r\nHost: x\r\n\r\n", 200);
     ReplayResult get_result = replay_one(rl.loop, get_entry, 42);
     CHECK(get_result.replayed);
     CHECK_EQ(get_result.actual_status, 200);
 
     // POST /admin → matches first rule → 403
-    CaptureEntry post_entry = make_captured_request(
-        "POST /admin HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 403);
+    CaptureEntry post_entry =
+        make_captured_request("POST /admin HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 403);
     post_entry.method = static_cast<u8>(LogHttpMethod::Post);
     ReplayResult post_result = replay_one(rl.loop, post_entry, 43);
     CHECK(post_result.replayed);
@@ -409,18 +402,15 @@ TEST(route, multiple_routes_first_match_wins) {
     rl.setup(&cfg);
 
     // /api/v1/users → matches first rule
-    CaptureEntry e1 = make_captured_request(
-        "GET /api/v1/users HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    CaptureEntry e1 = make_captured_request("GET /api/v1/users HTTP/1.1\r\nHost: x\r\n\r\n", 200);
     CHECK_EQ(replay_one(rl.loop, e1, 42).actual_status, 200);
 
     // /api/v2 → matches second rule (prefix /api)
-    CaptureEntry e2 = make_captured_request(
-        "GET /api/v2 HTTP/1.1\r\nHost: x\r\n\r\n", 301);
+    CaptureEntry e2 = make_captured_request("GET /api/v2 HTTP/1.1\r\nHost: x\r\n\r\n", 301);
     CHECK_EQ(replay_one(rl.loop, e2, 43).actual_status, 301);
 
     // /other → matches third rule (prefix /)
-    CaptureEntry e3 = make_captured_request(
-        "GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 404);
+    CaptureEntry e3 = make_captured_request("GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 404);
     CHECK_EQ(replay_one(rl.loop, e3, 44).actual_status, 404);
 }
 
@@ -486,8 +476,8 @@ TEST(route, detect_config_regression) {
     // /api/users: was 200, new config / → 404 → mismatch
     // /admin: was 403, now 200 → mismatch
     // /other: was 404, / → 404 → match
-    CHECK_EQ(summary.matched, 1u);    // /other (404 → 404)
-    CHECK_EQ(summary.mismatched, 2u); // /api/users + /admin changed
+    CHECK_EQ(summary.matched, 1u);     // /other (404 → 404)
+    CHECK_EQ(summary.mismatched, 2u);  // /api/users + /admin changed
 
     reader.close();
     tmp.cleanup();
@@ -509,8 +499,7 @@ TEST(replay_gap, conn_slot_exhaustion) {
     CHECK_EQ(loop.free_top, 0u);
 
     // replay_one should fail gracefully
-    CaptureEntry entry = make_captured_request(
-        "GET / HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    CaptureEntry entry = make_captured_request("GET / HTTP/1.1\r\nHost: x\r\n\r\n", 200);
     ReplayResult result = replay_one(loop, entry, 999);
     CHECK(!result.replayed);
 
@@ -607,8 +596,8 @@ TEST(replay_gap, format_static_response_wire_format) {
         // Find body after \r\n\r\n
         u32 body_start = 0;
         for (u32 i = 0; i + 3 < len; i++) {
-            if (data[i] == '\r' && data[i + 1] == '\n' &&
-                data[i + 2] == '\r' && data[i + 3] == '\n') {
+            if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' &&
+                data[i + 3] == '\n') {
                 body_start = i + 4;
                 break;
             }
@@ -681,8 +670,8 @@ TEST(replay_gap, query_string_in_path) {
 
     // Path with query string — depends on what HTTP parser puts in req_path
     // The parser stores the full path including query string in req.path
-    CaptureEntry entry = make_captured_request(
-        "GET /health?check=1 HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    CaptureEntry entry =
+        make_captured_request("GET /health?check=1 HTTP/1.1\r\nHost: x\r\n\r\n", 200);
     ReplayResult result = replay_one(rl.loop, entry, 42);
     CHECK(result.replayed);
     // /health?check=1 should prefix-match /health
@@ -721,8 +710,7 @@ TEST(replay_gap, method_enum_vs_raw_bytes) {
 
     // Entry says method=Post (enum), but raw_headers say "GET ..."
     // Route matcher should use raw bytes, not enum
-    CaptureEntry entry = make_captured_request(
-        "GET /test HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    CaptureEntry entry = make_captured_request("GET /test HTTP/1.1\r\nHost: x\r\n\r\n", 200);
     entry.method = static_cast<u8>(LogHttpMethod::Post);  // lie
 
     ReplayResult result = replay_one(rl.loop, entry, 42);
@@ -739,8 +727,7 @@ TEST(replay_gap, malformed_request_hits_catchall) {
     rl.setup(&cfg);
 
     // Completely garbage headers — parser will fail, req_path stays "/"
-    CaptureEntry entry = make_captured_request(
-        "GARBAGE\r\n\r\n", 404);
+    CaptureEntry entry = make_captured_request("GARBAGE\r\n\r\n", 404);
     ReplayResult result = replay_one(rl.loop, entry, 42);
     CHECK(result.replayed);
     CHECK_EQ(result.actual_status, 404);  // "/" catch-all
@@ -787,4 +774,6 @@ TEST(replay_gap, upstream_name_truncation_boundary) {
     rl.loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 0));
 }
 
-int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }
+int main(int argc, char** argv) {
+    return rut::test::run_all(argc, argv);
+}

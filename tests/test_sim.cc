@@ -1,8 +1,8 @@
 // Simulation tests — uses real Shard + EpollBackend + loopback TCP.
 // Verifies that captured traffic replayed through production code path
 // produces identical routing results, and collects latency/resource metrics.
-#include "rut/runtime/sim_engine.h"
 #include "rut/runtime/shard.h"
+#include "rut/runtime/sim_engine.h"
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/traffic_replay.h"
 #include "test.h"
@@ -50,9 +50,7 @@ struct SimServer {
         return true;
     }
 
-    void teardown() {
-        shard.shutdown();
-    }
+    void teardown() { shard.shutdown(); }
 };
 
 // === Basic simulation ===
@@ -164,8 +162,10 @@ TEST(sim, multiple_routes) {
         summary.total++;
         if (result.success) {
             summary.succeeded++;
-            if (result.status_match) summary.matched++;
-            else summary.mismatched++;
+            if (result.status_match)
+                summary.matched++;
+            else
+                summary.mismatched++;
             summary.latency_sum += result.latency_us;
             if (result.latency_us < summary.latency_min) summary.latency_min = result.latency_us;
             if (result.latency_us > summary.latency_max) summary.latency_max = result.latency_us;
@@ -197,7 +197,11 @@ TEST(sim, multiple_routes) {
 TEST(sim, format_result_output) {
     SimResult r{};
     r.method = static_cast<u8>(LogHttpMethod::Get);
-    r.path[0] = '/'; r.path[1] = 'a'; r.path[2] = 'p'; r.path[3] = 'i'; r.path[4] = '\0';
+    r.path[0] = '/';
+    r.path[1] = 'a';
+    r.path[2] = 'p';
+    r.path[3] = 'i';
+    r.path[4] = '\0';
     r.expected_status = 200;
     r.actual_status = 200;
     r.status_match = true;
@@ -221,7 +225,9 @@ TEST(sim, format_result_output) {
     // MISS case
     SimResult r2{};
     r2.method = static_cast<u8>(LogHttpMethod::Post);
-    r2.path[0] = '/'; r2.path[1] = 'x'; r2.path[2] = '\0';
+    r2.path[0] = '/';
+    r2.path[1] = 'x';
+    r2.path[2] = '\0';
     r2.expected_status = 200;
     r2.actual_status = 404;
     r2.status_match = false;
@@ -294,8 +300,10 @@ TEST(sim, capture_file_simulate) {
         summary.total++;
         if (result.success) {
             summary.succeeded++;
-            if (result.status_match) summary.matched++;
-            else summary.mismatched++;
+            if (result.status_match)
+                summary.matched++;
+            else
+                summary.mismatched++;
             summary.latency_sum += result.latency_us;
             if (result.latency_us < summary.latency_min) summary.latency_min = result.latency_us;
             if (result.latency_us > summary.latency_max) summary.latency_max = result.latency_us;
@@ -363,7 +371,8 @@ TEST(sim_gap, format_fail_verdict) {
     SimResult r{};
     r.success = false;
     r.method = static_cast<u8>(LogHttpMethod::Get);
-    r.path[0] = '/'; r.path[1] = '\0';
+    r.path[0] = '/';
+    r.path[1] = '\0';
     r.expected_status = 200;
     r.actual_status = 0;
     r.latency_us = 0;
@@ -385,14 +394,14 @@ TEST(sim_gap, format_fail_verdict) {
 // GAP-5: all 10 method names + out-of-range clamp
 TEST(sim_gap, format_all_methods) {
     const char* expected[] = {
-        "GET", "POST", "PUT", "DELETE", "PATCH",
-        "HEAD", "OPTIONS", "CONNECT", "TRACE", "OTHER"};
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE", "OTHER"};
 
     for (u32 m = 0; m <= 10; m++) {
         SimResult r{};
         r.success = true;
         r.method = static_cast<u8>(m);
-        r.path[0] = '/'; r.path[1] = '\0';
+        r.path[0] = '/';
+        r.path[1] = '\0';
         r.expected_status = 200;
         r.actual_status = 200;
         r.status_match = true;
@@ -410,9 +419,15 @@ TEST(sim_gap, format_all_methods) {
         for (u32 i = 0; i + elen <= len; i++) {
             bool match = true;
             for (u32 j = 0; j < elen; j++) {
-                if (buf[i + j] != exp[j]) { match = false; break; }
+                if (buf[i + j] != exp[j]) {
+                    match = false;
+                    break;
+                }
             }
-            if (match) { found = true; break; }
+            if (match) {
+                found = true;
+                break;
+            }
         }
         CHECK(found);
     }
@@ -497,8 +512,8 @@ TEST(sim_gap, summary_zero_succeeded) {
     // Should contain "Latency avg: 0us"
     bool found = false;
     for (u32 i = 0; i + 16 < len; i++) {
-        if (buf[i] == 'a' && buf[i + 1] == 'v' && buf[i + 2] == 'g' &&
-            buf[i + 3] == ':' && buf[i + 4] == ' ' && buf[i + 5] == '0') {
+        if (buf[i] == 'a' && buf[i + 1] == 'v' && buf[i + 2] == 'g' && buf[i + 3] == ':' &&
+            buf[i + 4] == ' ' && buf[i + 5] == '0') {
             found = true;
             break;
         }
@@ -542,11 +557,11 @@ TEST(sim_gap, summary_fields_and_metrics) {
 
     bool found_conn = false, found_req = false;
     for (u32 i = 0; i + 12 < len; i++) {
-        if (buf[i] == 'C' && buf[i + 1] == 'o' && buf[i + 2] == 'n' &&
-            buf[i + 3] == 'n' && buf[i + 4] == 'e')
+        if (buf[i] == 'C' && buf[i + 1] == 'o' && buf[i + 2] == 'n' && buf[i + 3] == 'n' &&
+            buf[i + 4] == 'e')
             found_conn = true;
-        if (buf[i] == 'R' && buf[i + 1] == 'e' && buf[i + 2] == 'q' &&
-            buf[i + 3] == 'u' && buf[i + 4] == 'e')
+        if (buf[i] == 'R' && buf[i + 1] == 'e' && buf[i + 2] == 'q' && buf[i + 3] == 'u' &&
+            buf[i + 4] == 'e')
             found_req = true;
     }
     CHECK(found_conn);
@@ -560,7 +575,8 @@ TEST(sim_gap, format_result_with_upstream) {
     SimResult r{};
     r.success = true;
     r.method = static_cast<u8>(LogHttpMethod::Get);
-    r.path[0] = '/'; r.path[1] = '\0';
+    r.path[0] = '/';
+    r.path[1] = '\0';
     r.expected_status = 200;
     r.actual_status = 200;
     r.status_match = true;
@@ -574,8 +590,8 @@ TEST(sim_gap, format_result_with_upstream) {
     // Should contain "upstream: api-v1"
     bool found = false;
     for (u32 i = 0; i + 6 < len; i++) {
-        if (buf[i] == 'a' && buf[i + 1] == 'p' && buf[i + 2] == 'i' &&
-            buf[i + 3] == '-' && buf[i + 4] == 'v' && buf[i + 5] == '1') {
+        if (buf[i] == 'a' && buf[i + 1] == 'p' && buf[i + 2] == 'i' && buf[i + 3] == '-' &&
+            buf[i + 4] == 'v' && buf[i + 5] == '1') {
             found = true;
             break;
         }
@@ -616,7 +632,8 @@ TEST(sim_gap, format_tiny_buffer) {
     SimResult r{};
     r.success = true;
     r.method = 0;
-    r.path[0] = '/'; r.path[1] = '\0';
+    r.path[0] = '/';
+    r.path[1] = '\0';
     r.expected_status = 200;
     r.actual_status = 200;
     r.status_match = true;
@@ -628,7 +645,10 @@ TEST(sim_gap, format_tiny_buffer) {
     // Null-terminated or newline within bounds
     bool terminated = false;
     for (u32 i = 0; i < 5; i++) {
-        if (buf[i] == '\0' || buf[i] == '\n') { terminated = true; break; }
+        if (buf[i] == '\0' || buf[i] == '\n') {
+            terminated = true;
+            break;
+        }
     }
     CHECK(terminated);
 
@@ -639,4 +659,6 @@ TEST(sim_gap, format_tiny_buffer) {
     CHECK(slen <= 5);
 }
 
-int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }
+int main(int argc, char** argv) {
+    return rut::test::run_all(argc, argv);
+}

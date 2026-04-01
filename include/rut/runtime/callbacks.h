@@ -274,8 +274,7 @@ static inline void capture_stage_headers(Connection& conn) {
     if (len == 0) return;
 
     u32 copy_len = len;
-    if (copy_len > CaptureEntry::kMaxHeaderLen)
-        copy_len = CaptureEntry::kMaxHeaderLen;
+    if (copy_len > CaptureEntry::kMaxHeaderLen) copy_len = CaptureEntry::kMaxHeaderLen;
 
     __builtin_memcpy(conn.capture_buf, data, copy_len);
     conn.capture_header_len = static_cast<u16>(copy_len);
@@ -298,22 +297,38 @@ static const char kResponse200Close[] =
 // Map common status codes to reason phrases.
 static inline const char* status_reason(u16 code) {
     switch (code) {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 429: return "Too Many Requests";
-        case 500: return "Internal Server Error";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        default: return "Unknown";
+        case 200:
+            return "OK";
+        case 201:
+            return "Created";
+        case 204:
+            return "No Content";
+        case 301:
+            return "Moved Permanently";
+        case 302:
+            return "Found";
+        case 304:
+            return "Not Modified";
+        case 400:
+            return "Bad Request";
+        case 401:
+            return "Unauthorized";
+        case 403:
+            return "Forbidden";
+        case 404:
+            return "Not Found";
+        case 405:
+            return "Method Not Allowed";
+        case 429:
+            return "Too Many Requests";
+        case 500:
+            return "Internal Server Error";
+        case 502:
+            return "Bad Gateway";
+        case 503:
+            return "Service Unavailable";
+        default:
+            return "Unknown";
     }
 }
 
@@ -407,9 +422,8 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         cap.raw_header_len = conn.capture_header_len;
         cap.method = conn.req_method;
         cap.shard_id = conn.shard_id;
-        cap.flags = (conn.capture_header_len == CaptureEntry::kMaxHeaderLen)
-                        ? kCaptureFlagTruncated
-                        : 0;
+        cap.flags =
+            (conn.capture_header_len == CaptureEntry::kMaxHeaderLen) ? kCaptureFlagTruncated : 0;
         constexpr u32 kCopyLen = sizeof(conn.upstream_name) < sizeof(cap.upstream_name)
                                      ? sizeof(conn.upstream_name)
                                      : sizeof(cap.upstream_name);
@@ -466,7 +480,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         route = config->match(
             reinterpret_cast<const u8*>(conn.req_path),
             // strlen of null-terminated req_path
-            [&]() -> u32 { u32 n = 0; while (conn.req_path[n]) n++; return n; }(),
+            [&]() -> u32 {
+                u32 n = 0;
+                while (conn.req_path[n]) n++;
+                return n;
+            }(),
             conn.recv_buf.data() ? conn.recv_buf.data()[0] : 0);
     }
 

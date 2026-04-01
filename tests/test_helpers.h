@@ -8,11 +8,11 @@
 #include "rut/runtime/epoll_backend.h"
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/io_event.h"
-#include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/socket.h"
 #include "rut/runtime/timer_wheel.h"
+#include "rut/runtime/traffic_capture.h"
 #include <atomic>
 
 #include <errno.h>

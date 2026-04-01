@@ -20,9 +20,9 @@ namespace rut {
 // Result of simulating one captured request through a real Shard.
 struct SimResult {
     // Identity
-    u8 method;            // LogHttpMethod enum from capture
-    char path[64];        // from capture entry raw headers
-    char upstream[32];    // expected upstream (from capture)
+    u8 method;          // LogHttpMethod enum from capture
+    char path[64];      // from capture entry raw headers
+    char upstream[32];  // expected upstream (from capture)
 
     // Expected (from capture file)
     u16 expected_status;
@@ -32,10 +32,10 @@ struct SimResult {
     bool status_match;
 
     // Performance
-    u32 latency_us;       // round-trip: send headers → recv response
+    u32 latency_us;  // round-trip: send headers → recv response
 
     // Flags
-    bool success;         // false if connection/send/recv failed
+    bool success;  // false if connection/send/recv failed
 };
 
 // Summary of a simulation session.
@@ -44,7 +44,7 @@ struct SimSummary {
     u32 succeeded;
     u32 matched;
     u32 mismatched;
-    u32 failed;           // connection/IO errors
+    u32 failed;  // connection/IO errors
 
     // Latency (microseconds)
     u32 latency_min;
@@ -91,12 +91,10 @@ inline void sim_extract_request_info(const CaptureEntry& entry, SimResult& resul
 
     // Read path
     u32 path_start = pos;
-    while (pos < len && h[pos] != ' ' && h[pos] != '\r' && h[pos] != '?')
-        pos++;
+    while (pos < len && h[pos] != ' ' && h[pos] != '\r' && h[pos] != '?') pos++;
     u32 path_len = pos - path_start;
     if (path_len >= sizeof(result.path)) path_len = sizeof(result.path) - 1;
-    for (u32 i = 0; i < path_len; i++)
-        result.path[i] = static_cast<char>(h[path_start + i]);
+    for (u32 i = 0; i < path_len; i++) result.path[i] = static_cast<char>(h[path_start + i]);
     result.path[path_len] = '\0';
 }
 
@@ -141,7 +139,10 @@ inline SimResult sim_one(u16 server_port, const CaptureEntry& entry) {
     u32 remaining = entry.raw_header_len;
     while (remaining > 0) {
         ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
-        if (n <= 0) { close(fd); return result; }
+        if (n <= 0) {
+            close(fd);
+            return result;
+        }
         p += n;
         remaining -= static_cast<u32>(n);
     }
@@ -166,8 +167,7 @@ inline SimResult sim_one(u16 server_port, const CaptureEntry& entry) {
 
     // Parse status code from "HTTP/1.1 NNN ..."
     if (resp[0] != 'H' || resp[8] != ' ') return result;
-    u16 code = static_cast<u16>(
-        (resp[9] - '0') * 100 + (resp[10] - '0') * 10 + (resp[11] - '0'));
+    u16 code = static_cast<u16>((resp[9] - '0') * 100 + (resp[10] - '0') * 10 + (resp[11] - '0'));
 
     result.actual_status = code;
     result.status_match = (code == entry.resp_status);
@@ -186,13 +186,17 @@ inline u32 sim_format_result(const SimResult& r, char* buf, u32 buf_size) {
     auto put_u16 = [&](u16 v) {
         char tmp[6];
         u32 n = 0;
-        if (v == 0) { tmp[n++] = '0'; }
-        else {
+        if (v == 0) {
+            tmp[n++] = '0';
+        } else {
             u16 d = 10000;
             bool started = false;
             while (d > 0) {
                 char c = static_cast<char>('0' + (v / d) % 10);
-                if (c != '0' || started) { tmp[n++] = c; started = true; }
+                if (c != '0' || started) {
+                    tmp[n++] = c;
+                    started = true;
+                }
                 d /= 10;
             }
         }
@@ -201,13 +205,17 @@ inline u32 sim_format_result(const SimResult& r, char* buf, u32 buf_size) {
     auto put_u32 = [&](u32 v) {
         char tmp[11];
         u32 n = 0;
-        if (v == 0) { tmp[n++] = '0'; }
-        else {
+        if (v == 0) {
+            tmp[n++] = '0';
+        } else {
             u32 d = 1000000000;
             bool started = false;
             while (d > 0) {
                 char c = static_cast<char>('0' + (v / d) % 10);
-                if (c != '0' || started) { tmp[n++] = c; started = true; }
+                if (c != '0' || started) {
+                    tmp[n++] = c;
+                    started = true;
+                }
                 d /= 10;
             }
         }
@@ -223,9 +231,16 @@ inline u32 sim_format_result(const SimResult& r, char* buf, u32 buf_size) {
         put("MISS   ");
 
     // Method
-    static const char* kMethods[] = {
-        "GET    ", "POST   ", "PUT    ", "DELETE ", "PATCH  ",
-        "HEAD   ", "OPTIONS", "CONNECT", "TRACE  ", "OTHER  "};
+    static const char* kMethods[] = {"GET    ",
+                                     "POST   ",
+                                     "PUT    ",
+                                     "DELETE ",
+                                     "PATCH  ",
+                                     "HEAD   ",
+                                     "OPTIONS",
+                                     "CONNECT",
+                                     "TRACE  ",
+                                     "OTHER  "};
     u8 m = r.method < 10 ? r.method : 9;
     put(kMethods[m]);
     put(" ");
@@ -266,13 +281,17 @@ inline u32 sim_format_summary(const SimSummary& s, char* buf, u32 buf_size) {
     auto put_u32 = [&](u32 v) {
         char tmp[11];
         u32 n = 0;
-        if (v == 0) { tmp[n++] = '0'; }
-        else {
+        if (v == 0) {
+            tmp[n++] = '0';
+        } else {
             u32 d = 1000000000;
             bool started = false;
             while (d > 0) {
                 char c = static_cast<char>('0' + (v / d) % 10);
-                if (c != '0' || started) { tmp[n++] = c; started = true; }
+                if (c != '0' || started) {
+                    tmp[n++] = c;
+                    started = true;
+                }
                 d /= 10;
             }
         }
@@ -281,13 +300,17 @@ inline u32 sim_format_summary(const SimSummary& s, char* buf, u32 buf_size) {
     auto put_u64 = [&](u64 v) {
         char tmp[21];
         u32 n = 0;
-        if (v == 0) { tmp[n++] = '0'; }
-        else {
+        if (v == 0) {
+            tmp[n++] = '0';
+        } else {
             u64 d = 10000000000000000000ULL;
             bool started = false;
             while (d > 0) {
                 char c = static_cast<char>('0' + (v / d) % 10);
-                if (c != '0' || started) { tmp[n++] = c; started = true; }
+                if (c != '0' || started) {
+                    tmp[n++] = c;
+                    started = true;
+                }
                 d /= 10;
             }
         }
@@ -295,16 +318,36 @@ inline u32 sim_format_summary(const SimSummary& s, char* buf, u32 buf_size) {
     };
 
     put("--- Simulation Summary ---\n");
-    put("Total:      "); put_u32(s.total); put("\n");
-    put("Succeeded:  "); put_u32(s.succeeded); put("\n");
-    put("Matched:    "); put_u32(s.matched); put("\n");
-    put("Mismatched: "); put_u32(s.mismatched); put("\n");
-    put("Failed:     "); put_u32(s.failed); put("\n");
-    put("Latency avg: "); put_u32(s.latency_avg()); put("us\n");
-    put("Latency min: "); put_u32(s.latency_min); put("us\n");
-    put("Latency max: "); put_u32(s.latency_max); put("us\n");
-    put("Connections: "); put_u64(s.connections_total); put("\n");
-    put("Requests:   "); put_u64(s.requests_total); put("\n");
+    put("Total:      ");
+    put_u32(s.total);
+    put("\n");
+    put("Succeeded:  ");
+    put_u32(s.succeeded);
+    put("\n");
+    put("Matched:    ");
+    put_u32(s.matched);
+    put("\n");
+    put("Mismatched: ");
+    put_u32(s.mismatched);
+    put("\n");
+    put("Failed:     ");
+    put_u32(s.failed);
+    put("\n");
+    put("Latency avg: ");
+    put_u32(s.latency_avg());
+    put("us\n");
+    put("Latency min: ");
+    put_u32(s.latency_min);
+    put("us\n");
+    put("Latency max: ");
+    put_u32(s.latency_max);
+    put("us\n");
+    put("Connections: ");
+    put_u64(s.connections_total);
+    put("\n");
+    put("Requests:   ");
+    put_u64(s.requests_total);
+    put("\n");
 
     if (pos < buf_size) buf[pos] = '\0';
     return pos;

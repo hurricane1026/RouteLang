@@ -137,8 +137,7 @@ public:
         // Backfill capture_buf on existing active connections.
         for (u32 i = 0; i < kMaxConns; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf =
-                    capture_region_ + static_cast<u64>(i) * 8192u;
+                conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * 8192u;
         }
         return true;
     }
@@ -367,8 +366,7 @@ public:
         conns[id].send_slice = ss;
         conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
-        if (capture_region_)
-            conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * 8192u;
+        if (capture_region_) conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * 8192u;
         return &conns[id];
     }
 

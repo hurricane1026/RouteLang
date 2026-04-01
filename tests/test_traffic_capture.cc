@@ -244,9 +244,8 @@ TEST(capture_file, write_read_roundtrip) {
 
 TEST(capture_integration, basic_request_captured) {
     // Allocate ring on heap (too large for stack: 256 * 8256 = ~2MB)
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -294,9 +293,8 @@ TEST(capture_integration, basic_request_captured) {
     CHECK_GT(cap.raw_header_len, 0);
 
     // Verify raw headers contain the request line
-    bool found_get = cap.raw_headers[0] == 'G' &&
-                     cap.raw_headers[1] == 'E' &&
-                     cap.raw_headers[2] == 'T';
+    bool found_get =
+        cap.raw_headers[0] == 'G' && cap.raw_headers[1] == 'E' && cap.raw_headers[2] == 'T';
     CHECK(found_get);
 
     munmap(ring, sizeof(CaptureRing));
@@ -319,9 +317,8 @@ TEST(capture_integration, no_capture_when_disabled) {
 }
 
 TEST(capture_integration, keepalive_captures_both) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -358,9 +355,8 @@ TEST(capture_integration, keepalive_captures_both) {
 // === Runtime enable/disable via control block ===
 
 TEST(capture_control, enable_via_control_block) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -384,9 +380,8 @@ TEST(capture_control, enable_via_control_block) {
 }
 
 TEST(capture_control, disable_via_control_block) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -411,9 +406,8 @@ TEST(capture_control, disable_via_control_block) {
 }
 
 TEST(capture_control, enable_captures_disable_stops) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -463,9 +457,8 @@ TEST(capture_control, enable_captures_disable_stops) {
 }
 
 TEST(capture_control, conn_before_enable_gets_backfilled) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -547,9 +540,8 @@ static u32 send_request(SmallLoop& loop, Connection& conn, const char* req_str) 
 
 // 2. on → accept → off → request: disable after accept, request not captured
 TEST(capture_transition, on_accept_off_request) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -575,9 +567,8 @@ TEST(capture_transition, on_accept_off_request) {
 
 // 3. on → accept → off → on → request: re-enable backfills, request captured
 TEST(capture_transition, on_off_on_reenable_backfill) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -624,9 +615,8 @@ TEST(capture_transition, on_off_on_reenable_backfill) {
 // 4. Disable mid-request: headers staged (capture on), but completion sees capture off.
 //    Should not crash, request silently not captured.
 TEST(capture_transition, disable_mid_request) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -669,9 +659,8 @@ TEST(capture_transition, disable_mid_request) {
 // 5. Mixed: conn1 accepted while off, conn2 accepted while on.
 //    set_capture() backfills conn1, so BOTH should be captured.
 TEST(capture_transition, mixed_conns_both_captured_after_enable) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -707,9 +696,8 @@ TEST(capture_transition, mixed_conns_both_captured_after_enable) {
 
 // 6. Close connection after disable — no crash.
 TEST(capture_transition, close_after_disable) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -733,9 +721,8 @@ TEST(capture_transition, close_after_disable) {
 // 7. Keep-alive: capture off for req1, on for req2. req2 must NOT
 //    contain stale header data from req1.
 TEST(capture_transition, keepalive_off_then_on_no_stale) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -785,9 +772,8 @@ TEST(capture_transition, keepalive_off_then_on_no_stale) {
 //    then re-enabled before next request. Stale capture_header_len from req1
 //    must not leak into the next request's capture entry.
 TEST(capture_transition, stale_header_len_across_disable_reenable) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -890,9 +876,8 @@ TEST(capture_ring, overflow_pressure) {
 
 // A1: off → off → on (3 requests, capture only on for req3)
 TEST(capture_cross, keepalive_off_off_on) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -935,9 +920,8 @@ TEST(capture_cross, keepalive_off_off_on) {
 
 // A2: off → on → off (3 requests, only req2 captured)
 TEST(capture_cross, keepalive_off_on_off) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -967,9 +951,8 @@ TEST(capture_cross, keepalive_off_on_off) {
 
 // A3: on → on → off (3 requests, req1+req2 captured, req3 not)
 TEST(capture_cross, keepalive_on_on_off) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -996,9 +979,8 @@ TEST(capture_cross, keepalive_on_on_off) {
 
 // A4: on → off → off (3 requests, only req1 captured)
 TEST(capture_cross, keepalive_on_off_off) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1025,9 +1007,8 @@ TEST(capture_cross, keepalive_on_off_off) {
 
 // A5: Double toggle: on → off → on → off (4 requests)
 TEST(capture_cross, keepalive_double_toggle) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1075,9 +1056,8 @@ TEST(capture_cross, keepalive_double_toggle) {
 // Should NOT capture — header_len is 0, even though ring is now set.
 
 TEST(capture_cross, enable_between_header_and_complete) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1122,9 +1102,8 @@ TEST(capture_cross, enable_between_header_and_complete) {
 // --- C. Multi-connection interleaved enable/disable ---
 
 TEST(capture_cross, two_conns_alternating_capture) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1163,9 +1142,8 @@ TEST(capture_cross, two_conns_alternating_capture) {
 // --- D. Cross with drain mode ---
 
 TEST(capture_cross, capture_during_drain) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1196,9 +1174,8 @@ TEST(capture_cross, capture_during_drain) {
 // --- E. Close with staged headers (capture on at header, conn reset before completion) ---
 
 TEST(capture_cross, close_with_staged_headers) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1225,7 +1202,7 @@ TEST(capture_cross, close_with_staged_headers) {
 
     // Send fails → connection close (before on_request_complete writes capture)
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -32));  // EPIPE
-    CHECK_EQ(loop.conns[cid].fd, -1);  // closed
+    CHECK_EQ(loop.conns[cid].fd, -1);                                // closed
 
     // Headers were staged but never written to ring (close bypasses on_request_complete)
     CHECK_EQ(ring->available(), 0u);
@@ -1236,9 +1213,8 @@ TEST(capture_cross, close_with_staged_headers) {
 // --- F. Proxy flow with capture ---
 
 TEST(capture_cross, proxy_cycle_captured) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1271,7 +1247,8 @@ TEST(capture_cross, proxy_cycle_captured) {
 
     // Proxy cycle: connect → send → recv response → send to client
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(sizeof(req) - 1)));
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(sizeof(req) - 1)));
     inject_upstream_response(loop, *conn);
 
     // Complete: send proxy response to client
@@ -1300,9 +1277,8 @@ TEST(capture_cross, proxy_cycle_captured) {
 
 // Proxy 502 (upstream connect failure) with capture
 TEST(capture_cross, proxy_502_captured) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1343,9 +1319,8 @@ TEST(capture_cross, proxy_502_captured) {
 // --- G. Ring overflow with live event loop ---
 
 TEST(capture_cross, ring_overflow_live) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1382,9 +1357,8 @@ TEST(capture_cross, ring_overflow_live) {
 
 // H1. Full pipeline: event loop → ring → file → read back → verify headers
 TEST(capture_e2e, pipeline_to_file) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1461,7 +1435,10 @@ TEST(capture_e2e, pipeline_to_file) {
                     break;
                 }
             }
-            if (match) { found = true; break; }
+            if (match) {
+                found = true;
+                break;
+            }
         }
         CHECK(found);
     }
@@ -1521,9 +1498,8 @@ TEST(capture_e2e, truncated_entry_read_fails) {
 
 // H4. set_capture idempotent — calling twice with same ring doesn't double-backfill
 TEST(capture_e2e, set_capture_idempotent) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1553,12 +1529,10 @@ TEST(capture_e2e, set_capture_idempotent) {
 
 // H5. Disable then enable with different ring — old entries stay in old ring
 TEST(capture_e2e, switch_ring) {
-    auto* ring1 = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    auto* ring2 = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring1 = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring2 = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring1 != MAP_FAILED);
     REQUIRE(ring2 != MAP_FAILED);
     ring1->init();
@@ -1591,9 +1565,8 @@ TEST(capture_e2e, switch_ring) {
 
 // H6. Large header near 8KB limit — verify truncation flag
 TEST(capture_e2e, large_header_near_limit) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1635,8 +1608,8 @@ TEST(capture_e2e, large_header_near_limit) {
     CHECK_EQ(ring->available(), 1u);
     CaptureEntry cap{};
     ring->pop(cap);
-    CHECK_GT(cap.raw_header_len, 100);   // captured something substantial
-    CHECK(cap.raw_header_len <= total);   // not more than sent
+    CHECK_GT(cap.raw_header_len, 100);               // captured something substantial
+    CHECK(cap.raw_header_len <= total);              // not more than sent
     CHECK_EQ(cap.flags & kCaptureFlagTruncated, 0);  // not truncated (under 8KB)
 
     munmap(ring, sizeof(CaptureRing));
@@ -1663,8 +1636,7 @@ static void* capture_producer(void* arg) {
         entry.req_content_length = i;  // use as sequence number
         entry.raw_header_len = 10;
         // Write a recognizable pattern into raw_headers
-        for (u32 j = 0; j < 10; j++)
-            entry.raw_headers[j] = static_cast<u8>((i + j) & 0xFF);
+        for (u32 j = 0; j < 10; j++) entry.raw_headers[j] = static_cast<u8>((i + j) & 0xFF);
         if (ctx->ring->push(entry))
             ctx->pushed++;
         else
@@ -1697,8 +1669,7 @@ static void* capture_consumer(void* arg) {
             ctx->last_seq = seq;
             // Verify data integrity
             for (u32 j = 0; j < 10; j++) {
-                if (entry.raw_headers[j] != static_cast<u8>((seq + j) & 0xFF))
-                    ctx->data_ok = false;
+                if (entry.raw_headers[j] != static_cast<u8>((seq + j) & 0xFF)) ctx->data_ok = false;
             }
             ctx->consumed++;
         }
@@ -1708,9 +1679,8 @@ static void* capture_consumer(void* arg) {
 
 // Dual-thread SPSC: verify no loss, no reorder, no data corruption.
 TEST(capture_stress, spsc_concurrent) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1736,9 +1706,8 @@ TEST(capture_stress, spsc_concurrent) {
 
 // Backpressure: producer overwhelms consumer, verify drops + ordering.
 TEST(capture_stress, spsc_backpressure) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1761,8 +1730,7 @@ TEST(capture_stress, spsc_backpressure) {
                 if (seq < last_seq) order_ok = false;
                 last_seq = seq;
                 for (u32 k = 0; k < 10; k++) {
-                    if (entry.raw_headers[k] != static_cast<u8>((seq + k) & 0xFF))
-                        data_ok = false;
+                    if (entry.raw_headers[k] != static_cast<u8>((seq + k) & 0xFF)) data_ok = false;
                 }
                 consumed++;
             }
@@ -1791,9 +1759,8 @@ TEST(capture_stress, spsc_backpressure) {
 // Rapid enable/disable toggle with concurrent requests on SmallLoop.
 // Verifies no crash, no corruption under rapid state changes.
 TEST(capture_stress, rapid_toggle) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1821,9 +1788,8 @@ TEST(capture_stress, rapid_toggle) {
 
     // Ring entries should match expected count (capped at capacity)
     u32 ring_count = ring->available();
-    u32 expected = total_captured < CaptureRing::kCapacity
-                       ? total_captured
-                       : CaptureRing::kCapacity;
+    u32 expected =
+        total_captured < CaptureRing::kCapacity ? total_captured : CaptureRing::kCapacity;
     CHECK_EQ(ring_count, expected);
 
     // Verify all entries in ring are valid (status 200, non-zero header_len)
@@ -1849,16 +1815,14 @@ TEST(capture_gap, truncation_flag_set) {
     // Use mmap for a recv buffer larger than 8KB
     u32 big_size = CaptureEntry::kMaxHeaderLen + 1024;
     u8* big_recv = static_cast<u8*>(
-        mmap(nullptr, big_size, PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        mmap(nullptr, big_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(big_recv != MAP_FAILED);
 
     conn.capture_buf = capture_buf;
     conn.recv_buf.bind(big_recv, big_size);
 
     // Fill with data larger than 8KB
-    for (u32 i = 0; i < big_size; i++)
-        big_recv[i] = static_cast<u8>('A' + (i % 26));
+    for (u32 i = 0; i < big_size; i++) big_recv[i] = static_cast<u8>('A' + (i % 26));
     conn.recv_buf.commit(big_size);
     conn.req_header_end = big_size;  // pretend headers are huge
 
@@ -1870,8 +1834,8 @@ TEST(capture_gap, truncation_flag_set) {
     ring.init();
     CaptureEntry cap{};
     cap.raw_header_len = conn.capture_header_len;
-    cap.flags = (conn.capture_header_len == CaptureEntry::kMaxHeaderLen)
-                    ? kCaptureFlagTruncated : 0;
+    cap.flags =
+        (conn.capture_header_len == CaptureEntry::kMaxHeaderLen) ? kCaptureFlagTruncated : 0;
     __builtin_memcpy(cap.raw_headers, conn.capture_buf, conn.capture_header_len);
     ring.push(cap);
 
@@ -1888,9 +1852,8 @@ TEST(capture_gap, truncation_flag_set) {
 
 // G2. upstream_name: verify correct copy into captured entry, including boundary
 TEST(capture_gap, upstream_name_copied) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -1914,8 +1877,7 @@ TEST(capture_gap, upstream_name_copied) {
 
     // Set upstream_name before completion
     const char up_name[] = "api-backend-v2";
-    for (u32 i = 0; i < sizeof(up_name); i++)
-        conn->upstream_name[i] = up_name[i];
+    for (u32 i = 0; i < sizeof(up_name); i++) conn->upstream_name[i] = up_name[i];
 
     // Complete send
     loop.inject_and_dispatch(
@@ -1960,9 +1922,8 @@ TEST(capture_gap, upstream_name_max_length) {
 
 // G3. Metadata fields: timestamp, shard_id, content lengths
 TEST(capture_gap, metadata_fields) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -2023,9 +1984,8 @@ TEST(capture_gap, file_header_wrong_magic_middle) {
 
 // G6. set_capture(nullptr) leaves capture_buf intact on connections
 TEST(capture_gap, disable_preserves_capture_buf) {
-    auto* ring = static_cast<CaptureRing*>(
-        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring = static_cast<CaptureRing*>(mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     REQUIRE(ring != MAP_FAILED);
     ring->init();
 
@@ -2051,4 +2011,6 @@ TEST(capture_gap, disable_preserves_capture_buf) {
     munmap(ring, sizeof(CaptureRing));
 }
 
-int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }
+int main(int argc, char** argv) {
+    return rut::test::run_all(argc, argv);
+}

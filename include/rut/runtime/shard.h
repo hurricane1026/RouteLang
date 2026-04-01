@@ -6,10 +6,10 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
-#include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/shard_control.h"
+#include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
 
 #include <pthread.h>

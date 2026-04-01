@@ -198,8 +198,10 @@ struct Shard {
         capture_ring->init();
 
         if (!thread_spawned) {
-            // Direct apply — no thread running.
-            if (loop) loop->capture_ring = capture_ring;
+            // Direct apply — no thread running. Use set_capture() for
+            // consistency (lazy region alloc + backfill, though no
+            // connections exist pre-spawn).
+            if (loop) loop->set_capture(capture_ring);
             return capture_ring;
         }
         control.pending_capture.store(capture_ring, std::memory_order_release);

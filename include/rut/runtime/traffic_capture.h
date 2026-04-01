@@ -4,7 +4,6 @@
 #include "rut/runtime/access_log.h"  // realtime_us()
 
 #include <atomic>
-#include <string.h>
 #include <unistd.h>
 
 namespace rut {
@@ -128,8 +127,9 @@ struct CaptureRing {
     }
 };
 
-// Write captured entries to a file descriptor (append mode).
-// Returns number of entries written. Updates header entry_count.
+// Write one captured entry to a file descriptor opened in append mode.
+// Returns 0 on success, -1 on write error. The caller updates header
+// entry_count separately.
 //
 // Usage pattern (background flusher):
 //   CaptureEntry entry;

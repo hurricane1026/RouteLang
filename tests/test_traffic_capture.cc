@@ -27,6 +27,78 @@ TEST(capture_entry, metadata_offset) {
     CHECK_EQ(static_cast<u32>(headers - base), 64u);
 }
 
+// === capture_stage_headers edge cases (direct unit tests) ===
+
+TEST(capture_stage, null_capture_buf) {
+    Connection conn;
+    conn.reset();
+    // capture_buf is nullptr after reset
+    CHECK(conn.capture_buf == nullptr);
+    capture_stage_headers(conn);
+    CHECK_EQ(conn.capture_header_len, 0);
+}
+
+TEST(capture_stage, null_recv_data) {
+    Connection conn;
+    conn.reset();
+    u8 buf[CaptureEntry::kMaxHeaderLen];
+    conn.capture_buf = buf;
+    // recv_buf has nullptr data (not bound)
+    CHECK(conn.recv_buf.data() == nullptr);
+    capture_stage_headers(conn);
+    CHECK_EQ(conn.capture_header_len, 0);  // early return, no crash
+}
+
+TEST(capture_stage, zero_length_recv) {
+    Connection conn;
+    conn.reset();
+    u8 capture_buf[CaptureEntry::kMaxHeaderLen];
+    u8 recv_storage[128];
+    conn.capture_buf = capture_buf;
+    conn.recv_buf.bind(recv_storage, 128);
+    // recv_buf is bound but empty (len=0), header_end=0
+    conn.req_header_end = 0;
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    capture_stage_headers(conn);
+    CHECK_EQ(conn.capture_header_len, 0);  // nothing to copy
+}
+
+TEST(capture_stage, normal_copy) {
+    Connection conn;
+    conn.reset();
+    u8 capture_buf[CaptureEntry::kMaxHeaderLen];
+    u8 recv_storage[256];
+    conn.capture_buf = capture_buf;
+    conn.recv_buf.bind(recv_storage, 256);
+
+    const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    conn.recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    conn.req_header_end = sizeof(req) - 1;
+
+    capture_stage_headers(conn);
+    CHECK_EQ(conn.capture_header_len, static_cast<u16>(sizeof(req) - 1));
+    CHECK_EQ(capture_buf[0], static_cast<u8>('G'));
+    CHECK_EQ(capture_buf[1], static_cast<u8>('E'));
+    CHECK_EQ(capture_buf[2], static_cast<u8>('T'));
+}
+
+TEST(capture_stage, header_end_zero_falls_back_to_recv_len) {
+    Connection conn;
+    conn.reset();
+    u8 capture_buf[CaptureEntry::kMaxHeaderLen];
+    u8 recv_storage[256];
+    conn.capture_buf = capture_buf;
+    conn.recv_buf.bind(recv_storage, 256);
+
+    const char data[] = "partial data";
+    conn.recv_buf.write(reinterpret_cast<const u8*>(data), sizeof(data) - 1);
+    conn.req_header_end = 0;  // parser didn't set it
+
+    capture_stage_headers(conn);
+    // Falls back to recv_buf.len()
+    CHECK_EQ(conn.capture_header_len, static_cast<u16>(sizeof(data) - 1));
+}
+
 // === CaptureRing ===
 
 TEST(capture_ring, push_pop_single) {

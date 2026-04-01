@@ -493,4 +493,298 @@ TEST(route, detect_config_regression) {
     tmp.cleanup();
 }
 
+// ============================================================
+// Coverage gap tests
+// ============================================================
+
+// G1. Connection slot exhaustion → replay_one returns replayed=false
+TEST(replay_gap, conn_slot_exhaustion) {
+    SmallLoop loop;
+    loop.setup();
+
+    // Fill all 64 connection slots
+    for (u32 i = 0; i < SmallLoop::kMaxConns; i++) {
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, static_cast<i32>(100 + i)));
+    }
+    CHECK_EQ(loop.free_top, 0u);
+
+    // replay_one should fail gracefully
+    CaptureEntry entry = make_captured_request(
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    ReplayResult result = replay_one(loop, entry, 999);
+    CHECK(!result.replayed);
+
+    // replay_file should count it as failed
+    CaptureEntry entries[2];
+    entries[0] = make_captured_request("GET /a HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /b HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 2));
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+    ReplaySummary summary = replay_file(loop, reader);
+    CHECK_EQ(summary.failed, 2u);
+    reader.close();
+    tmp.cleanup();
+}
+
+// G2. recv_buf 4KB truncation: entry with headers > SmallLoop::kBufSize
+TEST(replay_gap, large_header_truncated_by_smallloop) {
+    SmallLoop loop;
+    loop.setup();
+
+    // Create an entry with ~5KB headers (exceeds SmallLoop's 4096 buf)
+    CaptureEntry entry{};
+    entry.resp_status = 200;
+    entry.method = static_cast<u8>(LogHttpMethod::Get);
+    // Build a valid-ish request with lots of padding headers
+    const char prefix[] = "GET / HTTP/1.1\r\nHost: x\r\n";
+    u32 pos = 0;
+    for (u32 i = 0; i < sizeof(prefix) - 1; i++)
+        entry.raw_headers[pos++] = static_cast<u8>(prefix[i]);
+    // Pad with headers until ~5000 bytes
+    while (pos < 5000) {
+        const char hdr[] = "X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+        for (u32 i = 0; i < sizeof(hdr) - 1 && pos < 5000; i++)
+            entry.raw_headers[pos++] = static_cast<u8>(hdr[i]);
+    }
+    entry.raw_headers[pos++] = '\r';
+    entry.raw_headers[pos++] = '\n';
+    entry.raw_header_len = static_cast<u16>(pos);
+
+    // replay_one should not crash — headers get truncated to 4KB
+    ReplayResult result = replay_one(loop, entry, 42);
+    CHECK(result.replayed);
+    // Status might not match exactly due to truncation, but no crash
+    CHECK_EQ(result.actual_status, 200);
+}
+
+// G3. format_static_response wire format: verify Content-Length matches body
+TEST(replay_gap, format_static_response_wire_format) {
+    // Test various status codes and verify the response is well-formed
+    struct TestCase {
+        u16 code;
+        const char* reason;
+        u32 reason_len;
+    };
+    TestCase cases[] = {
+        {200, "OK", 2},
+        {404, "Not Found", 9},
+        {500, "Internal Server Error", 21},
+        {204, "No Content", 10},
+        {301, "Moved Permanently", 17},
+    };
+
+    for (auto& tc : cases) {
+        Connection conn;
+        conn.reset();
+        u8 send_storage[4096];
+        conn.send_buf.bind(send_storage, 4096);
+        format_static_response(conn, tc.code, true);
+
+        // Parse the response to find Content-Length
+        const u8* data = conn.send_buf.data();
+        u32 len = conn.send_buf.len();
+
+        // Find "Content-Length: " and parse the number
+        u32 cl_val = 0;
+        bool found_cl = false;
+        for (u32 i = 0; i + 16 < len; i++) {
+            if (data[i] == 'C' && data[i + 1] == 'o' && data[i + 8] == 'L') {
+                // "Content-Length: "
+                u32 j = i + 16;
+                while (j < len && data[j] >= '0' && data[j] <= '9') {
+                    cl_val = cl_val * 10 + (data[j] - '0');
+                    j++;
+                }
+                found_cl = true;
+                break;
+            }
+        }
+        CHECK(found_cl);
+        CHECK_EQ(cl_val, tc.reason_len);
+
+        // Find body after \r\n\r\n
+        u32 body_start = 0;
+        for (u32 i = 0; i + 3 < len; i++) {
+            if (data[i] == '\r' && data[i + 1] == '\n' &&
+                data[i + 2] == '\r' && data[i + 3] == '\n') {
+                body_start = i + 4;
+                break;
+            }
+        }
+        CHECK_GT(body_start, 0u);
+        u32 body_len = len - body_start;
+        CHECK_EQ(body_len, tc.reason_len);
+
+        // Verify status line contains the code
+        CHECK_EQ(data[9], static_cast<u8>('0' + (tc.code / 100) % 10));
+        CHECK_EQ(data[10], static_cast<u8>('0' + (tc.code / 10) % 10));
+        CHECK_EQ(data[11], static_cast<u8>('0' + tc.code % 10));
+
+        // Unbind to prevent Buffer destructor trap
+        conn.send_buf.bind(nullptr, 0);
+    }
+}
+
+// G4. Proxy route socket fail → 502 (via replay, not manual proxy setup)
+// Note: In SmallLoop, UpstreamPool::create_socket() calls real socket()
+// which typically succeeds. We can't easily force it to fail without
+// mocking. Instead, test the proxy route path works end-to-end by
+// verifying the connection enters Proxying state.
+TEST(replay_gap, proxy_route_enters_proxy_state) {
+    RouteConfig cfg;
+    auto up_result = cfg.add_upstream("backend", 0x7F000001, 9999);
+    REQUIRE(up_result.has_value());
+    cfg.add_proxy("/api", 0, static_cast<u16>(up_result.value()));
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    // Accept and inject request manually (don't use replay_one — need
+    // to check intermediate state before proxy completes)
+    rl.loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = rl.loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    conn->recv_buf.reset();
+    const char req[] = "GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n";
+    conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    rl.loop.backend.inject(recv_ev);
+    IoEvent events[8];
+    u32 n = rl.loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) rl.loop.dispatch(events[i]);
+
+    // Should be in proxy state with upstream_fd set
+    CHECK_EQ(conn->state, ConnState::Proxying);
+    CHECK(conn->upstream_fd >= 0);
+
+    // upstream_name should be copied
+    CHECK_EQ(conn->upstream_name[0], 'b');  // "backend"
+
+    // Clean up the real socket
+    close(conn->upstream_fd);
+    conn->upstream_fd = -1;
+    // Close connection
+    rl.loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 0));
+}
+
+// G5. Query string in path: /health?foo=bar should match /health prefix
+TEST(replay_gap, query_string_in_path) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 200);
+    cfg.add_static("/", 0, 404);
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    // Path with query string — depends on what HTTP parser puts in req_path
+    // The parser stores the full path including query string in req.path
+    CaptureEntry entry = make_captured_request(
+        "GET /health?check=1 HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    ReplayResult result = replay_one(rl.loop, entry, 42);
+    CHECK(result.replayed);
+    // /health?check=1 should prefix-match /health
+    CHECK_EQ(result.actual_status, 200);
+}
+
+// G6. ReplayReader: next after close, double close
+TEST(replay_gap, reader_next_after_close) {
+    CaptureEntry entries[1];
+    entries[0] = make_captured_request("GET / HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 1));
+
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+    reader.close();
+
+    // next after close should return -1
+    CaptureEntry out{};
+    CHECK_EQ(reader.next(out), -1);
+
+    // double close should not crash
+    reader.close();
+
+    tmp.cleanup();
+}
+
+// G7. CaptureEntry::method enum vs raw bytes: raw headers win for routing
+TEST(replay_gap, method_enum_vs_raw_bytes) {
+    RouteConfig cfg;
+    cfg.add_static("/test", 'G', 200);  // GET only
+    cfg.add_static("/test", 'P', 403);  // POST → 403
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    // Entry says method=Post (enum), but raw_headers say "GET ..."
+    // Route matcher should use raw bytes, not enum
+    CaptureEntry entry = make_captured_request(
+        "GET /test HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entry.method = static_cast<u8>(LogHttpMethod::Post);  // lie
+
+    ReplayResult result = replay_one(rl.loop, entry, 42);
+    CHECK(result.replayed);
+    CHECK_EQ(result.actual_status, 200);  // matched on raw 'G', not enum Post
+}
+
+// G8. Malformed request → req_path defaults to "/" → hits catch-all
+TEST(replay_gap, malformed_request_hits_catchall) {
+    RouteConfig cfg;
+    cfg.add_static("/", 0, 404);
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    // Completely garbage headers — parser will fail, req_path stays "/"
+    CaptureEntry entry = make_captured_request(
+        "GARBAGE\r\n\r\n", 404);
+    ReplayResult result = replay_one(rl.loop, entry, 42);
+    CHECK(result.replayed);
+    CHECK_EQ(result.actual_status, 404);  // "/" catch-all
+}
+
+// G9. Upstream name truncation at Connection::kMaxUpstreamNameLen boundary
+TEST(replay_gap, upstream_name_truncation_boundary) {
+    // Create upstream with name exactly 23 chars (fills 24-byte field with null)
+    RouteConfig cfg;
+    char long_name[32];
+    for (u32 i = 0; i < 23; i++) long_name[i] = static_cast<char>('a' + i % 26);
+    long_name[23] = '\0';
+
+    auto up = cfg.add_upstream(long_name, 0x7F000001, 9999);
+    REQUIRE(up.has_value());
+    cfg.add_proxy("/up", 0, static_cast<u16>(up.value()));
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    rl.loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = rl.loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    conn->recv_buf.reset();
+    const char req[] = "GET /up/test HTTP/1.1\r\nHost: x\r\n\r\n";
+    conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    rl.loop.backend.inject(recv_ev);
+    IoEvent events[8];
+    u32 n = rl.loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) rl.loop.dispatch(events[i]);
+
+    // Name should be truncated to kMaxUpstreamNameLen-1 = 23 chars + null
+    CHECK_EQ(conn->upstream_name[0], 'a');
+    CHECK_EQ(conn->upstream_name[22], static_cast<char>('a' + 22 % 26));
+    CHECK_EQ(conn->upstream_name[23], '\0');
+
+    // Clean up real socket
+    if (conn->upstream_fd >= 0) {
+        close(conn->upstream_fd);
+        conn->upstream_fd = -1;
+    }
+    rl.loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 0));
+}
+
 int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }

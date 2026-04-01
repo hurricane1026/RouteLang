@@ -316,4 +316,181 @@ TEST(replay_e2e, capture_then_replay) {
     munmap(ring, sizeof(CaptureRing));
 }
 
+// === Route matching tests (static routes) ===
+
+// Helper: set up SmallLoop with a RouteConfig wired into config_ptr.
+struct RoutedLoop {
+    SmallLoop loop;
+    const RouteConfig* active_config;
+
+    void setup(RouteConfig* cfg) {
+        loop.setup();
+        active_config = cfg;
+        loop.config_ptr = &active_config;
+    }
+};
+
+TEST(route, static_200) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 'G', 200);
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    CaptureEntry entry = make_captured_request(
+        "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    ReplayResult result = replay_one(rl.loop, entry, 42);
+    CHECK(result.replayed);
+    CHECK_EQ(result.actual_status, 200);
+    CHECK(result.status_match);
+}
+
+TEST(route, static_404) {
+    RouteConfig cfg;
+    cfg.add_static("/", 0, 404);  // catch-all 404
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    CaptureEntry entry = make_captured_request(
+        "GET /anything HTTP/1.1\r\nHost: x\r\n\r\n", 404);
+    ReplayResult result = replay_one(rl.loop, entry, 42);
+    CHECK(result.replayed);
+    CHECK_EQ(result.actual_status, 404);
+    CHECK(result.status_match);
+}
+
+TEST(route, no_match_default_200) {
+    RouteConfig cfg;
+    cfg.add_static("/api", 'G', 200);
+    // /other doesn't match /api
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    CaptureEntry entry = make_captured_request(
+        "GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    ReplayResult result = replay_one(rl.loop, entry, 42);
+    CHECK(result.replayed);
+    CHECK_EQ(result.actual_status, 200);  // default
+}
+
+TEST(route, method_filtering) {
+    RouteConfig cfg;
+    cfg.add_static("/admin", 'P', 403);  // POST /admin → 403
+    cfg.add_static("/admin", 'G', 200);  // GET /admin → 200
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    // GET /admin → matches second rule → 200
+    CaptureEntry get_entry = make_captured_request(
+        "GET /admin HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    ReplayResult get_result = replay_one(rl.loop, get_entry, 42);
+    CHECK(get_result.replayed);
+    CHECK_EQ(get_result.actual_status, 200);
+
+    // POST /admin → matches first rule → 403
+    CaptureEntry post_entry = make_captured_request(
+        "POST /admin HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 403);
+    post_entry.method = static_cast<u8>(LogHttpMethod::Post);
+    ReplayResult post_result = replay_one(rl.loop, post_entry, 43);
+    CHECK(post_result.replayed);
+    CHECK_EQ(post_result.actual_status, 403);
+}
+
+TEST(route, multiple_routes_first_match_wins) {
+    RouteConfig cfg;
+    cfg.add_static("/api/v1", 0, 200);  // specific prefix
+    cfg.add_static("/api", 0, 301);     // broader prefix
+    cfg.add_static("/", 0, 404);        // catch-all
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    // /api/v1/users → matches first rule
+    CaptureEntry e1 = make_captured_request(
+        "GET /api/v1/users HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    CHECK_EQ(replay_one(rl.loop, e1, 42).actual_status, 200);
+
+    // /api/v2 → matches second rule (prefix /api)
+    CaptureEntry e2 = make_captured_request(
+        "GET /api/v2 HTTP/1.1\r\nHost: x\r\n\r\n", 301);
+    CHECK_EQ(replay_one(rl.loop, e2, 43).actual_status, 301);
+
+    // /other → matches third rule (prefix /)
+    CaptureEntry e3 = make_captured_request(
+        "GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 404);
+    CHECK_EQ(replay_one(rl.loop, e3, 44).actual_status, 404);
+}
+
+TEST(route, replay_file_with_routing) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 200);
+    cfg.add_static("/api", 0, 200);
+    cfg.add_static("/", 0, 404);
+
+    // Capture entries with expected statuses
+    CaptureEntry entries[4];
+    entries[0] = make_captured_request("GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /api/data HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[2] = make_captured_request("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 404);
+    entries[3] = make_captured_request("GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 4));
+
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    ReplaySummary summary = replay_file(rl.loop, reader);
+    CHECK_EQ(summary.total, 4u);
+    CHECK_EQ(summary.replayed, 4u);
+    CHECK_EQ(summary.matched, 4u);
+    CHECK_EQ(summary.mismatched, 0u);
+
+    reader.close();
+    tmp.cleanup();
+}
+
+// Detect config change: replay captured traffic against a DIFFERENT config
+TEST(route, detect_config_regression) {
+    // Old config: /api → 200, /admin → 403, / → 404
+    // Captured traffic expects these statuses.
+    CaptureEntry entries[3];
+    entries[0] = make_captured_request("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /admin HTTP/1.1\r\nHost: x\r\n\r\n", 403);
+    entries[2] = make_captured_request("GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 404);
+
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 3));
+
+    // New config: /admin is now 200 (permission change), /api removed
+    RouteConfig new_cfg;
+    new_cfg.add_static("/admin", 0, 200);  // changed from 403 to 200
+    new_cfg.add_static("/", 0, 404);       // catch-all
+
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+
+    RoutedLoop rl;
+    rl.setup(&new_cfg);
+
+    ReplaySummary summary = replay_file(rl.loop, reader);
+    CHECK_EQ(summary.total, 3u);
+    CHECK_EQ(summary.replayed, 3u);
+
+    // /api/users: was 200, new config / → 404 → mismatch
+    // /admin: was 403, now 200 → mismatch
+    // /other: was 404, / → 404 → match
+    CHECK_EQ(summary.matched, 1u);    // /other (404 → 404)
+    CHECK_EQ(summary.mismatched, 2u); // /api/users + /admin changed
+
+    reader.close();
+    tmp.cleanup();
+}
+
 int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }

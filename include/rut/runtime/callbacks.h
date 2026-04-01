@@ -5,7 +5,9 @@
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/route_table.h"
 #include "rut/runtime/traffic_capture.h"
+#include "rut/runtime/upstream_pool.h"
 
 namespace rut {
 
@@ -293,6 +295,72 @@ static const char kResponse200Close[] =
     "\r\n"
     "OK";
 
+// Map common status codes to reason phrases.
+static inline const char* status_reason(u16 code) {
+    switch (code) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 304: return "Not Modified";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 429: return "Too Many Requests";
+        case 500: return "Internal Server Error";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        default: return "Unknown";
+    }
+}
+
+// Format a static HTTP response into send_buf.
+// "HTTP/1.1 {code} {reason}\r\nContent-Length: {N}\r\nConnection: {ka}\r\n\r\n{reason}"
+static inline void format_static_response(Connection& conn, u16 code, bool keep_alive) {
+    const char* reason = status_reason(code);
+    u32 reason_len = 0;
+    while (reason[reason_len]) reason_len++;
+
+    conn.send_buf.reset();
+    conn.send_buf.write(reinterpret_cast<const u8*>("HTTP/1.1 "), 9);
+
+    // Status code as 3 digits
+    char code_buf[3];
+    code_buf[0] = static_cast<char>('0' + (code / 100) % 10);
+    code_buf[1] = static_cast<char>('0' + (code / 10) % 10);
+    code_buf[2] = static_cast<char>('0' + code % 10);
+    conn.send_buf.write(reinterpret_cast<const u8*>(code_buf), 3);
+    conn.send_buf.write(reinterpret_cast<const u8*>(" "), 1);
+    conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
+    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+
+    // Content-Length: {reason_len}
+    conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
+    if (reason_len >= 100) {
+        char d = static_cast<char>('0' + reason_len / 100);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (reason_len >= 10) {
+        char d = static_cast<char>('0' + (reason_len / 10) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    char d = static_cast<char>('0' + reason_len % 10);
+    conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+
+    // Connection header
+    if (keep_alive)
+        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
+    else
+        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
+
+    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
+}
+
 // Called on request completion — records metrics and writes access log.
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size) {
@@ -387,23 +455,71 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
-    conn.state = ConnState::Sending;
-    conn.resp_status = kStatusOK;
 
-    // During drain: respond with Connection: close to signal client migration.
-    if (loop->is_draining()) {
-        conn.keep_alive = false;
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
-                            sizeof(kResponse200Close) - 1);
-    } else {
-        conn.keep_alive = true;
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200), sizeof(kResponse200) - 1);
+    bool keep_alive = !loop->is_draining();
+    conn.keep_alive = keep_alive;
+
+    // Route matching: config_ptr → active RouteConfig (may be null in tests).
+    const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    const RouteEntry* route = nullptr;
+    if (config) {
+        route = config->match(
+            reinterpret_cast<const u8*>(conn.req_path),
+            // strlen of null-terminated req_path
+            [&]() -> u32 { u32 n = 0; while (conn.req_path[n]) n++; return n; }(),
+            conn.recv_buf.data() ? conn.recv_buf.data()[0] : 0);
     }
 
-    conn.on_complete = &on_response_sent<Loop>;
-    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    if (route && route->action == RouteAction::Proxy) {
+        // Proxy route: connect to upstream target.
+        conn.state = ConnState::Proxying;
+        auto& target = config->upstreams[route->upstream_id];
+
+        // Copy upstream name for access log + capture.
+        for (u32 i = 0; i < sizeof(conn.upstream_name) && i < target.name_len; i++)
+            conn.upstream_name[i] = target.name[i];
+        if (target.name_len < sizeof(conn.upstream_name))
+            conn.upstream_name[target.name_len] = '\0';
+        else
+            conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
+
+        i32 ufd = UpstreamPool::create_socket();
+        if (ufd < 0) {
+            // Socket creation failed → 502
+            conn.resp_status = kStatusBadGateway;
+            format_static_response(conn, 502, false);
+            conn.keep_alive = false;
+            conn.on_complete = &on_response_sent<Loop>;
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
+        conn.upstream_fd = ufd;
+        conn.upstream_start_us = monotonic_us();
+        conn.on_complete = &on_upstream_connected<Loop>;
+        loop->submit_connect(conn, &target.addr, sizeof(target.addr));
+    } else if (route && route->action == RouteAction::Static) {
+        // Static route: respond with configured status code.
+        conn.state = ConnState::Sending;
+        conn.resp_status = route->status_code;
+        format_static_response(conn, route->status_code, keep_alive);
+        conn.on_complete = &on_response_sent<Loop>;
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    } else {
+        // No route match or no config: default 200 OK.
+        conn.state = ConnState::Sending;
+        conn.resp_status = kStatusOK;
+        if (keep_alive) {
+            conn.send_buf.reset();
+            conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200),
+                                sizeof(kResponse200) - 1);
+        } else {
+            conn.send_buf.reset();
+            conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
+                                sizeof(kResponse200Close) - 1);
+        }
+        conn.on_complete = &on_response_sent<Loop>;
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    }
 }
 
 template <typename Loop>

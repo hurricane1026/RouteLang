@@ -141,12 +141,10 @@ jobs:
             --object build/tests/test_metrics \
             --object build/tests/test_chunked_parser \
             --object build/tests/test_rir \
-            --object build/tests/test_shard_control \
             --object build/tests/test_traffic_capture \
             --object build/tests/test_traffic_replay \
-            --object build/tests/test_sim \
             --sources include/rut/common/ include/rut/runtime/ src/runtime/ \
-            --ignore-filename-regex='io_uring_backend|epoll_backend|socket\.cc|access_log\.cc|shard\.h|epoll_event_loop\.h' | tee build/coverage.txt
+            --ignore-filename-regex='io_uring_backend|epoll_backend|socket\.cc|access_log\.cc|shard\.h|epoll_event_loop\.h|iouring_event_loop\.h|sim_engine\.h' | tee build/coverage.txt
 
           cat build/coverage.txt
 

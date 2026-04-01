@@ -64,6 +64,7 @@ public:
     i32 listen_fd = -1;
 
     AccessLogRing* access_log = nullptr;
+    struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
 
     const RouteConfig** config_ptr = nullptr;

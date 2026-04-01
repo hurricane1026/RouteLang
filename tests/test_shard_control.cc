@@ -1135,6 +1135,126 @@ TEST(shard_control, real_shard_simultaneous_config_and_jit) {
     munmap(cfg_mem, sizeof(RouteConfig));
 }
 
+// === Shard capture control ===
+
+TEST(shard_capture, enable_before_spawn_applies_directly) {
+    Shard<EpollEventLoop> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+    CaptureRing* ring = s.enable_capture();
+    REQUIRE(ring != nullptr);
+    CHECK_EQ(s.capture_ring, ring);
+    CHECK_EQ(s.loop->capture_ring, ring);
+    s.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, enable_returns_existing_if_already_enabled) {
+    Shard<EpollEventLoop> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+    CaptureRing* ring1 = s.enable_capture();
+    CaptureRing* ring2 = s.enable_capture();
+    CHECK_EQ(ring1, ring2);
+    s.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, disable_before_spawn_clears_ring) {
+    Shard<EpollEventLoop> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+    s.enable_capture();
+    CHECK(s.loop->capture_ring != nullptr);
+    s.disable_capture();
+    CHECK(s.loop->capture_ring == nullptr);
+    CHECK(s.capture_ring != nullptr);
+    s.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, free_capture_ring_idempotent) {
+    Shard<EpollEventLoop> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+    s.free_capture_ring();
+    CHECK(s.capture_ring == nullptr);
+    s.enable_capture();
+    s.free_capture_ring();
+    s.free_capture_ring();
+    CHECK(s.capture_ring == nullptr);
+    s.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, enable_after_spawn_via_control_block) {
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    Shard<EpollEventLoop> shard;
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn().has_value());
+    CaptureRing* ring = shard.enable_capture();
+    REQUIRE(ring != nullptr);
+    for (u32 i = 0; i < 2000; i++) {
+        if (shard.loop->capture_ring == ring) break;
+        usleep(1000);
+    }
+    CHECK_EQ(shard.loop->capture_ring, ring);
+    CHECK(shard.loop->capture_region_ != nullptr);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, disable_after_spawn_via_control_block) {
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    Shard<EpollEventLoop> shard;
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn().has_value());
+    CaptureRing* ring = shard.enable_capture();
+    REQUIRE(ring != nullptr);
+    for (u32 i = 0; i < 2000; i++) {
+        if (shard.loop->capture_ring == ring) break;
+        usleep(1000);
+    }
+    shard.disable_capture();
+    for (u32 i = 0; i < 2000; i++) {
+        if (shard.loop->capture_ring == nullptr) break;
+        usleep(1000);
+    }
+    CHECK(shard.loop->capture_ring == nullptr);
+    CHECK(shard.loop->capture_region_ != nullptr);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, shutdown_cleans_up_capture) {
+    Shard<EpollEventLoop> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+    s.enable_capture();
+    CHECK(s.capture_ring != nullptr);
+    s.shutdown();
+    CHECK(s.capture_ring == nullptr);
+    close(lfd);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

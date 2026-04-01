@@ -7,6 +7,7 @@
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/upstream_pool.h"
@@ -57,6 +58,7 @@ struct Shard {
 
     // Per-shard access log ring (mmap'd, read by background flusher thread).
     AccessLogRing* log_ring = nullptr;
+    CaptureRing* capture_ring = nullptr;
 
     // Per-shard metrics (stack-allocated, ~200 bytes).
     ShardMetrics shard_metrics{};
@@ -144,6 +146,7 @@ struct Shard {
         // Init per-shard control block and epoch.
         control.pending_config.store(nullptr, std::memory_order_relaxed);
         control.pending_jit.store(nullptr, std::memory_order_relaxed);
+        control.pending_capture.store(nullptr, std::memory_order_relaxed);
         epoch.epoch.store(0, std::memory_order_relaxed);
 
         // Wire control pointers into EventLoop for poll_command/epoch.
@@ -170,6 +173,42 @@ struct Shard {
         log_ring->init();
         if (loop) loop->access_log = log_ring;
         return {};
+    }
+
+    CaptureRing* enable_capture() {
+        if (capture_ring) return capture_ring;
+        void* ring_mem = mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ring_mem == MAP_FAILED) return nullptr;
+        capture_ring = new (ring_mem) CaptureRing();
+        capture_ring->init();
+        if (!thread_spawned) {
+            if (loop && !loop->set_capture(capture_ring)) {
+                capture_ring->~CaptureRing();
+                munmap(ring_mem, sizeof(CaptureRing));
+                capture_ring = nullptr;
+                return nullptr;
+            }
+            return capture_ring;
+        }
+        control.pending_capture.store(capture_ring, std::memory_order_release);
+        return capture_ring;
+    }
+
+    void disable_capture() {
+        if (!thread_spawned) {
+            if (loop) loop->capture_ring = nullptr;
+            return;
+        }
+        control.pending_capture.store(kCaptureDisable, std::memory_order_release);
+    }
+
+    void free_capture_ring() {
+        if (capture_ring) {
+            capture_ring->~CaptureRing();
+            munmap(capture_ring, sizeof(CaptureRing));
+            capture_ring = nullptr;
+        }
     }
 
     // Spawn the shard's thread. Optionally pin to CPU core.
@@ -268,6 +307,7 @@ struct Shard {
             munmap(log_ring, sizeof(AccessLogRing));
             log_ring = nullptr;
         }
+        free_capture_ring();
         if (upstream) {
             upstream->shutdown();
             upstream->~UpstreamPool();
@@ -278,6 +318,7 @@ struct Shard {
             // Sync listen_fd: EventLoop may have closed it during drain.
             if (loop->listen_fd < 0) listen_fd = -1;
             loop->access_log = nullptr;
+            loop->capture_ring = nullptr;
             loop->shutdown();
             loop->~EventLoopType();
             munmap(loop, sizeof(EventLoopType));

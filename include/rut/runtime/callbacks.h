@@ -5,6 +5,9 @@
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/route_table.h"
+#include "rut/runtime/traffic_capture.h"
+#include "rut/runtime/upstream_pool.h"
 
 #include <errno.h>
 #include <sys/socket.h>
@@ -158,6 +161,7 @@ static inline void capture_request_metadata(Connection& conn) {
     conn.req_path[1] = '\0';
     conn.upstream_us = 0;
     conn.upstream_name[0] = '\0';
+    conn.capture_header_len = 0;
     // Reset request body state (prevents stale Chunked mode from
     // previous keep-alive request bleeding into the next).
     conn.req_body_mode = BodyMode::None;
@@ -290,7 +294,7 @@ static inline void pipeline_dispatch(Loop* loop, Connection& conn) {
     // EventLoop::dispatch() which calls timer.refresh().
     loop->timer.refresh(&conn, loop->keepalive_timeout);
     IoEvent synth = {conn.id, static_cast<i32>(conn.recv_buf.len()), 0, 0, IoEventType::Recv, 0};
-    on_header_received<Loop>(loop, conn, synth);
+    on_header_received<Loop>(static_cast<void*>(loop), conn, synth);
 }
 
 // Stash leftover bytes from recv_buf into send_buf (proxy path).
@@ -340,6 +344,78 @@ static const char kResponse200Close[] =
     "\r\n"
     "OK";
 
+// Stage raw request headers for traffic capture.
+static inline void capture_stage_headers(Connection& conn) {
+    conn.capture_header_len = 0;
+    if (!conn.capture_buf) return;
+    const u8* data = conn.recv_buf.data();
+    if (!data) return;
+    u32 len = conn.req_header_end;
+    if (len == 0) len = conn.recv_buf.len();
+    if (len == 0) return;
+    u32 copy_len = len;
+    if (copy_len > CaptureEntry::kMaxHeaderLen) copy_len = CaptureEntry::kMaxHeaderLen;
+    __builtin_memcpy(conn.capture_buf, data, copy_len);
+    conn.capture_header_len = static_cast<u16>(copy_len);
+}
+
+static inline const char* status_reason(u16 code) {
+    switch (code) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 304: return "Not Modified";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 429: return "Too Many Requests";
+        case 500: return "Internal Server Error";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        default: return "Unknown";
+    }
+}
+
+static inline void format_static_response(Connection& conn, u16 code, bool keep_alive) {
+    const char* reason = status_reason(code);
+    u32 reason_len = 0;
+    while (reason[reason_len]) reason_len++;
+    bool no_body = (code < 200 || code == 204 || code == 304);
+    u32 body_len = no_body ? 0 : reason_len;
+    conn.send_buf.reset();
+    conn.send_buf.write(reinterpret_cast<const u8*>("HTTP/1.1 "), 9);
+    char code_buf[3];
+    code_buf[0] = static_cast<char>('0' + (code / 100) % 10);
+    code_buf[1] = static_cast<char>('0' + (code / 10) % 10);
+    code_buf[2] = static_cast<char>('0' + code % 10);
+    conn.send_buf.write(reinterpret_cast<const u8*>(code_buf), 3);
+    conn.send_buf.write(reinterpret_cast<const u8*>(" "), 1);
+    conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
+    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
+    if (body_len >= 100) {
+        char d = static_cast<char>('0' + body_len / 100);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 10) {
+        char d = static_cast<char>('0' + (body_len / 10) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    char d = static_cast<char>('0' + body_len % 10);
+    conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    if (keep_alive)
+        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
+    else
+        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
+    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    if (body_len > 0) conn.send_buf.write(reinterpret_cast<const u8*>(reason), body_len);
+}
+
 // Called on request completion — records metrics and writes access log.
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size) {
@@ -374,6 +450,32 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
             if (conn.upstream_name[i] == '\0') break;
         }
         loop->access_log->push(entry);
+    }
+
+    // Write traffic capture entry (if enabled).
+    if (loop->capture_ring && conn.capture_buf && conn.capture_header_len > 0) {
+        CaptureEntry cap;
+        __builtin_memset(&cap, 0,
+                         static_cast<u64>(reinterpret_cast<u8*>(&cap.raw_headers) -
+                                          reinterpret_cast<u8*>(&cap)));
+        cap.timestamp_us = realtime_us();
+        cap.req_content_length = conn.req_content_length;
+        cap.resp_content_length = resp_size;
+        cap.resp_status = status;
+        cap.raw_header_len = conn.capture_header_len;
+        cap.method = conn.req_method;
+        cap.shard_id = conn.shard_id;
+        cap.flags =
+            (conn.capture_header_len == CaptureEntry::kMaxHeaderLen) ? kCaptureFlagTruncated : 0;
+        constexpr u32 kCopyLen = sizeof(conn.upstream_name) < sizeof(cap.upstream_name)
+                                     ? sizeof(conn.upstream_name)
+                                     : sizeof(cap.upstream_name);
+        for (u32 i = 0; i < kCopyLen; i++) {
+            cap.upstream_name[i] = conn.upstream_name[i];
+            if (conn.upstream_name[i] == '\0') break;
+        }
+        __builtin_memcpy(cap.raw_headers, conn.capture_buf, conn.capture_header_len);
+        loop->capture_ring->push(cap);
     }
 }
 
@@ -412,25 +514,66 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     capture_request_metadata(conn);
 
     conn.req_start_us = monotonic_us();
+    if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
-    conn.state = ConnState::Sending;
-    conn.resp_status = kStatusOK;
 
-    // During drain: respond with Connection: close to signal client migration.
-    if (loop->is_draining()) {
-        conn.keep_alive = false;
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
-                            sizeof(kResponse200Close) - 1);
-    } else {
-        conn.keep_alive = true;
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200), sizeof(kResponse200) - 1);
+    bool keep_alive = !loop->is_draining();
+    conn.keep_alive = keep_alive;
+
+    // Route matching: config_ptr → active RouteConfig (may be null in tests).
+    const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    const RouteEntry* route = nullptr;
+    if (config) {
+        route = config->match(
+            reinterpret_cast<const u8*>(conn.req_path),
+            [&]() -> u32 { u32 n = 0; while (conn.req_path[n]) n++; return n; }(),
+            conn.recv_buf.data() ? conn.recv_buf.data()[0] : 0);
     }
 
-    conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
-    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    if (route && route->action == RouteAction::Proxy) {
+        conn.state = ConnState::Proxying;
+        auto& target = config->upstreams[route->upstream_id];
+        for (u32 i = 0; i < sizeof(conn.upstream_name) && i < target.name_len; i++)
+            conn.upstream_name[i] = target.name[i];
+        if (target.name_len < sizeof(conn.upstream_name))
+            conn.upstream_name[target.name_len] = '\0';
+        else
+            conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
+        i32 ufd = UpstreamPool::create_socket();
+        if (ufd < 0) {
+            conn.resp_status = kStatusBadGateway;
+            format_static_response(conn, 502, false);
+            conn.keep_alive = false;
+            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
+        conn.upstream_fd = ufd;
+        conn.upstream_start_us = monotonic_us();
+        conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+        loop->submit_connect(conn, &target.addr, sizeof(target.addr));
+    } else if (route && route->action == RouteAction::Static) {
+        conn.state = ConnState::Sending;
+        conn.resp_status = route->status_code;
+        format_static_response(conn, route->status_code, keep_alive);
+        conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    } else {
+        conn.state = ConnState::Sending;
+        conn.resp_status = kStatusOK;
+        if (keep_alive) {
+            conn.send_buf.reset();
+            conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200),
+                                sizeof(kResponse200) - 1);
+        } else {
+            conn.send_buf.reset();
+            conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
+                                sizeof(kResponse200Close) - 1);
+        }
+        conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    }
 }
 
 template <typename Loop>

@@ -65,11 +65,20 @@ struct SimSummary {
 inline void sim_extract_request_info(const CaptureEntry& entry, SimResult& result) {
     result.method = entry.method;
 
-    // Copy upstream from capture
-    for (u32 i = 0; i < sizeof(result.upstream) && i < sizeof(entry.upstream_name); i++) {
-        result.upstream[i] = entry.upstream_name[i];
+    // Copy upstream from capture (ensure null termination)
+    constexpr u32 kUpCopy = sizeof(result.upstream) < sizeof(entry.upstream_name)
+                                ? sizeof(result.upstream)
+                                : sizeof(entry.upstream_name);
+    u32 up_len = 0;
+    for (u32 i = 0; i < kUpCopy; i++) {
         if (entry.upstream_name[i] == '\0') break;
+        result.upstream[i] = entry.upstream_name[i];
+        up_len = i + 1;
     }
+    if (up_len < sizeof(result.upstream))
+        result.upstream[up_len] = '\0';
+    else
+        result.upstream[sizeof(result.upstream) - 1] = '\0';
 
     // Extract path from raw headers: skip "METHOD " → read until ' ' or '\r'
     const u8* h = entry.raw_headers;

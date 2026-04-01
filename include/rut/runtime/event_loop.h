@@ -719,6 +719,18 @@ private:
             }
             c->fd = fd;
             c->peer_addr = deferred_accept_addrs[i];
+            if (tls_server) {
+                auto tls_result = create_tls_server_ssl(tls_server, fd);
+                if (!tls_result) {
+                    ::close(fd);
+                    c->fd = -1;
+                    this->free_conn(*c);
+                    continue;
+                }
+                c->tls_active = true;
+                c->tls_handshake_complete = false;
+                c->tls = tls_result.value();
+            }
             c->state = ConnState::ReadingHeader;
             c->keep_alive = !draining_.load(std::memory_order_relaxed);
             c->on_recv = &on_header_received<Self>;

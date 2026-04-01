@@ -17,8 +17,27 @@ namespace rut {
 static constexpr u32 kListenConnId = 0xFFFFFF;
 static constexpr u32 kTimerConnId = 0xFFFFFE;
 
+namespace {
+
+i32 default_ssl_accept(SSL* ssl) { return SSL_accept(ssl); }
+i32 default_ssl_read(SSL* ssl, void* buf, i32 len) { return SSL_read(ssl, buf, len); }
+i32 default_ssl_write(SSL* ssl, const void* buf, i32 len) { return SSL_write(ssl, buf, len); }
+i32 default_ssl_get_error(SSL* ssl, i32 rc) { return SSL_get_error(ssl, rc); }
+
+EpollTlsHooks default_tls_hooks = {
+    default_ssl_accept, default_ssl_read, default_ssl_write, default_ssl_get_error};
+const EpollTlsHooks* active_tls_hooks = &default_tls_hooks;
+
+}  // namespace
+
+void set_epoll_tls_hooks_for_test(const EpollTlsHooks* hooks) {
+    active_tls_hooks = hooks ? hooks : &default_tls_hooks;
+}
+
+void reset_epoll_tls_hooks_for_test() { active_tls_hooks = &default_tls_hooks; }
+
 static i32 map_tls_error(SSL* ssl, i32 rc) {
-    i32 err = SSL_get_error(ssl, rc);
+    i32 err = active_tls_hooks->ssl_get_error(ssl, rc);
     if (err == SSL_ERROR_ZERO_RETURN) return 0;
     if (err == SSL_ERROR_SYSCALL) {
         if (errno != 0) return -errno;
@@ -231,13 +250,13 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
     SSL* ssl = c.tls;
     u32 sent = 0;
     while (sent < len) {
-        i32 nw = SSL_write(ssl, buf + sent, static_cast<i32>(len - sent));
+        i32 nw = active_tls_hooks->ssl_write(ssl, buf + sent, static_cast<i32>(len - sent));
         if (nw > 0) {
             sent += static_cast<u32>(nw);
             continue;
         }
 
-        i32 ssl_err = SSL_get_error(ssl, nw);
+        i32 ssl_err = active_tls_hooks->ssl_get_error(ssl, nw);
         if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
             send_state[c.id] = {buf, c.fd, sent, len - sent, IoEventType::Send, true};
             set_fd_interest(epoll_fd, c.fd, c.id, IoEventType::Send, tls_interest_for_error(ssl_err));
@@ -351,6 +370,8 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         u32 conn_id;
         IoEventType type;
         decode_data(ep_events[i].data.u64, conn_id, type);
+        bool has_read = (ep_events[i].events & EPOLLIN) != 0;
+        bool has_write = (ep_events[i].events & EPOLLOUT) != 0;
 
         if (conn_id == kListenConnId) {
             for (;;) {
@@ -381,7 +402,27 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 events[out].more = 0;
                 out++;
             }
-        } else if (ep_events[i].events & EPOLLIN) {
+        } else if (type == IoEventType::UpstreamConnect && has_write) {
+            i32 err = 0;
+            socklen_t errlen = sizeof(err);
+            i32 cfd = (conn_id < kMaxFdMap) ? upstream_fd_map[conn_id] : -1;
+            if (cfd >= 0) getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+            events[out].conn_id = conn_id;
+            events[out].type = IoEventType::UpstreamConnect;
+            events[out].result = err ? -err : 0;
+            events[out].buf_id = 0;
+            events[out].has_buf = 0;
+            events[out].more = 0;
+            out++;
+            continue;
+        } else if (type == IoEventType::Recv && conn_id < max_conns && conns[conn_id].tls_active &&
+                   (has_read || has_write)) {
+            goto handle_epollin;
+        } else if (type == IoEventType::Send && conn_id < kMaxFdMap && send_state[conn_id].tls &&
+                   send_state[conn_id].remaining > 0 && (has_read || has_write)) {
+            goto handle_epollout;
+        } else if (has_read) {
+        handle_epollin:
             IoEventType recv_type = type;
             if (type == IoEventType::Send) recv_type = IoEventType::Recv;
             i32 fd = -1;
@@ -402,12 +443,12 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     result = -EINVAL;
                 } else {
                     if (!conn.tls_handshake_complete) {
-                        i32 rc = SSL_accept(ssl);
+                        i32 rc = active_tls_hooks->ssl_accept(ssl);
                         if (rc == 1) {
                             conn.tls_handshake_complete = true;
                             set_fd_interest(epoll_fd, fd, conn_id, type, EPOLLIN);
                         } else {
-                            i32 ssl_err = SSL_get_error(ssl, rc);
+                            i32 ssl_err = active_tls_hooks->ssl_get_error(ssl, rc);
                             if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
                                 set_fd_interest(
                                     epoll_fd, fd, conn_id, type, tls_interest_for_error(ssl_err));
@@ -429,13 +470,14 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     if (avail == 0) {
                         result = -ENOBUFS;
                     } else {
-                        i32 nr = SSL_read(ssl, buf.write_ptr(), static_cast<i32>(avail));
+                        i32 nr =
+                            active_tls_hooks->ssl_read(ssl, buf.write_ptr(), static_cast<i32>(avail));
                         if (nr > 0) {
                             buf.commit(static_cast<u32>(nr));
                             result = nr;
                             set_fd_interest(epoll_fd, fd, conn_id, type, EPOLLIN);
                         } else {
-                            i32 ssl_err = SSL_get_error(ssl, nr);
+                            i32 ssl_err = active_tls_hooks->ssl_get_error(ssl, nr);
                             if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
                                 set_fd_interest(
                                     epoll_fd, fd, conn_id, type, tls_interest_for_error(ssl_err));
@@ -473,27 +515,12 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             events[out].more = 0;
             out++;
 
-            if ((ep_events[i].events & EPOLLOUT) && conn_id < kMaxFdMap &&
+            if (has_write && conn_id < kMaxFdMap &&
                 send_state[conn_id].remaining > 0 && out < max_events) {
                 goto handle_epollout;
             }
-        } else if (ep_events[i].events & EPOLLOUT) {
+        } else if (has_write) {
         handle_epollout:
-            if (type == IoEventType::UpstreamConnect) {
-                i32 err = 0;
-                socklen_t errlen = sizeof(err);
-                i32 cfd = (conn_id < kMaxFdMap) ? upstream_fd_map[conn_id] : -1;
-                if (cfd >= 0) getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &errlen);
-                events[out].conn_id = conn_id;
-                events[out].type = IoEventType::UpstreamConnect;
-                events[out].result = err ? -err : 0;
-                events[out].buf_id = 0;
-                events[out].has_buf = 0;
-                events[out].more = 0;
-                out++;
-                continue;
-            }
-
             if (conn_id >= kMaxFdMap || conn_id >= max_conns) continue;
             auto& ss = send_state[conn_id];
             if (ss.remaining == 0 || !ss.src || ss.fd < 0) {
@@ -519,14 +546,14 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     result = -EINVAL;
                 } else {
                     while (ss.remaining > 0) {
-                        i32 nw =
-                            SSL_write(ssl, ss.src + ss.offset, static_cast<i32>(ss.remaining));
+                        i32 nw = active_tls_hooks->ssl_write(
+                            ssl, ss.src + ss.offset, static_cast<i32>(ss.remaining));
                         if (nw > 0) {
                             ss.offset += static_cast<u32>(nw);
                             ss.remaining -= static_cast<u32>(nw);
                             continue;
                         }
-                        i32 ssl_err = SSL_get_error(ssl, nw);
+                        i32 ssl_err = active_tls_hooks->ssl_get_error(ssl, nw);
                         if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
                             set_fd_interest(epoll_fd,
                                             ss.fd,

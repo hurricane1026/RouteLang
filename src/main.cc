@@ -295,21 +295,21 @@ int main(int argc, char** argv) {
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                     pool_prealloc = pool_prealloc * 10 + static_cast<u32>(*p - '0');
             } else if (str_eq(argv[i], "--access-log")) {
-                if (starts_with_dash_dash(argv[i + 1])) {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
                     write_str("--access-log requires a path argument\n");
                     return 1;
                 }
                 i++;
                 access_log_path = argv[i];
             } else if (str_eq(argv[i], "--tls-cert")) {
-                if (starts_with_dash_dash(argv[i + 1])) {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
                     write_str("--tls-cert requires a path argument\n");
                     return 1;
                 }
                 i++;
                 tls_cert_path = argv[i];
             } else if (str_eq(argv[i], "--tls-key")) {
-                if (starts_with_dash_dash(argv[i + 1])) {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
                     write_str("--tls-key requires a path argument\n");
                     return 1;
                 }

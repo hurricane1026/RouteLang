@@ -9,6 +9,9 @@ struct RouteConfig;  // forward declare
 struct CaptureRing;  // forward declare
 
 // Sentinel: "disable capture". Distinct from nullptr ("no pending change").
+// NOLINT: reinterpret_cast of integer to pointer is implementation-defined
+// but well-defined on all targets we support (x86-64, aarch64). Using a
+// pointer type keeps the atomic<CaptureRing*> interface clean.
 static inline CaptureRing* kCaptureDisable = reinterpret_cast<CaptureRing*>(1);
 
 // Per-shard control block. Config, JIT, and capture have independent atomic slots.

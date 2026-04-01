@@ -176,7 +176,15 @@ struct Shard {
     }
 
     CaptureRing* enable_capture() {
-        if (capture_ring) return capture_ring;
+        if (capture_ring) {
+            // Ring exists (possibly disabled on loop). Re-apply it.
+            if (!thread_spawned) {
+                if (loop) loop->set_capture(capture_ring);
+            } else {
+                control.pending_capture.store(capture_ring, std::memory_order_release);
+            }
+            return capture_ring;
+        }
         void* ring_mem = mmap(nullptr,
                               sizeof(CaptureRing),
                               PROT_READ | PROT_WRITE,
@@ -201,7 +209,7 @@ struct Shard {
 
     void disable_capture() {
         if (!thread_spawned) {
-            if (loop) loop->capture_ring = nullptr;
+            if (loop) loop->set_capture(nullptr);
             return;
         }
         control.pending_capture.store(kCaptureDisable, std::memory_order_release);
@@ -299,6 +307,12 @@ struct Shard {
             if (cfg) active_config = cfg;
             auto* jit = control.pending_jit.exchange(nullptr, std::memory_order_acq_rel);
             if (jit) jit_code = jit;
+            auto* cap = control.pending_capture.exchange(nullptr, std::memory_order_acq_rel);
+            if (cap == kCaptureDisable) {
+                if (loop) loop->set_capture(nullptr);
+            } else if (cap) {
+                if (loop) loop->set_capture(cap);
+            }
         }
     }
 

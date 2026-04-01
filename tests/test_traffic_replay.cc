@@ -244,9 +244,10 @@ TEST(replay_file, empty_capture) {
 
 TEST(replay_e2e, capture_then_replay) {
     // Step 1: Capture traffic from a live loop
-    auto* ring = static_cast<CaptureRing*>(mmap(
-        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    REQUIRE(ring != MAP_FAILED);
+    void* ring_mem = mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(ring_mem != MAP_FAILED);
+    auto* ring = new (ring_mem) CaptureRing();
     ring->init();
 
     SmallLoop capture_loop;

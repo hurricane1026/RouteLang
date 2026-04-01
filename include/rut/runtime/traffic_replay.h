@@ -79,9 +79,10 @@ struct ReplayReader {
         return 0;
     }
 
-    // Read the next entry. Returns 0 on success, -1 on EOF/error.
+    // Read the next entry. Returns 0 on success, -1 on EOF/error/past entry_count.
     i32 next(CaptureEntry& entry) {
         if (fd < 0) return -1;
+        if (entries_read >= header.entry_count) return -1;
         i32 rc = capture_read_entry(fd, entry);
         if (rc == 0) entries_read++;
         return rc;

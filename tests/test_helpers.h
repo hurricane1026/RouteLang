@@ -421,6 +421,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         running = true;
         draining = false;
         access_log = nullptr;
+        capture_ring = nullptr;
         metrics = nullptr;
         config_ptr = nullptr;
         control = nullptr;

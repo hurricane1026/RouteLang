@@ -5,6 +5,7 @@
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/traffic_capture.h"
 
 namespace rut {
 
@@ -153,6 +154,9 @@ static inline void capture_request_metadata(Connection& conn) {
     conn.req_path[1] = '\0';
     conn.upstream_us = 0;
     conn.upstream_name[0] = '\0';
+    // Reset capture staging (prevents stale header_len from a previous
+    // keep-alive request bleeding into the next if capture is toggled).
+    conn.capture_header_len = 0;
     // Reset request body state (prevents stale Chunked mode from
     // previous keep-alive request bleeding into the next).
     conn.req_body_mode = BodyMode::None;
@@ -248,6 +252,30 @@ static inline void capture_request_metadata(Connection& conn) {
     conn.req_path[copy_len] = '\0';
 }
 
+// Stage raw request headers for traffic capture. Called after
+// capture_request_metadata() when capture is enabled. Copies
+// recv_buf[0..header_end] into conn.capture_buf so it survives
+// body streaming (which overwrites recv_buf).
+//
+// capture_buf must point to pre-allocated memory of at least
+// CaptureEntry::kMaxHeaderLen bytes (typically from Arena or
+// inline test storage).
+static inline void capture_stage_headers(Connection& conn) {
+    conn.capture_header_len = 0;
+    if (!conn.capture_buf) return;
+
+    const u8* data = conn.recv_buf.data();
+    u32 len = conn.req_header_end;
+    if (!data || len == 0) len = conn.recv_buf.len();
+
+    u32 copy_len = len;
+    if (copy_len > CaptureEntry::kMaxHeaderLen)
+        copy_len = CaptureEntry::kMaxHeaderLen;
+
+    __builtin_memcpy(conn.capture_buf, data, copy_len);
+    conn.capture_header_len = static_cast<u16>(copy_len);
+}
+
 static const char kResponse200[] =
     "HTTP/1.1 200 OK\r\n"
     "Content-Length: 2\r\n"
@@ -297,6 +325,27 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         }
         loop->access_log->push(entry);
     }
+
+    // Write traffic capture entry (if enabled).
+    if (loop->capture_ring && conn.capture_buf && conn.capture_header_len > 0) {
+        CaptureEntry cap{};
+        cap.timestamp_us = realtime_us();
+        cap.req_content_length = conn.req_content_length;
+        cap.resp_content_length = resp_size;
+        cap.resp_status = status;
+        cap.raw_header_len = conn.capture_header_len;
+        cap.method = conn.req_method;
+        cap.shard_id = conn.shard_id;
+        cap.flags = (conn.capture_header_len == CaptureEntry::kMaxHeaderLen)
+                        ? kCaptureFlagTruncated
+                        : 0;
+        for (u32 i = 0; i < sizeof(cap.upstream_name); i++) {
+            cap.upstream_name[i] = conn.upstream_name[i];
+            if (conn.upstream_name[i] == '\0') break;
+        }
+        __builtin_memcpy(cap.raw_headers, conn.capture_buf, conn.capture_header_len);
+        loop->capture_ring->push(cap);
+    }
 }
 
 template <typename Loop>
@@ -328,6 +377,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 
     conn.req_start_us = monotonic_us();
     capture_request_metadata(conn);
+    // Stage raw headers for traffic capture (before body streaming overwrites recv_buf).
+    if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
     conn.state = ConnState::Sending;

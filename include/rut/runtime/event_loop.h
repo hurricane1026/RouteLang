@@ -104,6 +104,43 @@ public:
     // Per-shard access log ring. Set by Shard before run(). Null = no logging.
     AccessLogRing* access_log = nullptr;
 
+    // Per-shard traffic capture ring. Use set_capture() to change — it
+    // handles backfilling capture_buf on existing active connections.
+    struct CaptureRing* capture_ring = nullptr;
+
+    // Flat mmap region for capture header staging (kMaxConns × 8KB).
+    // Lazy-allocated on first capture enable. Indexed by conn_id.
+    // Null when capture has never been enabled (zero overhead).
+    u8* capture_region_ = nullptr;
+
+    // Enable or disable traffic capture. Handles lazy region allocation
+    // and backfilling capture_buf on existing active connections.
+    // ring = nullptr → disable. ring = valid pointer → enable.
+    void set_capture(CaptureRing* ring) {
+        capture_ring = ring;
+        if (!ring) return;
+        // Lazy-allocate capture region on first enable (one mmap, ~1μs).
+        if (!capture_region_) {
+            void* region = mmap(nullptr,
+                                static_cast<u64>(kMaxConns) * 8192u,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS,
+                                -1,
+                                0);
+            if (region == MAP_FAILED) {
+                capture_ring = nullptr;  // alloc failed, disable
+                return;
+            }
+            capture_region_ = static_cast<u8*>(region);
+        }
+        // Backfill capture_buf on existing active connections.
+        for (u32 i = 0; i < kMaxConns; i++) {
+            if (conns[i].fd >= 0 && !conns[i].capture_buf)
+                conns[i].capture_buf =
+                    capture_region_ + static_cast<u64>(i) * 8192u;
+        }
+    }
+
     // Per-shard metrics. Set by Shard before run(). Null = no metrics.
     ShardMetrics* metrics = nullptr;
 
@@ -123,6 +160,8 @@ public:
         drain_start_.store(0, std::memory_order_relaxed);
         drain_period_.store(0, std::memory_order_relaxed);
         keepalive_timeout = kDefaultKeepaliveTimeout;
+        capture_ring = nullptr;
+        capture_region_ = nullptr;
         config_ptr = nullptr;
         control = nullptr;
         epoch = nullptr;
@@ -185,9 +224,8 @@ public:
     bool is_running() const { return running_.load(std::memory_order_acquire); }
     bool is_draining() const { return draining_.load(std::memory_order_acquire); }
 
-    // Poll the per-shard control block. Independent config + JIT slots.
-    // Zero-cost when neither flag is set (two atomic loads, both predicted
-    // not-taken).
+    // Poll the per-shard control block. Independent config + JIT + capture slots.
+    // Zero-cost when no flags are set (three atomic loads, all predicted not-taken).
     void poll_command() {
         if (!control) return;
         // Single atomic exchange per slot: read + clear in one op.
@@ -197,6 +235,13 @@ public:
 
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;
+
+        auto* cap = control->pending_capture.exchange(nullptr, std::memory_order_acq_rel);
+        if (cap == kCaptureDisable) {
+            set_capture(nullptr);
+        } else if (cap) {
+            set_capture(cap);
+        }
     }
 
     // RCU monotonic epoch. Both enter and leave increment, so the control
@@ -217,6 +262,10 @@ public:
         if constexpr (Backend::kAsyncIo) reclaim_pending();
         backend.shutdown();
         pool.destroy();
+        if (capture_region_) {
+            munmap(capture_region_, static_cast<u64>(kMaxConns) * 8192u);
+            capture_region_ = nullptr;
+        }
     }
 
     // Reclaim a single slot from pending_free by conn_id. Frees slices,
@@ -316,6 +365,8 @@ public:
         conns[id].send_slice = ss;
         conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
+        if (capture_region_)
+            conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * 8192u;
         return &conns[id];
     }
 

@@ -86,6 +86,11 @@ struct Connection {
     char upstream_name[kMaxUpstreamNameLen];
     u64 upstream_start_us;
 
+    // Traffic capture: raw headers staged in Arena at on_header_received,
+    // written to CaptureRing at on_request_complete. Null when capture disabled.
+    u8* capture_buf;
+    u16 capture_header_len;
+
     // Request timing (for access log)
     u64 req_start_us;
 
@@ -148,6 +153,8 @@ struct Connection {
         upstream_us = 0;
         upstream_name[0] = '\0';
         upstream_start_us = 0;
+        capture_buf = nullptr;
+        capture_header_len = 0;
         req_start_us = 0;
         pending_ops = 0;
         recv_slice = nullptr;

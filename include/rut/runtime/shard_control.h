@@ -5,9 +5,13 @@
 
 namespace rut {
 
-struct RouteConfig;  // forward declare
+struct RouteConfig;   // forward declare
+struct CaptureRing;   // forward declare
 
-// Per-shard control block. Config and JIT have independent atomic slots.
+// Sentinel: "disable capture". Distinct from nullptr ("no pending change").
+static inline CaptureRing* kCaptureDisable = reinterpret_cast<CaptureRing*>(1);
+
+// Per-shard control block. Config, JIT, and capture have independent atomic slots.
 // nullptr = no pending update. Non-null = fire-and-forget update.
 // Producer: pending_config.store(ptr, release)
 // Consumer: pending_config.exchange(nullptr, acq_rel)
@@ -15,6 +19,8 @@ struct RouteConfig;  // forward declare
 struct alignas(64) ShardControlBlock {
     std::atomic<const RouteConfig*> pending_config{nullptr};
     std::atomic<void*> pending_jit{nullptr};
+    // Capture control: nullptr = no change, valid ptr = enable, kCaptureDisable = disable.
+    std::atomic<CaptureRing*> pending_capture{nullptr};
 };
 
 // Per-shard monotonic epoch for RCU progress tracking.

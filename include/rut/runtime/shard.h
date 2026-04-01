@@ -6,6 +6,7 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
+#include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/shard_control.h"
@@ -54,6 +55,9 @@ struct Shard {
 
     // Per-shard access log ring (mmap'd, read by background flusher thread).
     AccessLogRing* log_ring = nullptr;
+
+    // Per-shard capture ring (mmap'd, read by background flusher thread).
+    CaptureRing* capture_ring = nullptr;
 
     // Per-shard metrics (stack-allocated, ~200 bytes).
     ShardMetrics shard_metrics{};
@@ -141,6 +145,7 @@ struct Shard {
         // Init per-shard control block and epoch.
         control.pending_config.store(nullptr, std::memory_order_relaxed);
         control.pending_jit.store(nullptr, std::memory_order_relaxed);
+        control.pending_capture.store(nullptr, std::memory_order_relaxed);
         epoch.epoch.store(0, std::memory_order_relaxed);
 
         // Wire control pointers into EventLoop for poll_command/epoch.
@@ -167,6 +172,59 @@ struct Shard {
         log_ring->init();
         if (loop) loop->access_log = log_ring;
         return {};
+    }
+
+    // Enable traffic capture on this shard (runtime, fire-and-forget).
+    // Allocates CaptureRing on the control plane side. The shard thread
+    // lazy-allocates capture_region_ on first poll_command() (one mmap).
+    //
+    // Safe to call before or after spawn():
+    //   Before spawn: direct apply (no thread to race with).
+    //   After spawn: queued via ShardControlBlock, applied next poll_command().
+    //
+    // Returns the CaptureRing pointer (caller can use it to drain entries).
+    // Returns nullptr on allocation failure.
+    CaptureRing* enable_capture() {
+        if (capture_ring) return capture_ring;  // already enabled
+
+        void* ring_mem = mmap(nullptr,
+                              sizeof(CaptureRing),
+                              PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS,
+                              -1,
+                              0);
+        if (ring_mem == MAP_FAILED) return nullptr;
+        capture_ring = new (ring_mem) CaptureRing();
+        capture_ring->init();
+
+        if (!thread_spawned) {
+            // Direct apply — no thread running.
+            if (loop) loop->capture_ring = capture_ring;
+            return capture_ring;
+        }
+        control.pending_capture.store(capture_ring, std::memory_order_release);
+        return capture_ring;
+    }
+
+    // Disable traffic capture on this shard (runtime, fire-and-forget).
+    // The CaptureRing is NOT freed here — caller should drain remaining
+    // entries first, then free via disable_capture_free().
+    void disable_capture() {
+        if (!thread_spawned) {
+            if (loop) loop->capture_ring = nullptr;
+            return;
+        }
+        control.pending_capture.store(kCaptureDisable, std::memory_order_release);
+    }
+
+    // Free the CaptureRing after disable. Call only after the shard thread
+    // has consumed the disable (i.e., after join, or after enough poll cycles).
+    void free_capture_ring() {
+        if (capture_ring) {
+            capture_ring->~CaptureRing();
+            munmap(capture_ring, sizeof(CaptureRing));
+            capture_ring = nullptr;
+        }
     }
 
     // Spawn the shard's thread. Optionally pin to CPU core.
@@ -265,6 +323,7 @@ struct Shard {
             munmap(log_ring, sizeof(AccessLogRing));
             log_ring = nullptr;
         }
+        free_capture_ring();
         if (upstream) {
             upstream->shutdown();
             upstream->~UpstreamPool();
@@ -275,6 +334,8 @@ struct Shard {
             // Sync listen_fd: EventLoop may have closed it during drain.
             if (loop->listen_fd < 0) listen_fd = -1;
             loop->access_log = nullptr;
+            loop->capture_ring = nullptr;
+            // capture_region_ is freed by loop->shutdown()
             loop->shutdown();
             loop->~EventLoop();
             munmap(loop, sizeof(EventLoop<Backend>));

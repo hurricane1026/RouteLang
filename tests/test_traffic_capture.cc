@@ -1836,4 +1836,219 @@ TEST(capture_stress, rapid_toggle) {
     munmap(ring, sizeof(CaptureRing));
 }
 
+// ============================================================
+// Coverage gap tests (from systematic review)
+// ============================================================
+
+// G1. Truncation flag: capture_stage_headers with >8KB data
+TEST(capture_gap, truncation_flag_set) {
+    Connection conn;
+    conn.reset();
+    // Allocate a large capture buf and recv buf
+    u8 capture_buf[CaptureEntry::kMaxHeaderLen];
+    // Use mmap for a recv buffer larger than 8KB
+    u32 big_size = CaptureEntry::kMaxHeaderLen + 1024;
+    u8* big_recv = static_cast<u8*>(
+        mmap(nullptr, big_size, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(big_recv != MAP_FAILED);
+
+    conn.capture_buf = capture_buf;
+    conn.recv_buf.bind(big_recv, big_size);
+
+    // Fill with data larger than 8KB
+    for (u32 i = 0; i < big_size; i++)
+        big_recv[i] = static_cast<u8>('A' + (i % 26));
+    conn.recv_buf.commit(big_size);
+    conn.req_header_end = big_size;  // pretend headers are huge
+
+    capture_stage_headers(conn);
+    CHECK_EQ(conn.capture_header_len, static_cast<u16>(CaptureEntry::kMaxHeaderLen));
+
+    // Now simulate on_request_complete writing the entry
+    CaptureRing ring;
+    ring.init();
+    CaptureEntry cap{};
+    cap.raw_header_len = conn.capture_header_len;
+    cap.flags = (conn.capture_header_len == CaptureEntry::kMaxHeaderLen)
+                    ? kCaptureFlagTruncated : 0;
+    __builtin_memcpy(cap.raw_headers, conn.capture_buf, conn.capture_header_len);
+    ring.push(cap);
+
+    CaptureEntry out{};
+    ring.pop(out);
+    CHECK_EQ(out.flags & kCaptureFlagTruncated, kCaptureFlagTruncated);
+    CHECK_EQ(out.raw_header_len, static_cast<u16>(CaptureEntry::kMaxHeaderLen));
+    CHECK_EQ(out.raw_headers[0], static_cast<u8>('A'));
+
+    // Clean up — unbind before munmap to avoid Buffer destructor trap
+    conn.recv_buf.bind(nullptr, 0);
+    munmap(big_recv, big_size);
+}
+
+// G2. upstream_name: verify correct copy into captured entry, including boundary
+TEST(capture_gap, upstream_name_copied) {
+    auto* ring = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    SmallLoop loop;
+    loop.setup();
+    loop.set_capture(ring);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Recv request, then manually set upstream_name (simulating proxy path)
+    conn->recv_buf.reset();
+    const char req[] = "GET /up HTTP/1.1\r\nHost: x\r\n\r\n";
+    conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    loop.backend.inject(recv_ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Set upstream_name before completion
+    const char up_name[] = "api-backend-v2";
+    for (u32 i = 0; i < sizeof(up_name); i++)
+        conn->upstream_name[i] = up_name[i];
+
+    // Complete send
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+
+    CHECK_EQ(ring->available(), 1u);
+    CaptureEntry cap{};
+    ring->pop(cap);
+
+    // Verify upstream_name was copied correctly
+    bool name_match = true;
+    for (u32 i = 0; i < sizeof(up_name) - 1; i++) {
+        if (cap.upstream_name[i] != up_name[i]) name_match = false;
+    }
+    CHECK(name_match);
+    CHECK_EQ(cap.upstream_name[sizeof(up_name) - 1], '\0');
+
+    munmap(ring, sizeof(CaptureRing));
+}
+
+// G2b. upstream_name at max length (23 chars + null) — no overflow
+TEST(capture_gap, upstream_name_max_length) {
+    Connection conn;
+    conn.reset();
+    // Fill upstream_name to max (23 chars + null = 24 bytes)
+    for (u32 i = 0; i < Connection::kMaxUpstreamNameLen - 1; i++)
+        conn.upstream_name[i] = static_cast<char>('a' + (i % 26));
+    conn.upstream_name[Connection::kMaxUpstreamNameLen - 1] = '\0';
+
+    // Simulate the copy loop from on_request_complete
+    CaptureEntry cap{};
+    for (u32 i = 0; i < sizeof(conn.upstream_name); i++) {
+        cap.upstream_name[i] = conn.upstream_name[i];
+        if (conn.upstream_name[i] == '\0') break;
+    }
+
+    // Verify: 23 chars copied, null terminated
+    CHECK_EQ(cap.upstream_name[Connection::kMaxUpstreamNameLen - 1], '\0');
+    CHECK_EQ(cap.upstream_name[0], 'a');
+    CHECK_EQ(cap.upstream_name[22], static_cast<char>('a' + 22 % 26));
+}
+
+// G3. Metadata fields: timestamp, shard_id, content lengths
+TEST(capture_gap, metadata_fields) {
+    auto* ring = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    SmallLoop loop;
+    loop.setup();
+    loop.shard_id = 7;
+    loop.set_capture(ring);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    u64 before_us = realtime_us();
+    send_request(loop, *conn, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    u64 after_us = realtime_us();
+
+    CaptureEntry cap{};
+    ring->pop(cap);
+
+    // Timestamp should be between before and after
+    CHECK(cap.timestamp_us >= before_us);
+    CHECK(cap.timestamp_us <= after_us);
+
+    // shard_id comes from conn.shard_id (set at alloc)
+    // SmallLoop doesn't set shard_id on conns, so it's 0
+    CHECK_EQ(cap.shard_id, 0);
+
+    // No body → content lengths should be 0
+    CHECK_EQ(cap.req_content_length, 0u);
+
+    // resp_content_length is the resp_size passed to on_request_complete
+    CHECK_GT(cap.resp_content_length, 0u);
+
+    munmap(ring, sizeof(CaptureRing));
+}
+
+// G5. File header validation: wrong version, wrong entry_size
+TEST(capture_gap, file_header_wrong_version) {
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.version = 2;
+    CHECK(!capture_file_header_valid(&hdr));
+}
+
+TEST(capture_gap, file_header_wrong_entry_size) {
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.entry_size = 100;
+    CHECK(!capture_file_header_valid(&hdr));
+}
+
+TEST(capture_gap, file_header_wrong_magic_middle) {
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.magic[4] = 'X';  // corrupt middle of magic
+    CHECK(!capture_file_header_valid(&hdr));
+}
+
+// G6. set_capture(nullptr) leaves capture_buf intact on connections
+TEST(capture_gap, disable_preserves_capture_buf) {
+    auto* ring = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    SmallLoop loop;
+    loop.setup();
+    loop.set_capture(ring);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    CHECK(conn->capture_buf != nullptr);
+    u8* saved_buf = conn->capture_buf;
+
+    // Disable — capture_buf should remain (region not freed)
+    loop.set_capture(nullptr);
+    CHECK_EQ(conn->capture_buf, saved_buf);
+
+    // New connection after disable — should still get capture_buf
+    // (because capture_region_ is never freed, and alloc_conn checks it)
+    // Note: SmallLoop uses static storage, so this is always true.
+    // The real EventLoop path checks capture_region_ in alloc_conn.
+
+    munmap(ring, sizeof(CaptureRing));
+}
+
 int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }

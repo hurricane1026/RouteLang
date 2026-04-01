@@ -342,7 +342,7 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         cap.flags = (conn.capture_header_len == CaptureEntry::kMaxHeaderLen)
                         ? kCaptureFlagTruncated
                         : 0;
-        for (u32 i = 0; i < sizeof(cap.upstream_name); i++) {
+        for (u32 i = 0; i < sizeof(conn.upstream_name); i++) {
             cap.upstream_name[i] = conn.upstream_name[i];
             if (conn.upstream_name[i] == '\0') break;
         }

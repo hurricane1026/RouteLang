@@ -1,5 +1,7 @@
 // Tests for traffic capture: CaptureEntry, CaptureRing, file I/O, and
 // integration with the mock event loop (capture through callback pipeline).
+#include "rut/runtime/epoll_event_loop.h"
+#include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/traffic_capture.h"
 #include "test.h"
 #include "test_helpers.h"
@@ -12,6 +14,26 @@
 #include <unistd.h>
 
 using namespace rut;
+
+// Compile-time interface checks: every EventLoop type that callbacks.h
+// templates instantiate for MUST have capture_ring and set_capture().
+// If a new loop type is added without these, this file won't compile.
+namespace {
+template <typename Loop>
+void verify_capture_interface() {
+    Loop* lp = nullptr;
+    (void)lp->capture_ring;
+    (void)lp->set_capture(nullptr);
+}
+// Force instantiation for all production + test loop types.
+[[maybe_unused]] void compile_time_capture_check() {
+    verify_capture_interface<EpollEventLoop>();
+    verify_capture_interface<IoUringEventLoop>();
+    verify_capture_interface<SmallLoop>();
+    // EventLoop<EpollBackend> and EventLoop<IoUringBackend> covered
+    // by the concrete loop types above.
+}
+}  // namespace
 
 // === CaptureEntry layout ===
 

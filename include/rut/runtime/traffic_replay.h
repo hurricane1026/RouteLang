@@ -5,6 +5,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/traffic_capture.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -41,7 +42,9 @@ struct ReplayReader {
     u64 entries_read = 0;
 
     // Open a capture file. Returns 0 on success, -1 on error.
+    // Closes any previously open fd to prevent leaks on re-open.
     i32 open(const char* path) {
+        if (fd >= 0) { ::close(fd); fd = -1; }
         fd = ::open(path, O_RDONLY);
         if (fd < 0) return -1;
 
@@ -49,7 +52,13 @@ struct ReplayReader {
         u32 remaining = sizeof(header);
         while (remaining > 0) {
             ssize_t n = ::read(fd, p, remaining);
-            if (n <= 0) {
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                ::close(fd);
+                fd = -1;
+                return -1;
+            }
+            if (n == 0) {
                 ::close(fd);
                 fd = -1;
                 return -1;

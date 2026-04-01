@@ -4,6 +4,7 @@
 #include "rut/runtime/access_log.h"  // realtime_us()
 #include <atomic>
 
+#include <errno.h>
 #include <unistd.h>
 
 namespace rut {
@@ -146,7 +147,11 @@ inline i32 capture_write_entry(i32 fd, const CaptureEntry& entry) {
     u32 remaining = sizeof(CaptureEntry);
     while (remaining > 0) {
         ssize_t n = write(fd, p, remaining);
-        if (n <= 0) return -1;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;  // shouldn't happen on regular files
         p += n;
         remaining -= static_cast<u32>(n);
     }
@@ -160,7 +165,11 @@ inline i32 capture_read_entry(i32 fd, CaptureEntry& entry) {
     u32 remaining = sizeof(CaptureEntry);
     while (remaining > 0) {
         ssize_t n = read(fd, p, remaining);
-        if (n <= 0) return -1;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;  // EOF mid-entry
         p += n;
         remaining -= static_cast<u32>(n);
     }

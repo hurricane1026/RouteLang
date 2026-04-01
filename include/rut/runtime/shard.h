@@ -199,9 +199,14 @@ struct Shard {
 
         if (!thread_spawned) {
             // Direct apply — no thread running. Use set_capture() for
-            // consistency (lazy region alloc + backfill, though no
-            // connections exist pre-spawn).
-            if (loop) loop->set_capture(capture_ring);
+            // consistency (lazy region alloc + backfill).
+            if (loop && !loop->set_capture(capture_ring)) {
+                // set_capture failed (mmap): clean up and propagate failure.
+                capture_ring->~CaptureRing();
+                munmap(ring_mem, sizeof(CaptureRing));
+                capture_ring = nullptr;
+                return nullptr;
+            }
             return capture_ring;
         }
         control.pending_capture.store(capture_ring, std::memory_order_release);
@@ -210,7 +215,7 @@ struct Shard {
 
     // Disable traffic capture on this shard (runtime, fire-and-forget).
     // The CaptureRing is NOT freed here — caller should drain remaining
-    // entries first, then free via disable_capture_free().
+    // entries first, then free via free_capture_ring().
     void disable_capture() {
         if (!thread_spawned) {
             if (loop) loop->capture_ring = nullptr;

@@ -333,11 +333,16 @@ static inline const char* status_reason(u16 code) {
 }
 
 // Format a static HTTP response into send_buf.
-// "HTTP/1.1 {code} {reason}\r\nContent-Length: {N}\r\nConnection: {ka}\r\n\r\n{reason}"
+// For bodyless status codes (1xx, 204, 304) sends Content-Length: 0 and no body.
+// For all others: body = reason phrase, Content-Length = len(reason).
 static inline void format_static_response(Connection& conn, u16 code, bool keep_alive) {
     const char* reason = status_reason(code);
     u32 reason_len = 0;
     while (reason[reason_len]) reason_len++;
+
+    // HTTP semantics: 1xx, 204, and 304 MUST NOT include a body.
+    bool no_body = (code < 200 || code == 204 || code == 304);
+    u32 body_len = no_body ? 0 : reason_len;
 
     conn.send_buf.reset();
     conn.send_buf.write(reinterpret_cast<const u8*>("HTTP/1.1 "), 9);
@@ -352,17 +357,17 @@ static inline void format_static_response(Connection& conn, u16 code, bool keep_
     conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
 
-    // Content-Length: {reason_len}
+    // Content-Length
     conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
-    if (reason_len >= 100) {
-        char d = static_cast<char>('0' + reason_len / 100);
+    if (body_len >= 100) {
+        char d = static_cast<char>('0' + body_len / 100);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
-    if (reason_len >= 10) {
-        char d = static_cast<char>('0' + (reason_len / 10) % 10);
+    if (body_len >= 10) {
+        char d = static_cast<char>('0' + (body_len / 10) % 10);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
-    char d = static_cast<char>('0' + reason_len % 10);
+    char d = static_cast<char>('0' + body_len % 10);
     conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
 
@@ -373,7 +378,8 @@ static inline void format_static_response(Connection& conn, u16 code, bool keep_
         conn.send_buf.write(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
 
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
-    conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
+    if (body_len > 0)
+        conn.send_buf.write(reinterpret_cast<const u8*>(reason), body_len);
 }
 
 // Called on request completion — records metrics and writes access log.
@@ -414,7 +420,11 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
 
     // Write traffic capture entry (if enabled).
     if (loop->capture_ring && conn.capture_buf && conn.capture_header_len > 0) {
-        CaptureEntry cap{};
+        CaptureEntry cap;
+        // Zero only the 64-byte metadata, not the 8KB raw_headers buffer.
+        __builtin_memset(&cap, 0,
+                         static_cast<u64>(reinterpret_cast<u8*>(&cap.raw_headers) -
+                                          reinterpret_cast<u8*>(&cap)));
         cap.timestamp_us = realtime_us();
         cap.req_content_length = conn.req_content_length;
         cap.resp_content_length = resp_size;

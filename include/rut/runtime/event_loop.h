@@ -108,9 +108,10 @@ public:
     // handles backfilling capture_buf on existing active connections.
     struct CaptureRing* capture_ring = nullptr;
 
-    // Flat mmap region for capture header staging (kMaxConns × 8KB).
+    // Flat mmap region for capture header staging (kMaxConns × kCaptureSliceSize).
     // Lazy-allocated on first capture enable. Indexed by conn_id.
     // Null when capture has never been enabled (zero overhead).
+    static constexpr u32 kCaptureSliceSize = 8192;  // must match CaptureEntry::kMaxHeaderLen
     u8* capture_region_ = nullptr;
 
     // Enable or disable traffic capture. Handles lazy region allocation
@@ -123,7 +124,7 @@ public:
         // Lazy-allocate capture region on first enable (one mmap, ~1μs).
         if (!capture_region_) {
             void* region = mmap(nullptr,
-                                static_cast<u64>(kMaxConns) * 8192u,
+                                static_cast<u64>(kMaxConns) * kCaptureSliceSize,
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS,
                                 -1,
@@ -137,7 +138,7 @@ public:
         // Backfill capture_buf on existing active connections.
         for (u32 i = 0; i < kMaxConns; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * 8192u;
+                conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
         }
         return true;
     }
@@ -264,7 +265,7 @@ public:
         backend.shutdown();
         pool.destroy();
         if (capture_region_) {
-            munmap(capture_region_, static_cast<u64>(kMaxConns) * 8192u);
+            munmap(capture_region_, static_cast<u64>(kMaxConns) * kCaptureSliceSize);
             capture_region_ = nullptr;
         }
     }
@@ -366,7 +367,8 @@ public:
         conns[id].send_slice = ss;
         conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
-        if (capture_region_) conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * 8192u;
+        if (capture_region_)
+            conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
         return &conns[id];
     }
 

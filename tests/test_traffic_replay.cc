@@ -555,13 +555,14 @@ TEST(replay_gap, format_static_response_wire_format) {
         u16 code;
         const char* reason;
         u32 reason_len;
+        u32 body_len;  // 0 for no-body status codes (204, 304)
     };
     TestCase cases[] = {
-        {200, "OK", 2},
-        {404, "Not Found", 9},
-        {500, "Internal Server Error", 21},
-        {204, "No Content", 10},
-        {301, "Moved Permanently", 17},
+        {200, "OK", 2, 2},
+        {404, "Not Found", 9, 9},
+        {500, "Internal Server Error", 21, 21},
+        {204, "No Content", 10, 0},   // no body per HTTP spec
+        {301, "Moved Permanently", 17, 17},
     };
 
     for (auto& tc : cases) {
@@ -591,7 +592,7 @@ TEST(replay_gap, format_static_response_wire_format) {
             }
         }
         CHECK(found_cl);
-        CHECK_EQ(cl_val, tc.reason_len);
+        CHECK_EQ(cl_val, tc.body_len);
 
         // Find body after \r\n\r\n
         u32 body_start = 0;
@@ -604,7 +605,7 @@ TEST(replay_gap, format_static_response_wire_format) {
         }
         CHECK_GT(body_start, 0u);
         u32 body_len = len - body_start;
-        CHECK_EQ(body_len, tc.reason_len);
+        CHECK_EQ(body_len, tc.body_len);
 
         // Verify status line contains the code
         CHECK_EQ(data[9], static_cast<u8>('0' + (tc.code / 100) % 10));

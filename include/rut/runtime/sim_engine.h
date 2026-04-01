@@ -8,10 +8,12 @@
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/traffic_capture.h"
 
+#include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 

@@ -287,7 +287,7 @@ public:
         if (cap == kCaptureDisable) {
             set_capture(nullptr);
         } else if (cap) {
-            set_capture(cap);
+            if (!set_capture(cap)) control->pending_capture.store(cap, std::memory_order_release);
         }
     }
 

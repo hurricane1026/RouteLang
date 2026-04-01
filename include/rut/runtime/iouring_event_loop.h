@@ -170,10 +170,11 @@ public:
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;
         auto* cap = control->pending_capture.exchange(nullptr, std::memory_order_acq_rel);
-        if (cap == kCaptureDisable)
+        if (cap == kCaptureDisable) {
             set_capture(nullptr);
-        else if (cap)
-            set_capture(cap);
+        } else if (cap) {
+            if (!set_capture(cap)) control->pending_capture.store(cap, std::memory_order_release);
+        }
     }
 
     void epoch_enter() {

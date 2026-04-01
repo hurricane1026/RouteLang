@@ -1199,15 +1199,19 @@ TEST(shard_capture, enable_after_spawn_via_control_block) {
     auto lfd_result = create_listen_socket(0);
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
     Shard<EpollEventLoop> shard;
     REQUIRE(shard.init(0, lfd).has_value());
     REQUIRE(shard.spawn().has_value());
     CaptureRing* ring = shard.enable_capture();
     REQUIRE(ring != nullptr);
+    // Connect a dummy client to wake epoll_wait so poll_command() runs.
+    i32 dummy = connect_to(port);
     for (u32 i = 0; i < 2000; i++) {
         if (shard.loop->capture_ring == ring) break;
         usleep(1000);
     }
+    if (dummy >= 0) close(dummy);
     CHECK_EQ(shard.loop->capture_ring, ring);
     CHECK(shard.loop->capture_region_ != nullptr);
     shard.stop();
@@ -1220,20 +1224,27 @@ TEST(shard_capture, disable_after_spawn_via_control_block) {
     auto lfd_result = create_listen_socket(0);
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
     Shard<EpollEventLoop> shard;
     REQUIRE(shard.init(0, lfd).has_value());
     REQUIRE(shard.spawn().has_value());
     CaptureRing* ring = shard.enable_capture();
     REQUIRE(ring != nullptr);
+    // Dummy connection to wake epoll_wait for poll_command.
+    i32 dummy = connect_to(port);
     for (u32 i = 0; i < 2000; i++) {
         if (shard.loop->capture_ring == ring) break;
         usleep(1000);
     }
     shard.disable_capture();
+    // Another dummy to wake for disable poll_command.
+    i32 dummy2 = connect_to(port);
     for (u32 i = 0; i < 2000; i++) {
         if (shard.loop->capture_ring == nullptr) break;
         usleep(1000);
     }
+    if (dummy >= 0) close(dummy);
+    if (dummy2 >= 0) close(dummy2);
     CHECK(shard.loop->capture_ring == nullptr);
     CHECK(shard.loop->capture_region_ != nullptr);
     shard.stop();

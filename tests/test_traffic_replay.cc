@@ -13,7 +13,9 @@ using namespace rut;
 
 struct TempCapture {
     char path[64];
-    i32 fd;
+    i32 fd = -1;
+
+    ~TempCapture() { cleanup(); }
 
     bool create(const CaptureEntry* entries, u32 count) {
         __builtin_memcpy(path, "/tmp/rut_replay_XXXXXX", 23);
@@ -23,20 +25,34 @@ struct TempCapture {
         CaptureFileHeader hdr;
         capture_file_header_init(&hdr);
         hdr.entry_count = count;
-        if (write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) return false;
-
-        for (u32 i = 0; i < count; i++) {
-            if (capture_write_entry(fd, entries[i]) != 0) return false;
+        if (write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+            close(fd);
+            fd = -1;
+            unlink(path);
+            return false;
         }
 
-        // Seek back to start for reading
-        lseek(fd, 0, SEEK_SET);
+        for (u32 i = 0; i < count; i++) {
+            if (capture_write_entry(fd, entries[i]) != 0) {
+                close(fd);
+                fd = -1;
+                unlink(path);
+                return false;
+            }
+        }
+
         close(fd);
         fd = -1;
         return true;
     }
 
-    void cleanup() { unlink(path); }
+    void cleanup() {
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+        unlink(path);
+    }
 };
 
 static CaptureEntry make_captured_request(const char* req, u16 status) {

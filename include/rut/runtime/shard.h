@@ -217,8 +217,9 @@ struct Shard {
         control.pending_capture.store(kCaptureDisable, std::memory_order_release);
     }
 
-    // Free the CaptureRing after disable. Call only after the shard thread
-    // has consumed the disable (i.e., after join, or after enough poll cycles).
+    // Free the CaptureRing after disable. Call only after join() — there is
+    // no synchronization to confirm the shard thread consumed the disable,
+    // so calling this while the thread is running risks use-after-free.
     void free_capture_ring() {
         if (capture_ring) {
             capture_ring->~CaptureRing();

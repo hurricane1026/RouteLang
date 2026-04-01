@@ -265,8 +265,11 @@ static inline void capture_stage_headers(Connection& conn) {
     if (!conn.capture_buf) return;
 
     const u8* data = conn.recv_buf.data();
+    if (!data) return;
+
     u32 len = conn.req_header_end;
-    if (!data || len == 0) len = conn.recv_buf.len();
+    if (len == 0) len = conn.recv_buf.len();
+    if (len == 0) return;
 
     u32 copy_len = len;
     if (copy_len > CaptureEntry::kMaxHeaderLen)

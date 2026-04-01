@@ -1136,6 +1136,223 @@ TEST(shard_control, real_shard_simultaneous_config_and_jit) {
     munmap(cfg_mem, sizeof(RouteConfig));
 }
 
+// === Shard capture control ===
+
+TEST(shard_capture, enable_before_spawn_applies_directly) {
+    Shard<EpollBackend> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+
+    CaptureRing* ring = s.enable_capture();
+    REQUIRE(ring != nullptr);
+    CHECK_EQ(s.capture_ring, ring);
+    // Pre-spawn: direct apply — loop should have capture_ring set
+    CHECK_EQ(s.loop->capture_ring, ring);
+
+    s.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, enable_returns_existing_if_already_enabled) {
+    Shard<EpollBackend> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+
+    CaptureRing* ring1 = s.enable_capture();
+    CaptureRing* ring2 = s.enable_capture();
+    CHECK_EQ(ring1, ring2);  // idempotent
+
+    s.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, disable_before_spawn_clears_ring) {
+    Shard<EpollBackend> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+
+    s.enable_capture();
+    CHECK(s.loop->capture_ring != nullptr);
+
+    s.disable_capture();
+    CHECK(s.loop->capture_ring == nullptr);
+    // shard.capture_ring still set (caller must free after drain)
+    CHECK(s.capture_ring != nullptr);
+
+    s.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, free_capture_ring_releases_memory) {
+    Shard<EpollBackend> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+
+    s.enable_capture();
+    CHECK(s.capture_ring != nullptr);
+
+    s.disable_capture();
+    s.free_capture_ring();
+    CHECK(s.capture_ring == nullptr);
+
+    s.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, free_capture_ring_idempotent) {
+    Shard<EpollBackend> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+
+    // Never enabled — free should be safe
+    s.free_capture_ring();
+    CHECK(s.capture_ring == nullptr);
+
+    // Enable + free + free — double free should be safe
+    s.enable_capture();
+    s.free_capture_ring();
+    s.free_capture_ring();
+    CHECK(s.capture_ring == nullptr);
+
+    s.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, enable_after_spawn_via_control_block) {
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+
+    Shard<EpollBackend> shard;
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn().has_value());
+
+    // enable_capture after spawn → queued via pending_capture
+    CaptureRing* ring = shard.enable_capture();
+    REQUIRE(ring != nullptr);
+
+    // Wait for shard thread to consume (up to 2s)
+    for (u32 i = 0; i < 2000; i++) {
+        if (shard.loop->capture_ring == ring) break;
+        usleep(1000);
+    }
+    CHECK_EQ(shard.loop->capture_ring, ring);
+
+    // capture_region_ should have been lazy-allocated
+    CHECK(shard.loop->capture_region_ != nullptr);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, disable_after_spawn_via_control_block) {
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+
+    Shard<EpollBackend> shard;
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn().has_value());
+
+    // Enable, wait for apply
+    CaptureRing* ring = shard.enable_capture();
+    REQUIRE(ring != nullptr);
+    for (u32 i = 0; i < 2000; i++) {
+        if (shard.loop->capture_ring == ring) break;
+        usleep(1000);
+    }
+    CHECK_EQ(shard.loop->capture_ring, ring);
+
+    // Disable
+    shard.disable_capture();
+
+    // Wait for shard thread to consume
+    for (u32 i = 0; i < 2000; i++) {
+        if (shard.loop->capture_ring == nullptr) break;
+        usleep(1000);
+    }
+    CHECK(shard.loop->capture_ring == nullptr);
+
+    // Region stays allocated (connections may reference it)
+    CHECK(shard.loop->capture_region_ != nullptr);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, enable_disable_enable_cycle) {
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+
+    Shard<EpollBackend> shard;
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn().has_value());
+
+    // First enable
+    CaptureRing* ring1 = shard.enable_capture();
+    REQUIRE(ring1 != nullptr);
+    for (u32 i = 0; i < 2000; i++) {
+        if (shard.loop->capture_ring == ring1) break;
+        usleep(1000);
+    }
+
+    // Disable
+    shard.disable_capture();
+    for (u32 i = 0; i < 2000; i++) {
+        if (shard.loop->capture_ring == nullptr) break;
+        usleep(1000);
+    }
+
+    // Free old ring, re-enable with new ring
+    shard.free_capture_ring();
+    CaptureRing* ring2 = shard.enable_capture();
+    REQUIRE(ring2 != nullptr);
+    // Note: ring2 may == ring1 if mmap reuses the same VA after munmap.
+    // What matters is that it's a valid, initialized ring.
+
+    for (u32 i = 0; i < 2000; i++) {
+        if (shard.loop->capture_ring == ring2) break;
+        usleep(1000);
+    }
+    CHECK_EQ(shard.loop->capture_ring, ring2);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard_capture, shutdown_cleans_up_capture) {
+    Shard<EpollBackend> s;
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    REQUIRE(s.init(0, lfd).has_value());
+
+    s.enable_capture();
+    CHECK(s.capture_ring != nullptr);
+
+    // shutdown should free the ring
+    s.shutdown();
+    CHECK(s.capture_ring == nullptr);
+    close(lfd);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

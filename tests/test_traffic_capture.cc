@@ -1303,4 +1303,270 @@ TEST(capture_cross, ring_overflow_live) {
     munmap(ring, sizeof(CaptureRing));
 }
 
+// ============================================================
+// End-to-end and failure path verification
+// ============================================================
+
+// H1. Full pipeline: event loop → ring → file → read back → verify headers
+TEST(capture_e2e, pipeline_to_file) {
+    auto* ring = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    SmallLoop loop;
+    loop.setup();
+    loop.set_capture(ring);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Three distinct requests
+    const char* reqs[] = {
+        "GET /users HTTP/1.1\r\nHost: api.example.com\r\nAccept: application/json\r\n\r\n",
+        "POST /login HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 0\r\n\r\n",
+        "DELETE /session HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer tok\r\n\r\n",
+    };
+    for (int i = 0; i < 3; i++) {
+        send_request(loop, *conn, reqs[i]);
+    }
+    CHECK_EQ(ring->available(), 3u);
+
+    // Write to temp file
+    char path[] = "/tmp/rut_e2e_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.entry_count = 3;
+    ssize_t hw = write(fd, &hdr, sizeof(hdr));
+    CHECK_EQ(static_cast<u32>(hw), static_cast<u32>(sizeof(hdr)));
+
+    CaptureEntry entry{};
+    for (u32 i = 0; i < 3; i++) {
+        CHECK(ring->pop(entry));
+        CHECK_EQ(capture_write_entry(fd, entry), 0);
+    }
+    CHECK_EQ(ring->available(), 0u);
+
+    // Read back and verify
+    lseek(fd, 0, SEEK_SET);
+
+    CaptureFileHeader read_hdr;
+    ssize_t hr = read(fd, &read_hdr, sizeof(read_hdr));
+    CHECK_EQ(static_cast<u32>(hr), static_cast<u32>(sizeof(read_hdr)));
+    CHECK(capture_file_header_valid(&read_hdr));
+    CHECK_EQ(read_hdr.entry_count, 3u);
+
+    // Verify each entry's headers match what was sent
+    const char* expected_paths[] = {"/users", "/login", "/session"};
+    const u8 expected_methods[] = {
+        static_cast<u8>(LogHttpMethod::Get),
+        static_cast<u8>(LogHttpMethod::Post),
+        static_cast<u8>(LogHttpMethod::Delete),
+    };
+
+    for (u32 i = 0; i < 3; i++) {
+        CaptureEntry cap{};
+        CHECK_EQ(capture_read_entry(fd, cap), 0);
+        CHECK_EQ(cap.resp_status, 200);
+        CHECK_EQ(cap.method, expected_methods[i]);
+        CHECK_GT(cap.raw_header_len, 0);
+
+        // Find expected path in raw headers
+        u32 plen = 0;
+        while (expected_paths[i][plen]) plen++;
+        bool found = false;
+        for (u32 j = 0; j + plen <= cap.raw_header_len; j++) {
+            bool match = true;
+            for (u32 k = 0; k < plen; k++) {
+                if (cap.raw_headers[j + k] != static_cast<u8>(expected_paths[i][k])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) { found = true; break; }
+        }
+        CHECK(found);
+    }
+
+    // EOF — no more entries
+    CaptureEntry eof_cap{};
+    CHECK_EQ(capture_read_entry(fd, eof_cap), -1);
+
+    close(fd);
+    unlink(path);
+    munmap(ring, sizeof(CaptureRing));
+}
+
+// H2. Empty file — read returns -1 immediately
+TEST(capture_e2e, read_empty_file) {
+    char path[] = "/tmp/rut_empty_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+
+    // Write only header, no entries
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.entry_count = 0;
+    write(fd, &hdr, sizeof(hdr));
+
+    lseek(fd, sizeof(hdr), SEEK_SET);
+    CaptureEntry cap{};
+    CHECK_EQ(capture_read_entry(fd, cap), -1);  // no entries
+
+    close(fd);
+    unlink(path);
+}
+
+// H3. Partial write recovery — truncated entry detected on read
+TEST(capture_e2e, truncated_entry_read_fails) {
+    char path[] = "/tmp/rut_trunc_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.entry_count = 1;
+    write(fd, &hdr, sizeof(hdr));
+
+    // Write only half an entry
+    CaptureEntry entry{};
+    entry.resp_status = 200;
+    write(fd, &entry, sizeof(entry) / 2);
+
+    lseek(fd, sizeof(hdr), SEEK_SET);
+    CaptureEntry cap{};
+    CHECK_EQ(capture_read_entry(fd, cap), -1);  // incomplete → error
+
+    close(fd);
+    unlink(path);
+}
+
+// H4. set_capture idempotent — calling twice with same ring doesn't double-backfill
+TEST(capture_e2e, set_capture_idempotent) {
+    auto* ring = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    SmallLoop loop;
+    loop.setup();
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    CHECK(conn->capture_buf == nullptr);
+
+    // First set_capture — backfills
+    loop.set_capture(ring);
+    CHECK(conn->capture_buf != nullptr);
+    u8* buf1 = conn->capture_buf;
+
+    // Second set_capture with same ring — should not change capture_buf
+    loop.set_capture(ring);
+    CHECK_EQ(conn->capture_buf, buf1);  // same pointer, not double-assigned
+
+    // Request works correctly
+    send_request(loop, *conn, "GET /idem HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK_EQ(ring->available(), 1u);
+
+    munmap(ring, sizeof(CaptureRing));
+}
+
+// H5. Disable then enable with different ring — old entries stay in old ring
+TEST(capture_e2e, switch_ring) {
+    auto* ring1 = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    auto* ring2 = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring1 != MAP_FAILED);
+    REQUIRE(ring2 != MAP_FAILED);
+    ring1->init();
+    ring2->init();
+
+    SmallLoop loop;
+    loop.setup();
+    loop.set_capture(ring1);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Request to ring1
+    send_request(loop, *conn, "GET /r1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK_EQ(ring1->available(), 1u);
+    CHECK_EQ(ring2->available(), 0u);
+
+    // Switch to ring2
+    loop.set_capture(ring2);
+
+    // Request to ring2
+    send_request(loop, *conn, "GET /r2 HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK_EQ(ring1->available(), 1u);  // unchanged
+    CHECK_EQ(ring2->available(), 1u);
+
+    munmap(ring1, sizeof(CaptureRing));
+    munmap(ring2, sizeof(CaptureRing));
+}
+
+// H6. Large header near 8KB limit — verify truncation flag
+TEST(capture_e2e, large_header_near_limit) {
+    auto* ring = static_cast<CaptureRing*>(
+        mmap(nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(ring != MAP_FAILED);
+    ring->init();
+
+    SmallLoop loop;
+    loop.setup();
+    loop.set_capture(ring);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Build a request with many headers that stays under SmallLoop's 4KB buf
+    // (SmallLoop uses 4KB buffers, so we can't test the full 8KB path here,
+    // but we can verify capture works near the buffer limit)
+    conn->recv_buf.reset();
+    const char prefix[] = "GET /big HTTP/1.1\r\nHost: x\r\n";
+    conn->recv_buf.write(reinterpret_cast<const u8*>(prefix), sizeof(prefix) - 1);
+
+    // Fill with padding headers up to ~3.5KB
+    u32 target = 3500;
+    while (conn->recv_buf.len() < target) {
+        const char hdr[] = "X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+        u32 avail = conn->recv_buf.write_avail();
+        if (avail < sizeof(hdr)) break;
+        conn->recv_buf.write(reinterpret_cast<const u8*>(hdr), sizeof(hdr) - 1);
+    }
+    conn->recv_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+
+    u32 total = conn->recv_buf.len();
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(total));
+    loop.backend.inject(recv_ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+
+    CHECK_EQ(ring->available(), 1u);
+    CaptureEntry cap{};
+    ring->pop(cap);
+    CHECK_GT(cap.raw_header_len, 100);   // captured something substantial
+    CHECK(cap.raw_header_len <= total);   // not more than sent
+    CHECK_EQ(cap.flags & kCaptureFlagTruncated, 0);  // not truncated (under 8KB)
+
+    munmap(ring, sizeof(CaptureRing));
+}
+
 int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }

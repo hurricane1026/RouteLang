@@ -21,3 +21,22 @@ Outstanding work items, tracked from code TODOs and Copilot review findings.
 - [x] **SlicePool** — 16KB slice allocator, mmap-backed, O(1) alloc/free via free-stack. Per-shard, for on-demand network I/O buffers (idle connections hold 0 slices).
 - [x] **SlabPool\<T, Cap\>** — generic fixed-size object pool, mmap-backed. alloc/free by pointer or index, index_of, capacity/available/in_use stats. Generalizes EventLoop's Connection free-stack.
 - [ ] **Integration**: replace Connection inline storage with SlicePool slices (idle connections → zero buffer memory)
+
+## Testing methodology gaps
+
+### Fault injection for rare-condition bugs
+Bugs like `elapsed_us` nsec underflow (#1), EINTR non-retry (#2-3), and mmap failure silent degradation (#7) all share a pattern: they involve OS-level conditions (clock boundary crossing, signal interruption, memory pressure) that normal unit tests never trigger.
+
+**TODO**: Build a fault injection framework:
+- **EINTR simulation**: wrap `write()`/`read()` in test builds to probabilistically return EINTR before the real call. Verifies all I/O loops retry correctly.
+- **mmap failure injection**: allow tests to force `mmap()` to return MAP_FAILED on demand. Verifies all allocation paths propagate failure instead of silently degrading.
+- **Boundary value clock**: provide a `clock_gettime()` shim that returns specific `timespec` values (e.g., `{tv_sec=1, tv_nsec=999999000}` → `{tv_sec=2, tv_nsec=1000}`) to exercise arithmetic edge cases.
+- **Goal**: every new I/O function or time calculation automatically gets tested against these failure modes, so review doesn't have to catch them manually.
+
+### API misuse pattern testing
+Bugs like double-open fd leak (#4) and bodyless status codes (#5) involve using APIs in ways the happy path doesn't exercise.
+
+**TODO**: Establish a testing checklist for new APIs:
+- For any resource-owning struct (fd, mmap pointer): test double-open, use-after-close, double-close.
+- For any function that takes a status/error code: test all semantic categories (1xx, 2xx, 3xx, 4xx, 5xx) and specifically codes with special HTTP semantics (204, 304, 101).
+- For any function with a size parameter: test 0, 1, boundary-1, boundary, boundary+1.

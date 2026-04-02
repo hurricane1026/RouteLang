@@ -11,6 +11,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 
@@ -19,6 +20,7 @@ namespace {
 thread_local int g_slice_pool_fail_mmap_call = 0;
 thread_local int g_slice_pool_mmap_call_count = 0;
 thread_local bool g_slice_pool_fail_mprotect = false;
+thread_local int g_fake_upstream_socket_fd = -1;
 pthread_once_t g_slice_pool_syscall_once = PTHREAD_ONCE_INIT;
 
 struct ScopedSlicePoolFault {
@@ -35,15 +37,26 @@ struct ScopedSlicePoolFault {
     }
 };
 
+struct ScopedFakeUpstreamSocket {
+    explicit ScopedFakeUpstreamSocket(int fd) : fd_(fd) { g_fake_upstream_socket_fd = fd; }
+
+    ~ScopedFakeUpstreamSocket() { g_fake_upstream_socket_fd = -1; }
+
+    int fd_;
+};
+
 using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
 using MprotectFn = int (*)(void*, size_t, int);
+using SocketFn = int (*)(int, int, int);
 
 MmapFn g_real_mmap = nullptr;
 MprotectFn g_real_mprotect = nullptr;
+SocketFn g_real_socket = nullptr;
 
 void resolve_slice_pool_syscalls() {
     g_real_mmap = reinterpret_cast<MmapFn>(dlsym(RTLD_NEXT, "mmap"));
     g_real_mprotect = reinterpret_cast<MprotectFn>(dlsym(RTLD_NEXT, "mprotect"));
+    g_real_socket = reinterpret_cast<SocketFn>(dlsym(RTLD_NEXT, "socket"));
 }
 
 }  // namespace
@@ -73,6 +86,20 @@ extern "C" int mprotect(void* addr, size_t len, int prot) {
         return -1;
     }
     return g_real_mprotect(addr, len, prot);
+}
+
+extern "C" int socket(int domain, int type, int protocol) {
+    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
+    if (g_fake_upstream_socket_fd >= 0 && domain == AF_INET && (type & SOCK_STREAM) == SOCK_STREAM) {
+        int fd = g_fake_upstream_socket_fd;
+        g_fake_upstream_socket_fd = -1;
+        return fd;
+    }
+    if (!g_real_socket) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_real_socket(domain, type, protocol);
 }
 
 // === Accept ===
@@ -5626,6 +5653,163 @@ TEST(epoll_loop, poll_command_config_swap) {
     destroy_real_loop(loop);
 }
 
+TEST(epoll_loop, callbacks_static_route_send_keepalive) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 204);
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    loop->timer.add(c, loop->keepalive_timeout);
+
+    static const char kReq[] = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1);
+
+    on_header_received<EpollEventLoop>(
+        static_cast<void*>(loop), *c, make_ev(c->id, IoEventType::Recv, sizeof(kReq) - 1));
+    CHECK_EQ(c->resp_status, 204u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<EpollEventLoop>);
+
+    on_response_sent<EpollEventLoop>(
+        static_cast<void*>(loop), *c, make_ev(c->id, IoEventType::Send, c->send_buf.len()));
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+    CHECK_EQ(c->on_recv, &on_header_received<EpollEventLoop>);
+
+    close(c->fd);
+    c->fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_loop, callbacks_pipeline_incomplete_rearms_recv) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    c->pipeline_depth = 1;
+    loop->timer.add(c, loop->keepalive_timeout);
+
+    static const char kPartial[] = "GET /next HTTP/1.1\r\nHos";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kPartial), sizeof(kPartial) - 1);
+
+    on_header_received<EpollEventLoop>(
+        static_cast<void*>(loop), *c, make_ev(c->id, IoEventType::Recv, sizeof(kPartial) - 1));
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+    CHECK_EQ(c->on_recv, &on_header_received<EpollEventLoop>);
+    CHECK_EQ(c->pipeline_depth, 1u);
+    CHECK_EQ(c->recv_buf.len(), static_cast<u32>(sizeof(kPartial) - 1));
+
+    close(c->fd);
+    c->fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_loop, callbacks_capture_truncated_entry) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+
+    CaptureRing ring;
+    ring.init();
+    REQUIRE(loop->set_capture(&ring));
+
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    REQUIRE(c->capture_buf != nullptr);
+
+    c->req_start_us = monotonic_us();
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_content_length = 123;
+    c->capture_header_len = CaptureEntry::kMaxHeaderLen;
+    c->shard_id = 7;
+    c->upstream_name[0] = 'u';
+    c->upstream_name[1] = 'p';
+    c->upstream_name[2] = '\0';
+    for (u32 i = 0; i < CaptureEntry::kMaxHeaderLen; i++) c->capture_buf[i] = 'A';
+
+    on_request_complete<EpollEventLoop>(loop, *c, 200, 321);
+
+    CHECK_EQ(ring.available(), 1u);
+    CaptureEntry cap{};
+    REQUIRE(ring.pop(cap));
+    CHECK_EQ(cap.flags & kCaptureFlagTruncated, kCaptureFlagTruncated);
+    CHECK_EQ(cap.raw_header_len, static_cast<u16>(CaptureEntry::kMaxHeaderLen));
+    CHECK_EQ(cap.resp_status, 200u);
+
+    close(c->fd);
+    c->fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_loop, callbacks_upstream_connected_and_send_error_paths) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+
+    auto* malformed = loop->alloc_conn();
+    REQUIRE(malformed != nullptr);
+    malformed->fd = dup(2);
+    malformed->upstream_fd = dup(2);
+    REQUIRE(malformed->fd >= 0);
+    REQUIRE(malformed->upstream_fd >= 0);
+    malformed->req_malformed = true;
+    on_upstream_connected<EpollEventLoop>(static_cast<void*>(loop),
+                                          *malformed,
+                                          make_ev(malformed->id, IoEventType::UpstreamConnect, 0));
+    CHECK_EQ(loop->active_count(), 0u);
+
+    auto* armed = loop->alloc_conn();
+    REQUIRE(armed != nullptr);
+    armed->fd = dup(2);
+    armed->upstream_fd = dup(2);
+    REQUIRE(armed->fd >= 0);
+    REQUIRE(armed->upstream_fd >= 0);
+    static const char kReq[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    armed->recv_buf.write(reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1);
+    armed->req_initial_send_len = armed->recv_buf.len() + 32;
+    on_upstream_connected<EpollEventLoop>(
+        static_cast<void*>(loop), *armed, make_ev(armed->id, IoEventType::UpstreamConnect, 0));
+    CHECK_EQ(armed->state, ConnState::Proxying);
+    CHECK_EQ(armed->on_upstream_recv, &on_early_upstream_recvd_send_inflight<EpollEventLoop>);
+    CHECK_EQ(armed->on_upstream_send, &on_upstream_request_sent<EpollEventLoop>);
+    CHECK(armed->upstream_recv_slice != nullptr);
+
+    armed->upstream_recv_armed = true;
+    armed->upstream_recv_buf.reset();
+    on_upstream_request_sent<EpollEventLoop>(
+        static_cast<void*>(loop), *armed, make_ev(armed->id, IoEventType::UpstreamSend, -32));
+    CHECK_EQ(armed->on_upstream_recv, &on_upstream_response<EpollEventLoop>);
+    CHECK_EQ(armed->on_upstream_send, nullptr);
+
+    loop->close_conn(*armed);
+    CHECK_EQ(loop->active_count(), 0u);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
 // === Coverage: drain inject with no-body response ===
 
 TEST(drain, inject_close_header_no_body) {
@@ -9437,6 +9621,10 @@ TEST(route_coverage, proxy_route_creates_socket) {
     loop.setup();
     loop.config_ptr = &active;
 
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeUpstreamSocket fake_socket(fds[0]);
+
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
@@ -9451,11 +9639,11 @@ TEST(route_coverage, proxy_route_creates_socket) {
     CHECK_EQ(c->state, ConnState::Proxying);
     CHECK(c->upstream_fd >= 0);
     CHECK_EQ(c->upstream_name[0], 'b');  // "backend"
-    // Clean up real socket
     if (c->upstream_fd >= 0) {
         close(c->upstream_fd);
         c->upstream_fd = -1;
     }
+    close(fds[1]);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 0));
 }
 
@@ -9468,6 +9656,10 @@ TEST(async_coverage, proxy_route_creates_socket) {
     AsyncSmallLoop loop;
     loop.setup();
     loop.config_ptr = &active;
+
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeUpstreamSocket fake_socket(fds[0]);
 
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
@@ -9486,6 +9678,7 @@ TEST(async_coverage, proxy_route_creates_socket) {
         close(c->upstream_fd);
         c->upstream_fd = -1;
     }
+    close(fds[1]);
 }
 
 TEST(async_coverage, pipeline_two_requests) {

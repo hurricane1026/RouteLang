@@ -52,7 +52,9 @@ static bool parse_u32_token(const char* s, u32 len, u32* out) {
     u32 v = 0;
     for (u32 i = 0; i < len; i++) {
         if (s[i] < '0' || s[i] > '9') return false;
-        v = v * 10 + static_cast<u32>(s[i] - '0');
+        const u32 digit = static_cast<u32>(s[i] - '0');
+        if (v > (static_cast<u32>(-1) - digit) / 10) return false;
+        v = v * 10 + digit;
     }
     *out = v;
     return true;
@@ -156,7 +158,9 @@ static bool route_matches(const Engine::CompiledRoute& route, const char* path, 
         if (route.pattern[ri] == ':') {
             ri++;
             while (ri < route.pattern_len && route.pattern[ri] != '/') ri++;
+            const u32 param_start = pi;
             while (pi < path_len && path[pi] != '/' && path[pi] != '?') pi++;
+            if (pi == param_start) return false;
             continue;
         }
         if (pi >= path_len) return false;
@@ -354,8 +358,11 @@ bool load_manifest(const char* path, Manifest& out) {
             }
             auto& route = out.routes[out.route_count++];
             route.method = kMethod;
-            u32 pattern_len = tokens[2].len;
-            if (pattern_len >= sizeof(route.pattern)) pattern_len = sizeof(route.pattern) - 1;
+            if (tokens[2].len >= sizeof(route.pattern)) {
+                munmap(map, static_cast<u64>(st.st_size));
+                return false;
+            }
+            const u32 pattern_len = tokens[2].len;
             for (u32 i = 0; i < pattern_len; i++) route.pattern[i] = tokens[2].ptr[i];
             route.pattern[pattern_len] = '\0';
 

@@ -1,6 +1,7 @@
 #include "rut/sim/simulate_engine.h"
 #include "test.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -14,8 +15,10 @@ static CaptureEntry make_entry(const char* req, u16 status, const char* upstream
     CaptureEntry entry{};
     u32 len = 0;
     while (req[len]) len++;
-    __builtin_memcpy(entry.raw_headers, req, len);
-    entry.raw_header_len = static_cast<u16>(len);
+    const u32 bounded_len =
+        len > CaptureEntry::kMaxHeaderLen ? static_cast<u32>(CaptureEntry::kMaxHeaderLen) : len;
+    __builtin_memcpy(entry.raw_headers, req, bounded_len);
+    entry.raw_header_len = static_cast<u16>(bounded_len);
     entry.resp_status = status;
     if (upstream) {
         u32 i = 0;
@@ -140,6 +143,73 @@ TEST(simulate_engine, param_prefix_route_matches) {
 
     engine.shutdown();
     ctx.destroy();
+}
+
+TEST(simulate_engine, param_route_rejects_empty_segment) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = 'G';
+    strcpy(manifest.routes[0].pattern, "/users/:id");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 201;
+
+    ModuleContext ctx;
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+
+    const auto result =
+        simulate_one(engine, make_entry("GET /users/ HTTP/1.1\r\nHost: x\r\n\r\n", 200));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 200u);
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
+TEST(simulate_engine, make_entry_clamps_long_headers) {
+    char req[CaptureEntry::kMaxHeaderLen + 32];
+    for (u32 i = 0; i + 1 < sizeof(req); i++) req[i] = 'a';
+    req[sizeof(req) - 1] = '\0';
+
+    const auto entry = make_entry(req, 204);
+    CHECK_EQ(entry.raw_header_len, static_cast<u16>(CaptureEntry::kMaxHeaderLen));
+}
+
+TEST(simulate_engine, load_manifest_rejects_overflowing_u32) {
+    char path[] = "/tmp/rut_sim_manifest_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+
+    static const char kManifest[] = "upstream 42949672960 api-v1\n";
+    REQUIRE(write(fd, kManifest, sizeof(kManifest) - 1) ==
+            static_cast<ssize_t>(sizeof(kManifest) - 1));
+    close(fd);
+
+    Manifest manifest;
+    CHECK(!load_manifest(path, manifest));
+    unlink(path);
+}
+
+TEST(simulate_engine, load_manifest_rejects_too_long_pattern) {
+    char pattern[160];
+    pattern[0] = '/';
+    for (u32 i = 1; i + 1 < sizeof(pattern); i++) pattern[i] = 'a';
+    pattern[sizeof(pattern) - 1] = '\0';
+
+    char manifest_buf[256];
+    const i32 manifest_len =
+        snprintf(manifest_buf, sizeof(manifest_buf), "route GET %s status 204\n", pattern);
+    REQUIRE(manifest_len > 0);
+
+    char path[] = "/tmp/rut_sim_manifest_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    REQUIRE(write(fd, manifest_buf, static_cast<size_t>(manifest_len)) == manifest_len);
+    close(fd);
+
+    Manifest manifest;
+    CHECK(!load_manifest(path, manifest));
+    unlink(path);
 }
 
 TEST(simulate_engine, summary_counts_mismatch) {

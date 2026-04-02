@@ -285,10 +285,12 @@ bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
 
 void ModuleContext::destroy() {
     arena.destroy();
+    module = {};
 }
 
 bool load_manifest(const char* path, Manifest& out) {
     out = Manifest{};
+    Manifest parsed{};
 
     const i32 kFd = ::open(path, O_RDONLY);
     if (kFd < 0) return false;
@@ -353,7 +355,7 @@ bool load_manifest(const char* path, Manifest& out) {
         if (tok_count == 0) continue;
 
         if (tokens[0].len == 8 && __builtin_memcmp(tokens[0].ptr, "upstream", 8) == 0) {
-            if (tok_count != 3 || out.upstream_count >= Manifest::kMaxUpstreams) {
+            if (tok_count != 3 || parsed.upstream_count >= Manifest::kMaxUpstreams) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
@@ -362,12 +364,12 @@ bool load_manifest(const char* path, Manifest& out) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
-            auto& up = out.upstreams[out.upstream_count];
+            auto& up = parsed.upstreams[parsed.upstream_count];
             if (tokens[2].len >= sizeof(up.name)) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
-            out.upstream_count++;
+            parsed.upstream_count++;
             up.id = static_cast<u16>(id);
             u32 copy_len = tokens[2].len;
             for (u32 i = 0; i < copy_len; i++) up.name[i] = tokens[2].ptr[i];
@@ -376,7 +378,7 @@ bool load_manifest(const char* path, Manifest& out) {
         }
 
         if (tokens[0].len == 5 && __builtin_memcmp(tokens[0].ptr, "route", 5) == 0) {
-            if (tok_count != 5 || out.route_count >= Manifest::kMaxRoutes) {
+            if (tok_count != 5 || parsed.route_count >= Manifest::kMaxRoutes) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
@@ -386,7 +388,7 @@ bool load_manifest(const char* path, Manifest& out) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
-            auto& route = out.routes[out.route_count++];
+            auto& route = parsed.routes[parsed.route_count++];
             route.method = kMethod;
             if (tokens[2].len >= sizeof(route.pattern)) {
                 munmap(map, static_cast<u64>(st.st_size));
@@ -423,12 +425,14 @@ bool load_manifest(const char* path, Manifest& out) {
         return false;
     }
 
-    const bool ok = validate_manifest(out);
+    const bool ok = validate_manifest(parsed);
     munmap(map, static_cast<u64>(st.st_size));
+    if (ok) out = parsed;
     return ok;
 }
 
 bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
+    if (manifest.route_count > Manifest::kMaxRoutes) return false;
     if (!ctx.init(manifest.route_count == 0 ? 1 : manifest.route_count)) return false;
     const auto fail = [&ctx]() {
         ctx.destroy();

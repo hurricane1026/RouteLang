@@ -289,6 +289,21 @@ TEST(simulate_engine, load_manifest_rejects_invalid_inputs) {
     }
 }
 
+TEST(simulate_engine, load_manifest_failure_clears_partial_state) {
+    Manifest manifest{};
+    manifest.route_count = 3;
+    manifest.upstream_count = 2;
+    manifest.routes[0].status_code = 503;
+    strcpy(manifest.upstreams[0].name, "stale");
+
+    CHECK(!load_manifest_text("upstream 7 api-v1\nroute GET /x proxy 9\n", &manifest));
+    CHECK_EQ(manifest.route_count, 0u);
+    CHECK_EQ(manifest.upstream_count, 0u);
+    CHECK_EQ(manifest.routes[0].status_code, 200u);
+    CHECK_EQ(manifest.routes[0].upstream_id, 0u);
+    CHECK_EQ(manifest.upstreams[0].name[0], '\0');
+}
+
 TEST(simulate_engine, load_manifest_rejects_too_large_file) {
     char path[] = "/tmp/rut_sim_manifest_XXXXXX";
     i32 fd = mkstemp(path);
@@ -299,6 +314,40 @@ TEST(simulate_engine, load_manifest_rejects_too_large_file) {
     Manifest manifest;
     CHECK(!load_manifest(path, manifest));
     unlink(path);
+}
+
+TEST(simulate_engine, module_context_destroy_resets_state) {
+    ModuleContext ctx{};
+    REQUIRE(ctx.init(2));
+    CHECK(ctx.arena.current != nullptr);
+    CHECK(ctx.module.arena == &ctx.arena);
+    CHECK(ctx.module.functions != nullptr);
+    CHECK(ctx.module.struct_defs != nullptr);
+
+    ctx.destroy();
+    CHECK_EQ(ctx.arena.current, nullptr);
+    CHECK_EQ(ctx.module.arena, nullptr);
+    CHECK_EQ(ctx.module.functions, nullptr);
+    CHECK_EQ(ctx.module.struct_defs, nullptr);
+    CHECK_EQ(ctx.module.func_count, 0u);
+    CHECK_EQ(ctx.module.func_cap, 0u);
+    CHECK_EQ(ctx.module.struct_count, 0u);
+    CHECK_EQ(ctx.module.struct_cap, 0u);
+
+    ctx.destroy();
+    CHECK_EQ(ctx.arena.current, nullptr);
+    CHECK_EQ(ctx.module.arena, nullptr);
+}
+
+TEST(simulate_engine, build_module_rejects_invalid_route_count_without_init) {
+    Manifest manifest{};
+    manifest.route_count = Manifest::kMaxRoutes + 1;
+
+    ModuleContext ctx{};
+    CHECK(!build_module_from_manifest(manifest, ctx));
+    CHECK_EQ(ctx.arena.current, nullptr);
+    CHECK_EQ(ctx.module.arena, nullptr);
+    CHECK_EQ(ctx.module.functions, nullptr);
 }
 
 TEST(simulate_engine, param_route_matching_matrix) {

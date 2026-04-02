@@ -79,10 +79,7 @@ struct AccessLogRing {
     alignas(64) std::atomic<u32> read_pos;   // written by flusher thread only
     AccessLogEntry entries[kCapacity];
 
-    void init() {
-        write_pos = 0;
-        read_pos = 0;
-    }
+    void init();
 
     // Producer: write an entry. Returns false if full (entry dropped).
     // Called from shard thread only — no contention on write_pos.
@@ -92,38 +89,14 @@ struct AccessLogRing {
     // read_pos while the consumer is mid-read of the slot being overwritten.
     // Dropping newest under backpressure is acceptable for access logs —
     // the flusher will catch up and future entries will succeed.
-    bool push(const AccessLogEntry& entry) {
-        u32 wp = write_pos.load(std::memory_order_relaxed);
-        u32 rp = read_pos.load(std::memory_order_acquire);
-
-        if (wp - rp >= kCapacity) {
-            return false;  // full — drop this entry
-        }
-
-        entries[wp & kMask] = entry;
-        write_pos.store(wp + 1, std::memory_order_release);
-        return true;
-    }
+    bool push(const AccessLogEntry& entry);
 
     // Consumer: read one entry. Returns false if empty.
     // Called from flusher thread only — no contention on read_pos.
-    bool pop(AccessLogEntry& out) {
-        u32 rp = read_pos.load(std::memory_order_relaxed);
-        u32 wp = write_pos.load(std::memory_order_acquire);
-
-        if (rp == wp) return false;  // empty
-
-        out = entries[rp & kMask];
-        read_pos.store(rp + 1, std::memory_order_release);
-        return true;
-    }
+    bool pop(AccessLogEntry& out);
 
     // Number of entries available to read.
-    u32 available() const {
-        u32 wp = write_pos.load(std::memory_order_acquire);
-        u32 rp = read_pos.load(std::memory_order_relaxed);
-        return wp - rp;
-    }
+    u32 available() const;
 };
 
 // Format an access log entry as a text line into buf.
@@ -167,26 +140,9 @@ struct AccessLogFlusher {
     void init(i32 fd,
               bool compress_enabled = false,
               i32 level = kDefaultLevel,
-              u32 interval_ms = 100) {
-        ring_count = 0;
-        output_fd = fd;
-        flush_interval_ms = interval_ms;
-        compress = compress_enabled;
-        // Clamp level to supported range (fast + doubleFast only).
-        if (level < kMinLevel) level = kMinLevel;
-        if (level > kMaxLevel) level = kMaxLevel;
-        compress_level = level;
-        thread = 0;
-        running = false;
-        zstd_ctx = nullptr;
-        for (u32 i = 0; i < kMaxRings; i++) rings[i] = nullptr;
-    }
+              u32 interval_ms = 100);
 
-    void add_ring(AccessLogRing* ring) {
-        if (ring_count < kMaxRings) {
-            rings[ring_count++] = ring;
-        }
-    }
+    void add_ring(AccessLogRing* ring);
 
     core::Expected<void, Error> start();
     void stop();

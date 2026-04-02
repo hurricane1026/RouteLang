@@ -4,9 +4,6 @@
 #include "rut/runtime/access_log.h"  // realtime_us()
 #include <atomic>
 
-#include <errno.h>
-#include <unistd.h>
-
 namespace rut {
 
 // Traffic capture entry — fixed-size, written by shard thread on request completion.
@@ -56,27 +53,8 @@ struct CaptureFileHeader {
 
 static_assert(sizeof(CaptureFileHeader) == 64, "CaptureFileHeader must be 64 bytes");
 
-inline void capture_file_header_init(CaptureFileHeader* hdr) {
-    __builtin_memset(hdr, 0, sizeof(*hdr));
-    // "RUTCAP01"
-    hdr->magic[0] = 'R';
-    hdr->magic[1] = 'U';
-    hdr->magic[2] = 'T';
-    hdr->magic[3] = 'C';
-    hdr->magic[4] = 'A';
-    hdr->magic[5] = 'P';
-    hdr->magic[6] = '0';
-    hdr->magic[7] = '1';
-    hdr->version = 1;
-    hdr->entry_size = sizeof(CaptureEntry);
-}
-
-inline bool capture_file_header_valid(const CaptureFileHeader* hdr) {
-    return hdr->magic[0] == 'R' && hdr->magic[1] == 'U' && hdr->magic[2] == 'T' &&
-           hdr->magic[3] == 'C' && hdr->magic[4] == 'A' && hdr->magic[5] == 'P' &&
-           hdr->magic[6] == '0' && hdr->magic[7] == '1' && hdr->version == 1 &&
-           hdr->entry_size == sizeof(CaptureEntry);
-}
+void capture_file_header_init(CaptureFileHeader* hdr);
+bool capture_file_header_valid(const CaptureFileHeader* hdr);
 
 // SPSC ring buffer for traffic capture entries.
 //
@@ -142,38 +120,10 @@ struct CaptureRing {
 //       capture_write_entry(fd, entry);
 //       count++;
 //   }
-inline i32 capture_write_entry(i32 fd, const CaptureEntry& entry) {
-    const u8* p = reinterpret_cast<const u8*>(&entry);
-    u32 remaining = sizeof(CaptureEntry);
-    while (remaining > 0) {
-        ssize_t n = write(fd, p, remaining);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;  // shouldn't happen on regular files
-        p += n;
-        remaining -= static_cast<u32>(n);
-    }
-    return 0;
-}
+i32 capture_write_entry(i32 fd, const CaptureEntry& entry);
 
 // Read one capture entry from fd at current position.
 // Returns 0 on success, -1 on error/EOF.
-inline i32 capture_read_entry(i32 fd, CaptureEntry& entry) {
-    u8* p = reinterpret_cast<u8*>(&entry);
-    u32 remaining = sizeof(CaptureEntry);
-    while (remaining > 0) {
-        ssize_t n = read(fd, p, remaining);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;  // EOF mid-entry
-        p += n;
-        remaining -= static_cast<u32>(n);
-    }
-    return 0;
-}
+i32 capture_read_entry(i32 fd, CaptureEntry& entry);
 
 }  // namespace rut

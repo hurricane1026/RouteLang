@@ -3,7 +3,7 @@
 // Shared test infrastructure — mock event loop, real socket helpers.
 
 #include "mock_backend.h"
-#include "rut/runtime/callbacks.h"
+#include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/event_loop.h"

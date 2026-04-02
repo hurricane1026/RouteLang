@@ -165,6 +165,12 @@ vA8OzIXZ3awxryXhlCUrFw==
 )";
 
 struct TempFile {
+    TempFile() { path[0] = '\0'; }
+    ~TempFile() { cleanup(); }
+
+    TempFile(const TempFile&) = delete;
+    TempFile& operator=(const TempFile&) = delete;
+
     char path[64];
     bool valid = false;
 
@@ -1141,8 +1147,6 @@ TEST(shard, serves_https_requests) {
     shard.shutdown();
     close(lfd);
     destroy_tls_server_context(tls_ctx.value());
-    cert_file.cleanup();
-    key_file.cleanup();
 }
 
 TEST(tls, rejects_invalid_private_key_file) {
@@ -1153,9 +1157,6 @@ TEST(tls, rejects_invalid_private_key_file) {
 
     auto tls_ctx = create_tls_server_context(cert_file.path, invalid_key_file.path);
     CHECK(!tls_ctx.has_value());
-
-    cert_file.cleanup();
-    invalid_key_file.cleanup();
 }
 
 TEST(shard, serves_https_keepalive_requests) {
@@ -1207,8 +1208,6 @@ TEST(shard, serves_https_keepalive_requests) {
     shard.shutdown();
     close(lfd);
     destroy_tls_server_context(tls_ctx.value());
-    cert_file.cleanup();
-    key_file.cleanup();
 }
 
 TEST(shard, recovers_after_failed_tls_handshake) {
@@ -1266,8 +1265,6 @@ TEST(shard, recovers_after_failed_tls_handshake) {
     shard.shutdown();
     close(lfd);
     destroy_tls_server_context(tls_ctx.value());
-    cert_file.cleanup();
-    key_file.cleanup();
 }
 
 // Two shards on same port (SO_REUSEPORT)

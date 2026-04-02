@@ -57,7 +57,7 @@ static i32 map_tls_error(SSL* ssl, i32 rc) {
 }
 
 static u32 tls_interest_for_error(i32 ssl_err) {
-    if (ssl_err == SSL_ERROR_WANT_WRITE) return EPOLLIN | EPOLLOUT;
+    if (ssl_err == SSL_ERROR_WANT_WRITE) return EPOLLOUT;
     return EPOLLIN;
 }
 

@@ -1,13 +1,20 @@
 #pragma once
 
+#include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/callbacks.h"
+#include "rut/runtime/chunked_parser.h"
+#include "rut/runtime/connection.h"
+#include "rut/runtime/connection_base.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/io_event.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
 
 #include <errno.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 namespace rut {
 
@@ -22,19 +29,19 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
 
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size) {
-    u32 duration_us = static_cast<u32>(monotonic_us() - conn.req_start_us);
+    const u32 kDurationUs = static_cast<u32>(monotonic_us() - conn.req_start_us);
 
     // Clear req_start_us so close_conn_impl knows no request is in flight.
     conn.req_start_us = 0;
 
     if (loop->metrics) {
-        loop->metrics->on_request_complete(duration_us);
+        loop->metrics->on_request_complete(kDurationUs);
     }
 
     if (loop->access_log) {
         AccessLogEntry entry{};
         entry.timestamp_us = realtime_us();
-        entry.duration_us = duration_us;
+        entry.duration_us = kDurationUs;
         entry.status = status;
         entry.method = conn.req_method;
         entry.shard_id = conn.shard_id;
@@ -86,8 +93,9 @@ void pipeline_dispatch(Loop* loop, Connection& conn) {
     // Refresh keepalive timer — synthetic dispatch skips the normal
     // EventLoop::dispatch() which calls timer.refresh().
     loop->timer.refresh(&conn, loop->keepalive_timeout);
-    IoEvent synth = {conn.id, static_cast<i32>(conn.recv_buf.len()), 0, 0, IoEventType::Recv, 0};
-    on_header_received<Loop>(static_cast<void*>(loop), conn, synth);
+    const IoEvent kSynth = {
+        conn.id, static_cast<i32>(conn.recv_buf.len()), 0, 0, IoEventType::Recv, 0};
+    on_header_received<Loop>(static_cast<void*>(loop), conn, kSynth);
 }
 
 template <typename Loop>
@@ -129,8 +137,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
 
-    bool keep_alive = !loop->is_draining();
-    conn.keep_alive = keep_alive;
+    const bool kKeepAlive = !loop->is_draining();
+    conn.keep_alive = kKeepAlive;
 
     // Route matching: config_ptr → active RouteConfig (may be null in tests).
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
@@ -142,7 +150,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // is a known limitation of RouteConfig — JIT routing will use
         // the full HttpMethod enum.
         static constexpr u8 kMethodChars[] = {'G', 'P', 'P', 'D', 'P', 'H', 'O', 'C', 'T', 0};
-        u8 method_char = conn.req_method < sizeof(kMethodChars) ? kMethodChars[conn.req_method] : 0;
+        const u8 kMethodChar =
+            conn.req_method < sizeof(kMethodChars) ? kMethodChars[conn.req_method] : 0;
         route = config->match(
             reinterpret_cast<const u8*>(conn.req_path),
             [&]() -> u32 {
@@ -150,7 +159,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 while (conn.req_path[n]) n++;
                 return n;
             }(),
-            method_char);
+            kMethodChar);
     }
 
     if (route && route->action == RouteAction::Proxy) {
@@ -162,8 +171,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_name[target.name_len] = '\0';
         else
             conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
-        i32 ufd = UpstreamPool::create_socket();
-        if (ufd < 0) {
+        const i32 kUpstreamFd = UpstreamPool::create_socket();
+        if (kUpstreamFd < 0) {
             conn.state = ConnState::Sending;
             conn.resp_status = kStatusBadGateway;
             format_static_response(conn, 502, false);
@@ -172,21 +181,21 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
-        conn.upstream_fd = ufd;
+        conn.upstream_fd = kUpstreamFd;
         conn.upstream_start_us = monotonic_us();
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
         loop->submit_connect(conn, &target.addr, sizeof(target.addr));
     } else if (route && route->action == RouteAction::Static) {
         conn.state = ConnState::Sending;
         conn.resp_status = route->status_code;
-        format_static_response(conn, route->status_code, keep_alive);
+        format_static_response(conn, route->status_code, kKeepAlive);
         conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
     } else {
         conn.state = ConnState::Sending;
         conn.resp_status = kStatusOK;
         conn.send_buf.reset();
-        if (keep_alive)
+        if (kKeepAlive)
             conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200), kResponse200Len);
         else
             conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
@@ -298,11 +307,11 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         if (conn.upstream_fd >= 0) {
-            u32 avail = conn.upstream_recv_buf.write_avail();
-            if (avail > 0) {
+            const u32 kAvail = conn.upstream_recv_buf.write_avail();
+            if (kAvail > 0) {
                 ssize_t nr;
                 do {
-                    nr = recv(conn.upstream_fd, conn.upstream_recv_buf.write_ptr(), avail, 0);
+                    nr = recv(conn.upstream_fd, conn.upstream_recv_buf.write_ptr(), kAvail, 0);
                 } while (nr < 0 && errno == EINTR);
                 if (nr > 0) {
                     conn.upstream_recv_buf.commit(static_cast<u32>(nr));
@@ -319,11 +328,11 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    bool more_req_body =
+    const bool kMoreReqBody =
         (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
         (conn.req_body_mode == BodyMode::Chunked &&
          conn.req_chunk_parser.state != ChunkedParser::State::Complete);
-    if (more_req_body) {
+    if (kMoreReqBody) {
         conn.recv_buf.reset();
         conn.set_slots(
             &on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
@@ -359,9 +368,9 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     conn.set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
-    u32 remaining = consume_upstream_sent(conn);
-    if (remaining > 0) {
-        IoEvent synth = {conn.id, static_cast<i32>(remaining), 0, 0, IoEventType::UpstreamRecv, 0};
+    const u32 kRemaining = consume_upstream_sent(conn);
+    if (kRemaining > 0) {
+        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
         loop->submit_recv_upstream(conn);
@@ -383,28 +392,28 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    u32 data_len = conn.upstream_recv_buf.len();
-    u32 send_len = data_len;
+    const u32 kDataLen = conn.upstream_recv_buf.len();
+    u32 send_len = kDataLen;
 
     if (conn.resp_body_mode == BodyMode::ContentLength) {
-        u32 consume = data_len;
+        u32 consume = kDataLen;
         if (consume > conn.resp_body_remaining) consume = conn.resp_body_remaining;
         conn.resp_body_remaining -= consume;
         send_len = consume;
     } else if (conn.resp_body_mode == BodyMode::Chunked) {
         const u8* body_data = conn.upstream_recv_buf.data();
         u32 pos = 0;
-        while (pos < data_len) {
+        while (pos < kDataLen) {
             u32 consumed = 0, out_start = 0, out_len = 0;
-            ChunkStatus cs = conn.resp_chunk_parser.feed(
-                body_data + pos, data_len - pos, &consumed, &out_start, &out_len);
+            const ChunkStatus kChunkStatus = conn.resp_chunk_parser.feed(
+                body_data + pos, kDataLen - pos, &consumed, &out_start, &out_len);
             pos += consumed;
-            if (cs == ChunkStatus::Done) break;
-            if (cs == ChunkStatus::Error) {
+            if (kChunkStatus == ChunkStatus::Done) break;
+            if (kChunkStatus == ChunkStatus::Error) {
                 loop->close_conn(conn);
                 return;
             }
-            if (cs == ChunkStatus::NeedMore) break;
+            if (kChunkStatus == ChunkStatus::NeedMore) break;
         }
         send_len = pos;
     }
@@ -426,7 +435,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     conn.set_slots(nullptr, nullptr, nullptr, nullptr);
-    u32 remaining = consume_upstream_sent(conn);
+    const u32 kRemaining = consume_upstream_sent(conn);
 
     bool body_done = false;
     if (conn.resp_body_mode == BodyMode::ContentLength) {
@@ -455,9 +464,9 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         }
 
         if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
-            u16 slen = conn.pipeline_stash_len;
-            u32 late_len = conn.recv_buf.len();
-            if (static_cast<u32>(slen) + late_len > conn.recv_buf.capacity()) {
+            const u16 kStashLen = conn.pipeline_stash_len;
+            const u32 kLateLen = conn.recv_buf.len();
+            if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
                 conn.pipeline_stash_len = 0;
                 conn.send_buf.reset();
                 loop->close_conn(conn);
@@ -465,10 +474,10 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
             }
             conn.pipeline_stash_len = 0;
             conn.upstream_recv_buf.reset();
-            conn.upstream_recv_buf.write(conn.recv_buf.data(), late_len);
+            conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
             conn.recv_buf.reset();
-            conn.recv_buf.write(conn.send_buf.data(), slen);
-            conn.recv_buf.write(conn.upstream_recv_buf.data(), late_len);
+            conn.recv_buf.write(conn.send_buf.data(), kStashLen);
+            conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
             conn.upstream_recv_buf.reset();
             conn.send_buf.reset();
             conn.pipeline_depth++;
@@ -493,8 +502,8 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     conn.set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
-    if (remaining > 0) {
-        IoEvent synth = {conn.id, static_cast<i32>(remaining), 0, 0, IoEventType::UpstreamRecv, 0};
+    if (kRemaining > 0) {
+        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
         loop->submit_recv_upstream(conn);
@@ -516,29 +525,29 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
     ParsedResponse resp;
     resp.reset();
     resp_parser.reset();
-    ParseStatus ps =
+    const ParseStatus kParseStatus =
         resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
-    bool can_rearm = !conn.upstream_recv_armed && !send_in_flight;
-    if (ps == ParseStatus::Incomplete) {
-        if (can_rearm) loop->submit_recv_upstream(conn);
+    const bool kCanRearm = !conn.upstream_recv_armed && !send_in_flight;
+    if (kParseStatus == ParseStatus::Incomplete) {
+        if (kCanRearm) loop->submit_recv_upstream(conn);
         return;
     }
-    if (ps == ParseStatus::Complete && resp.status_code >= 100 && resp.status_code < 200 &&
-        resp.status_code != 101) {
-        u32 interim_end = resp_parser.header_end;
-        u32 total = conn.upstream_recv_buf.len();
-        if (interim_end < total) {
-            u32 remaining = total - interim_end;
-            const u8* src = conn.upstream_recv_buf.data() + interim_end;
+    if (kParseStatus == ParseStatus::Complete && resp.status_code >= 100 &&
+        resp.status_code < 200 && resp.status_code != 101) {
+        const u32 kInterimEnd = resp_parser.header_end;
+        const u32 kTotal = conn.upstream_recv_buf.len();
+        if (kInterimEnd < kTotal) {
+            const u32 kRemaining = kTotal - kInterimEnd;
+            const u8* src = conn.upstream_recv_buf.data() + kInterimEnd;
             conn.upstream_recv_buf.reset();
             u8* dst = conn.upstream_recv_buf.write_ptr();
-            __builtin_memmove(dst, src, remaining);
-            conn.upstream_recv_buf.commit(remaining);
+            __builtin_memmove(dst, src, kRemaining);
+            conn.upstream_recv_buf.commit(kRemaining);
             handle_early_upstream_recv<Loop>(loop, conn, ev, send_in_flight);
             return;
         }
         conn.upstream_recv_buf.reset();
-        if (can_rearm) loop->submit_recv_upstream(conn);
+        if (kCanRearm) loop->submit_recv_upstream(conn);
         return;
     }
     conn.on_upstream_send = &on_body_send_with_early_response<Loop>;
@@ -556,11 +565,12 @@ void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
     ParsedResponse probe_resp;
     probe_resp.reset();
     probe.reset();
-    ParseStatus ps =
+    const ParseStatus kParseStatus =
         probe.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &probe_resp);
-    i32 synth_result =
-        (ps == ParseStatus::Incomplete) ? 0 : static_cast<i32>(conn.upstream_recv_buf.len());
-    IoEvent synth = {conn.id, synth_result, 0, 0, IoEventType::UpstreamRecv, 0};
+    const i32 kSynthResult = (kParseStatus == ParseStatus::Incomplete)
+                                 ? 0
+                                 : static_cast<i32>(conn.upstream_recv_buf.len());
+    IoEvent synth = {conn.id, kSynthResult, 0, 0, IoEventType::UpstreamRecv, 0};
     on_upstream_response<Loop>(lp, conn, synth);
 }
 
@@ -588,11 +598,11 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         if (conn.upstream_fd >= 0) {
-            u32 avail = conn.upstream_recv_buf.write_avail();
-            if (avail > 0) {
+            const u32 kAvail = conn.upstream_recv_buf.write_avail();
+            if (kAvail > 0) {
                 ssize_t nr;
                 do {
-                    nr = recv(conn.upstream_fd, conn.upstream_recv_buf.write_ptr(), avail, 0);
+                    nr = recv(conn.upstream_fd, conn.upstream_recv_buf.write_ptr(), kAvail, 0);
                 } while (nr < 0 && errno == EINTR);
                 if (nr > 0) {
                     conn.upstream_recv_buf.commit(static_cast<u32>(nr));
@@ -666,27 +676,27 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    u32 data_len = conn.recv_buf.len();
-    u32 send_len = data_len;
+    const u32 kDataLen = conn.recv_buf.len();
+    u32 send_len = kDataLen;
     if (conn.req_body_mode == BodyMode::ContentLength) {
-        u32 consume = data_len;
+        u32 consume = kDataLen;
         if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
         conn.req_body_remaining -= consume;
         send_len = consume;
     } else if (conn.req_body_mode == BodyMode::Chunked) {
         const u8* body_data = conn.recv_buf.data();
         u32 pos = 0;
-        while (pos < data_len) {
+        while (pos < kDataLen) {
             u32 consumed = 0, out_start = 0, out_len = 0;
-            ChunkStatus cs = conn.req_chunk_parser.feed(
-                body_data + pos, data_len - pos, &consumed, &out_start, &out_len);
+            const ChunkStatus kChunkStatus = conn.req_chunk_parser.feed(
+                body_data + pos, kDataLen - pos, &consumed, &out_start, &out_len);
             pos += consumed;
-            if (cs == ChunkStatus::Done) break;
-            if (cs == ChunkStatus::Error) {
+            if (kChunkStatus == ChunkStatus::Done) break;
+            if (kChunkStatus == ChunkStatus::Error) {
                 loop->close_conn(conn);
                 return;
             }
-            if (cs == ChunkStatus::NeedMore) break;
+            if (kChunkStatus == ChunkStatus::NeedMore) break;
         }
         send_len = pos;
     }
@@ -751,15 +761,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     conn.resp_status = resp.status_code;
 
     if (resp.status_code >= 100 && resp.status_code < 200 && resp.status_code != 101) {
-        u32 interim_end = resp_parser.header_end;
-        u32 total = conn.upstream_recv_buf.len();
-        if (interim_end < total) {
-            u32 remaining = total - interim_end;
-            const u8* src = conn.upstream_recv_buf.data() + interim_end;
+        const u32 kInterimEnd = resp_parser.header_end;
+        const u32 kTotal = conn.upstream_recv_buf.len();
+        if (kInterimEnd < kTotal) {
+            const u32 kRemaining = kTotal - kInterimEnd;
+            const u8* src = conn.upstream_recv_buf.data() + kInterimEnd;
             conn.upstream_recv_buf.reset();
             u8* dst = conn.upstream_recv_buf.write_ptr();
-            __builtin_memmove(dst, src, remaining);
-            conn.upstream_recv_buf.commit(remaining);
+            __builtin_memmove(dst, src, kRemaining);
+            conn.upstream_recv_buf.commit(kRemaining);
             on_upstream_response<Loop>(lp, conn, ev);
             return;
         }
@@ -768,11 +778,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    bool is_head = (conn.req_method == static_cast<u8>(LogHttpMethod::Head));
-    bool no_body_status =
+    const bool kIsHead = (conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+    const bool kNoBodyStatus =
         resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304;
 
-    if (is_head || no_body_status) {
+    if (kIsHead || kNoBodyStatus) {
         conn.resp_body_mode = BodyMode::None;
         conn.resp_body_remaining = 0;
     } else if (resp.chunked) {
@@ -787,31 +797,31 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.resp_body_remaining = 0;
     }
 
-    u32 header_len = resp_parser.header_end;
-    u32 total_len = conn.upstream_recv_buf.len();
-    u32 initial_body_len = (total_len > header_len) ? total_len - header_len : 0;
+    const u32 kHeaderLen = resp_parser.header_end;
+    const u32 kTotalLen = conn.upstream_recv_buf.len();
+    const u32 kInitialBodyLen = (kTotalLen > kHeaderLen) ? kTotalLen - kHeaderLen : 0;
 
-    if (conn.resp_body_mode == BodyMode::ContentLength && initial_body_len > 0) {
-        u32 consume = initial_body_len;
+    if (conn.resp_body_mode == BodyMode::ContentLength && kInitialBodyLen > 0) {
+        u32 consume = kInitialBodyLen;
         if (consume > conn.resp_body_remaining) consume = conn.resp_body_remaining;
         conn.resp_body_remaining -= consume;
     }
 
     bool chunked_done = false;
-    u32 chunked_consumed = initial_body_len;
-    if (conn.resp_body_mode == BodyMode::Chunked && initial_body_len > 0) {
-        const u8* body_start = conn.upstream_recv_buf.data() + header_len;
+    u32 chunked_consumed = kInitialBodyLen;
+    if (conn.resp_body_mode == BodyMode::Chunked && kInitialBodyLen > 0) {
+        const u8* body_start = conn.upstream_recv_buf.data() + kHeaderLen;
         u32 pos = 0;
-        while (pos < initial_body_len) {
+        while (pos < kInitialBodyLen) {
             u32 consumed = 0, out_start = 0, out_len = 0;
-            ChunkStatus cs = conn.resp_chunk_parser.feed(
-                body_start + pos, initial_body_len - pos, &consumed, &out_start, &out_len);
+            const ChunkStatus kChunkStatus = conn.resp_chunk_parser.feed(
+                body_start + pos, kInitialBodyLen - pos, &consumed, &out_start, &out_len);
             pos += consumed;
-            if (cs == ChunkStatus::Done) {
+            if (kChunkStatus == ChunkStatus::Done) {
                 chunked_done = true;
                 break;
             }
-            if (cs == ChunkStatus::Error) {
+            if (kChunkStatus == ChunkStatus::Error) {
                 if (conn.upstream_fd >= 0) {
                     ::close(conn.upstream_fd);
                     conn.upstream_fd = -1;
@@ -831,29 +841,29 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
-            if (cs == ChunkStatus::NeedMore) break;
+            if (kChunkStatus == ChunkStatus::NeedMore) break;
         }
         chunked_consumed = pos;
     }
 
     if (loop->is_draining()) {
         u8* d = const_cast<u8*>(conn.upstream_recv_buf.data());
-        u32 len = conn.upstream_recv_buf.len();
-        u32 hdr_end =
+        const u32 kLen = conn.upstream_recv_buf.len();
+        const u32 kHdrEnd =
             (resp_parser.header_end >= kHeaderEndLen) ? resp_parser.header_end - kHeaderEndLen : 0;
 
         bool rewritten = false;
-        if (hdr_end > 0) {
-            for (u32 j = 0; j + 14 <= hdr_end; j++) {
+        if (kHdrEnd > 0) {
+            for (u32 j = 0; j + 14 <= kHdrEnd; j++) {
                 if (d[j] == '\r' && d[j + 1] == '\n' && ascii_ci_eq(d + j + 2, "connection", 10) &&
                     d[j + 12] == ':') {
                     u32 val_start = j + 13;
-                    while (val_start < hdr_end && d[val_start] == ' ') val_start++;
+                    while (val_start < kHdrEnd && d[val_start] == ' ') val_start++;
                     u32 val_end = val_start;
-                    while (val_end + 1 < hdr_end && !(d[val_end] == '\r' && d[val_end + 1] == '\n'))
+                    while (val_end + 1 < kHdrEnd && (d[val_end] != '\r' || d[val_end + 1] != '\n'))
                         val_end++;
-                    u32 val_len = val_end - val_start;
-                    if (val_len >= 5) {
+                    const u32 kValLen = val_end - val_start;
+                    if (kValLen >= 5) {
                         d[val_start] = 'c';
                         d[val_start + 1] = 'l';
                         d[val_start + 2] = 'o';
@@ -867,28 +877,29 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             }
         }
 
-        if (!rewritten && hdr_end > 0) {
-            u32 body_start = hdr_end + kHeaderEndLen;
-            u32 raw_body_len = (len > body_start) ? len - body_start : 0;
-            u32 body_len = raw_body_len;
+        if (!rewritten && kHdrEnd > 0) {
+            const u32 kBodyStart = kHdrEnd + kHeaderEndLen;
+            const u32 kRawBodyLen = (kLen > kBodyStart) ? kLen - kBodyStart : 0;
+            u32 body_len = kRawBodyLen;
             if (conn.resp_body_mode == BodyMode::None)
                 body_len = 0;
             else if (conn.resp_body_mode == BodyMode::ContentLength &&
                      body_len > resp.content_length)
                 body_len = resp.content_length;
             static const char kConnClose[] = "Connection: close\r\n";
-            if (hdr_end + kConnCloseLen + kHeaderEndLen + body_len <= conn.send_buf.capacity()) {
+            if (kHdrEnd + kConnCloseLen + kHeaderEndLen + body_len <= conn.send_buf.capacity()) {
                 conn.send_buf.reset();
-                conn.send_buf.write(d, hdr_end + 2);
+                conn.send_buf.write(d, kHdrEnd + 2);
                 conn.send_buf.write(reinterpret_cast<const u8*>(kConnClose), kConnCloseLen);
-                conn.send_buf.write(d + hdr_end + 2, 2 + body_len);
+                conn.send_buf.write(d + kHdrEnd + 2, 2 + body_len);
                 conn.keep_alive = false;
                 conn.resp_body_sent = conn.send_buf.len();
-                bool drain_body_done = (conn.resp_body_mode == BodyMode::None) ||
-                                       (conn.resp_body_mode == BodyMode::ContentLength &&
-                                        conn.resp_body_remaining == 0) ||
-                                       (conn.resp_body_mode == BodyMode::Chunked && chunked_done);
-                if (!drain_body_done) {
+                const bool kDrainBodyDone =
+                    (conn.resp_body_mode == BodyMode::None) ||
+                    (conn.resp_body_mode == BodyMode::ContentLength &&
+                     conn.resp_body_remaining == 0) ||
+                    (conn.resp_body_mode == BodyMode::Chunked && chunked_done);
+                if (!kDrainBodyDone) {
                     conn.set_slots(nullptr, &on_response_header_sent<Loop>, nullptr, nullptr);
                 } else {
                     conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
@@ -910,15 +921,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         body_complete = chunked_done;
     }
 
-    u32 actual_body = initial_body_len;
+    u32 actual_body = kInitialBodyLen;
     if (conn.resp_body_mode == BodyMode::None)
         actual_body = 0;
     else if (conn.resp_body_mode == BodyMode::ContentLength &&
-             initial_body_len > resp.content_length)
+             kInitialBodyLen > resp.content_length)
         actual_body = resp.content_length;
     else if (conn.resp_body_mode == BodyMode::Chunked)
         actual_body = chunked_consumed;
-    u32 initial_send_len = header_len + actual_body;
+    u32 initial_send_len = kHeaderLen + actual_body;
 
     conn.resp_body_sent = initial_send_len;
     conn.upstream_send_len = initial_send_len;
@@ -962,9 +973,9 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.upstream_send_armed = false;
 
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
-        u16 slen = conn.pipeline_stash_len;
-        u32 late_len = conn.recv_buf.len();
-        if (static_cast<u32>(slen) + late_len > conn.recv_buf.capacity()) {
+        const u16 kStashLen = conn.pipeline_stash_len;
+        const u32 kLateLen = conn.recv_buf.len();
+        if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
             conn.pipeline_stash_len = 0;
             conn.send_buf.reset();
             loop->close_conn(conn);
@@ -972,10 +983,10 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.pipeline_stash_len = 0;
         conn.upstream_recv_buf.reset();
-        conn.upstream_recv_buf.write(conn.recv_buf.data(), late_len);
+        conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
         conn.recv_buf.reset();
-        conn.recv_buf.write(conn.send_buf.data(), slen);
-        conn.recv_buf.write(conn.upstream_recv_buf.data(), late_len);
+        conn.recv_buf.write(conn.send_buf.data(), kStashLen);
+        conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();
         conn.pipeline_depth++;

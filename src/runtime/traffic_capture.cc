@@ -1,5 +1,7 @@
 #include "rut/runtime/traffic_capture.h"
 
+#include "rut/common/types.h"
+
 #include <errno.h>
 #include <unistd.h>
 
@@ -30,14 +32,14 @@ i32 capture_write_entry(i32 fd, const CaptureEntry& entry) {
     const u8* p = reinterpret_cast<const u8*>(&entry);
     u32 remaining = sizeof(CaptureEntry);
     while (remaining > 0) {
-        ssize_t n = write(fd, p, remaining);
-        if (n < 0) {
+        const ssize_t kBytesWritten = write(fd, p, remaining);
+        if (kBytesWritten < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (n == 0) return -1;
-        p += n;
-        remaining -= static_cast<u32>(n);
+        if (kBytesWritten == 0) return -1;
+        p += kBytesWritten;
+        remaining -= static_cast<u32>(kBytesWritten);
     }
     return 0;
 }
@@ -46,14 +48,14 @@ i32 capture_read_entry(i32 fd, CaptureEntry& entry) {
     u8* p = reinterpret_cast<u8*>(&entry);
     u32 remaining = sizeof(CaptureEntry);
     while (remaining > 0) {
-        ssize_t n = read(fd, p, remaining);
-        if (n < 0) {
+        const ssize_t kBytesRead = read(fd, p, remaining);
+        if (kBytesRead < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (n == 0) return -1;
-        p += n;
-        remaining -= static_cast<u32>(n);
+        if (kBytesRead == 0) return -1;
+        p += kBytesRead;
+        remaining -= static_cast<u32>(kBytesRead);
     }
     return 0;
 }

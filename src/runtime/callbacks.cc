@@ -234,19 +234,23 @@ bool pipeline_recover(Connection& conn) {
     return true;
 }
 
-const char kResponse200[] =
+extern const char kResponse200[] =
     "HTTP/1.1 200 OK\r\n"
     "Content-Length: 2\r\n"
     "Connection: keep-alive\r\n"
     "\r\n"
     "OK";
 
-const char kResponse200Close[] =
+extern const char kResponse200Close[] =
     "HTTP/1.1 200 OK\r\n"
     "Content-Length: 2\r\n"
     "Connection: close\r\n"
     "\r\n"
     "OK";
+
+static_assert(sizeof(kResponse200) - 1 == kResponse200Len, "kResponse200Len must match payload");
+static_assert(sizeof(kResponse200Close) - 1 == kResponse200CloseLen,
+              "kResponse200CloseLen must match payload");
 
 void capture_stage_headers(Connection& conn) {
     conn.capture_header_len = 0;

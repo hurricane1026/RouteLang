@@ -18,6 +18,22 @@
 
 namespace rut {
 
+u8 map_log_method(HttpMethod method);
+u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len);
+void capture_request_metadata(Connection& conn);
+u32 pipeline_leftover(const Connection& conn);
+bool pipeline_shift(Connection& conn);
+void pipeline_stash(Connection& conn);
+bool pipeline_recover(Connection& conn);
+void capture_stage_headers(Connection& conn);
+const char* status_reason(u16 code);
+void format_static_response(Connection& conn, u16 code, bool keep_alive);
+void prepare_early_response_state(Connection& conn);
+u32 consume_upstream_sent(Connection& conn);
+
+extern const char kResponse200[];
+extern const char kResponse200Close[];
+
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size);
 

@@ -1767,6 +1767,7 @@ TEST(capture_stress, spsc_backpressure) {
 
     pthread_t prod_thread;
     pthread_create(&prod_thread, nullptr, capture_producer, &prod);
+    pthread_join(prod_thread, nullptr);
 
     u32 consumed = 0;
     u32 last_seq = 0;
@@ -1774,7 +1775,7 @@ TEST(capture_stress, spsc_backpressure) {
     bool data_ok = true;
     CaptureEntry entry{};
 
-    // Slow consumer: pop in small batches
+    // Drain in small batches after the producer has already overrun the ring.
     for (u32 batch = 0; batch < 50; batch++) {
         for (u32 j = 0; j < 32; j++) {
             if (ring->pop(entry)) {
@@ -1788,8 +1789,6 @@ TEST(capture_stress, spsc_backpressure) {
             }
         }
     }
-
-    pthread_join(prod_thread, nullptr);
 
     // Drain
     while (ring->pop(entry)) {

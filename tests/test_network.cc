@@ -9,12 +9,17 @@
 #include "test_helpers.h"
 
 #include <dlfcn.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/types.h>
 
 namespace {
 
 thread_local int g_slice_pool_fail_mmap_call = 0;
 thread_local int g_slice_pool_mmap_call_count = 0;
 thread_local bool g_slice_pool_fail_mprotect = false;
+pthread_once_t g_slice_pool_syscall_once = PTHREAD_ONCE_INIT;
 
 struct ScopedSlicePoolFault {
     explicit ScopedSlicePoolFault(int fail_mmap_call = 0, bool fail_mprotect = false) {
@@ -33,25 +38,41 @@ struct ScopedSlicePoolFault {
 using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
 using MprotectFn = int (*)(void*, size_t, int);
 
+MmapFn g_real_mmap = nullptr;
+MprotectFn g_real_mprotect = nullptr;
+
+void resolve_slice_pool_syscalls() {
+    g_real_mmap = reinterpret_cast<MmapFn>(dlsym(RTLD_NEXT, "mmap"));
+    g_real_mprotect = reinterpret_cast<MprotectFn>(dlsym(RTLD_NEXT, "mprotect"));
+}
+
 }  // namespace
 
 extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
-    static auto* real_mmap = reinterpret_cast<MmapFn>(dlsym(RTLD_NEXT, "mmap"));
+    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
     if (g_slice_pool_fail_mmap_call > 0 &&
         ++g_slice_pool_mmap_call_count == g_slice_pool_fail_mmap_call) {
         errno = ENOMEM;
         return MAP_FAILED;
     }
-    return real_mmap(addr, len, prot, flags, fd, offset);
+    if (!g_real_mmap) {
+        errno = ENOSYS;
+        return MAP_FAILED;
+    }
+    return g_real_mmap(addr, len, prot, flags, fd, offset);
 }
 
 extern "C" int mprotect(void* addr, size_t len, int prot) {
-    static auto* real_mprotect = reinterpret_cast<MprotectFn>(dlsym(RTLD_NEXT, "mprotect"));
+    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
     if (g_slice_pool_fail_mprotect) {
         errno = ENOMEM;
         return -1;
     }
-    return real_mprotect(addr, len, prot);
+    if (!g_real_mprotect) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_real_mprotect(addr, len, prot);
 }
 
 // === Accept ===

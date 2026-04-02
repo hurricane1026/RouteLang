@@ -217,7 +217,7 @@ static const char* verdict_str(Verdict verdict) {
         case Verdict::Match:
             return "MATCH";
         case Verdict::Mismatch:
-            return "MISS";
+            return "MISMATCH";
         case Verdict::Failed:
             return "FAIL";
         case Verdict::Unsupported:

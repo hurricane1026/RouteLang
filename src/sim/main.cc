@@ -3,16 +3,31 @@
 #include "rut/runtime/traffic_replay.h"
 #include "rut/sim/simulate_engine.h"
 
+#include <errno.h>
 #include <unistd.h>
 
 using namespace rut;
 
 namespace {
 
+static bool write_all(i32 fd, const char* s, u32 len) {
+    u32 pos = 0;
+    while (pos < len) {
+        const ssize_t n = ::write(fd, s + pos, len - pos);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        pos += static_cast<u32>(n);
+    }
+    return true;
+}
+
 static void write_str(i32 fd, const char* s) {
     u32 len = 0;
     while (s[len]) len++;
-    (void)::write(fd, s, len);
+    (void)write_all(fd, s, len);
 }
 
 static void usage() {
@@ -21,6 +36,7 @@ static void usage() {
     write_str(2, "  upstream <id> <name>\n");
     write_str(2, "  route <METHOD|ANY> <pattern> status <code>\n");
     write_str(2, "  route <METHOD|ANY> <pattern> proxy <upstream-id>\n");
+    write_str(2, "  pattern is prefix-matched and may include ':param' segments\n");
 }
 
 }  // namespace
@@ -80,12 +96,12 @@ int main(int argc, char** argv) {
                 break;
         }
         const u32 kLen = sim::format_result(kResult, line, sizeof(line));
-        (void)::write(1, line, kLen);
+        (void)write_all(1, line, kLen);
     }
 
     char summary_buf[256];
     const u32 kSlen = sim::format_summary(summary, summary_buf, sizeof(summary_buf));
-    (void)::write(1, summary_buf, kSlen);
+    (void)write_all(1, summary_buf, kSlen);
 
     reader.close();
     engine.shutdown();

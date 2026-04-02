@@ -59,6 +59,10 @@ struct ModuleContext {
 //   route <METHOD|ANY> <pattern> proxy <upstream-id>
 //
 // Tokens are whitespace-separated; blank lines and '#' comments are ignored.
+// Route matching uses the request path only and ignores any query string.
+// METHOD is matched RouteConfig-style by first character; ANY matches any method.
+// <pattern> is prefix-matched and may include ':param' segments.
+// Each ':param' matches exactly one non-empty path segment and never crosses '/'.
 bool load_manifest(const char* path, Manifest& out);
 
 // Build a sync-only RIR module that mirrors the manifest.

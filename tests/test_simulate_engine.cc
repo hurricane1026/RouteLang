@@ -437,6 +437,22 @@ TEST(simulate_engine, summary_counts_mismatch) {
     ctx.destroy();
 }
 
+TEST(simulate_engine, format_result_uses_mismatch_label) {
+    SimulateResult result{};
+    result.verdict = Verdict::Mismatch;
+    result.method = 'G';
+    strcpy(result.path, "/api");
+    result.action = jit::HandlerAction::ReturnStatus;
+    result.expected_status = 200;
+    result.actual_status = 503;
+
+    char buf[256];
+    const u32 len = format_result(result, buf, sizeof(buf));
+    REQUIRE(len > 0);
+    CHECK(strstr(buf, "MISMATCH") != nullptr);
+    CHECK(strstr(buf, "MISS ") == nullptr);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

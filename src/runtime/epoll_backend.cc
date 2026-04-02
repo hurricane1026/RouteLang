@@ -3,7 +3,6 @@
 #include "core/expected.h"
 #include "epoll_tls_hooks.h"
 #include "rut/runtime/error.h"
-#include <atomic>
 
 #include <errno.h>
 #include <openssl/ssl.h>
@@ -18,6 +17,8 @@ namespace rut {
 
 static constexpr u32 kListenConnId = 0xFFFFFF;
 static constexpr u32 kTimerConnId = 0xFFFFFE;
+
+const EpollTlsHooks* get_epoll_tls_hooks_for_test() __attribute__((weak));
 
 namespace {
 
@@ -36,21 +37,15 @@ i32 default_ssl_get_error(SSL* ssl, i32 rc) {
 
 EpollTlsHooks default_tls_hooks = {
     default_ssl_accept, default_ssl_read, default_ssl_write, default_ssl_get_error};
-std::atomic<const EpollTlsHooks*> active_tls_hooks = &default_tls_hooks;
 
 const EpollTlsHooks* get_tls_hooks() {
-    return active_tls_hooks.load(std::memory_order_acquire);
+    if (const EpollTlsHooks* hooks =
+            get_epoll_tls_hooks_for_test ? get_epoll_tls_hooks_for_test() : nullptr)
+        return hooks;
+    return &default_tls_hooks;
 }
 
 }  // namespace
-
-void set_epoll_tls_hooks_for_test(const EpollTlsHooks* hooks) {
-    active_tls_hooks.store(hooks ? hooks : &default_tls_hooks, std::memory_order_release);
-}
-
-void reset_epoll_tls_hooks_for_test() {
-    active_tls_hooks.store(&default_tls_hooks, std::memory_order_release);
-}
 
 static i32 map_tls_error(SSL* ssl, i32 rc) {
     i32 err = get_tls_hooks()->ssl_get_error(ssl, rc);

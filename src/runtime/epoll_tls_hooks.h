@@ -15,7 +15,4 @@ struct EpollTlsHooks {
     i32 (*ssl_get_error)(SSL* ssl, i32 rc);
 };
 
-void set_epoll_tls_hooks_for_test(const EpollTlsHooks* hooks);
-void reset_epoll_tls_hooks_for_test();
-
 }  // namespace rut

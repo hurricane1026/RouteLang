@@ -17,8 +17,26 @@ add_test(NAME test_network COMMAND test_network)
 set_tests_properties(test_network PROPERTIES LABELS "unit;network")
 
 find_package(Threads REQUIRED)
+find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
 
-add_executable(test_integration test_integration.cc)
+set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
+set(RUT_TLS_TEST_CERT ${RUT_TLS_TESTDATA_DIR}/localhost_cert.pem)
+set(RUT_TLS_TEST_KEY ${RUT_TLS_TESTDATA_DIR}/localhost_key.pem)
+
+add_custom_command(
+    OUTPUT ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${RUT_TLS_TESTDATA_DIR}
+    COMMAND ${OPENSSL_EXECUTABLE} req -x509 -newkey rsa:2048 -keyout ${RUT_TLS_TEST_KEY} -out ${RUT_TLS_TEST_CERT} -sha256 -nodes -days 1 -subj /CN=localhost
+    COMMENT "Generating TLS fixtures for integration tests"
+    VERBATIM
+)
+
+add_custom_target(test_tls_fixtures DEPENDS ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY})
+
+add_executable(test_integration
+    test_integration.cc
+    epoll_tls_test_hooks.cc
+)
 target_link_libraries(test_integration
     rue_runtime
     Threads::Threads
@@ -32,8 +50,9 @@ target_include_directories(test_integration PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_definitions(test_integration PRIVATE
-    RUT_TESTDATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/testdata"
+    RUT_TESTDATA_DIR="${RUT_TLS_TESTDATA_DIR}"
 )
+add_dependencies(test_integration test_tls_fixtures)
 add_test(NAME test_integration COMMAND test_integration)
 set_tests_properties(test_integration PROPERTIES LABELS "integration;network")
 

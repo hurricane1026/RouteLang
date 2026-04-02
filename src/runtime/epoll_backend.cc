@@ -75,13 +75,16 @@ static u32 tls_send_interest_for_state(const EpollBackend::SendState& ss) {
     return EPOLLIN | (ss.tls_wait_events ? ss.tls_wait_events : EPOLLIN);
 }
 
-static void set_fd_interest(i32 epoll_fd, i32 fd, u32 conn_id, IoEventType type, u32 events) {
+static i32 set_fd_interest(i32 epoll_fd, i32 fd, u32 conn_id, IoEventType type, u32 events) {
     struct epoll_event ev;
     ev.events = events;
     ev.data.u64 = (static_cast<u64>(conn_id) << 8) | static_cast<u64>(type);
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) < 0 && errno == ENOENT) {
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    i32 rc = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+    if (rc < 0 && errno == ENOENT) {
+        rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
     }
+    if (rc < 0) return -errno;
+    return 0;
 }
 
 static void rearm_recv_interest(i32 epoll_fd,
@@ -93,12 +96,13 @@ static void rearm_recv_interest(i32 epoll_fd,
 
     if (type == IoEventType::UpstreamRecv || type == IoEventType::UpstreamSend) {
         i32 fd = upstream_fd_map[conn_id];
-        if (fd >= 0) set_fd_interest(epoll_fd, fd, conn_id, IoEventType::UpstreamRecv, EPOLLIN);
+        if (fd >= 0)
+            (void)set_fd_interest(epoll_fd, fd, conn_id, IoEventType::UpstreamRecv, EPOLLIN);
         return;
     }
 
     i32 fd = downstream_fd_map[conn_id];
-    if (fd >= 0) set_fd_interest(epoll_fd, fd, conn_id, IoEventType::Recv, EPOLLIN);
+    if (fd >= 0) (void)set_fd_interest(epoll_fd, fd, conn_id, IoEventType::Recv, EPOLLIN);
 }
 
 u64 EpollBackend::encode_data(u32 conn_id, IoEventType type) {
@@ -320,8 +324,20 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
                                 IoEventType::Send,
                                 true,
                                 tls_interest_for_error(ssl_err)};
-            set_fd_interest(
+            i32 rc = set_fd_interest(
                 epoll_fd, c.fd, c.id, IoEventType::Send, tls_send_interest_for_error(ssl_err));
+            if (rc < 0) {
+                send_state[c.id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
+                if (pending_count < 64) {
+                    pending_completions[pending_count].conn_id = c.id;
+                    pending_completions[pending_count].type = IoEventType::Send;
+                    pending_completions[pending_count].result = rc;
+                    pending_completions[pending_count].buf_id = 0;
+                    pending_completions[pending_count].has_buf = 0;
+                    pending_completions[pending_count].more = 0;
+                    pending_count++;
+                }
+            }
             return true;
         }
 

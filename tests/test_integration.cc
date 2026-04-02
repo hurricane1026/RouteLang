@@ -1120,6 +1120,46 @@ TEST(tls_state_machine, send_rejects_out_of_range_conn_id) {
     backend.shutdown();
 }
 
+TEST(tls_state_machine, send_arm_failure_returns_error_completion) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    ScopedTlsHooks hooks(tls_state);
+
+    close(fds[0]);
+    conn.fd = fds[0];
+
+    static const u8 kPayload[] = {'f', 'a', 'i', 'l'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+    CHECK_EQ(backend.send_state[0].fd, -1);
+    REQUIRE_EQ(backend.pending_count, 1u);
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].conn_id, 0u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, -EBADF);
+
+    close(fds[1]);
+    backend.shutdown();
+}
+
 TEST(tls_state_machine, spurious_epollout_with_empty_tls_send_state_is_ignored) {
     i32 fds[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);

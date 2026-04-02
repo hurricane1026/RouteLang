@@ -31,6 +31,9 @@ target_include_directories(test_integration PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+target_compile_definitions(test_integration PRIVATE
+    RUT_TESTDATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/testdata"
+)
 add_test(NAME test_integration COMMAND test_integration)
 set_tests_properties(test_integration PROPERTIES LABELS "integration;network")
 

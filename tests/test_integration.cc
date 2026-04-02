@@ -360,106 +360,12 @@ static void run_tls_send_readable_while_waiting_for_write_case(rut::test::TestCa
 
 }  // namespace
 
-static const char kTestCertPem[] = R"(-----BEGIN CERTIFICATE-----
-MIIDCTCCAfGgAwIBAgIUV3bWh2n8VuB0S9B7iXRm/ALvk0gwDQYJKoZIhvcNAQEL
-BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDQwMTE1MTIyN1oXDTI2MDQw
-MjE1MTIyN1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEAskukbS5awVDfLmJRaRCbgJnPcMlmXjT8riE2P1pR/Rz4
-ri54ue+vNTK5oRrtSGB13z9yZOnIyIVf+nb3HN+GsVIy++lksk0yWJTZyuEHlFZE
-sdaOQjTUYea7o43bhSzFIaXi52NIxNIHGOAOSKvdjFzJmAAtkK9FLrz3HjYoHxuu
-mlSoPRJwa7tREgXceRTTPmfAEUSBkfnsxYz0IiU4+stmv5zjeRoRMGlnYT9EPoGU
-JzgWT4CCJNx95taW6ZQq+3Q8Q/XY/NObEPvUpgo8Bm9fXVlMGix+6DS6kSxK7Qh4
-SFvQddriQwLZAs84BAtZ0f0IUDwYAZTQ8mP9eyA4TQIDAQABo1MwUTAdBgNVHQ4E
-FgQUzzhFroszJLtXxRHDa6jeZZyqJy4wHwYDVR0jBBgwFoAUzzhFroszJLtXxRHD
-a6jeZZyqJy4wDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAXbCo
-zwEV+Q1n22DOhMrFkKS7H7ZvOTDqmSI1+DtMHcwt+OPO35Az1bJgnqZd3TJv8ytG
-SckPo+kvgCHRIuiyiR/p2extD6x6VYnfXdF3rWxMxC28xlfRB4KKTRnle4LydlbR
-bj77tlgFd4eCcyr8Di/Jnsu0KTaTaJZqzqS47xYRr2CtW/p73USExwhKT0Tnk9tW
-cnNRFXbC3hK8TOLMtF4zxzpLeAfK4IqP8sZhyuwvaks3MPbht3WxG6YQYf0MdC26
-gNsAt3xPpqw0JxZTEIRV40iAnvQ9TQacuwQE/PN7/8jiVBPqEpYVBiHVXA+jgYss
-gZpx2i7c/4TljnWrrg==
------END CERTIFICATE-----
-)";
+#ifndef RUT_TESTDATA_DIR
+#error "RUT_TESTDATA_DIR must be defined for test_integration"
+#endif
 
-static const char kTestKeyPem[] = R"(-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCyS6RtLlrBUN8u
-YlFpEJuAmc9wyWZeNPyuITY/WlH9HPiuLni57681MrmhGu1IYHXfP3Jk6cjIhV/6
-dvcc34axUjL76WSyTTJYlNnK4QeUVkSx1o5CNNRh5rujjduFLMUhpeLnY0jE0gcY
-4A5Iq92MXMmYAC2Qr0UuvPceNigfG66aVKg9EnBru1ESBdx5FNM+Z8ARRIGR+ezF
-jPQiJTj6y2a/nON5GhEwaWdhP0Q+gZQnOBZPgIIk3H3m1pbplCr7dDxD9dj805sQ
-+9SmCjwGb19dWUwaLH7oNLqRLErtCHhIW9B12uJDAtkCzzgEC1nR/QhQPBgBlNDy
-Y/17IDhNAgMBAAECggEAJo8L0g3olC62eYxLQW7VRnBdJ63yrNSGQe1OU1Cn8xa5
-JEhKFSIkENv1v8T4RIMR8tRAm9jgcpc/nMXuJskjksUtYAQHYjUmOniEimb0seyf
-Qhud2+0bcknJUjN7Yld+kYqT4gk7g09NuCA6jpZWnUSy12PQdt4k1tkIk3jQX/uK
-5Gzjp6eVC+oRedCwzYKlQhU12XhgBC2f1M3eqD07b1j9BpigjLa8K+wZh8Hthjr7
-tbPTgyOGlvhPkPGJPa2xk9T9+6B/cX2J0ooKGuIyW1IcL5rtKncTNZuCP8ze7IAn
-tRfbP4CE7rLvXKDe73RB3N4AhwgxTRGnuQrRAGGWkQKBgQDdq1IbMn+OYVA+hMJ3
-X2m/1LXcNQg7x3UzvUGhgvCYEBHJ3xougnJ0MH2UOMU2JYA/5MSzYTqxXE0uaBlg
-8U0qjA1Gwarr8jEzZfbN4RzufshZpiC2mgIHp1ZQLFg0S7n51xGscA5o8aHH4gjF
-AlYY4iOcKlLJT2nBjmZHAe4W3QKBgQDN6KbI1d0uxNqpphBtANxbsrrdGzWxlv5V
-2quFzuVzJn6GTV+IW3WPfIASNz918qsFIDDL2aP3E0s/PAiYNfOvaYa06EklQqVF
-bNxwJmYOzdjkVTfSCuWyBRxRPJaXc7Yxulh0Dwz/bP1YLK2xoH+SVPo61UqSIYbl
-hyOu6Su4MQKBgBeu6DTTrmEt8H7dfFF4tjmypkOCvwB0DQecHtj8vmvgu6XP2mJB
-uazESYZ+kkN4uj0ZWhK4PqcYb36XzK5Y2Z/EGt8GbhaLZ8pQCJByjr7EeO9rGm+o
-ALOEo2opcrsTpCkXW2ILDt8Tge9zLPCvkTdTYe6bbwDnJSty5WaMxD1ZAoGAUOZo
-qR3Fwjtbwi3Z5EnjSi/l1Tt8lCLEGM1KeM86PUzRh0jdEQEGJnL/CqkkSN4oLWJh
-aaZAErJE7TpUEiGYdcHbSDa/jmEp+CX2UiX0ETr1TXjh7qeTaacyYgSREj5HRjB1
-0lubervCqiMbt19c4Ax9KCJnIxUDIClBbtZz8/ECgYBXZduc7mfJi7jlNWEoS6D5
-Lc7h+C2n33p4Cg9NMeysB13vsxe0aPrDY0PI1Su9qRK1j3C/TZeLZIQiQqXsWiep
-Yq4u2YfSYRx8Eu33gIU7g+hylVXQElEbFHKAdjvESt5PDKwArtgybbNdUZIEakxc
-vA8OzIXZ3awxryXhlCUrFw==
------END PRIVATE KEY-----
-)";
-
-struct TempFile {
-    TempFile() { path[0] = '\0'; }
-    ~TempFile() { cleanup(); }
-
-    TempFile(const TempFile&) = delete;
-    TempFile& operator=(const TempFile&) = delete;
-
-    char path[64];
-    bool valid = false;
-
-    bool write_all(const char* tmpl, const char* content) {
-        u32 i = 0;
-        for (; tmpl[i] && i + 1 < sizeof(path); i++) path[i] = tmpl[i];
-        path[i] = '\0';
-
-        i32 fd = mkstemp(path);
-        if (fd < 0) return false;
-
-        u32 len = 0;
-        while (content[len]) len++;
-        bool ok = true;
-        u32 written = 0;
-        while (written < len) {
-            ssize_t n = write(fd, content + written, len - written);
-            if (n > 0) {
-                written += static_cast<u32>(n);
-                continue;
-            }
-            if (n < 0 && errno == EINTR) continue;
-            ok = false;
-            break;
-        }
-        close(fd);
-        if (!ok) {
-            unlink(path);
-            path[0] = '\0';
-            return false;
-        }
-        valid = true;
-        return true;
-    }
-
-    void cleanup() {
-        if (!valid) return;
-        unlink(path);
-        valid = false;
-        path[0] = '\0';
-    }
-};
+static constexpr char kTestCertPath[] = RUT_TESTDATA_DIR "/localhost_cert.pem";
+static constexpr char kTestKeyPath[] = RUT_TESTDATA_DIR "/localhost_key.pem";
 
 static bool ssl_write_all(SSL* ssl, const char* data, u32 len) {
     u32 sent = 0;
@@ -1160,6 +1066,94 @@ TEST(tls_state_machine, send_arm_failure_returns_error_completion) {
     backend.shutdown();
 }
 
+TEST(tls_state_machine, send_rejects_out_of_range_conn_id_with_full_pending_ring) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    for (u32 i = 0; i < 64; i++) {
+        backend.pending_completions[i].conn_id = i;
+        backend.pending_completions[i].type = IoEventType::Recv;
+        backend.pending_completions[i].result = static_cast<i32>(i);
+        backend.pending_completions[i].buf_id = 0;
+        backend.pending_completions[i].has_buf = 0;
+        backend.pending_completions[i].more = 0;
+    }
+    backend.pending_count = 64;
+
+    TestConn tc;
+    tc.init(EpollBackend::kMaxFdMap, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    ScopedTlsHooks hooks(tls_state);
+
+    static const u8 kPayload[] = {'f', 'u', 'l', 'l'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    REQUIRE_EQ(backend.pending_count, 64u);
+    CHECK_EQ(backend.pending_completions[63].conn_id, EpollBackend::kMaxFdMap);
+    CHECK_EQ(backend.pending_completions[63].type, IoEventType::Send);
+    CHECK_EQ(backend.pending_completions[63].result, -EINVAL);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(tls_state_machine, send_arm_failure_returns_error_with_full_pending_ring) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    for (u32 i = 0; i < 64; i++) {
+        backend.pending_completions[i].conn_id = i;
+        backend.pending_completions[i].type = IoEventType::Recv;
+        backend.pending_completions[i].result = static_cast<i32>(i);
+        backend.pending_completions[i].buf_id = 0;
+        backend.pending_completions[i].has_buf = 0;
+        backend.pending_completions[i].more = 0;
+    }
+    backend.pending_count = 64;
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    ScopedTlsHooks hooks(tls_state);
+
+    close(fds[0]);
+    conn.fd = fds[0];
+
+    static const u8 kPayload[] = {'f', 'a', 'i', 'l'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+    CHECK_EQ(backend.send_state[0].fd, -1);
+    REQUIRE_EQ(backend.pending_count, 64u);
+    CHECK_EQ(backend.pending_completions[63].conn_id, 0u);
+    CHECK_EQ(backend.pending_completions[63].type, IoEventType::Send);
+    CHECK_EQ(backend.pending_completions[63].result, -EBADF);
+
+    close(fds[1]);
+    backend.shutdown();
+}
+
 TEST(tls_state_machine, spurious_epollout_with_empty_tls_send_state_is_ignored) {
     i32 fds[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
@@ -1324,12 +1318,7 @@ TEST(shard, serves_requests) {
 }
 
 TEST(shard, serves_https_requests) {
-    TempFile cert_file;
-    TempFile key_file;
-    REQUIRE(cert_file.write_all("/tmp/rut-cert-XXXXXX", kTestCertPem));
-    REQUIRE(key_file.write_all("/tmp/rut-key-XXXXXX", kTestKeyPem));
-
-    auto tls_ctx = create_tls_server_context(cert_file.path, key_file.path);
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
     REQUIRE(tls_ctx.has_value());
 
     Shard<EpollEventLoop> shard;
@@ -1373,22 +1362,12 @@ TEST(shard, serves_https_requests) {
 }
 
 TEST(tls, rejects_invalid_private_key_file) {
-    TempFile cert_file;
-    TempFile invalid_key_file;
-    REQUIRE(cert_file.write_all("/tmp/rut-cert-XXXXXX", kTestCertPem));
-    REQUIRE(invalid_key_file.write_all("/tmp/rut-key-XXXXXX", kTestCertPem));
-
-    auto tls_ctx = create_tls_server_context(cert_file.path, invalid_key_file.path);
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestCertPath);
     CHECK(!tls_ctx.has_value());
 }
 
 TEST(shard, serves_https_keepalive_requests) {
-    TempFile cert_file;
-    TempFile key_file;
-    REQUIRE(cert_file.write_all("/tmp/rut-cert-XXXXXX", kTestCertPem));
-    REQUIRE(key_file.write_all("/tmp/rut-key-XXXXXX", kTestKeyPem));
-
-    auto tls_ctx = create_tls_server_context(cert_file.path, key_file.path);
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
     REQUIRE(tls_ctx.has_value());
 
     Shard<EpollEventLoop> shard;
@@ -1434,12 +1413,7 @@ TEST(shard, serves_https_keepalive_requests) {
 }
 
 TEST(shard, recovers_after_failed_tls_handshake) {
-    TempFile cert_file;
-    TempFile key_file;
-    REQUIRE(cert_file.write_all("/tmp/rut-cert-XXXXXX", kTestCertPem));
-    REQUIRE(key_file.write_all("/tmp/rut-key-XXXXXX", kTestKeyPem));
-
-    auto tls_ctx = create_tls_server_context(cert_file.path, key_file.path);
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
     REQUIRE(tls_ctx.has_value());
 
     Shard<EpollEventLoop> shard;

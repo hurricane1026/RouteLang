@@ -75,6 +75,26 @@ static u32 tls_send_interest_for_state(const EpollBackend::SendState& ss) {
     return EPOLLIN | (ss.tls_wait_events ? ss.tls_wait_events : EPOLLIN);
 }
 
+static void queue_pending_completion(IoEvent* pending_completions,
+                                     u32& pending_count,
+                                     u32 conn_id,
+                                     IoEventType type,
+                                     i32 result,
+                                     bool force_slot = false) {
+    if (pending_count >= 64) {
+        if (!force_slot) return;
+        pending_count = 63;
+    }
+
+    pending_completions[pending_count].conn_id = conn_id;
+    pending_completions[pending_count].type = type;
+    pending_completions[pending_count].result = result;
+    pending_completions[pending_count].buf_id = 0;
+    pending_completions[pending_count].has_buf = 0;
+    pending_completions[pending_count].more = 0;
+    pending_count++;
+}
+
 static i32 set_fd_interest(i32 epoll_fd, i32 fd, u32 conn_id, IoEventType type, u32 events) {
     struct epoll_event ev;
     ev.events = events;
@@ -306,15 +326,8 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
         i32 ssl_err = tls_hooks->ssl_get_error(ssl, nw);
         if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
             if (c.id >= kMaxFdMap) {
-                if (pending_count < 64) {
-                    pending_completions[pending_count].conn_id = c.id;
-                    pending_completions[pending_count].type = IoEventType::Send;
-                    pending_completions[pending_count].result = -EINVAL;
-                    pending_completions[pending_count].buf_id = 0;
-                    pending_completions[pending_count].has_buf = 0;
-                    pending_completions[pending_count].more = 0;
-                    pending_count++;
-                }
+                queue_pending_completion(
+                    pending_completions, pending_count, c.id, IoEventType::Send, -EINVAL, true);
                 return true;
             }
             send_state[c.id] = {buf,
@@ -328,15 +341,8 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
                 epoll_fd, c.fd, c.id, IoEventType::Send, tls_send_interest_for_error(ssl_err));
             if (rc < 0) {
                 send_state[c.id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
-                if (pending_count < 64) {
-                    pending_completions[pending_count].conn_id = c.id;
-                    pending_completions[pending_count].type = IoEventType::Send;
-                    pending_completions[pending_count].result = rc;
-                    pending_completions[pending_count].buf_id = 0;
-                    pending_completions[pending_count].has_buf = 0;
-                    pending_completions[pending_count].more = 0;
-                    pending_count++;
-                }
+                queue_pending_completion(
+                    pending_completions, pending_count, c.id, IoEventType::Send, rc, true);
             }
             return true;
         }

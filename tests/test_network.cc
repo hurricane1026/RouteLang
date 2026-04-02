@@ -5787,7 +5787,7 @@ TEST(metadata, format_static_response_wire_format) {
         u8 send_storage[4096];
         conn.send_buf.bind(send_storage, sizeof(send_storage));
 
-        CHECK_EQ(status_reason(tc.code), tc.reason);
+        CHECK(__builtin_strcmp(status_reason(tc.code), tc.reason) == 0);
         format_static_response(conn, tc.code, tc.keep_alive);
 
         const u8* data = conn.send_buf.data();
@@ -5868,8 +5868,7 @@ TEST(early_response, prepare_state_direct_content_length_body) {
     conn.recv_buf.bind(recv_storage, sizeof(recv_storage));
     conn.send_buf.bind(send_storage, sizeof(send_storage));
 
-    const char req[] =
-        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    const char req[] = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
     conn.recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
     conn.req_body_mode = BodyMode::ContentLength;
     conn.req_body_remaining = 3;

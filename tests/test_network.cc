@@ -5753,6 +5753,171 @@ TEST(metadata, fallback_all_methods) {
     }
 }
 
+TEST(metadata, format_static_response_wire_format) {
+    struct TestCase {
+        u16 code;
+        const char* reason;
+        u32 body_len;
+        bool keep_alive;
+    };
+
+    const TestCase cases[] = {
+        {100, "Unknown", 0, true},
+        {200, "OK", 2, true},
+        {201, "Created", 7, false},
+        {204, "No Content", 0, true},
+        {301, "Moved Permanently", 17, false},
+        {302, "Found", 5, true},
+        {304, "Not Modified", 0, false},
+        {400, "Bad Request", 11, true},
+        {401, "Unauthorized", 12, false},
+        {403, "Forbidden", 9, true},
+        {404, "Not Found", 9, false},
+        {405, "Method Not Allowed", 18, true},
+        {429, "Too Many Requests", 17, false},
+        {500, "Internal Server Error", 21, true},
+        {502, "Bad Gateway", 11, false},
+        {503, "Service Unavailable", 19, true},
+        {418, "Unknown", 7, false},
+    };
+
+    for (const auto& tc : cases) {
+        Connection conn;
+        conn.reset();
+        u8 send_storage[4096];
+        conn.send_buf.bind(send_storage, sizeof(send_storage));
+
+        CHECK_EQ(status_reason(tc.code), tc.reason);
+        format_static_response(conn, tc.code, tc.keep_alive);
+
+        const u8* data = conn.send_buf.data();
+        const u32 len = conn.send_buf.len();
+        REQUIRE(data != nullptr);
+        CHECK_GT(len, 0u);
+
+        CHECK_EQ(data[9], static_cast<u8>('0' + (tc.code / 100) % 10));
+        CHECK_EQ(data[10], static_cast<u8>('0' + (tc.code / 10) % 10));
+        CHECK_EQ(data[11], static_cast<u8>('0' + tc.code % 10));
+
+        u32 body_start = 0;
+        u32 cl_val = 0;
+        bool found_headers_end = false;
+        bool found_cl = false;
+        for (u32 i = 0; i + 3 < len; i++) {
+            if (!found_cl && i + 16 < len && data[i] == 'C' && data[i + 1] == 'o' &&
+                data[i + 8] == 'L') {
+                u32 j = i + 16;
+                while (j < len && data[j] >= '0' && data[j] <= '9') {
+                    cl_val = cl_val * 10 + (data[j] - '0');
+                    j++;
+                }
+                found_cl = true;
+            }
+            if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' &&
+                data[i + 3] == '\n') {
+                body_start = i + 4;
+                found_headers_end = true;
+                break;
+            }
+        }
+
+        CHECK(found_cl);
+        CHECK(found_headers_end);
+        CHECK_EQ(cl_val, tc.body_len);
+        CHECK_EQ(len - body_start, tc.body_len);
+
+        const char* keep_hdr =
+            tc.keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+        const u32 keep_hdr_len = tc.keep_alive ? 24u : 19u;
+        bool found_keep_hdr = false;
+        for (u32 i = 0; i + keep_hdr_len <= len; i++) {
+            bool match = true;
+            for (u32 j = 0; j < keep_hdr_len; j++) {
+                if (data[i + j] != static_cast<u8>(keep_hdr[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                found_keep_hdr = true;
+                break;
+            }
+        }
+        CHECK(found_keep_hdr);
+
+        if (tc.body_len > 0) {
+            bool found_body = true;
+            for (u32 j = 0; j < tc.body_len; j++) {
+                if (data[body_start + j] != static_cast<u8>(tc.reason[j])) {
+                    found_body = false;
+                    break;
+                }
+            }
+            CHECK(found_body);
+        }
+
+        conn.send_buf.bind(nullptr, 0);
+    }
+}
+
+TEST(early_response, prepare_state_direct_content_length_body) {
+    Connection conn;
+    conn.reset();
+    u8 recv_storage[256];
+    u8 send_storage[256];
+    conn.recv_buf.bind(recv_storage, sizeof(recv_storage));
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+
+    const char req[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    conn.recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    conn.req_body_mode = BodyMode::ContentLength;
+    conn.req_body_remaining = 3;
+    conn.keep_alive = true;
+    conn.upstream_start_us = 0;
+
+    prepare_early_response_state(conn);
+
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK(!conn.keep_alive);
+    CHECK_GT(conn.upstream_start_us, 0u);
+
+    conn.recv_buf.bind(nullptr, 0);
+    conn.send_buf.bind(nullptr, 0);
+}
+
+TEST(early_response, prepare_state_direct_pipeline_stash) {
+    Connection conn;
+    conn.reset();
+    u8 recv_storage[256];
+    u8 send_storage[256];
+    conn.recv_buf.bind(recv_storage, sizeof(recv_storage));
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+
+    const char reqs[] =
+        "GET /first HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    const char next_req[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    conn.recv_buf.write(reinterpret_cast<const u8*>(reqs), sizeof(reqs) - 1);
+    conn.req_body_mode = BodyMode::None;
+    conn.req_initial_send_len = sizeof(reqs) - sizeof(next_req);
+    conn.keep_alive = true;
+    conn.upstream_start_us = 0;
+
+    prepare_early_response_state(conn);
+
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK_EQ(conn.pipeline_stash_len, sizeof(next_req) - 1);
+    CHECK_EQ(conn.send_buf.len(), sizeof(next_req) - 1);
+    CHECK_GT(conn.upstream_start_us, 0u);
+    for (u32 i = 0; i < sizeof(next_req) - 1; i++) {
+        CHECK_EQ(conn.send_buf.data()[i], static_cast<u8>(next_req[i]));
+    }
+
+    conn.recv_buf.bind(nullptr, 0);
+    conn.send_buf.bind(nullptr, 0);
+}
+
 // === Coverage: upstream_response EOF with partial data ===
 
 TEST(streaming, upstream_eof_with_partial_data_502) {

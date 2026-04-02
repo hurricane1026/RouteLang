@@ -141,7 +141,7 @@ void capture_request_metadata(Connection& conn) {
                 }
                 chunk_consumed = pos;
             }
-            if (chunk_consumed == 0 && conn.req_body_mode == BodyMode::None) {
+            if (conn.req_malformed) {
                 conn.req_initial_send_len = 0;
             } else {
                 conn.req_initial_send_len = parser.header_end + chunk_consumed;

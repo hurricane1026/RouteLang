@@ -8561,6 +8561,7 @@ TEST(coverage, malformed_chunked_req_initial_send_len_zero) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     CHECK(c->req_malformed);
+    CHECK_EQ(c->req_initial_send_len, 0);
 }
 
 // Sync recv fallback with real socket pair. Lines 590-597 and 991-998.

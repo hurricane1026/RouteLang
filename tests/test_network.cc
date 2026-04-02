@@ -2105,6 +2105,39 @@ TEST(slab_pool, invalid_free_guards) {
     pool.free(static_cast<u32>(0));  // !free_stack guard after destroy
 }
 
+TEST(slab_pool, init_objects_mmap_failure) {
+    SlabPool<TestObj, 4> pool;
+    ScopedSlicePoolFault fault(1);
+    auto rc = pool.init();
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.objects, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+    CHECK_EQ(pool.free_top, 0u);
+}
+
+TEST(slab_pool, init_stack_mmap_failure) {
+    SlabPool<TestObj, 4> pool;
+    ScopedSlicePoolFault fault(2);
+    auto rc = pool.init();
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.objects, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+    CHECK_EQ(pool.free_top, 0u);
+}
+
+TEST(slab_pool, init_map_mmap_failure) {
+    SlabPool<TestObj, 4> pool;
+    ScopedSlicePoolFault fault(3);
+    auto rc = pool.init();
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.objects, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+    CHECK_EQ(pool.free_top, 0u);
+}
+
 TEST(upstream_pool, double_free_rejected) {
     UpstreamPool pool;
     pool.init();

@@ -47,7 +47,7 @@ static bool str_eq(const char* a, const char* b) {
 }
 
 static bool starts_with_dash_dash(const char* s) {
-    return s[0] == '-' && s[1] == '-';
+    return s[0] != '\0' && s[0] == '-' && s[1] == '-';
 }
 
 static bool detect_io_uring() {

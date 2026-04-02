@@ -1,33 +1,24 @@
 #include "rut/runtime/tls.h"
 
+#include <mutex>
+
 #include <errno.h>
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
 #include <stdlib.h>
-#include <unistd.h>
 
 namespace rut {
 
 namespace {
 
 core::Expected<void, Error> tls_init_once() {
-    static i32 state = 0;  // 0=uninitialized, 1=initializing, 2=ready, -1=failed
+    static std::once_flag init_once;
+    static bool init_ok = false;
 
-    for (;;) {
-        i32 observed = __atomic_load_n(&state, __ATOMIC_ACQUIRE);
-        if (observed == 2) return {};
-        if (observed == -1) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
-        if (observed == 0 && __atomic_compare_exchange_n(
-                                 &state, &observed, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            if (OPENSSL_init_ssl(0, nullptr) == 1) {
-                __atomic_store_n(&state, 2, __ATOMIC_RELEASE);
-                return {};
-            }
-            __atomic_store_n(&state, -1, __ATOMIC_RELEASE);
-            return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
-        }
-        usleep(1000);
-    }
+    std::call_once(init_once, []() { init_ok = (OPENSSL_init_ssl(0, nullptr) == 1); });
+
+    if (init_ok) return {};
+    return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
 }
 
 }  // namespace

@@ -75,6 +75,23 @@ TEST(simulate_engine, load_manifest_file) {
     unlink(path);
 }
 
+TEST(simulate_engine, load_manifest_accepts_whitespace_comments_and_forward_refs) {
+    static const char kManifest[] =
+        "\n"
+        "   # comment before content\n"
+        "\troute GET /health status 204   \n"
+        "route ANY /api proxy 7   # trailing comment\n"
+        "   \n"
+        "upstream 7 api-v1\n";
+
+    Manifest manifest;
+    REQUIRE(load_manifest_text(kManifest, &manifest));
+    CHECK_EQ(manifest.upstream_count, 1u);
+    CHECK_EQ(manifest.route_count, 2u);
+    CHECK_EQ(manifest.routes[0].status_code, 204u);
+    CHECK_EQ(manifest.routes[1].upstream_id, 7u);
+}
+
 TEST(simulate_engine, static_status_match) {
     Manifest manifest{};
     manifest.route_count = 1;
@@ -232,6 +249,7 @@ TEST(simulate_engine, load_manifest_rejects_invalid_inputs) {
     static const Case kCases[] = {
         {"upstream x api-v1\n"},
         {"upstream 65536 api-v1\n"},
+        {"upstream 7 api-v1 extra\n"},
         {"route FETCH /x status 204\n"},
         {"route GET /x bounce 7\n"},
         {"route GET /x status 70000\n"},
@@ -239,6 +257,10 @@ TEST(simulate_engine, load_manifest_rejects_invalid_inputs) {
         {"route GET /x status 42949672960\n"},
         {"route GET /x proxy 42949672960\n"},
         {"route GET /x status\n"},
+        {"route GET /x status 204 extra\n"},
+        {"unknown thing here\n"},
+        {"upstream 7 api-v1\nupstream 7 api-v2\n"},
+        {"route GET /x proxy 7\n"},
     };
 
     for (const auto& tc : kCases) {

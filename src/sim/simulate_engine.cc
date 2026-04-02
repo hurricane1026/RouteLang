@@ -141,6 +141,28 @@ static const ManifestUpstream* find_upstream(const Engine& engine, u16 id) {
     return nullptr;
 }
 
+static bool manifest_has_upstream_id(const Manifest& manifest, u16 id) {
+    for (u32 i = 0; i < manifest.upstream_count; i++) {
+        if (manifest.upstreams[i].id == id) return true;
+    }
+    return false;
+}
+
+static bool validate_manifest(const Manifest& manifest) {
+    for (u32 i = 0; i < manifest.upstream_count; i++) {
+        for (u32 j = i + 1; j < manifest.upstream_count; j++) {
+            if (manifest.upstreams[i].id == manifest.upstreams[j].id) return false;
+        }
+    }
+    for (u32 i = 0; i < manifest.route_count; i++) {
+        const auto& route = manifest.routes[i];
+        if (route.action == ManifestAction::Proxy &&
+            !manifest_has_upstream_id(manifest, route.upstream_id))
+            return false;
+    }
+    return true;
+}
+
 static bool copy_str_into_arena(MmapArena& arena, const char* src, u32 len, Str* out) {
     char* mem = arena.alloc_array<char>(len + 1);
     if (!mem) return false;
@@ -393,8 +415,9 @@ bool load_manifest(const char* path, Manifest& out) {
         return false;
     }
 
+    const bool ok = validate_manifest(out);
     munmap(map, static_cast<u64>(st.st_size));
-    return true;
+    return ok;
 }
 
 bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {

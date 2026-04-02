@@ -1,4 +1,5 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
+#include "epoll_tls_test_hooks.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/shard.h"

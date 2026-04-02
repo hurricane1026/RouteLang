@@ -19,7 +19,6 @@ set_tests_properties(test_network PROPERTIES LABELS "unit;network")
 find_package(Threads REQUIRED)
 
 add_executable(test_integration test_integration.cc)
-target_compile_definitions(test_integration PRIVATE RUT_TESTING)
 target_link_libraries(test_integration
     rue_runtime
     Threads::Threads

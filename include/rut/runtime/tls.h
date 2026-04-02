@@ -4,8 +4,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
-typedef struct ssl_ctx_st SSL_CTX;
-typedef struct ssl_st SSL;
+#include <openssl/base.h>
 
 namespace rut {
 

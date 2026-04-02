@@ -128,7 +128,6 @@ add_library(rue_runtime STATIC
 target_include_directories(rue_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
-target_compile_definitions(rue_runtime PRIVATE RUT_TESTING)
 target_link_libraries(rue_runtime
     zstd_compress
     ssl
@@ -138,6 +137,7 @@ target_link_libraries(rue_runtime
 
 # SIMD source needs to find simd.h and char_tables.h via "simd.h" include
 target_include_directories(rue_runtime PRIVATE
+    ${PROJECT_SOURCE_DIR}/testing
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/simd
 )

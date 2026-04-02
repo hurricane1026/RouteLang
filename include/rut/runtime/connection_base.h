@@ -5,7 +5,7 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
 
-typedef struct ssl_st SSL;
+#include <openssl/base.h>
 
 namespace rut {
 

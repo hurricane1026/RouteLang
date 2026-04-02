@@ -14,6 +14,18 @@ namespace rut {
 
 // --- Text formatting helpers (no stdlib) ---
 
+u64 realtime_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+}
+
+u64 monotonic_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+}
+
 static u32 write_u64_dec(char* buf, u64 val) {
     if (val == 0) {
         buf[0] = '0';

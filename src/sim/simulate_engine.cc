@@ -1,0 +1,632 @@
+#include "rut/sim/simulate_engine.h"
+
+#include "rut/compiler/rir_builder.h"
+#include "rut/jit/codegen.h"
+#include "rut/jit/jit_engine.h"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace rut::sim {
+
+namespace {
+
+static u32 cstr_len(const char* s) {
+    u32 n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+static void copy_cstr(char* dst, u32 dst_size, const char* src) {
+    if (dst_size == 0) return;
+    u32 i = 0;
+    while (i + 1 < dst_size && src[i]) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+static bool streq(const char* a, const char* b) {
+    u32 i = 0;
+    while (a[i] && b[i]) {
+        if (a[i] != b[i]) return false;
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+static bool parse_u32_token(const char* s, u32 len, u32* out) {
+    if (len == 0) return false;
+    u32 v = 0;
+    for (u32 i = 0; i < len; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        v = v * 10 + static_cast<u32>(s[i] - '0');
+    }
+    *out = v;
+    return true;
+}
+
+static u8 parse_method_token(const char* s, u32 len, bool* ok) {
+    *ok = true;
+    if (len == 3 && s[0] == 'A' && s[1] == 'N' && s[2] == 'Y') return 0;
+    if (len == 3 && s[0] == 'G' && s[1] == 'E' && s[2] == 'T') return 'G';
+    if (len == 4 && s[0] == 'P' && s[1] == 'O' && s[2] == 'S' && s[3] == 'T') return 'P';
+    if (len == 3 && s[0] == 'P' && s[1] == 'U' && s[2] == 'T') return 'P';
+    if (len == 6 && s[0] == 'D' && s[1] == 'E' && s[2] == 'L' && s[3] == 'E' && s[4] == 'T' &&
+        s[5] == 'E')
+        return 'D';
+    if (len == 5 && s[0] == 'P' && s[1] == 'A' && s[2] == 'T' && s[3] == 'C' && s[4] == 'H')
+        return 'P';
+    if (len == 4 && s[0] == 'H' && s[1] == 'E' && s[2] == 'A' && s[3] == 'D') return 'H';
+    if (len == 7 && s[0] == 'O' && s[1] == 'P' && s[2] == 'T' && s[3] == 'I' && s[4] == 'O' &&
+        s[5] == 'N' && s[6] == 'S')
+        return 'O';
+    if (len == 7 && s[0] == 'C' && s[1] == 'O' && s[2] == 'N' && s[3] == 'N' && s[4] == 'E' &&
+        s[5] == 'C' && s[6] == 'T')
+        return 'C';
+    if (len == 5 && s[0] == 'T' && s[1] == 'R' && s[2] == 'A' && s[3] == 'C' && s[4] == 'E')
+        return 'T';
+    *ok = false;
+    return 0;
+}
+
+static u8 http_method_char(HttpMethod method) {
+    switch (method) {
+        case HttpMethod::GET:
+            return 'G';
+        case HttpMethod::POST:
+            return 'P';
+        case HttpMethod::PUT:
+            return 'P';
+        case HttpMethod::DELETE:
+            return 'D';
+        case HttpMethod::PATCH:
+            return 'P';
+        case HttpMethod::HEAD:
+            return 'H';
+        case HttpMethod::OPTIONS:
+            return 'O';
+        case HttpMethod::CONNECT:
+            return 'C';
+        case HttpMethod::TRACE:
+            return 'T';
+        case HttpMethod::Unknown:
+            return 0;
+    }
+    return 0;
+}
+
+static u8 log_method(HttpMethod method) {
+    switch (method) {
+        case HttpMethod::GET:
+            return static_cast<u8>(LogHttpMethod::Get);
+        case HttpMethod::POST:
+            return static_cast<u8>(LogHttpMethod::Post);
+        case HttpMethod::PUT:
+            return static_cast<u8>(LogHttpMethod::Put);
+        case HttpMethod::DELETE:
+            return static_cast<u8>(LogHttpMethod::Delete);
+        case HttpMethod::PATCH:
+            return static_cast<u8>(LogHttpMethod::Patch);
+        case HttpMethod::HEAD:
+            return static_cast<u8>(LogHttpMethod::Head);
+        case HttpMethod::OPTIONS:
+            return static_cast<u8>(LogHttpMethod::Options);
+        case HttpMethod::CONNECT:
+            return static_cast<u8>(LogHttpMethod::Connect);
+        case HttpMethod::TRACE:
+            return static_cast<u8>(LogHttpMethod::Trace);
+        case HttpMethod::Unknown:
+            return static_cast<u8>(LogHttpMethod::Other);
+    }
+    return static_cast<u8>(LogHttpMethod::Other);
+}
+
+static const ManifestUpstream* find_upstream(const Engine& engine, u16 id) {
+    for (u32 i = 0; i < engine.upstream_count; i++) {
+        if (engine.upstreams[i].id == id) return &engine.upstreams[i];
+    }
+    return nullptr;
+}
+
+static bool copy_str_into_arena(MmapArena& arena, const char* src, u32 len, Str* out) {
+    char* mem = arena.alloc_array<char>(len + 1);
+    if (!mem) return false;
+    for (u32 i = 0; i < len; i++) mem[i] = src[i];
+    mem[len] = '\0';
+    out->ptr = mem;
+    out->len = len;
+    return true;
+}
+
+static bool route_matches(const Engine::CompiledRoute& route, const char* path, u32 path_len) {
+    u32 pi = 0;
+    u32 ri = 0;
+    while (ri < route.pattern_len) {
+        if (route.pattern[ri] == ':') {
+            ri++;
+            while (ri < route.pattern_len && route.pattern[ri] != '/') ri++;
+            while (pi < path_len && path[pi] != '/' && path[pi] != '?') pi++;
+            continue;
+        }
+        if (pi >= path_len) return false;
+        if (path[pi] == '?') return false;
+        if (route.pattern[ri] != path[pi]) return false;
+        ri++;
+        pi++;
+    }
+    return true;
+}
+
+static const Engine::CompiledRoute* select_route(const Engine& engine,
+                                                 u8 method_char,
+                                                 const char* path,
+                                                 u32 path_len) {
+    for (u32 i = 0; i < engine.route_count; i++) {
+        const auto& route = engine.routes[i];
+        if (route.method != 0 && route.method != method_char) continue;
+        if (route_matches(route, path, path_len)) return &route;
+    }
+    return nullptr;
+}
+
+static u32 visible_path_len(Str path) {
+    u32 n = 0;
+    while (n < path.len && path.ptr[n] != '?') n++;
+    return n;
+}
+
+static const char* verdict_str(Verdict verdict) {
+    switch (verdict) {
+        case Verdict::Match:
+            return "MATCH";
+        case Verdict::Mismatch:
+            return "MISS";
+        case Verdict::Failed:
+            return "FAIL";
+        case Verdict::Unsupported:
+            return "UNSUPPORTED";
+    }
+    return "FAIL";
+}
+
+static const char* action_str(jit::HandlerAction action) {
+    switch (action) {
+        case jit::HandlerAction::ReturnStatus:
+            return "status";
+        case jit::HandlerAction::Proxy:
+            return "proxy";
+        case jit::HandlerAction::Yield:
+            return "yield";
+    }
+    return "status";
+}
+
+static void put_str(char* buf, u32 buf_size, u32* pos, const char* s) {
+    while (*s && *pos + 1 < buf_size) buf[(*pos)++] = *s++;
+}
+
+static void put_u32(char* buf, u32 buf_size, u32* pos, u32 value) {
+    char tmp[11];
+    u32 n = 0;
+    if (value == 0) {
+        tmp[n++] = '0';
+    } else {
+        while (value > 0) {
+            tmp[n++] = static_cast<char>('0' + value % 10);
+            value /= 10;
+        }
+    }
+    while (n > 0 && *pos + 1 < buf_size) buf[(*pos)++] = tmp[--n];
+}
+
+static void put_name(char* buf, u32 buf_size, u32* pos, const char* s) {
+    for (u32 i = 0; s[i] && *pos + 1 < buf_size; i++) buf[(*pos)++] = s[i];
+}
+
+}  // namespace
+
+bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
+    if (!arena.init(4096)) return false;
+    module.name = {"simulate_manifest", 17};
+    module.arena = &arena;
+    module.functions = arena.alloc_array<rir::Function>(func_cap == 0 ? 1 : func_cap);
+    if (!module.functions) {
+        arena.destroy();
+        return false;
+    }
+    module.func_count = 0;
+    module.func_cap = func_cap == 0 ? 1 : func_cap;
+    module.struct_defs = arena.alloc_array<rir::StructDef*>(struct_cap == 0 ? 1 : struct_cap);
+    if (!module.struct_defs) {
+        arena.destroy();
+        return false;
+    }
+    module.struct_count = 0;
+    module.struct_cap = struct_cap == 0 ? 1 : struct_cap;
+    return true;
+}
+
+void ModuleContext::destroy() { arena.destroy(); }
+
+bool load_manifest(const char* path, Manifest& out) {
+    out = Manifest{};
+
+    i32 fd = ::open(path, O_RDONLY);
+    if (fd < 0) return false;
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        ::close(fd);
+        return false;
+    }
+    if (st.st_size <= 0) {
+        ::close(fd);
+        return true;
+    }
+
+    void* map = mmap(nullptr, static_cast<u64>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (map == MAP_FAILED) return false;
+
+    const char* data = static_cast<const char*>(map);
+    u32 size = static_cast<u32>(st.st_size);
+    u32 pos = 0;
+
+    while (pos < size) {
+        while (pos < size && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\r')) pos++;
+        if (pos >= size) break;
+        if (data[pos] == '\n') {
+            pos++;
+            continue;
+        }
+        if (data[pos] == '#') {
+            while (pos < size && data[pos] != '\n') pos++;
+            continue;
+        }
+
+        const char* toks[5]{};
+        u32 lens[5]{};
+        u32 tok_count = 0;
+        while (pos < size && data[pos] != '\n') {
+            while (pos < size && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\r')) pos++;
+            if (pos >= size || data[pos] == '\n' || data[pos] == '#') break;
+            if (tok_count >= 5) {
+                munmap(map, static_cast<u64>(st.st_size));
+                return false;
+            }
+            toks[tok_count] = data + pos;
+            while (pos < size && data[pos] != '\n' && data[pos] != ' ' && data[pos] != '\t' &&
+                   data[pos] != '\r')
+                pos++;
+            lens[tok_count] = static_cast<u32>((data + pos) - toks[tok_count]);
+            tok_count++;
+        }
+        while (pos < size && data[pos] != '\n') pos++;
+        if (pos < size && data[pos] == '\n') pos++;
+        if (tok_count == 0) continue;
+
+        if (lens[0] == 8 && __builtin_memcmp(toks[0], "upstream", 8) == 0) {
+            if (tok_count != 3 || out.upstream_count >= Manifest::kMaxUpstreams) {
+                munmap(map, static_cast<u64>(st.st_size));
+                return false;
+            }
+            u32 id = 0;
+            if (!parse_u32_token(toks[1], lens[1], &id) || id > 65535) {
+                munmap(map, static_cast<u64>(st.st_size));
+                return false;
+            }
+            auto& up = out.upstreams[out.upstream_count++];
+            up.id = static_cast<u16>(id);
+            u32 copy_len = lens[2];
+            if (copy_len >= sizeof(up.name)) copy_len = sizeof(up.name) - 1;
+            for (u32 i = 0; i < copy_len; i++) up.name[i] = toks[2][i];
+            up.name[copy_len] = '\0';
+            continue;
+        }
+
+        if (lens[0] == 5 && __builtin_memcmp(toks[0], "route", 5) == 0) {
+            if (tok_count != 5 || out.route_count >= Manifest::kMaxRoutes) {
+                munmap(map, static_cast<u64>(st.st_size));
+                return false;
+            }
+            bool method_ok = false;
+            u8 method = parse_method_token(toks[1], lens[1], &method_ok);
+            if (!method_ok) {
+                munmap(map, static_cast<u64>(st.st_size));
+                return false;
+            }
+            auto& route = out.routes[out.route_count++];
+            route.method = method;
+            u32 pattern_len = lens[2];
+            if (pattern_len >= sizeof(route.pattern)) pattern_len = sizeof(route.pattern) - 1;
+            for (u32 i = 0; i < pattern_len; i++) route.pattern[i] = toks[2][i];
+            route.pattern[pattern_len] = '\0';
+
+            if (lens[3] == 6 && __builtin_memcmp(toks[3], "status", 6) == 0) {
+                u32 code = 0;
+                if (!parse_u32_token(toks[4], lens[4], &code) || code > 65535) {
+                    munmap(map, static_cast<u64>(st.st_size));
+                    return false;
+                }
+                route.action = ManifestAction::ReturnStatus;
+                route.status_code = static_cast<u16>(code);
+            } else if (lens[3] == 5 && __builtin_memcmp(toks[3], "proxy", 5) == 0) {
+                u32 id = 0;
+                if (!parse_u32_token(toks[4], lens[4], &id) || id > 65535) {
+                    munmap(map, static_cast<u64>(st.st_size));
+                    return false;
+                }
+                route.action = ManifestAction::Proxy;
+                route.upstream_id = static_cast<u16>(id);
+            } else {
+                munmap(map, static_cast<u64>(st.st_size));
+                return false;
+            }
+            continue;
+        }
+
+        munmap(map, static_cast<u64>(st.st_size));
+        return false;
+    }
+
+    munmap(map, static_cast<u64>(st.st_size));
+    return true;
+}
+
+bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
+    if (!ctx.init(manifest.route_count == 0 ? 1 : manifest.route_count)) return false;
+
+    rir::Builder b;
+    b.init(&ctx.module);
+
+    for (u32 i = 0; i < manifest.route_count; i++) {
+        char name_buf[32];
+        name_buf[0] = 'r';
+        name_buf[1] = 'o';
+        name_buf[2] = 'u';
+        name_buf[3] = 't';
+        name_buf[4] = 'e';
+        name_buf[5] = '_';
+        u32 pos = 6;
+        u32 v = i;
+        char tmp[10];
+        u32 tn = 0;
+        if (v == 0) {
+            tmp[tn++] = '0';
+        } else {
+            while (v > 0) {
+                tmp[tn++] = static_cast<char>('0' + v % 10);
+                v /= 10;
+            }
+        }
+        while (tn > 0 && pos + 1 < sizeof(name_buf)) name_buf[pos++] = tmp[--tn];
+        name_buf[pos] = '\0';
+
+        Str name;
+        if (!copy_str_into_arena(ctx.arena, name_buf, cstr_len(name_buf), &name)) return false;
+        Str pattern;
+        if (!copy_str_into_arena(ctx.arena,
+                                 manifest.routes[i].pattern,
+                                 cstr_len(manifest.routes[i].pattern),
+                                 &pattern))
+            return false;
+
+        auto fn = b.create_function(name, pattern, manifest.routes[i].method);
+        if (!fn) return false;
+        auto entry = b.create_block(fn.value(), {"entry", 5});
+        if (!entry) return false;
+        b.set_insert_point(fn.value(), entry.value());
+
+        if (manifest.routes[i].action == ManifestAction::ReturnStatus) {
+            if (!b.emit_ret_status(manifest.routes[i].status_code)) return false;
+        } else {
+            auto upstream = b.emit_const_i32(manifest.routes[i].upstream_id);
+            if (!upstream) return false;
+            if (!b.emit_ret_proxy(upstream.value())) return false;
+        }
+    }
+
+    return true;
+}
+
+bool Engine::init(const rir::Module& module,
+                  const ManifestUpstream* upstream_list,
+                  u32 upstreams_len) {
+    if (upstreams_len > kMaxUpstreams || module.func_count > kMaxRoutes) return false;
+    route_count = 0;
+    upstream_count = upstreams_len;
+    for (u32 i = 0; i < upstreams_len; i++) upstreams[i] = upstream_list[i];
+
+    if (!jit.init()) return false;
+    auto cg = jit::codegen(module);
+    if (!cg.ok) {
+        jit.shutdown();
+        return false;
+    }
+    if (!jit.compile(cg.mod, cg.ctx)) {
+        jit.shutdown();
+        return false;
+    }
+
+    for (u32 i = 0; i < module.func_count; i++) {
+        const auto& fn = module.functions[i];
+        if (route_count >= kMaxRoutes) {
+            jit.shutdown();
+            return false;
+        }
+        char symbol[256] = "handler_";
+        u32 pos = 8;
+        for (u32 j = 0; j < fn.name.len && pos + 1 < sizeof(symbol); j++) symbol[pos++] = fn.name.ptr[j];
+        symbol[pos] = '\0';
+
+        void* addr = jit.lookup(symbol);
+        if (!addr) {
+            jit.shutdown();
+            return false;
+        }
+
+        auto& route = routes[route_count++];
+        route.method = fn.http_method;
+        route.pattern_len = fn.route_pattern.len;
+        if (route.pattern_len >= sizeof(route.pattern)) route.pattern_len = sizeof(route.pattern) - 1;
+        for (u32 j = 0; j < route.pattern_len; j++) route.pattern[j] = fn.route_pattern.ptr[j];
+        route.pattern[route.pattern_len] = '\0';
+        route.fn = reinterpret_cast<jit::HandlerFn>(addr);
+    }
+
+    return true;
+}
+
+void Engine::shutdown() {
+    jit.shutdown();
+    route_count = 0;
+    upstream_count = 0;
+}
+
+SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
+    SimulateResult result{};
+    result.expected_status = entry.resp_status;
+    copy_cstr(result.expected_upstream, sizeof(result.expected_upstream), entry.upstream_name);
+
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    req.reset();
+    if (parser.parse(entry.raw_headers, entry.raw_header_len, &req) != ParseStatus::Complete) {
+        result.verdict = Verdict::Failed;
+        return result;
+    }
+
+    result.method = log_method(req.method);
+    const u32 path_len = visible_path_len(req.path);
+    u32 copy_len = path_len;
+    if (copy_len >= sizeof(result.path)) copy_len = sizeof(result.path) - 1;
+    for (u32 i = 0; i < copy_len; i++) result.path[i] = req.path.ptr[i];
+    result.path[copy_len] = '\0';
+
+    const auto* route = select_route(engine, http_method_char(req.method), req.path.ptr, path_len);
+    if (!route) {
+        result.action = jit::HandlerAction::ReturnStatus;
+        result.actual_status = 200;
+        result.verdict = (entry.resp_status == 200 && entry.upstream_name[0] == '\0')
+                             ? Verdict::Match
+                             : Verdict::Mismatch;
+        return result;
+    }
+
+    Connection conn;
+    conn.reset();
+    jit::HandlerCtx ctx{};
+    ctx.state = 0;
+    ctx.handler_idx = 0;
+    ctx.slot_count = 0;
+
+    const u64 packed = route->fn(&conn,
+                                 &ctx,
+                                 entry.raw_headers,
+                                 entry.raw_header_len,
+                                 nullptr);
+    const auto handler = jit::HandlerResult::unpack(packed);
+    result.action = handler.action;
+
+    if (handler.action == jit::HandlerAction::ReturnStatus) {
+        result.actual_status = handler.status_code;
+        result.verdict = (handler.status_code == entry.resp_status && entry.upstream_name[0] == '\0')
+                             ? Verdict::Match
+                             : Verdict::Mismatch;
+        return result;
+    }
+
+    if (handler.action == jit::HandlerAction::Proxy) {
+        const auto* upstream = find_upstream(engine, handler.upstream_id);
+        if (!upstream) {
+            result.verdict = Verdict::Failed;
+            return result;
+        }
+        copy_cstr(result.actual_upstream, sizeof(result.actual_upstream), upstream->name);
+        result.verdict = streq(result.actual_upstream, result.expected_upstream) ? Verdict::Match
+                                                                                 : Verdict::Mismatch;
+        return result;
+    }
+
+    result.verdict = Verdict::Unsupported;
+    return result;
+}
+
+SimulateSummary simulate_file(Engine& engine, ReplayReader& reader) {
+    SimulateSummary summary{};
+    CaptureEntry entry{};
+    while (reader.next(entry) == 0) {
+        summary.total++;
+        const SimulateResult result = simulate_one(engine, entry);
+        switch (result.verdict) {
+            case Verdict::Match:
+                summary.matched++;
+                break;
+            case Verdict::Mismatch:
+                summary.mismatched++;
+                break;
+            case Verdict::Failed:
+                summary.failed++;
+                break;
+            case Verdict::Unsupported:
+                summary.unsupported++;
+                break;
+        }
+    }
+    return summary;
+}
+
+u32 format_result(const SimulateResult& result, char* buf, u32 buf_size) {
+    u32 pos = 0;
+    put_str(buf, buf_size, &pos, verdict_str(result.verdict));
+    put_str(buf, buf_size, &pos, " ");
+
+    static const char* kMethods[] = {"GET", "POST", "PUT", "DELETE", "PATCH",
+                                     "HEAD", "OPTIONS", "CONNECT", "TRACE", "OTHER"};
+    u8 method_idx = result.method < 10 ? result.method : 9;
+    put_str(buf, buf_size, &pos, kMethods[method_idx]);
+    put_str(buf, buf_size, &pos, " ");
+    put_str(buf, buf_size, &pos, result.path[0] ? result.path : "/");
+    put_str(buf, buf_size, &pos, " ");
+    put_str(buf, buf_size, &pos, action_str(result.action));
+    put_str(buf, buf_size, &pos, " ");
+
+    if (result.action == jit::HandlerAction::Proxy) {
+        put_name(buf, buf_size, &pos, result.expected_upstream[0] ? result.expected_upstream : "-");
+        put_str(buf, buf_size, &pos, " -> ");
+        put_name(buf, buf_size, &pos, result.actual_upstream[0] ? result.actual_upstream : "-");
+    } else {
+        put_u32(buf, buf_size, &pos, result.expected_status);
+        put_str(buf, buf_size, &pos, " -> ");
+        put_u32(buf, buf_size, &pos, result.actual_status);
+    }
+
+    if (pos + 1 < buf_size) buf[pos++] = '\n';
+    if (pos < buf_size) buf[pos] = '\0';
+    return pos;
+}
+
+u32 format_summary(const SimulateSummary& summary, char* buf, u32 buf_size) {
+    u32 pos = 0;
+    put_str(buf, buf_size, &pos, "--- Simulate Summary ---\n");
+    put_str(buf, buf_size, &pos, "Total: ");
+    put_u32(buf, buf_size, &pos, summary.total);
+    put_str(buf, buf_size, &pos, "\nMatched: ");
+    put_u32(buf, buf_size, &pos, summary.matched);
+    put_str(buf, buf_size, &pos, "\nMismatched: ");
+    put_u32(buf, buf_size, &pos, summary.mismatched);
+    put_str(buf, buf_size, &pos, "\nFailed: ");
+    put_u32(buf, buf_size, &pos, summary.failed);
+    put_str(buf, buf_size, &pos, "\nUnsupported: ");
+    put_u32(buf, buf_size, &pos, summary.unsupported);
+    if (pos + 1 < buf_size) buf[pos++] = '\n';
+    if (pos < buf_size) buf[pos] = '\0';
+    return pos;
+}
+
+}  // namespace rut::sim

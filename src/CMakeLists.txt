@@ -185,10 +185,30 @@ target_compile_definitions(rue_jit PRIVATE ${LLVM_DEFINITIONS})
 # rue_jit also links rue_runtime for runtime_helpers (uses HttpParser, Connection)
 target_link_libraries(rue_jit rue_runtime)
 
+# Offline simulate library — JIT-backed capture validation with no event loop.
+add_library(rue_simulate STATIC
+    sim/simulate_engine.cc
+)
+target_include_directories(rue_simulate PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+target_compile_definitions(rue_simulate PRIVATE ${LLVM_DEFINITIONS})
+target_link_libraries(rue_simulate
+    rue_runtime
+    rue_compiler
+    rue_jit
+)
+
 # Main executable
 add_executable(rue main.cc)
 target_link_libraries(rue
     rue_runtime
     rue_compiler
     rue_jit
+)
+
+add_executable(rut-simulate sim/main.cc)
+target_link_libraries(rut-simulate
+    rue_simulate
 )

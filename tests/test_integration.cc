@@ -1092,6 +1092,169 @@ TEST(shard, access_log_init) {
     close(lfd);
 }
 
+// === Route matching via real sockets (covers EpollEventLoop instantiation) ===
+
+TEST(route, static_200_real_socket) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 200);
+    cfg.add_static("/", 0, 404);
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    CHECK(has_200(buf, n));
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(route, static_404_real_socket) {
+    RouteConfig cfg;
+    cfg.add_static("/", 0, 404);
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 35);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    // Should contain "404"
+    bool found_404 = false;
+    for (i32 i = 0; i < n - 2; i++) {
+        if (buf[i] == '4' && buf[i + 1] == '0' && buf[i + 2] == '4') {
+            found_404 = true;
+            break;
+        }
+    }
+    CHECK(found_404);
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(route, multiple_status_codes_real_socket) {
+    RouteConfig cfg;
+    cfg.add_static("/e201", 0, 201);
+    cfg.add_static("/e204", 0, 204);
+    cfg.add_static("/e301", 0, 301);
+    cfg.add_static("/e403", 0, 403);
+    cfg.add_static("/e500", 0, 500);
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 50};
+    lt.start();
+
+    struct {
+        const char* req;
+        u32 req_len;
+        const char* expect;
+    } cases[] = {
+        {"GET /e201 HTTP/1.1\r\nHost: x\r\n\r\n", 31, "201"},
+        {"GET /e204 HTTP/1.1\r\nHost: x\r\n\r\n", 31, "204"},
+        {"GET /e301 HTTP/1.1\r\nHost: x\r\n\r\n", 31, "301"},
+        {"GET /e403 HTTP/1.1\r\nHost: x\r\n\r\n", 31, "403"},
+        {"GET /e500 HTTP/1.1\r\nHost: x\r\n\r\n", 31, "500"},
+    };
+    for (auto& tc : cases) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        send_all(c, tc.req, tc.req_len);
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i < n - 2; i++) {
+            if (buf[i] == tc.expect[0] && buf[i + 1] == tc.expect[1] &&
+                buf[i + 2] == tc.expect[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    }
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(route, capture_real_socket) {
+    RouteConfig cfg;
+    cfg.add_static("/", 0, 200);
+    const RouteConfig* active = &cfg;
+    CaptureRing ring;
+    ring.init();
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    loop->set_capture(&ring);
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /cap HTTP/1.1\r\nHost: x\r\n\r\n", 31);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    close(c);
+
+    lt.stop();
+    // Small delay for request completion
+    usleep(5000);
+    CHECK_EQ(ring.available(), 1u);
+
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

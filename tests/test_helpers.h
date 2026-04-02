@@ -12,6 +12,7 @@
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/socket.h"
 #include "rut/runtime/timer_wheel.h"
+#include "rut/runtime/traffic_capture.h"
 #include <atomic>
 
 #include <errno.h>
@@ -42,12 +43,24 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     u32 keepalive_timeout = 60;
     bool draining = false;
     AccessLogRing* access_log = nullptr;
+    struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
 
     // Inline buffer storage for tests (no SlicePool dependency).
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];
     u8 upstream_recv_storage[kMaxConns][kBufSize];
+    u8 capture_storage[kMaxConns][CaptureEntry::kMaxHeaderLen];
+
+    bool set_capture(CaptureRing* ring) {
+        capture_ring = ring;
+        if (!ring) return true;
+        for (u32 i = 0; i < kMaxConns; i++) {
+            if (conns[i].fd >= 0 && !conns[i].capture_buf)
+                conns[i].capture_buf = capture_storage[i];
+        }
+        return true;
+    }
 
     bool is_draining() const { return draining; }
 
@@ -76,12 +89,18 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         if (cfg && config_ptr) *config_ptr = cfg;
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;
+        auto* cap = control->pending_capture.exchange(nullptr, std::memory_order_acq_rel);
+        if (cap == kCaptureDisable)
+            set_capture(nullptr);
+        else if (cap)
+            set_capture(cap);
     }
 
     void setup() {
         running = true;
         draining = false;
         access_log = nullptr;
+        capture_ring = nullptr;
         metrics = nullptr;
         config_ptr = nullptr;
         control = nullptr;
@@ -118,6 +137,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         conns[id].send_slice = send_storage[id];
         conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
+        if (capture_ring) conns[id].capture_buf = capture_storage[id];
         return &conns[id];
     }
     void free_conn_impl(Connection& c) {
@@ -359,6 +379,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     u32 keepalive_timeout = 60;
     bool draining = false;
     AccessLogRing* access_log = nullptr;
+    struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
 
     u8 recv_storage[kMaxConns][kBufSize];
@@ -400,6 +421,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         running = true;
         draining = false;
         access_log = nullptr;
+        capture_ring = nullptr;
         metrics = nullptr;
         config_ptr = nullptr;
         control = nullptr;
@@ -615,6 +637,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     u32 keepalive_timeout = 60;
     bool draining = false;
     AccessLogRing* access_log = nullptr;
+    struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
 
     u8 recv_storage[kMaxConns][kBufSize];

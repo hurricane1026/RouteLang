@@ -8609,6 +8609,671 @@ TEST(coverage, body_send_error_sync_recv_with_real_fd) {
     close(fds[1]);
 }
 
+// Coverage: exercise callbacks.h routing + capture paths that were added
+// by the traffic capture PR. These run inside test_network's binary so
+// llvm-cov counts them. Without this, the code only exists in
+// test_traffic_capture/replay objects which are not in the report.
+
+TEST(route_coverage, static_routes) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 200);
+    cfg.add_static("/created", 0, 201);
+    cfg.add_static("/empty", 0, 204);
+    cfg.add_static("/moved", 0, 301);
+    cfg.add_static("/found", 0, 302);
+    cfg.add_static("/notmod", 0, 304);
+    cfg.add_static("/e400", 0, 400);
+    cfg.add_static("/e401", 0, 401);
+    cfg.add_static("/e403", 0, 403);
+    cfg.add_static("/e404", 0, 404);
+    cfg.add_static("/e405", 0, 405);
+    cfg.add_static("/e429", 0, 429);
+    cfg.add_static("/e500", 0, 500);
+    cfg.add_static("/e502", 0, 502);
+    cfg.add_static("/e503", 0, 503);
+    cfg.add_static("/e999", 0, 999);
+    const RouteConfig* active = &cfg;
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    struct {
+        const char* req;
+        u16 status;
+    } cases[] = {{"GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200},
+                 {"GET /created HTTP/1.1\r\nHost: x\r\n\r\n", 201},
+                 {"GET /empty HTTP/1.1\r\nHost: x\r\n\r\n", 204},
+                 {"GET /moved HTTP/1.1\r\nHost: x\r\n\r\n", 301},
+                 {"GET /found HTTP/1.1\r\nHost: x\r\n\r\n", 302},
+                 {"GET /notmod HTTP/1.1\r\nHost: x\r\n\r\n", 304},
+                 {"GET /e400 HTTP/1.1\r\nHost: x\r\n\r\n", 400},
+                 {"GET /e401 HTTP/1.1\r\nHost: x\r\n\r\n", 401},
+                 {"GET /e403 HTTP/1.1\r\nHost: x\r\n\r\n", 403},
+                 {"GET /e404 HTTP/1.1\r\nHost: x\r\n\r\n", 404},
+                 {"GET /e405 HTTP/1.1\r\nHost: x\r\n\r\n", 405},
+                 {"GET /e429 HTTP/1.1\r\nHost: x\r\n\r\n", 429},
+                 {"GET /e500 HTTP/1.1\r\nHost: x\r\n\r\n", 500},
+                 {"GET /e502 HTTP/1.1\r\nHost: x\r\n\r\n", 502},
+                 {"GET /e503 HTTP/1.1\r\nHost: x\r\n\r\n", 503},
+                 {"GET /e999 HTTP/1.1\r\nHost: x\r\n\r\n", 999},
+                 {"GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 200}};
+    i32 fake_fd = 50;
+    for (auto& tc : cases) {
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, fake_fd));
+        auto* c = loop.find_fd(fake_fd);
+        fake_fd++;
+        REQUIRE(c != nullptr);
+        c->recv_buf.reset();
+        u32 len = 0;
+        while (tc.req[len]) len++;
+        c->recv_buf.write(reinterpret_cast<const u8*>(tc.req), len);
+        IoEvent rev = {c->id, static_cast<i32>(len), 0, 0, IoEventType::Recv, 0};
+        loop.backend.inject(rev);
+        IoEvent events[8];
+        u32 n = loop.backend.wait(events, 8);
+        for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+        if (c->send_buf.len() > 0)
+            loop.inject_and_dispatch(
+                make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+        CHECK_EQ(c->resp_status, tc.status);
+        loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 0));
+    }
+}
+
+TEST(route_coverage, capture_stage_and_write) {
+    CaptureRing ring;
+    ring.init();
+    SmallLoop loop;
+    loop.setup();
+    loop.set_capture(&ring);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET /cap HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(ring.available(), 1u);
+    CaptureEntry cap{};
+    ring.pop(cap);
+    CHECK_EQ(cap.resp_status, 200);
+    CHECK_GT(cap.raw_header_len, 0);
+}
+
+TEST(route_coverage, drain_connection_close) {
+    RouteConfig cfg;
+    cfg.add_static("/", 0, 200);
+    const RouteConfig* active = &cfg;
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    loop.draining = true;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK(!c->keep_alive);
+    CHECK_EQ(c->resp_status, 200);
+}
+
+TEST(route_coverage, with_metrics_and_access_log) {
+    ShardMetrics metrics;
+    metrics.init();
+    AccessLogRing log_ring;
+    log_ring.init();
+
+    RouteConfig cfg;
+    cfg.add_static("/", 0, 200);
+    const RouteConfig* active = &cfg;
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    loop.metrics = &metrics;
+    loop.access_log = &log_ring;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(log_ring.available(), 1u);
+}
+
+// === AsyncSmallLoop coverage ===
+// These exercise callbacks.h template instantiations for AsyncSmallLoop,
+// covering the proxy body streaming paths that inflate uncovered line
+// counts in llvm-cov's per-instantiation accounting.
+
+// Helper: custom recv into upstream_recv_buf for AsyncSmallLoop.
+static void async_inject_upstream_recv(AsyncSmallLoop& loop,
+                                       Connection& conn,
+                                       const u8* data,
+                                       u32 len) {
+    conn.upstream_recv_buf.reset();
+    u8* dst = conn.upstream_recv_buf.write_ptr();
+    for (u32 i = 0; i < len; i++) dst[i] = data[i];
+    conn.upstream_recv_buf.commit(len);
+    IoEvent ev = make_ev(conn.id, IoEventType::UpstreamRecv, static_cast<i32>(len));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+}
+
+// Helper: set up proxy connection on AsyncSmallLoop.
+static Connection* async_setup_proxy(AsyncSmallLoop& loop) {
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    if (!conn) return nullptr;
+
+    const char* req = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+    u32 req_len = 30;
+    conn->recv_buf.reset();
+    u8* dst = conn->recv_buf.write_ptr();
+    for (u32 i = 0; i < req_len; i++) dst[i] = static_cast<u8>(req[i]);
+    conn->recv_buf.commit(req_len);
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(req_len));
+    loop.backend.inject(recv_ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    conn->upstream_fd = 100;
+    conn->on_upstream_send = &on_upstream_connected<AsyncSmallLoop>;
+    conn->state = ConnState::Proxying;
+    loop.submit_connect(*conn, nullptr, 0);
+
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(conn->recv_buf.len())));
+    return conn;
+}
+
+TEST(async_coverage, proxy_full_cycle) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    conn->recv_buf.reset();
+    const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {conn->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Default 200 OK path
+    CHECK_EQ(conn->on_send, &on_response_sent<AsyncSmallLoop>);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+}
+
+TEST(async_coverage, proxy_connect_502) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    conn->recv_buf.reset();
+    const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {conn->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    conn->upstream_fd = 100;
+    conn->on_upstream_send = &on_upstream_connected<AsyncSmallLoop>;
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -111));
+    // 502 sent
+    CHECK_EQ(conn->on_send, &on_response_sent<AsyncSmallLoop>);
+}
+
+TEST(async_coverage, content_length_streaming) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    auto* conn = async_setup_proxy(loop);
+    REQUIRE(conn != nullptr);
+
+    const char* resp_hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 8000\r\n"
+        "\r\n";
+    u32 hdr_len = 0;
+    while (resp_hdr[hdr_len]) hdr_len++;
+
+    u32 initial_body = AsyncSmallLoop::kBufSize - hdr_len;
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
+    for (u32 i = 0; i < hdr_len; i++) dst[i] = static_cast<u8>(resp_hdr[i]);
+    for (u32 i = 0; i < initial_body; i++) dst[hdr_len + i] = static_cast<u8>(i & 0xFF);
+    conn->upstream_recv_buf.commit(hdr_len + initial_body);
+
+    IoEvent ev =
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(hdr_len + initial_body));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK_EQ(conn->resp_body_mode, BodyMode::ContentLength);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(hdr_len + initial_body)));
+
+    u32 body_sent = initial_body;
+    u32 total_body = 8000;
+    while (body_sent < total_body) {
+        u32 chunk = total_body - body_sent;
+        if (chunk > AsyncSmallLoop::kBufSize) chunk = AsyncSmallLoop::kBufSize;
+        u8 body[AsyncSmallLoop::kBufSize];
+        for (u32 i = 0; i < chunk; i++) body[i] = static_cast<u8>(i & 0xFF);
+        async_inject_upstream_recv(loop, *conn, body, chunk);
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(chunk)));
+        body_sent += chunk;
+    }
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+}
+
+TEST(async_coverage, chunked_streaming) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    auto* conn = async_setup_proxy(loop);
+    REQUIRE(conn != nullptr);
+
+    const char resp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "A\r\n"
+        "0123456789\r\n"
+        "0\r\n"
+        "\r\n";
+    u32 resp_len = sizeof(resp) - 1;
+    async_inject_upstream_recv(loop, *conn, reinterpret_cast<const u8*>(resp), resp_len);
+    CHECK_EQ(conn->resp_body_mode, BodyMode::Chunked);
+
+    // Send headers+body to client
+    if (conn->send_buf.len() > 0)
+        loop.inject_and_dispatch(
+            make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    // Body streaming might need more sends
+    if (conn->on_send == &on_response_body_sent<AsyncSmallLoop>) {
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));
+    }
+}
+
+TEST(async_coverage, no_body_204) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    auto* conn = async_setup_proxy(loop);
+    REQUIRE(conn != nullptr);
+
+    const char resp[] =
+        "HTTP/1.1 204 No Content\r\n"
+        "\r\n";
+    async_inject_upstream_recv(loop, *conn, reinterpret_cast<const u8*>(resp), sizeof(resp) - 1);
+    CHECK_EQ(conn->resp_body_mode, BodyMode::None);
+}
+
+TEST(async_coverage, static_routes) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 200);
+    cfg.add_static("/", 0, 404);
+    const RouteConfig* active = &cfg;
+    AsyncSmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(c->resp_status, 200);
+}
+
+TEST(async_coverage, capture_write) {
+    CaptureRing ring;
+    ring.init();
+    AsyncSmallLoop loop;
+    loop.setup();
+    loop.capture_ring = &ring;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    // Manually set capture_buf since AsyncSmallLoop doesn't have set_capture
+    u8 cap_buf[CaptureEntry::kMaxHeaderLen];
+    c->capture_buf = cap_buf;
+
+    c->recv_buf.reset();
+    const char req[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(ring.available(), 1u);
+}
+
+TEST(async_coverage, with_metrics_and_access_log) {
+    ShardMetrics metrics;
+    metrics.init();
+    AccessLogRing log_ring;
+    log_ring.init();
+    AsyncSmallLoop loop;
+    loop.setup();
+    loop.metrics = &metrics;
+    loop.access_log = &log_ring;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(log_ring.available(), 1u);
+}
+
+TEST(async_coverage, drain_connection_close) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    loop.draining = true;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK(!c->keep_alive);
+}
+
+TEST(route_coverage, proxy_route_creates_socket) {
+    RouteConfig cfg;
+    auto up = cfg.add_upstream("backend", 0x7F000001, 9999);
+    REQUIRE(up.has_value());
+    cfg.add_proxy("/api", 0, static_cast<u16>(up.value()));
+    const RouteConfig* active = &cfg;
+
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET /api/test HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->state, ConnState::Proxying);
+    CHECK(c->upstream_fd >= 0);
+    CHECK_EQ(c->upstream_name[0], 'b');  // "backend"
+    // Clean up real socket
+    if (c->upstream_fd >= 0) {
+        close(c->upstream_fd);
+        c->upstream_fd = -1;
+    }
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 0));
+}
+
+TEST(async_coverage, proxy_route_creates_socket) {
+    RouteConfig cfg;
+    auto up = cfg.add_upstream("async-be", 0x7F000001, 9999);
+    REQUIRE(up.has_value());
+    cfg.add_proxy("/api", 0, static_cast<u16>(up.value()));
+    const RouteConfig* active = &cfg;
+    AsyncSmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET /api/x HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->state, ConnState::Proxying);
+    CHECK(c->upstream_fd >= 0);
+    if (c->upstream_fd >= 0) {
+        close(c->upstream_fd);
+        c->upstream_fd = -1;
+    }
+}
+
+TEST(async_coverage, pipeline_two_requests) {
+    AsyncSmallLoop loop;
+    loop.setup();
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    // First request
+    c->recv_buf.reset();
+    const char req1[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req1), sizeof(req1) - 1);
+    IoEvent rev1 = {c->id, static_cast<i32>(sizeof(req1) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev1);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+
+    // Second request (keep-alive)
+    c->recv_buf.reset();
+    const char req2[] = "GET /second HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req2), sizeof(req2) - 1);
+    IoEvent rev2 = {c->id, static_cast<i32>(sizeof(req2) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev2);
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+}
+
+TEST(async_coverage, all_status_codes) {
+    RouteConfig cfg;
+    cfg.add_static("/e201", 0, 201);
+    cfg.add_static("/e302", 0, 302);
+    cfg.add_static("/e304", 0, 304);
+    cfg.add_static("/e401", 0, 401);
+    cfg.add_static("/e403", 0, 403);
+    cfg.add_static("/e405", 0, 405);
+    cfg.add_static("/e429", 0, 429);
+    cfg.add_static("/e502", 0, 502);
+    cfg.add_static("/e503", 0, 503);
+    cfg.add_static("/e999", 0, 999);
+    const RouteConfig* active = &cfg;
+    AsyncSmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    struct {
+        const char* req;
+        u16 status;
+    } cases[] = {
+        {"GET /e201 HTTP/1.1\r\nHost: x\r\n\r\n", 201},
+        {"GET /e302 HTTP/1.1\r\nHost: x\r\n\r\n", 302},
+        {"GET /e304 HTTP/1.1\r\nHost: x\r\n\r\n", 304},
+        {"GET /e401 HTTP/1.1\r\nHost: x\r\n\r\n", 401},
+        {"GET /e403 HTTP/1.1\r\nHost: x\r\n\r\n", 403},
+        {"GET /e405 HTTP/1.1\r\nHost: x\r\n\r\n", 405},
+        {"GET /e429 HTTP/1.1\r\nHost: x\r\n\r\n", 429},
+        {"GET /e502 HTTP/1.1\r\nHost: x\r\n\r\n", 502},
+        {"GET /e503 HTTP/1.1\r\nHost: x\r\n\r\n", 503},
+        {"GET /e999 HTTP/1.1\r\nHost: x\r\n\r\n", 999},
+    };
+    i32 fake_fd = 50;
+    for (auto& tc : cases) {
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, fake_fd));
+        auto* c = loop.find_fd(fake_fd);
+        fake_fd++;
+        REQUIRE(c != nullptr);
+        c->recv_buf.reset();
+        u32 len = 0;
+        while (tc.req[len]) len++;
+        c->recv_buf.write(reinterpret_cast<const u8*>(tc.req), len);
+        IoEvent rev = {c->id, static_cast<i32>(len), 0, 0, IoEventType::Recv, 0};
+        loop.backend.inject(rev);
+        IoEvent events[8];
+        u32 n = loop.backend.wait(events, 8);
+        for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+        if (c->send_buf.len() > 0)
+            loop.inject_and_dispatch(
+                make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+        CHECK_EQ(c->resp_status, tc.status);
+        loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 0));
+    }
+}
+
+TEST(async_coverage, request_body_content_length) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    auto* conn = async_setup_proxy(loop);
+    REQUIRE(conn != nullptr);
+
+    // Simulate upstream response first so the connection reaches a
+    // request body streaming scenario. Instead, test the POST body
+    // streaming through on_request_body_recvd/sent.
+    // Reset and re-setup with a POST request that has a body.
+    // For simplicity, just accept a new connection with POST.
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));
+    auto* c2 = loop.find_fd(43);
+    REQUIRE(c2 != nullptr);
+    c2->recv_buf.reset();
+    const char req[] = "POST /data HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n";
+    u32 req_len = 0;
+    while (req[req_len]) req_len++;
+    c2->recv_buf.write(reinterpret_cast<const u8*>(req), req_len);
+    IoEvent rev = {c2->id, static_cast<i32>(req_len), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Default 200 OK (no route config) — body mode should be set
+    // even though we respond immediately. This covers req_body_mode path.
+    CHECK_EQ(c2->req_body_mode, BodyMode::ContentLength);
+}
+
+TEST(async_coverage, until_close_body) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    auto* conn = async_setup_proxy(loop);
+    REQUIRE(conn != nullptr);
+
+    // HTTP/1.0 response without Content-Length = until-close body mode
+    const char resp[] =
+        "HTTP/1.0 200 OK\r\n"
+        "\r\n"
+        "some body data here";
+    async_inject_upstream_recv(loop, *conn, reinterpret_cast<const u8*>(resp), sizeof(resp) - 1);
+    CHECK_EQ(conn->resp_body_mode, BodyMode::UntilClose);
+}
+
+TEST(async_coverage, early_response_on_proxy) {
+    AsyncSmallLoop loop;
+    loop.setup();
+
+    // Accept and do a POST with body
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->recv_buf.reset();
+    const char req[] = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\npartial";
+    u32 req_len = 0;
+    while (req[req_len]) req_len++;
+    conn->recv_buf.write(reinterpret_cast<const u8*>(req), req_len);
+    IoEvent rev = {conn->id, static_cast<i32>(req_len), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    // Switch to proxy and connect
+    conn->upstream_fd = 100;
+    conn->on_upstream_send = &on_upstream_connected<AsyncSmallLoop>;
+    conn->state = ConnState::Proxying;
+    loop.submit_connect(*conn, nullptr, 0);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+
+    // Send partial request body to upstream
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(conn->recv_buf.len())));
+
+    // At this point, body streaming or upstream response paths are active
+    // Just verify no crash and state is consistent
+    CHECK(conn->state == ConnState::Proxying || conn->state == ConnState::ReadingHeader);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

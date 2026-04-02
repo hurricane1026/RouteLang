@@ -8609,6 +8609,84 @@ TEST(coverage, body_send_error_sync_recv_with_real_fd) {
     close(fds[1]);
 }
 
+// Coverage: exercise callbacks.h routing + capture paths that were added
+// by the traffic capture PR. These run inside test_network's binary so
+// llvm-cov counts them. Without this, the code only exists in
+// test_traffic_capture/replay objects which are not in the report.
+
+TEST(route_coverage, static_routes) {
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 200);
+    cfg.add_static("/empty", 0, 204);
+    cfg.add_static("/moved", 0, 301);
+    cfg.add_static("/bad", 0, 400);
+    cfg.add_static("/nope", 0, 404);
+    cfg.add_static("/err", 0, 500);
+    const RouteConfig* active = &cfg;
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    struct {
+        const char* req;
+        u16 status;
+    } cases[] = {
+        {"GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200},
+        {"GET /empty HTTP/1.1\r\nHost: x\r\n\r\n", 204},
+        {"GET /moved HTTP/1.1\r\nHost: x\r\n\r\n", 301},
+        {"GET /bad HTTP/1.1\r\nHost: x\r\n\r\n", 400},
+        {"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n", 404},
+        {"GET /err HTTP/1.1\r\nHost: x\r\n\r\n", 500},
+        {"GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 200},  // no match → default
+    };
+    for (auto& tc : cases) {
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 50));
+        auto* c = loop.find_fd(50);
+        REQUIRE(c != nullptr);
+        c->recv_buf.reset();
+        u32 len = 0;
+        while (tc.req[len]) len++;
+        c->recv_buf.write(reinterpret_cast<const u8*>(tc.req), len);
+        IoEvent rev = {c->id, static_cast<i32>(len), 0, 0, IoEventType::Recv, 0};
+        loop.backend.inject(rev);
+        IoEvent events[8];
+        u32 n = loop.backend.wait(events, 8);
+        for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+        if (c->send_buf.len() > 0)
+            loop.inject_and_dispatch(
+                make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+        CHECK_EQ(c->resp_status, tc.status);
+        loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 0));
+    }
+}
+
+TEST(route_coverage, capture_stage_and_write) {
+    CaptureRing ring;
+    ring.init();
+    SmallLoop loop;
+    loop.setup();
+    loop.set_capture(&ring);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET /cap HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(ring.available(), 1u);
+    CaptureEntry cap{};
+    ring.pop(cap);
+    CHECK_EQ(cap.resp_status, 200);
+    CHECK_GT(cap.raw_header_len, 0);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

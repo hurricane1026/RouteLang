@@ -142,14 +142,7 @@ jobs:
             --object build/tests/test_chunked_parser \
             --object build/tests/test_rir \
             --sources include/rut/common/ include/rut/runtime/ src/runtime/ \
-            --ignore-filename-regex='io_uring_backend|epoll_backend|socket\.cc|access_log\.cc|shard\.h|epoll_event_loop\.h|iouring_event_loop\.h|callbacks\.h' | tee build/coverage.txt
-          # callbacks.h is excluded because it is a template header whose
-          # line count and coverage depend entirely on which Loop types
-          # are instantiated by the linked test binaries. Adding includes
-          # (route_table.h, upstream_pool.h) causes test_network's SmallLoop
-          # instantiation to pull in ~300 additional proxy body streaming
-          # lines that require real upstream TCP connections to exercise.
-          # This is a template coverage artifact, not a code quality issue.
+            --ignore-filename-regex='io_uring_backend|epoll_backend|socket\.cc|access_log\.cc|shard\.h|epoll_event_loop\.h|iouring_event_loop\.h' | tee build/coverage.txt
           # Note: test_traffic_capture, test_traffic_replay, test_sim, and
           # test_shard_control are excluded from the coverage report because
           # they instantiate callbacks.h templates for SmallLoop/EpollEventLoop

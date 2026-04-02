@@ -388,7 +388,23 @@ TEST(simulate_engine, load_manifest_rejects_too_large_file) {
     char path[] = "/tmp/rut_sim_manifest_XXXXXX";
     i32 fd = mkstemp(path);
     REQUIRE(fd >= 0);
-    REQUIRE(ftruncate(fd, static_cast<off_t>(1ULL << 32)) == 0);
+    const i32 rc = ftruncate(fd, static_cast<off_t>(1ULL << 32));
+    if (rc != 0) {
+        const i32 truncate_errno = errno;
+        close(fd);
+        unlink(path);
+        if (truncate_errno == ENOSPC
+#ifdef EDQUOT
+            || truncate_errno == EDQUOT
+#endif
+#ifdef EFBIG
+            || truncate_errno == EFBIG
+#endif
+        ) {
+            return;
+        }
+        REQUIRE(rc == 0);
+    }
     close(fd);
 
     Manifest manifest;
@@ -517,6 +533,41 @@ TEST(simulate_engine, summary_counts_mismatch) {
     ctx.destroy();
 }
 
+TEST(simulate_engine, simulate_file_counts_truncated_capture_as_failed) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = 'G';
+    strcpy(manifest.routes[0].pattern, "/ok");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 200;
+
+    ModuleContext ctx{};
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+
+    char path[] = "/tmp/rut_sim_capture_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.entry_count = 2;
+    REQUIRE(write(fd, &hdr, sizeof(hdr)) == static_cast<ssize_t>(sizeof(hdr)));
+    REQUIRE(capture_write_entry(fd, make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200)) == 0);
+    close(fd);
+
+    ReplayReader reader;
+    REQUIRE(reader.open(path) == 0);
+    const auto summary = simulate_file(engine, reader);
+    CHECK_EQ(summary.total, 2u);
+    CHECK_EQ(summary.matched, 1u);
+    CHECK_EQ(summary.failed, 1u);
+    CHECK_EQ(summary.mismatched, 0u);
+    reader.close();
+    unlink(path);
+    engine.shutdown();
+    ctx.destroy();
+}
+
 TEST(simulate_engine, format_result_uses_mismatch_label) {
     SimulateResult result{};
     result.verdict = Verdict::Mismatch;
@@ -550,6 +601,45 @@ TEST(simulate_engine, cli_usage_mentions_param_prefix_matching) {
     CHECK(strstr(stderr_buf, "Usage: rut-simulate") != nullptr);
     CHECK(strstr(stderr_buf, "prefix-matched") != nullptr);
     CHECK(strstr(stderr_buf, "':param'") != nullptr);
+}
+
+TEST(simulate_engine, cli_fails_on_truncated_capture) {
+    char manifest_path[] = "/tmp/rut_sim_manifest_XXXXXX";
+    i32 manifest_fd = mkstemp(manifest_path);
+    REQUIRE(manifest_fd >= 0);
+    static const char kManifest[] = "route GET /ok status 200\n";
+    REQUIRE(write(manifest_fd, kManifest, sizeof(kManifest) - 1) ==
+            static_cast<ssize_t>(sizeof(kManifest) - 1));
+    close(manifest_fd);
+
+    char capture_path[] = "/tmp/rut_sim_capture_XXXXXX";
+    i32 capture_fd = mkstemp(capture_path);
+    REQUIRE(capture_fd >= 0);
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.entry_count = 2;
+    REQUIRE(write(capture_fd, &hdr, sizeof(hdr)) == static_cast<ssize_t>(sizeof(hdr)));
+    REQUIRE(capture_write_entry(capture_fd,
+                                make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200)) == 0);
+    close(capture_fd);
+
+    char stdout_buf[512];
+    char stderr_buf[512];
+    i32 exit_code = -1;
+    REQUIRE(run_simulate_cli(manifest_path,
+                             capture_path,
+                             &exit_code,
+                             stdout_buf,
+                             sizeof(stdout_buf),
+                             stderr_buf,
+                             sizeof(stderr_buf)));
+    CHECK_EQ(exit_code, 1);
+    CHECK(strstr(stderr_buf, "Capture file is truncated or unreadable") != nullptr);
+    CHECK(strstr(stdout_buf, "Total: 2") != nullptr);
+    CHECK(strstr(stdout_buf, "Failed: 1") != nullptr);
+
+    unlink(manifest_path);
+    unlink(capture_path);
 }
 
 int main(int argc, char** argv) {

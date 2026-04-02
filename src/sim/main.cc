@@ -98,6 +98,15 @@ int main(int argc, char** argv) {
         const u32 kLen = sim::format_result(kResult, line, sizeof(line));
         (void)write_all(1, line, kLen);
     }
+    if (reader.entries_read != reader.entry_count()) {
+        const u64 kExpected = reader.entry_count();
+        const u64 kMissing = kExpected > summary.total ? (kExpected - summary.total) : 0;
+        if (kMissing > 0) {
+            summary.failed += static_cast<u32>(kMissing);
+            summary.total += static_cast<u32>(kMissing);
+        }
+        write_str(2, "Capture file is truncated or unreadable\n");
+    }
 
     char summary_buf[256];
     const u32 kSlen = sim::format_summary(summary, summary_buf, sizeof(summary_buf));

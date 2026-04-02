@@ -637,6 +637,12 @@ SimulateSummary simulate_file(Engine& engine, ReplayReader& reader) {
                 break;
         }
     }
+    const u64 kExpectedTotal = reader.entry_count();
+    if (summary.total < kExpectedTotal) {
+        const u64 kMissing = kExpectedTotal - summary.total;
+        summary.failed += static_cast<u32>(kMissing);
+        summary.total += static_cast<u32>(kMissing);
+    }
     return summary;
 }
 

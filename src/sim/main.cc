@@ -37,8 +37,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    sim::ModuleContext module_ctx;
+    sim::ModuleContext module_ctx{};
     if (!sim::build_module_from_manifest(manifest, module_ctx)) {
+        module_ctx.destroy();
         write_str(2, "Failed to build RIR module from manifest\n");
         return 1;
     }

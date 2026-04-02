@@ -302,6 +302,10 @@ bool load_manifest(const char* path, Manifest& out) {
         ::close(kFd);
         return true;
     }
+    if (static_cast<u64>(st.st_size) > static_cast<u64>(static_cast<u32>(-1))) {
+        ::close(kFd);
+        return false;
+    }
 
     void* map = mmap(nullptr, static_cast<u64>(st.st_size), PROT_READ, MAP_PRIVATE, kFd, 0);
     ::close(kFd);
@@ -358,10 +362,14 @@ bool load_manifest(const char* path, Manifest& out) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
-            auto& up = out.upstreams[out.upstream_count++];
+            auto& up = out.upstreams[out.upstream_count];
+            if (tokens[2].len >= sizeof(up.name)) {
+                munmap(map, static_cast<u64>(st.st_size));
+                return false;
+            }
+            out.upstream_count++;
             up.id = static_cast<u16>(id);
             u32 copy_len = tokens[2].len;
-            if (copy_len >= sizeof(up.name)) copy_len = sizeof(up.name) - 1;
             for (u32 i = 0; i < copy_len; i++) up.name[i] = tokens[2].ptr[i];
             up.name[copy_len] = '\0';
             continue;
@@ -422,6 +430,10 @@ bool load_manifest(const char* path, Manifest& out) {
 
 bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
     if (!ctx.init(manifest.route_count == 0 ? 1 : manifest.route_count)) return false;
+    const auto fail = [&ctx]() {
+        ctx.destroy();
+        return false;
+    };
 
     rir::Builder b;
     b.init(&ctx.module);
@@ -450,26 +462,26 @@ bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
         name_buf[pos] = '\0';
 
         Str name;
-        if (!copy_str_into_arena(ctx.arena, name_buf, cstr_len(name_buf), &name)) return false;
+        if (!copy_str_into_arena(ctx.arena, name_buf, cstr_len(name_buf), &name)) return fail();
         Str pattern;
         if (!copy_str_into_arena(ctx.arena,
                                  manifest.routes[i].pattern,
                                  cstr_len(manifest.routes[i].pattern),
                                  &pattern))
-            return false;
+            return fail();
 
         auto fn = b.create_function(name, pattern, manifest.routes[i].method);
-        if (!fn) return false;
+        if (!fn) return fail();
         auto entry = b.create_block(fn.value(), {"entry", 5});
-        if (!entry) return false;
+        if (!entry) return fail();
         b.set_insert_point(fn.value(), entry.value());
 
         if (manifest.routes[i].action == ManifestAction::ReturnStatus) {
-            if (!b.emit_ret_status(manifest.routes[i].status_code)) return false;
+            if (!b.emit_ret_status(manifest.routes[i].status_code)) return fail();
         } else {
             auto upstream = b.emit_const_i32(manifest.routes[i].upstream_id);
-            if (!upstream) return false;
-            if (!b.emit_ret_proxy(upstream.value())) return false;
+            if (!upstream) return fail();
+            if (!b.emit_ret_proxy(upstream.value())) return fail();
         }
     }
 

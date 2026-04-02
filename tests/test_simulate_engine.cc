@@ -241,6 +241,26 @@ TEST(simulate_engine, load_manifest_rejects_too_long_pattern) {
     unlink(path);
 }
 
+TEST(simulate_engine, load_manifest_rejects_too_long_upstream_name) {
+    char name[64];
+    for (u32 i = 0; i + 1 < sizeof(name); i++) name[i] = 'a';
+    name[sizeof(name) - 1] = '\0';
+
+    char manifest_buf[128];
+    const i32 manifest_len = snprintf(manifest_buf, sizeof(manifest_buf), "upstream 7 %s\n", name);
+    REQUIRE(manifest_len > 0);
+
+    char path[] = "/tmp/rut_sim_manifest_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    REQUIRE(write(fd, manifest_buf, static_cast<size_t>(manifest_len)) == manifest_len);
+    close(fd);
+
+    Manifest manifest;
+    CHECK(!load_manifest(path, manifest));
+    unlink(path);
+}
+
 TEST(simulate_engine, load_manifest_rejects_invalid_inputs) {
     struct Case {
         const char* text;
@@ -267,6 +287,18 @@ TEST(simulate_engine, load_manifest_rejects_invalid_inputs) {
         Manifest manifest;
         CHECK(!load_manifest_text(tc.text, &manifest));
     }
+}
+
+TEST(simulate_engine, load_manifest_rejects_too_large_file) {
+    char path[] = "/tmp/rut_sim_manifest_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    REQUIRE(ftruncate(fd, static_cast<off_t>(1ULL << 32)) == 0);
+    close(fd);
+
+    Manifest manifest;
+    CHECK(!load_manifest(path, manifest));
+    unlink(path);
 }
 
 TEST(simulate_engine, param_route_matching_matrix) {

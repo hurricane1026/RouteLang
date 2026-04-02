@@ -1,3 +1,6 @@
+#include "rut/common/types.h"
+#include "rut/runtime/traffic_capture.h"
+#include "rut/runtime/traffic_replay.h"
 #include "rut/sim/simulate_engine.h"
 
 #include <unistd.h>
@@ -59,9 +62,9 @@ int main(int argc, char** argv) {
     char line[512];
     sim::SimulateSummary summary{};
     while (reader.next(entry) == 0) {
-        const sim::SimulateResult result = sim::simulate_one(engine, entry);
+        const sim::SimulateResult kResult = sim::simulate_one(engine, entry);
         summary.total++;
-        switch (result.verdict) {
+        switch (kResult.verdict) {
             case sim::Verdict::Match:
                 summary.matched++;
                 break;
@@ -75,13 +78,13 @@ int main(int argc, char** argv) {
                 summary.unsupported++;
                 break;
         }
-        const u32 len = sim::format_result(result, line, sizeof(line));
-        (void)::write(1, line, len);
+        const u32 kLen = sim::format_result(kResult, line, sizeof(line));
+        (void)::write(1, line, kLen);
     }
 
     char summary_buf[256];
-    const u32 slen = sim::format_summary(summary, summary_buf, sizeof(summary_buf));
-    (void)::write(1, summary_buf, slen);
+    const u32 kSlen = sim::format_summary(summary, summary_buf, sizeof(summary_buf));
+    (void)::write(1, summary_buf, kSlen);
 
     reader.close();
     engine.shutdown();

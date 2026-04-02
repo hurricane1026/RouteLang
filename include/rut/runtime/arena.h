@@ -142,7 +142,7 @@ struct Arena {
         void* p = alloc(static_cast<u64>(sizeof(T)) * count);
         if (!p) return nullptr;
         auto* a = static_cast<T*>(p);
-        for (u32 i = 0; i < count; i++) ::new (&a[i]) T{};
+        for (u32 i = 0; i < count; i++) ::new (static_cast<void*>(&a[i])) T{};
         return a;
     }
 

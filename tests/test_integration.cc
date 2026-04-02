@@ -974,6 +974,68 @@ TEST(partial_send, epollout_no_pending_switches_to_epollin) {
     backend.shutdown();
 }
 
+TEST(partial_send, non_tls_send_completes_with_smaller_conn_table) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    i32 sndbuf = 2048;
+    REQUIRE_EQ(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
+    i32 rcvbuf = 2048;
+    REQUIRE_EQ(setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    static constexpr u32 kConnId = 7;
+    backend.downstream_fd_map[kConnId] = fds[0];
+
+    TestConn tc;
+    tc.init(kConnId, fds[0]);
+    Connection& conn = tc.conn;
+
+    u8 fill_data[4096];
+    for (u32 j = 0; j < sizeof(fill_data); j++) fill_data[j] = static_cast<u8>(j & 0xFF);
+    conn.send_buf.write(fill_data, sizeof(fill_data));
+
+    backend.add_send(fds[0], kConnId, conn.send_buf.data(), conn.send_buf.len());
+
+    IoEvent events[16];
+    bool got_full_send = false;
+    if (backend.pending_count > 0) {
+        u32 n = backend.wait(events, 16, &conn, 1);
+        for (u32 i = 0; i < n; i++) {
+            if (events[i].type == IoEventType::Send && events[i].conn_id == kConnId &&
+                events[i].result == 4096) {
+                got_full_send = true;
+            }
+        }
+    }
+
+    if (!got_full_send) {
+        char drain[8192];
+        for (int attempt = 0; attempt < 20; attempt++) {
+            for (;;) {
+                ssize_t nr = recv(fds[1], drain, sizeof(drain), MSG_DONTWAIT);
+                if (nr <= 0) break;
+            }
+            usleep(1000);
+
+            u32 n = backend.wait(events, 16, &conn, 1);
+            for (u32 i = 0; i < n; i++) {
+                if (events[i].type == IoEventType::Send && events[i].conn_id == kConnId &&
+                    events[i].result == 4096) {
+                    got_full_send = true;
+                }
+            }
+            if (got_full_send) break;
+        }
+    }
+    CHECK(got_full_send);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
 TEST(tls_state_machine, recv_retry_matrix) {
     for (const auto& tc : kTlsRecvRetryCases) {
         run_tls_recv_retry_case(_tc, tc);

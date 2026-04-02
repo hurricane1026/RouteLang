@@ -628,8 +628,9 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             }
         } else if (has_write) {
         handle_epollout:
-            if (conn_id >= kMaxFdMap || conn_id >= max_conns) continue;
+            if (conn_id >= kMaxFdMap) continue;
             auto& ss = send_state[conn_id];
+            if (ss.tls && conn_id >= max_conns) continue;
             if (ss.remaining == 0 || !ss.src || ss.fd < 0) {
                 // No outstanding send associated with this connection.
                 // Drop EPOLLOUT so a stale level-triggered wakeup cannot spin.

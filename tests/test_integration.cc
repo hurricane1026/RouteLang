@@ -2060,7 +2060,7 @@ TEST(route, capture_real_socket) {
     REQUIRE(loop->init(0, lfd).has_value());
     loop->config_ptr = &active;
     loop->set_capture(&ring);
-    LoopThread lt = {loop, {}, 20};
+    LoopThread lt = {loop, {}, 200};
     lt.start();
 
     i32 c = connect_to(port);
@@ -2071,11 +2071,10 @@ TEST(route, capture_real_socket) {
     CHECK_GT(n, 0);
     close(c);
 
-    lt.stop();
-    // Small delay for request completion
-    usleep(5000);
+    for (i32 i = 0; i < 200 && ring.available() == 0; i++) usleep(1000);
     CHECK_EQ(ring.available(), 1u);
 
+    lt.stop();
     loop->shutdown();
     close(lfd);
     destroy_real_loop(loop);

@@ -1,8 +1,17 @@
 #include "rut/sim/simulate_engine.h"
 
+#include "rut/common/types.h"
+#include "rut/compiler/rir.h"
 #include "rut/compiler/rir_builder.h"
 #include "rut/jit/codegen.h"
+#include "rut/jit/handler_abi.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/runtime/access_log.h"
+#include "rut/runtime/arena.h"
+#include "rut/runtime/connection.h"
+#include "rut/runtime/http_parser.h"
+#include "rut/runtime/traffic_capture.h"
+#include "rut/runtime/traffic_replay.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -78,13 +87,11 @@ static u8 http_method_char(HttpMethod method) {
         case HttpMethod::GET:
             return 'G';
         case HttpMethod::POST:
-            return 'P';
         case HttpMethod::PUT:
+        case HttpMethod::PATCH:
             return 'P';
         case HttpMethod::DELETE:
             return 'D';
-        case HttpMethod::PATCH:
-            return 'P';
         case HttpMethod::HEAD:
             return 'H';
         case HttpMethod::OPTIONS:
@@ -250,113 +257,119 @@ bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
     return true;
 }
 
-void ModuleContext::destroy() { arena.destroy(); }
+void ModuleContext::destroy() {
+    arena.destroy();
+}
 
 bool load_manifest(const char* path, Manifest& out) {
     out = Manifest{};
 
-    i32 fd = ::open(path, O_RDONLY);
-    if (fd < 0) return false;
+    const i32 kFd = ::open(path, O_RDONLY);
+    if (kFd < 0) return false;
 
     struct stat st;
-    if (fstat(fd, &st) < 0) {
-        ::close(fd);
+    if (fstat(kFd, &st) < 0) {
+        ::close(kFd);
         return false;
     }
     if (st.st_size <= 0) {
-        ::close(fd);
+        ::close(kFd);
         return true;
     }
 
-    void* map = mmap(nullptr, static_cast<u64>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
+    void* map = mmap(nullptr, static_cast<u64>(st.st_size), PROT_READ, MAP_PRIVATE, kFd, 0);
+    ::close(kFd);
     if (map == MAP_FAILED) return false;
 
     const char* data = static_cast<const char*>(map);
-    u32 size = static_cast<u32>(st.st_size);
+    const u32 kSize = static_cast<u32>(st.st_size);
     u32 pos = 0;
 
-    while (pos < size) {
-        while (pos < size && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\r')) pos++;
-        if (pos >= size) break;
+    while (pos < kSize) {
+        while (pos < kSize && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\r')) pos++;
+        if (pos >= kSize) break;
         if (data[pos] == '\n') {
             pos++;
             continue;
         }
         if (data[pos] == '#') {
-            while (pos < size && data[pos] != '\n') pos++;
+            while (pos < kSize && data[pos] != '\n') pos++;
             continue;
         }
 
-        const char* toks[5]{};
-        u32 lens[5]{};
+        struct Token {
+            const char* ptr = nullptr;
+            u32 len = 0;
+        };
+        Token tokens[5]{};
         u32 tok_count = 0;
-        while (pos < size && data[pos] != '\n') {
-            while (pos < size && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\r')) pos++;
-            if (pos >= size || data[pos] == '\n' || data[pos] == '#') break;
+        while (pos < kSize && data[pos] != '\n') {
+            while (pos < kSize && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\r'))
+                pos++;
+            if (pos >= kSize || data[pos] == '\n' || data[pos] == '#') break;
             if (tok_count >= 5) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
-            toks[tok_count] = data + pos;
-            while (pos < size && data[pos] != '\n' && data[pos] != ' ' && data[pos] != '\t' &&
+            tokens[tok_count].ptr = data + pos;
+            while (pos < kSize && data[pos] != '\n' && data[pos] != ' ' && data[pos] != '\t' &&
                    data[pos] != '\r')
                 pos++;
-            lens[tok_count] = static_cast<u32>((data + pos) - toks[tok_count]);
+            tokens[tok_count].len = static_cast<u32>((data + pos) - tokens[tok_count].ptr);
             tok_count++;
         }
-        while (pos < size && data[pos] != '\n') pos++;
-        if (pos < size && data[pos] == '\n') pos++;
+        while (pos < kSize && data[pos] != '\n') pos++;
+        if (pos < kSize && data[pos] == '\n') pos++;
         if (tok_count == 0) continue;
 
-        if (lens[0] == 8 && __builtin_memcmp(toks[0], "upstream", 8) == 0) {
+        if (tokens[0].len == 8 && __builtin_memcmp(tokens[0].ptr, "upstream", 8) == 0) {
             if (tok_count != 3 || out.upstream_count >= Manifest::kMaxUpstreams) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
             u32 id = 0;
-            if (!parse_u32_token(toks[1], lens[1], &id) || id > 65535) {
+            if (!parse_u32_token(tokens[1].ptr, tokens[1].len, &id) || id > 65535) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
             auto& up = out.upstreams[out.upstream_count++];
             up.id = static_cast<u16>(id);
-            u32 copy_len = lens[2];
+            u32 copy_len = tokens[2].len;
             if (copy_len >= sizeof(up.name)) copy_len = sizeof(up.name) - 1;
-            for (u32 i = 0; i < copy_len; i++) up.name[i] = toks[2][i];
+            for (u32 i = 0; i < copy_len; i++) up.name[i] = tokens[2].ptr[i];
             up.name[copy_len] = '\0';
             continue;
         }
 
-        if (lens[0] == 5 && __builtin_memcmp(toks[0], "route", 5) == 0) {
+        if (tokens[0].len == 5 && __builtin_memcmp(tokens[0].ptr, "route", 5) == 0) {
             if (tok_count != 5 || out.route_count >= Manifest::kMaxRoutes) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
             bool method_ok = false;
-            u8 method = parse_method_token(toks[1], lens[1], &method_ok);
+            const u8 kMethod = parse_method_token(tokens[1].ptr, tokens[1].len, &method_ok);
             if (!method_ok) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
             auto& route = out.routes[out.route_count++];
-            route.method = method;
-            u32 pattern_len = lens[2];
+            route.method = kMethod;
+            u32 pattern_len = tokens[2].len;
             if (pattern_len >= sizeof(route.pattern)) pattern_len = sizeof(route.pattern) - 1;
-            for (u32 i = 0; i < pattern_len; i++) route.pattern[i] = toks[2][i];
+            for (u32 i = 0; i < pattern_len; i++) route.pattern[i] = tokens[2].ptr[i];
             route.pattern[pattern_len] = '\0';
 
-            if (lens[3] == 6 && __builtin_memcmp(toks[3], "status", 6) == 0) {
+            if (tokens[3].len == 6 && __builtin_memcmp(tokens[3].ptr, "status", 6) == 0) {
                 u32 code = 0;
-                if (!parse_u32_token(toks[4], lens[4], &code) || code > 65535) {
+                if (!parse_u32_token(tokens[4].ptr, tokens[4].len, &code) || code > 65535) {
                     munmap(map, static_cast<u64>(st.st_size));
                     return false;
                 }
                 route.action = ManifestAction::ReturnStatus;
                 route.status_code = static_cast<u16>(code);
-            } else if (lens[3] == 5 && __builtin_memcmp(toks[3], "proxy", 5) == 0) {
+            } else if (tokens[3].len == 5 && __builtin_memcmp(tokens[3].ptr, "proxy", 5) == 0) {
                 u32 id = 0;
-                if (!parse_u32_token(toks[4], lens[4], &id) || id > 65535) {
+                if (!parse_u32_token(tokens[4].ptr, tokens[4].len, &id) || id > 65535) {
                     munmap(map, static_cast<u64>(st.st_size));
                     return false;
                 }
@@ -460,7 +473,8 @@ bool Engine::init(const rir::Module& module,
         }
         char symbol[256] = "handler_";
         u32 pos = 8;
-        for (u32 j = 0; j < fn.name.len && pos + 1 < sizeof(symbol); j++) symbol[pos++] = fn.name.ptr[j];
+        for (u32 j = 0; j < fn.name.len && pos + 1 < sizeof(symbol); j++)
+            symbol[pos++] = fn.name.ptr[j];
         symbol[pos] = '\0';
 
         void* addr = jit.lookup(symbol);
@@ -472,7 +486,8 @@ bool Engine::init(const rir::Module& module,
         auto& route = routes[route_count++];
         route.method = fn.http_method;
         route.pattern_len = fn.route_pattern.len;
-        if (route.pattern_len >= sizeof(route.pattern)) route.pattern_len = sizeof(route.pattern) - 1;
+        if (route.pattern_len >= sizeof(route.pattern))
+            route.pattern_len = sizeof(route.pattern) - 1;
         for (u32 j = 0; j < route.pattern_len; j++) route.pattern[j] = fn.route_pattern.ptr[j];
         route.pattern[route.pattern_len] = '\0';
         route.fn = reinterpret_cast<jit::HandlerFn>(addr);
@@ -502,13 +517,13 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     }
 
     result.method = log_method(req.method);
-    const u32 path_len = visible_path_len(req.path);
-    u32 copy_len = path_len;
+    const u32 kPathLen = visible_path_len(req.path);
+    u32 copy_len = kPathLen;
     if (copy_len >= sizeof(result.path)) copy_len = sizeof(result.path) - 1;
     for (u32 i = 0; i < copy_len; i++) result.path[i] = req.path.ptr[i];
     result.path[copy_len] = '\0';
 
-    const auto* route = select_route(engine, http_method_char(req.method), req.path.ptr, path_len);
+    const auto* route = select_route(engine, http_method_char(req.method), req.path.ptr, kPathLen);
     if (!route) {
         result.action = jit::HandlerAction::ReturnStatus;
         result.actual_status = 200;
@@ -525,31 +540,29 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     ctx.handler_idx = 0;
     ctx.slot_count = 0;
 
-    const u64 packed = route->fn(&conn,
-                                 &ctx,
-                                 entry.raw_headers,
-                                 entry.raw_header_len,
-                                 nullptr);
-    const auto handler = jit::HandlerResult::unpack(packed);
-    result.action = handler.action;
+    const u64 kPacked = route->fn(&conn, &ctx, entry.raw_headers, entry.raw_header_len, nullptr);
+    const auto kUnpacked = jit::HandlerResult::unpack(kPacked);
+    result.action = kUnpacked.action;
 
-    if (handler.action == jit::HandlerAction::ReturnStatus) {
-        result.actual_status = handler.status_code;
-        result.verdict = (handler.status_code == entry.resp_status && entry.upstream_name[0] == '\0')
-                             ? Verdict::Match
-                             : Verdict::Mismatch;
+    if (kUnpacked.action == jit::HandlerAction::ReturnStatus) {
+        result.actual_status = kUnpacked.status_code;
+        result.verdict =
+            (kUnpacked.status_code == entry.resp_status && entry.upstream_name[0] == '\0')
+                ? Verdict::Match
+                : Verdict::Mismatch;
         return result;
     }
 
-    if (handler.action == jit::HandlerAction::Proxy) {
-        const auto* upstream = find_upstream(engine, handler.upstream_id);
+    if (kUnpacked.action == jit::HandlerAction::Proxy) {
+        const auto* upstream = find_upstream(engine, kUnpacked.upstream_id);
         if (!upstream) {
             result.verdict = Verdict::Failed;
             return result;
         }
         copy_cstr(result.actual_upstream, sizeof(result.actual_upstream), upstream->name);
-        result.verdict = streq(result.actual_upstream, result.expected_upstream) ? Verdict::Match
-                                                                                 : Verdict::Mismatch;
+        result.verdict = streq(result.actual_upstream, result.expected_upstream)
+                             ? Verdict::Match
+                             : Verdict::Mismatch;
         return result;
     }
 
@@ -562,8 +575,8 @@ SimulateSummary simulate_file(Engine& engine, ReplayReader& reader) {
     CaptureEntry entry{};
     while (reader.next(entry) == 0) {
         summary.total++;
-        const SimulateResult result = simulate_one(engine, entry);
-        switch (result.verdict) {
+        const SimulateResult kSimResult = simulate_one(engine, entry);
+        switch (kSimResult.verdict) {
             case Verdict::Match:
                 summary.matched++;
                 break;
@@ -586,10 +599,10 @@ u32 format_result(const SimulateResult& result, char* buf, u32 buf_size) {
     put_str(buf, buf_size, &pos, verdict_str(result.verdict));
     put_str(buf, buf_size, &pos, " ");
 
-    static const char* kMethods[] = {"GET", "POST", "PUT", "DELETE", "PATCH",
-                                     "HEAD", "OPTIONS", "CONNECT", "TRACE", "OTHER"};
-    u8 method_idx = result.method < 10 ? result.method : 9;
-    put_str(buf, buf_size, &pos, kMethods[method_idx]);
+    static const char* const kMethodNames[] = {
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE", "OTHER"};
+    const u8 kMethodIdx = result.method < 10 ? result.method : 9;
+    put_str(buf, buf_size, &pos, kMethodNames[kMethodIdx]);
     put_str(buf, buf_size, &pos, " ");
     put_str(buf, buf_size, &pos, result.path[0] ? result.path : "/");
     put_str(buf, buf_size, &pos, " ");

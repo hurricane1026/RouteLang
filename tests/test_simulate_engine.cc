@@ -45,7 +45,8 @@ TEST(simulate_engine, load_manifest_file) {
         "upstream 7 api-v1\n"
         "route GET /health status 204\n"
         "route ANY /api proxy 7\n";
-    REQUIRE(write(fd, kManifest, sizeof(kManifest) - 1) == static_cast<ssize_t>(sizeof(kManifest) - 1));
+    REQUIRE(write(fd, kManifest, sizeof(kManifest) - 1) ==
+            static_cast<ssize_t>(sizeof(kManifest) - 1));
     close(fd);
 
     Manifest manifest;
@@ -71,7 +72,8 @@ TEST(simulate_engine, static_status_match) {
     Engine engine;
     REQUIRE(init_engine(manifest, ctx, engine));
 
-    const auto result = simulate_one(engine, make_entry("GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    const auto result =
+        simulate_one(engine, make_entry("GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 204));
     CHECK_EQ(result.verdict, Verdict::Match);
     CHECK_EQ(result.actual_status, 204u);
 
@@ -94,8 +96,8 @@ TEST(simulate_engine, proxy_upstream_match) {
     Engine engine;
     REQUIRE(init_engine(manifest, ctx, engine));
 
-    const auto result =
-        simulate_one(engine, make_entry("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 502, "api-v1"));
+    const auto result = simulate_one(
+        engine, make_entry("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 502, "api-v1"));
     CHECK_EQ(result.verdict, Verdict::Match);
     CHECK_EQ(result.action, jit::HandlerAction::Proxy);
 
@@ -111,7 +113,8 @@ TEST(simulate_engine, default_200_when_no_route_matches) {
     Engine engine;
     REQUIRE(engine.init(ctx.module, manifest.upstreams, manifest.upstream_count));
 
-    const auto result = simulate_one(engine, make_entry("GET /miss HTTP/1.1\r\nHost: x\r\n\r\n", 200));
+    const auto result =
+        simulate_one(engine, make_entry("GET /miss HTTP/1.1\r\nHost: x\r\n\r\n", 200));
     CHECK_EQ(result.verdict, Verdict::Match);
     CHECK_EQ(result.actual_status, 200u);
 
@@ -166,10 +169,10 @@ TEST(simulate_engine, summary_counts_mismatch) {
     hdr.entry_count = 3;
     REQUIRE(write(fd, &hdr, sizeof(hdr)) == static_cast<ssize_t>(sizeof(hdr)));
     REQUIRE(capture_write_entry(fd, make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200)) == 0);
-    REQUIRE(capture_write_entry(fd,
-                                make_entry("GET /api/x HTTP/1.1\r\nHost: x\r\n\r\n", 503, "edge")) == 0);
-    REQUIRE(capture_write_entry(fd,
-                                make_entry("GET /api/y HTTP/1.1\r\nHost: x\r\n\r\n", 503, "wrong")) == 0);
+    REQUIRE(capture_write_entry(
+                fd, make_entry("GET /api/x HTTP/1.1\r\nHost: x\r\n\r\n", 503, "edge")) == 0);
+    REQUIRE(capture_write_entry(
+                fd, make_entry("GET /api/y HTTP/1.1\r\nHost: x\r\n\r\n", 503, "wrong")) == 0);
     close(fd);
 
     ReplayReader reader;

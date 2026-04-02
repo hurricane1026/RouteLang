@@ -629,6 +629,36 @@ TEST(simulate_engine, format_result_uses_mismatch_label) {
     CHECK(strstr(buf, "MISS ") == nullptr);
 }
 
+TEST(simulate_engine, format_result_failed_status_uses_placeholder) {
+    SimulateResult result{};
+    result.verdict = Verdict::Failed;
+    result.method = 'G';
+    strcpy(result.path, "/bad");
+    result.action = jit::HandlerAction::ReturnStatus;
+    result.expected_status = 502;
+
+    char buf[256];
+    const u32 len = format_result(result, buf, sizeof(buf));
+    REQUIRE(len > 0);
+    CHECK(strstr(buf, "502 -> -") != nullptr);
+}
+
+TEST(simulate_engine, format_result_yield_uses_placeholders) {
+    SimulateResult result{};
+    result.verdict = Verdict::Unsupported;
+    result.method = 'G';
+    strcpy(result.path, "/yield");
+    result.action = jit::HandlerAction::Yield;
+    strcpy(result.expected_upstream, "edge");
+    result.expected_status = 204;
+
+    char buf[256];
+    const u32 len = format_result(result, buf, sizeof(buf));
+    REQUIRE(len > 0);
+    CHECK(strstr(buf, "yield - -> -") != nullptr);
+    CHECK(strstr(buf, "204 ->") == nullptr);
+}
+
 TEST(simulate_engine, cli_usage_mentions_param_prefix_matching) {
     char stdout_buf[64];
     char stderr_buf[512];
@@ -706,6 +736,21 @@ TEST(simulate_engine, cli_fails_on_truncated_capture) {
     }
 
     unlink(manifest_path);
+}
+
+TEST(simulate_engine, format_summary_supports_u64_counters) {
+    SimulateSummary summary{};
+    summary.total = (1ULL << 32) + 7;
+    summary.matched = 3;
+    summary.mismatched = 2;
+    summary.failed = (1ULL << 32) + 1;
+    summary.unsupported = 4;
+
+    char buf[256];
+    const u32 len = format_summary(summary, buf, sizeof(buf));
+    REQUIRE(len > 0);
+    CHECK(strstr(buf, "Total: 4294967303") != nullptr);
+    CHECK(strstr(buf, "Failed: 4294967297") != nullptr);
 }
 
 int main(int argc, char** argv) {

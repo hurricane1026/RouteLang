@@ -81,30 +81,13 @@ int main(int argc, char** argv) {
     while (reader.next(entry) == 0) {
         const sim::SimulateResult kResult = sim::simulate_one(engine, entry);
         summary.total++;
-        switch (kResult.verdict) {
-            case sim::Verdict::Match:
-                summary.matched++;
-                break;
-            case sim::Verdict::Mismatch:
-                summary.mismatched++;
-                break;
-            case sim::Verdict::Failed:
-                summary.failed++;
-                break;
-            case sim::Verdict::Unsupported:
-                summary.unsupported++;
-                break;
-        }
+        sim::accumulate_summary(summary, kResult.verdict);
         const u32 kLen = sim::format_result(kResult, line, sizeof(line));
         (void)write_all(1, line, kLen);
     }
-    if (reader.entries_read != reader.entry_count()) {
-        const u64 kExpected = reader.entry_count();
-        const u64 kMissing = kExpected > summary.total ? (kExpected - summary.total) : 0;
-        if (kMissing > 0) {
-            summary.failed += static_cast<u32>(kMissing);
-            summary.total += static_cast<u32>(kMissing);
-        }
+    const bool kTruncated = reader.entries_read != reader.entry_count();
+    sim::finalize_summary(summary, reader);
+    if (kTruncated) {
         write_str(2, "Capture file is truncated or unreadable\n");
     }
 

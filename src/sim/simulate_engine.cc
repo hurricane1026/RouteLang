@@ -256,6 +256,20 @@ static void put_u32(char* buf, u32 buf_size, u32* pos, u32 value) {
     while (n > 0 && *pos + 1 < buf_size) buf[(*pos)++] = tmp[--n];
 }
 
+static void put_u64(char* buf, u32 buf_size, u32* pos, u64 value) {
+    char tmp[21];
+    u32 n = 0;
+    if (value == 0) {
+        tmp[n++] = '0';
+    } else {
+        while (value > 0) {
+            tmp[n++] = static_cast<char>('0' + value % 10);
+            value /= 10;
+        }
+    }
+    while (n > 0 && *pos + 1 < buf_size) buf[(*pos)++] = tmp[--n];
+}
+
 static void put_name(char* buf, u32 buf_size, u32* pos, const char* s) {
     for (u32 i = 0; s[i] && *pos + 1 < buf_size; i++) buf[(*pos)++] = s[i];
 }
@@ -622,28 +636,36 @@ SimulateSummary simulate_file(Engine& engine, ReplayReader& reader) {
     while (reader.next(entry) == 0) {
         summary.total++;
         const SimulateResult kSimResult = simulate_one(engine, entry);
-        switch (kSimResult.verdict) {
-            case Verdict::Match:
-                summary.matched++;
-                break;
-            case Verdict::Mismatch:
-                summary.mismatched++;
-                break;
-            case Verdict::Failed:
-                summary.failed++;
-                break;
-            case Verdict::Unsupported:
-                summary.unsupported++;
-                break;
-        }
+        accumulate_summary(summary, kSimResult.verdict);
     }
+    finalize_summary(summary, reader);
+    return summary;
+}
+
+void accumulate_summary(SimulateSummary& summary, Verdict verdict) {
+    switch (verdict) {
+        case Verdict::Match:
+            summary.matched++;
+            break;
+        case Verdict::Mismatch:
+            summary.mismatched++;
+            break;
+        case Verdict::Failed:
+            summary.failed++;
+            break;
+        case Verdict::Unsupported:
+            summary.unsupported++;
+            break;
+    }
+}
+
+void finalize_summary(SimulateSummary& summary, const ReplayReader& reader) {
     const u64 kExpectedTotal = reader.entry_count();
     if (summary.total < kExpectedTotal) {
         const u64 kMissing = kExpectedTotal - summary.total;
-        summary.failed += static_cast<u32>(kMissing);
-        summary.total += static_cast<u32>(kMissing);
+        summary.failed += kMissing;
+        summary.total += kMissing;
     }
-    return summary;
 }
 
 u32 format_result(const SimulateResult& result, char* buf, u32 buf_size) {
@@ -665,6 +687,11 @@ u32 format_result(const SimulateResult& result, char* buf, u32 buf_size) {
         put_name(buf, buf_size, &pos, result.expected_upstream[0] ? result.expected_upstream : "-");
         put_str(buf, buf_size, &pos, " -> ");
         put_name(buf, buf_size, &pos, result.actual_upstream[0] ? result.actual_upstream : "-");
+    } else if (result.action == jit::HandlerAction::Yield) {
+        put_str(buf, buf_size, &pos, "- -> -");
+    } else if (result.verdict == Verdict::Failed || result.verdict == Verdict::Unsupported) {
+        put_u32(buf, buf_size, &pos, result.expected_status);
+        put_str(buf, buf_size, &pos, " -> -");
     } else {
         put_u32(buf, buf_size, &pos, result.expected_status);
         put_str(buf, buf_size, &pos, " -> ");
@@ -680,15 +707,15 @@ u32 format_summary(const SimulateSummary& summary, char* buf, u32 buf_size) {
     u32 pos = 0;
     put_str(buf, buf_size, &pos, "--- Simulate Summary ---\n");
     put_str(buf, buf_size, &pos, "Total: ");
-    put_u32(buf, buf_size, &pos, summary.total);
+    put_u64(buf, buf_size, &pos, summary.total);
     put_str(buf, buf_size, &pos, "\nMatched: ");
-    put_u32(buf, buf_size, &pos, summary.matched);
+    put_u64(buf, buf_size, &pos, summary.matched);
     put_str(buf, buf_size, &pos, "\nMismatched: ");
-    put_u32(buf, buf_size, &pos, summary.mismatched);
+    put_u64(buf, buf_size, &pos, summary.mismatched);
     put_str(buf, buf_size, &pos, "\nFailed: ");
-    put_u32(buf, buf_size, &pos, summary.failed);
+    put_u64(buf, buf_size, &pos, summary.failed);
     put_str(buf, buf_size, &pos, "\nUnsupported: ");
-    put_u32(buf, buf_size, &pos, summary.unsupported);
+    put_u64(buf, buf_size, &pos, summary.unsupported);
     if (pos + 1 < buf_size) buf[pos++] = '\n';
     if (pos < buf_size) buf[pos] = '\0';
     return pos;

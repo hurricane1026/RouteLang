@@ -89,11 +89,11 @@ struct SimulateResult {
 };
 
 struct SimulateSummary {
-    u32 total = 0;
-    u32 matched = 0;
-    u32 mismatched = 0;
-    u32 failed = 0;
-    u32 unsupported = 0;
+    u64 total = 0;
+    u64 matched = 0;
+    u64 mismatched = 0;
+    u64 failed = 0;
+    u64 unsupported = 0;
 };
 
 struct Engine {
@@ -121,6 +121,8 @@ struct Engine {
 
 SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry);
 SimulateSummary simulate_file(Engine& engine, ReplayReader& reader);
+void accumulate_summary(SimulateSummary& summary, Verdict verdict);
+void finalize_summary(SimulateSummary& summary, const ReplayReader& reader);
 
 u32 format_result(const SimulateResult& result, char* buf, u32 buf_size);
 u32 format_summary(const SimulateSummary& summary, char* buf, u32 buf_size);

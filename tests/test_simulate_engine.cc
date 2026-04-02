@@ -128,6 +128,27 @@ static bool run_simulate_cli(const char* arg1,
     return true;
 }
 
+static bool write_capture_file(i32 fd,
+                               u64 declared_count,
+                               const CaptureEntry* entries,
+                               u32 entry_count,
+                               const CaptureEntry* partial_entry = nullptr,
+                               u32 partial_len = 0) {
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.entry_count = declared_count;
+    if (write(fd, &hdr, sizeof(hdr)) != static_cast<ssize_t>(sizeof(hdr))) return false;
+    for (u32 i = 0; i < entry_count; i++) {
+        if (capture_write_entry(fd, entries[i]) != 0) return false;
+    }
+    if (partial_entry && partial_len > 0) {
+        if (partial_len > sizeof(CaptureEntry)) return false;
+        if (write(fd, partial_entry, partial_len) != static_cast<ssize_t>(partial_len))
+            return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 TEST(simulate_engine, load_manifest_file) {
@@ -534,6 +555,16 @@ TEST(simulate_engine, summary_counts_mismatch) {
 }
 
 TEST(simulate_engine, simulate_file_counts_truncated_capture_as_failed) {
+    struct Case {
+        const char* name;
+        u64 declared_count;
+        u32 full_count;
+        u32 partial_len;
+        u32 expected_total;
+        u32 expected_matched;
+        u32 expected_failed;
+    };
+
     Manifest manifest{};
     manifest.route_count = 1;
     manifest.routes[0].method = 'G';
@@ -545,25 +576,39 @@ TEST(simulate_engine, simulate_file_counts_truncated_capture_as_failed) {
     Engine engine;
     REQUIRE(init_engine(manifest, ctx, engine));
 
-    char path[] = "/tmp/rut_sim_capture_XXXXXX";
-    i32 fd = mkstemp(path);
-    REQUIRE(fd >= 0);
-    CaptureFileHeader hdr;
-    capture_file_header_init(&hdr);
-    hdr.entry_count = 2;
-    REQUIRE(write(fd, &hdr, sizeof(hdr)) == static_cast<ssize_t>(sizeof(hdr)));
-    REQUIRE(capture_write_entry(fd, make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200)) == 0);
-    close(fd);
+    const CaptureEntry entries[] = {
+        make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+    };
+    static const Case kCases[] = {
+        {"header_only", 1, 0, 0, 1, 0, 1},
+        {"missing_second_entry", 2, 1, 0, 2, 1, 1},
+        {"partial_second_entry", 2, 1, sizeof(CaptureEntry) / 2, 2, 1, 1},
+    };
 
-    ReplayReader reader;
-    REQUIRE(reader.open(path) == 0);
-    const auto summary = simulate_file(engine, reader);
-    CHECK_EQ(summary.total, 2u);
-    CHECK_EQ(summary.matched, 1u);
-    CHECK_EQ(summary.failed, 1u);
-    CHECK_EQ(summary.mismatched, 0u);
-    reader.close();
-    unlink(path);
+    for (const auto& tc : kCases) {
+        char path[] = "/tmp/rut_sim_capture_XXXXXX";
+        i32 fd = mkstemp(path);
+        REQUIRE(fd >= 0);
+        REQUIRE(write_capture_file(fd,
+                                   tc.declared_count,
+                                   entries,
+                                   tc.full_count,
+                                   tc.partial_len ? &entries[1] : nullptr,
+                                   tc.partial_len));
+        close(fd);
+
+        ReplayReader reader;
+        REQUIRE(reader.open(path) == 0);
+        const auto summary = simulate_file(engine, reader);
+        CHECK_EQ(summary.total, tc.expected_total);
+        CHECK_EQ(summary.matched, tc.expected_matched);
+        CHECK_EQ(summary.failed, tc.expected_failed);
+        CHECK_EQ(summary.mismatched, 0u);
+        reader.close();
+        unlink(path);
+    }
+
     engine.shutdown();
     ctx.destroy();
 }
@@ -604,6 +649,15 @@ TEST(simulate_engine, cli_usage_mentions_param_prefix_matching) {
 }
 
 TEST(simulate_engine, cli_fails_on_truncated_capture) {
+    struct Case {
+        const char* name;
+        u64 declared_count;
+        u32 full_count;
+        u32 partial_len;
+        const char* total_line;
+        const char* failed_line;
+    };
+
     char manifest_path[] = "/tmp/rut_sim_manifest_XXXXXX";
     i32 manifest_fd = mkstemp(manifest_path);
     REQUIRE(manifest_fd >= 0);
@@ -612,34 +666,46 @@ TEST(simulate_engine, cli_fails_on_truncated_capture) {
             static_cast<ssize_t>(sizeof(kManifest) - 1));
     close(manifest_fd);
 
-    char capture_path[] = "/tmp/rut_sim_capture_XXXXXX";
-    i32 capture_fd = mkstemp(capture_path);
-    REQUIRE(capture_fd >= 0);
-    CaptureFileHeader hdr;
-    capture_file_header_init(&hdr);
-    hdr.entry_count = 2;
-    REQUIRE(write(capture_fd, &hdr, sizeof(hdr)) == static_cast<ssize_t>(sizeof(hdr)));
-    REQUIRE(capture_write_entry(capture_fd,
-                                make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200)) == 0);
-    close(capture_fd);
+    const CaptureEntry entries[] = {
+        make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+    };
+    static const Case kCases[] = {
+        {"header_only", 1, 0, 0, "Total: 1", "Failed: 1"},
+        {"partial_second_entry", 2, 1, sizeof(CaptureEntry) / 2, "Total: 2", "Failed: 1"},
+    };
 
-    char stdout_buf[512];
-    char stderr_buf[512];
-    i32 exit_code = -1;
-    REQUIRE(run_simulate_cli(manifest_path,
-                             capture_path,
-                             &exit_code,
-                             stdout_buf,
-                             sizeof(stdout_buf),
-                             stderr_buf,
-                             sizeof(stderr_buf)));
-    CHECK_EQ(exit_code, 1);
-    CHECK(strstr(stderr_buf, "Capture file is truncated or unreadable") != nullptr);
-    CHECK(strstr(stdout_buf, "Total: 2") != nullptr);
-    CHECK(strstr(stdout_buf, "Failed: 1") != nullptr);
+    for (const auto& tc : kCases) {
+        char capture_path[] = "/tmp/rut_sim_capture_XXXXXX";
+        i32 capture_fd = mkstemp(capture_path);
+        REQUIRE(capture_fd >= 0);
+        REQUIRE(write_capture_file(capture_fd,
+                                   tc.declared_count,
+                                   entries,
+                                   tc.full_count,
+                                   tc.partial_len ? &entries[1] : nullptr,
+                                   tc.partial_len));
+        close(capture_fd);
+
+        char stdout_buf[512];
+        char stderr_buf[512];
+        i32 exit_code = -1;
+        REQUIRE(run_simulate_cli(manifest_path,
+                                 capture_path,
+                                 &exit_code,
+                                 stdout_buf,
+                                 sizeof(stdout_buf),
+                                 stderr_buf,
+                                 sizeof(stderr_buf)));
+        CHECK_EQ(exit_code, 1);
+        CHECK(strstr(stderr_buf, "Capture file is truncated or unreadable") != nullptr);
+        CHECK(strstr(stdout_buf, tc.total_line) != nullptr);
+        CHECK(strstr(stdout_buf, tc.failed_line) != nullptr);
+
+        unlink(capture_path);
+    }
 
     unlink(manifest_path);
-    unlink(capture_path);
 }
 
 int main(int argc, char** argv) {

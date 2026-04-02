@@ -301,6 +301,27 @@ TEST(timer, stress_200_wraparound) {
     CHECK_EQ(total, 200u);
 }
 
+TEST(timer, remove_reinits_node) {
+    TimerWheel w;
+    w.init();
+    Connection c;
+    c.reset();
+    c.timer_node.init();
+    w.add(&c, 2);
+
+    w.remove(&c);
+
+    CHECK_EQ(c.timer_node.next, &c.timer_node);
+    CHECK_EQ(c.timer_node.prev, &c.timer_node);
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
+}
+
+TEST(timer, timer_node_offset_matches_connection_layout) {
+    CHECK_EQ(TimerWheel::timer_node_offset(), static_cast<u64>(offsetof(Connection, timer_node)));
+}
+
 // === Connection Pool ===
 
 TEST(pool, alloc_free_reuse) {

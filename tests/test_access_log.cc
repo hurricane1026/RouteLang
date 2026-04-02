@@ -206,6 +206,27 @@ TEST(format, buf_too_small) {
     CHECK_EQ(n, 0u);
 }
 
+TEST(format, includes_upstream_fields) {
+    auto entry = make_entry(201, 4321, 4, "/proxy");
+    const char upstream[] = "backend-a";
+    u32 i = 0;
+    while (upstream[i] && i < sizeof(entry.upstream) - 1) {
+        entry.upstream[i] = upstream[i];
+        i++;
+    }
+    entry.upstream[i] = '\0';
+    entry.upstream_us = 987;
+
+    char buf[512];
+    u32 n = format_access_log_text(entry, buf, sizeof(buf));
+    REQUIRE(n > 0);
+    buf[n] = '\0';
+
+    CHECK(strstr(buf, "/proxy") != nullptr);
+    CHECK(strstr(buf, "backend-a 987us") != nullptr);
+    CHECK(strstr(buf, "201") != nullptr);
+}
+
 // === Flusher: plain text ===
 
 TEST(flusher, flush_empty_rings) {
@@ -309,6 +330,47 @@ TEST(batch, single_entry_flushes) {
     CHECK(strstr(buf, "503") != nullptr);
     CHECK(strstr(buf, "999us") != nullptr);
     CHECK(strstr(buf, "s=2") != nullptr);
+}
+
+TEST(batch, flushes_when_batch_overflows) {
+    AccessLogRing ring;
+    ring.init();
+
+    char long_path[sizeof(AccessLogEntry::path)];
+    for (u32 i = 0; i < sizeof(long_path) - 1; i++) long_path[i] = 'p';
+    long_path[sizeof(long_path) - 1] = '\0';
+
+    const char upstream[] = "backend-service-long";
+    for (u32 i = 0; i < AccessLogRing::kCapacity; i++) {
+        AccessLogEntry entry = make_entry(static_cast<u16>(200 + (i % 5)), 1000 + i, 7, long_path);
+        u32 j = 0;
+        while (upstream[j] && j < sizeof(entry.upstream) - 1) {
+            entry.upstream[j] = upstream[j];
+            j++;
+        }
+        entry.upstream[j] = '\0';
+        entry.upstream_us = 500 + i;
+        CHECK(ring.push(entry));
+    }
+
+    i32 fds[2];
+    REQUIRE(pipe(fds) == 0);
+    (void)fcntl(fds[0], 1031 /*F_SETPIPE_SZ*/, 1048576);
+
+    AccessLogFlusher flusher;
+    flusher.init(fds[1]);
+    flusher.add_ring(&ring);
+    CHECK_EQ(flusher.flush_once(), AccessLogRing::kCapacity);
+    close(fds[1]);
+
+    char buf[131072];
+    u32 n = read_all(fds[0], buf, sizeof(buf) - 1);
+    close(fds[0]);
+    buf[n] = '\0';
+
+    CHECK_EQ(count_lines(buf, n), AccessLogRing::kCapacity);
+    CHECK(strstr(buf, "backend-service-long") != nullptr);
+    CHECK(strstr(buf, "pppppppp") != nullptr);
 }
 
 // === Zstd compression ===
@@ -478,6 +540,22 @@ TEST(flusher, flush_to_closed_pipe) {
     flusher.flush_once();
     close(fds[1]);
     CHECK(true);  // no crash
+}
+
+TEST(flusher, compressed_flush_to_closed_pipe) {
+    AccessLogRing ring;
+    ring.init();
+    ring.push(make_entry(200, 100, 0, "/compressed"));
+
+    i32 fds[2];
+    REQUIRE(pipe(fds) == 0);
+    close(fds[0]);
+
+    AccessLogFlusher flusher;
+    flusher.init(fds[1], true);
+    flusher.add_ring(&ring);
+    CHECK_EQ(flusher.flush_once(), 1u);
+    close(fds[1]);
 }
 
 // === Zstd: stop() produces valid frame under backpressure ===

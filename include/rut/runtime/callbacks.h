@@ -474,6 +474,9 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
     }
 
     // Write traffic capture entry (if enabled).
+    // TODO: avoid 8KB stack alloc + double copy by adding a reserve/commit
+    // API to CaptureRing (write directly into ring slot). Acceptable for now
+    // since capture is a debug feature, not always-on production path.
     if (loop->capture_ring && conn.capture_buf && conn.capture_header_len > 0) {
         CaptureEntry cap;
         __builtin_memset(&cap, 0, sizeof(cap));
@@ -544,6 +547,13 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     const RouteEntry* route = nullptr;
     if (config) {
+        // Map LogHttpMethod back to RouteConfig's method_char format.
+        // RouteConfig::match() uses first-char matching ('G'=GET, etc.).
+        // This is still ambiguous for POST/PUT/PATCH (all 'P'), which
+        // is a known limitation of RouteConfig — JIT routing will use
+        // the full HttpMethod enum.
+        static constexpr u8 kMethodChars[] = {'G', 'P', 'P', 'D', 'P', 'H', 'O', 'C', 'T', 0};
+        u8 method_char = conn.req_method < sizeof(kMethodChars) ? kMethodChars[conn.req_method] : 0;
         route = config->match(
             reinterpret_cast<const u8*>(conn.req_path),
             [&]() -> u32 {
@@ -551,7 +561,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 while (conn.req_path[n]) n++;
                 return n;
             }(),
-            conn.recv_buf.data() ? conn.recv_buf.data()[0] : 0);
+            method_char);
     }
 
     if (route && route->action == RouteAction::Proxy) {

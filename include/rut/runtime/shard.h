@@ -179,7 +179,7 @@ struct Shard {
         if (capture_ring) {
             // Ring exists (possibly disabled on loop). Re-apply it.
             if (!thread_spawned) {
-                if (loop) loop->set_capture(capture_ring);
+                if (loop && !loop->set_capture(capture_ring)) return nullptr;
             } else {
                 control.pending_capture.store(capture_ring, std::memory_order_release);
             }

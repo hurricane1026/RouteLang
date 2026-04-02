@@ -8617,11 +8617,21 @@ TEST(coverage, body_send_error_sync_recv_with_real_fd) {
 TEST(route_coverage, static_routes) {
     RouteConfig cfg;
     cfg.add_static("/health", 0, 200);
+    cfg.add_static("/created", 0, 201);
     cfg.add_static("/empty", 0, 204);
     cfg.add_static("/moved", 0, 301);
-    cfg.add_static("/bad", 0, 400);
-    cfg.add_static("/nope", 0, 404);
-    cfg.add_static("/err", 0, 500);
+    cfg.add_static("/found", 0, 302);
+    cfg.add_static("/notmod", 0, 304);
+    cfg.add_static("/e400", 0, 400);
+    cfg.add_static("/e401", 0, 401);
+    cfg.add_static("/e403", 0, 403);
+    cfg.add_static("/e404", 0, 404);
+    cfg.add_static("/e405", 0, 405);
+    cfg.add_static("/e429", 0, 429);
+    cfg.add_static("/e500", 0, 500);
+    cfg.add_static("/e502", 0, 502);
+    cfg.add_static("/e503", 0, 503);
+    cfg.add_static("/e999", 0, 999);
     const RouteConfig* active = &cfg;
     SmallLoop loop;
     loop.setup();
@@ -8630,18 +8640,28 @@ TEST(route_coverage, static_routes) {
     struct {
         const char* req;
         u16 status;
-    } cases[] = {
-        {"GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200},
-        {"GET /empty HTTP/1.1\r\nHost: x\r\n\r\n", 204},
-        {"GET /moved HTTP/1.1\r\nHost: x\r\n\r\n", 301},
-        {"GET /bad HTTP/1.1\r\nHost: x\r\n\r\n", 400},
-        {"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n", 404},
-        {"GET /err HTTP/1.1\r\nHost: x\r\n\r\n", 500},
-        {"GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 200},  // no match → default
-    };
+    } cases[] = {{"GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200},
+                 {"GET /created HTTP/1.1\r\nHost: x\r\n\r\n", 201},
+                 {"GET /empty HTTP/1.1\r\nHost: x\r\n\r\n", 204},
+                 {"GET /moved HTTP/1.1\r\nHost: x\r\n\r\n", 301},
+                 {"GET /found HTTP/1.1\r\nHost: x\r\n\r\n", 302},
+                 {"GET /notmod HTTP/1.1\r\nHost: x\r\n\r\n", 304},
+                 {"GET /e400 HTTP/1.1\r\nHost: x\r\n\r\n", 400},
+                 {"GET /e401 HTTP/1.1\r\nHost: x\r\n\r\n", 401},
+                 {"GET /e403 HTTP/1.1\r\nHost: x\r\n\r\n", 403},
+                 {"GET /e404 HTTP/1.1\r\nHost: x\r\n\r\n", 404},
+                 {"GET /e405 HTTP/1.1\r\nHost: x\r\n\r\n", 405},
+                 {"GET /e429 HTTP/1.1\r\nHost: x\r\n\r\n", 429},
+                 {"GET /e500 HTTP/1.1\r\nHost: x\r\n\r\n", 500},
+                 {"GET /e502 HTTP/1.1\r\nHost: x\r\n\r\n", 502},
+                 {"GET /e503 HTTP/1.1\r\nHost: x\r\n\r\n", 503},
+                 {"GET /e999 HTTP/1.1\r\nHost: x\r\n\r\n", 999},
+                 {"GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 200}};
+    i32 fake_fd = 50;
     for (auto& tc : cases) {
-        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 50));
-        auto* c = loop.find_fd(50);
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, fake_fd));
+        auto* c = loop.find_fd(fake_fd);
+        fake_fd++;
         REQUIRE(c != nullptr);
         c->recv_buf.reset();
         u32 len = 0;
@@ -8685,6 +8705,62 @@ TEST(route_coverage, capture_stage_and_write) {
     ring.pop(cap);
     CHECK_EQ(cap.resp_status, 200);
     CHECK_GT(cap.raw_header_len, 0);
+}
+
+TEST(route_coverage, drain_connection_close) {
+    RouteConfig cfg;
+    cfg.add_static("/", 0, 200);
+    const RouteConfig* active = &cfg;
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    loop.draining = true;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK(!c->keep_alive);
+    CHECK_EQ(c->resp_status, 200);
+}
+
+TEST(route_coverage, with_metrics_and_access_log) {
+    ShardMetrics metrics;
+    metrics.init();
+    AccessLogRing log_ring;
+    log_ring.init();
+
+    RouteConfig cfg;
+    cfg.add_static("/", 0, 200);
+    const RouteConfig* active = &cfg;
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    loop.metrics = &metrics;
+    loop.access_log = &log_ring;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->recv_buf.reset();
+    const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(log_ring.available(), 1u);
 }
 
 // === AsyncSmallLoop coverage ===

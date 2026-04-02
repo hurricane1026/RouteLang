@@ -11,8 +11,8 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
-#include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 
 namespace {
@@ -90,7 +90,8 @@ extern "C" int mprotect(void* addr, size_t len, int prot) {
 
 extern "C" int socket(int domain, int type, int protocol) {
     pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
-    if (g_fake_upstream_socket_fd >= 0 && domain == AF_INET && (type & SOCK_STREAM) == SOCK_STREAM) {
+    if (g_fake_upstream_socket_fd >= 0 && domain == AF_INET &&
+        (type & SOCK_STREAM) == SOCK_STREAM) {
         int fd = g_fake_upstream_socket_fd;
         g_fake_upstream_socket_fd = -1;
         return fd;

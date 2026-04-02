@@ -14,6 +14,18 @@ namespace rut {
 
 // --- Text formatting helpers (no stdlib) ---
 
+u64 realtime_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+}
+
+u64 monotonic_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+}
+
 static u32 write_u64_dec(char* buf, u64 val) {
     if (val == 0) {
         buf[0] = '0';
@@ -217,6 +229,62 @@ static bool write_with_poll(
 }
 
 // --- AccessLogFlusher ---
+
+void AccessLogRing::init() {
+    write_pos = 0;
+    read_pos = 0;
+}
+
+bool AccessLogRing::push(const AccessLogEntry& entry) {
+    u32 wp = write_pos.load(std::memory_order_relaxed);
+    u32 rp = read_pos.load(std::memory_order_acquire);
+
+    if (wp - rp >= kCapacity) {
+        return false;  // full — drop this entry
+    }
+
+    entries[wp & kMask] = entry;
+    write_pos.store(wp + 1, std::memory_order_release);
+    return true;
+}
+
+bool AccessLogRing::pop(AccessLogEntry& out) {
+    u32 rp = read_pos.load(std::memory_order_relaxed);
+    u32 wp = write_pos.load(std::memory_order_acquire);
+
+    if (rp == wp) return false;  // empty
+
+    out = entries[rp & kMask];
+    read_pos.store(rp + 1, std::memory_order_release);
+    return true;
+}
+
+u32 AccessLogRing::available() const {
+    u32 wp = write_pos.load(std::memory_order_acquire);
+    u32 rp = read_pos.load(std::memory_order_relaxed);
+    return wp - rp;
+}
+
+void AccessLogFlusher::init(i32 fd, bool compress_enabled, i32 level, u32 interval_ms) {
+    ring_count = 0;
+    output_fd = fd;
+    flush_interval_ms = interval_ms;
+    compress = compress_enabled;
+    // Clamp level to supported range (fast + doubleFast only).
+    if (level < kMinLevel) level = kMinLevel;
+    if (level > kMaxLevel) level = kMaxLevel;
+    compress_level = level;
+    thread = 0;
+    running = false;
+    zstd_ctx = nullptr;
+    for (u32 i = 0; i < kMaxRings; i++) rings[i] = nullptr;
+}
+
+void AccessLogFlusher::add_ring(AccessLogRing* ring) {
+    if (ring_count < kMaxRings) {
+        rings[ring_count++] = ring;
+    }
+}
 
 core::Expected<void, Error> AccessLogFlusher::start() {
     if (running.load(std::memory_order_relaxed)) return {};

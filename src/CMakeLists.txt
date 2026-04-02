@@ -78,6 +78,7 @@ target_compile_options(zstd_compress PRIVATE
 add_library(rue_runtime STATIC
     placement_new.cc
     runtime/arena.cc
+    runtime/callbacks.cc
     runtime/shard.cc
     runtime/io_uring_backend.cc
     runtime/epoll_backend.cc
@@ -86,6 +87,7 @@ add_library(rue_runtime STATIC
     runtime/http_parser.cc
     runtime/chunked_parser.cc
     runtime/access_log.cc
+    runtime/traffic_capture.cc
     ${SIMD_SOURCE}
 )
 

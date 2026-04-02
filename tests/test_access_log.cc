@@ -2,13 +2,128 @@
 #include "rut/runtime/access_log.h"
 #include "test.h"
 #include "test_helpers.h"
+#include <atomic>
 
+#include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 using namespace rut;
+
+namespace {
+
+using PollFn = int (*)(struct pollfd*, nfds_t, int);
+using WriteFn = ssize_t (*)(int, const void*, size_t);
+
+pthread_once_t g_access_log_io_once = PTHREAD_ONCE_INIT;
+PollFn g_real_poll = nullptr;
+WriteFn g_real_write = nullptr;
+
+std::atomic<int> g_fault_fd{-1};
+std::atomic<int> g_poll_timeout_count{0};
+std::atomic<int> g_poll_eintr_count{0};
+std::atomic<int> g_poll_fatal_count{0};
+std::atomic<int> g_write_eagain_count{0};
+std::atomic<int> g_write_eintr_count{0};
+std::atomic<int> g_write_fatal_count{0};
+
+void resolve_access_log_io_symbols() {
+    g_real_poll = reinterpret_cast<PollFn>(dlsym(RTLD_NEXT, "poll"));
+    g_real_write = reinterpret_cast<WriteFn>(dlsym(RTLD_NEXT, "write"));
+}
+
+bool consume_fault(std::atomic<int>& counter) {
+    int remaining = counter.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (counter.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct ScopedAccessLogIoFault {
+    ScopedAccessLogIoFault(int fd,
+                           int poll_timeouts,
+                           int poll_eintrs,
+                           int poll_fatals,
+                           int write_eagains,
+                           int write_eintrs,
+                           int write_fatals) {
+        g_fault_fd.store(fd, std::memory_order_relaxed);
+        g_poll_timeout_count.store(poll_timeouts, std::memory_order_relaxed);
+        g_poll_eintr_count.store(poll_eintrs, std::memory_order_relaxed);
+        g_poll_fatal_count.store(poll_fatals, std::memory_order_relaxed);
+        g_write_eagain_count.store(write_eagains, std::memory_order_relaxed);
+        g_write_eintr_count.store(write_eintrs, std::memory_order_relaxed);
+        g_write_fatal_count.store(write_fatals, std::memory_order_relaxed);
+    }
+
+    ~ScopedAccessLogIoFault() {
+        g_fault_fd.store(-1, std::memory_order_relaxed);
+        g_poll_timeout_count.store(0, std::memory_order_relaxed);
+        g_poll_eintr_count.store(0, std::memory_order_relaxed);
+        g_poll_fatal_count.store(0, std::memory_order_relaxed);
+        g_write_eagain_count.store(0, std::memory_order_relaxed);
+        g_write_eintr_count.store(0, std::memory_order_relaxed);
+        g_write_fatal_count.store(0, std::memory_order_relaxed);
+    }
+};
+
+}  // namespace
+
+extern "C" int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
+    pthread_once(&g_access_log_io_once, resolve_access_log_io_symbols);
+    if (g_real_poll == nullptr) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    if (fds != nullptr && nfds == 1 && (fds[0].events & POLLOUT) != 0 &&
+        fds[0].fd == g_fault_fd.load(std::memory_order_relaxed)) {
+        if (consume_fault(g_poll_timeout_count)) return 0;
+        if (consume_fault(g_poll_eintr_count)) {
+            errno = EINTR;
+            return -1;
+        }
+        if (consume_fault(g_poll_fatal_count)) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+
+    return g_real_poll(fds, nfds, timeout);
+}
+
+extern "C" ssize_t write(int fd, const void* buf, size_t count) {
+    pthread_once(&g_access_log_io_once, resolve_access_log_io_symbols);
+    if (g_real_write == nullptr) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    if (fd == g_fault_fd.load(std::memory_order_relaxed)) {
+        if (consume_fault(g_write_eagain_count)) {
+            errno = EAGAIN;
+            return -1;
+        }
+        if (consume_fault(g_write_eintr_count)) {
+            errno = EINTR;
+            return -1;
+        }
+        if (consume_fault(g_write_fatal_count)) {
+            errno = EPIPE;
+            return -1;
+        }
+    }
+
+    return g_real_write(fd, buf, count);
+}
 
 // --- Helper: create a sample entry ---
 
@@ -206,6 +321,27 @@ TEST(format, buf_too_small) {
     CHECK_EQ(n, 0u);
 }
 
+TEST(format, includes_upstream_fields) {
+    auto entry = make_entry(201, 4321, 4, "/proxy");
+    const char upstream[] = "backend-a";
+    u32 i = 0;
+    while (upstream[i] && i < sizeof(entry.upstream) - 1) {
+        entry.upstream[i] = upstream[i];
+        i++;
+    }
+    entry.upstream[i] = '\0';
+    entry.upstream_us = 987;
+
+    char buf[512];
+    u32 n = format_access_log_text(entry, buf, sizeof(buf));
+    REQUIRE(n > 0);
+    buf[n] = '\0';
+
+    CHECK(strstr(buf, "/proxy") != nullptr);
+    CHECK(strstr(buf, "backend-a 987us") != nullptr);
+    CHECK(strstr(buf, "201") != nullptr);
+}
+
 // === Flusher: plain text ===
 
 TEST(flusher, flush_empty_rings) {
@@ -218,6 +354,39 @@ TEST(flusher, flush_empty_rings) {
     flusher.add_ring(&ring);
     CHECK_EQ(flusher.flush_once(), 0u);
     close(fd);
+}
+
+TEST(flusher, init_clamps_level_and_clears_slots) {
+    AccessLogFlusher flusher;
+    flusher.init(123, true, 99, 250);
+    CHECK_EQ(flusher.output_fd, 123);
+    CHECK(flusher.compress);
+    CHECK_EQ(flusher.compress_level, AccessLogFlusher::kMaxLevel);
+    CHECK_EQ(flusher.flush_interval_ms, 250u);
+    CHECK_EQ(flusher.ring_count, 0u);
+    CHECK(!flusher.running.load(std::memory_order_relaxed));
+    CHECK_EQ(flusher.zstd_ctx, nullptr);
+    for (u32 i = 0; i < AccessLogFlusher::kMaxRings; i++) CHECK_EQ(flusher.rings[i], nullptr);
+
+    flusher.init(456, false, -7, 10);
+    CHECK_EQ(flusher.output_fd, 456);
+    CHECK(!flusher.compress);
+    CHECK_EQ(flusher.compress_level, AccessLogFlusher::kMinLevel);
+    CHECK_EQ(flusher.flush_interval_ms, 10u);
+}
+
+TEST(flusher, add_ring_caps_at_max) {
+    AccessLogFlusher flusher;
+    flusher.init(-1);
+
+    AccessLogRing rings[AccessLogFlusher::kMaxRings + 1];
+    for (u32 i = 0; i < AccessLogFlusher::kMaxRings + 1; i++) {
+        rings[i].init();
+        flusher.add_ring(&rings[i]);
+    }
+
+    CHECK_EQ(flusher.ring_count, AccessLogFlusher::kMaxRings);
+    for (u32 i = 0; i < AccessLogFlusher::kMaxRings; i++) CHECK_EQ(flusher.rings[i], &rings[i]);
 }
 
 TEST(flusher, flush_text_to_fd) {
@@ -262,6 +431,104 @@ TEST(flusher, flush_multiple_rings) {
     flusher.add_ring(&ring2);
     CHECK_EQ(flusher.flush_once(), 2u);
     close(fd);
+}
+
+TEST(flusher, flush_retries_transient_poll_and_write_failures) {
+    AccessLogRing ring;
+    ring.init();
+    ring.push(make_entry(202, 111, 2, "/retry"));
+
+    i32 fds[2];
+    REQUIRE(pipe(fds) == 0);
+
+    AccessLogFlusher flusher;
+    flusher.init(fds[1]);
+    flusher.add_ring(&ring);
+    flusher.running.store(true, std::memory_order_relaxed);
+
+    ScopedAccessLogIoFault fault(fds[1], 1, 1, 0, 1, 1, 0);
+    CHECK_EQ(flusher.flush_once(), 1u);
+
+    flusher.running.store(false, std::memory_order_relaxed);
+    close(fds[1]);
+
+    char buf[1024];
+    u32 n = read_all(fds[0], buf, sizeof(buf) - 1);
+    close(fds[0]);
+    buf[n] = '\0';
+
+    CHECK(strstr(buf, "/retry") != nullptr);
+    CHECK(strstr(buf, "202") != nullptr);
+}
+
+TEST(flusher, flush_survives_single_timeout_while_stopped) {
+    AccessLogRing ring;
+    ring.init();
+    ring.push(make_entry(204, 9, 1, "/timeout"));
+
+    i32 fds[2];
+    REQUIRE(pipe(fds) == 0);
+
+    AccessLogFlusher flusher;
+    flusher.init(fds[1]);
+    flusher.add_ring(&ring);
+
+    ScopedAccessLogIoFault fault(fds[1], 1, 0, 0, 0, 0, 0);
+    CHECK_EQ(flusher.flush_once(), 1u);
+
+    close(fds[1]);
+    char buf[1024];
+    u32 n = read_all(fds[0], buf, sizeof(buf) - 1);
+    close(fds[0]);
+    buf[n] = '\0';
+
+    CHECK(strstr(buf, "/timeout") != nullptr);
+}
+
+TEST(flusher, flush_stops_on_non_eintr_poll_error) {
+    AccessLogRing ring;
+    ring.init();
+    ring.push(make_entry(500, 7, 0, "/poll-fail"));
+
+    i32 fds[2];
+    REQUIRE(pipe(fds) == 0);
+
+    AccessLogFlusher flusher;
+    flusher.init(fds[1]);
+    flusher.add_ring(&ring);
+    flusher.running.store(true, std::memory_order_relaxed);
+
+    ScopedAccessLogIoFault fault(fds[1], 0, 0, 1, 0, 0, 0);
+    CHECK_EQ(flusher.flush_once(), 1u);
+
+    flusher.running.store(false, std::memory_order_relaxed);
+    close(fds[1]);
+    char buf[64];
+    CHECK_EQ(read_all(fds[0], buf, sizeof(buf)), 0u);
+    close(fds[0]);
+}
+
+TEST(flusher, flush_stops_on_nonretryable_write_error) {
+    AccessLogRing ring;
+    ring.init();
+    ring.push(make_entry(503, 13, 0, "/write-fail"));
+
+    i32 fds[2];
+    REQUIRE(pipe(fds) == 0);
+
+    AccessLogFlusher flusher;
+    flusher.init(fds[1]);
+    flusher.add_ring(&ring);
+    flusher.running.store(true, std::memory_order_relaxed);
+
+    ScopedAccessLogIoFault fault(fds[1], 0, 0, 0, 0, 0, 1);
+    CHECK_EQ(flusher.flush_once(), 1u);
+
+    flusher.running.store(false, std::memory_order_relaxed);
+    close(fds[1]);
+    char buf[64];
+    CHECK_EQ(read_all(fds[0], buf, sizeof(buf)), 0u);
+    close(fds[0]);
 }
 
 // === Batch ===
@@ -309,6 +576,47 @@ TEST(batch, single_entry_flushes) {
     CHECK(strstr(buf, "503") != nullptr);
     CHECK(strstr(buf, "999us") != nullptr);
     CHECK(strstr(buf, "s=2") != nullptr);
+}
+
+TEST(batch, flushes_when_batch_overflows) {
+    AccessLogRing ring;
+    ring.init();
+
+    char long_path[sizeof(AccessLogEntry::path)];
+    for (u32 i = 0; i < sizeof(long_path) - 1; i++) long_path[i] = 'p';
+    long_path[sizeof(long_path) - 1] = '\0';
+
+    const char upstream[] = "backend-service-long";
+    for (u32 i = 0; i < AccessLogRing::kCapacity; i++) {
+        AccessLogEntry entry = make_entry(static_cast<u16>(200 + (i % 5)), 1000 + i, 7, long_path);
+        u32 j = 0;
+        while (upstream[j] && j < sizeof(entry.upstream) - 1) {
+            entry.upstream[j] = upstream[j];
+            j++;
+        }
+        entry.upstream[j] = '\0';
+        entry.upstream_us = 500 + i;
+        CHECK(ring.push(entry));
+    }
+
+    i32 fds[2];
+    REQUIRE(pipe(fds) == 0);
+    (void)fcntl(fds[0], 1031 /*F_SETPIPE_SZ*/, 1048576);
+
+    AccessLogFlusher flusher;
+    flusher.init(fds[1]);
+    flusher.add_ring(&ring);
+    CHECK_EQ(flusher.flush_once(), AccessLogRing::kCapacity);
+    close(fds[1]);
+
+    char buf[131072];
+    u32 n = read_all(fds[0], buf, sizeof(buf) - 1);
+    close(fds[0]);
+    buf[n] = '\0';
+
+    CHECK_EQ(count_lines(buf, n), AccessLogRing::kCapacity);
+    CHECK(strstr(buf, "backend-service-long") != nullptr);
+    CHECK(strstr(buf, "pppppppp") != nullptr);
 }
 
 // === Zstd compression ===
@@ -478,6 +786,22 @@ TEST(flusher, flush_to_closed_pipe) {
     flusher.flush_once();
     close(fds[1]);
     CHECK(true);  // no crash
+}
+
+TEST(flusher, compressed_flush_to_closed_pipe) {
+    AccessLogRing ring;
+    ring.init();
+    ring.push(make_entry(200, 100, 0, "/compressed"));
+
+    i32 fds[2];
+    REQUIRE(pipe(fds) == 0);
+    close(fds[0]);
+
+    AccessLogFlusher flusher;
+    flusher.init(fds[1], true);
+    flusher.add_ring(&ring);
+    CHECK_EQ(flusher.flush_once(), 1u);
+    close(fds[1]);
 }
 
 // === Zstd: stop() produces valid frame under backpressure ===

@@ -3606,6 +3606,122 @@ TEST(response_parser, multiple_headers) {
     CHECK(resp.has_content_length);
 }
 
+TEST(response_parser, duplicate_content_length_same_value) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n"
+        "hello",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(resp.has_content_length);
+    CHECK_EQ(resp.content_length, 5u);
+}
+
+TEST(response_parser, duplicate_content_length_mismatch) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "Content-Length: 6\r\n"
+        "\r\n"
+        "hello!",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(response_parser, invalid_version_prefix) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "XHTTP/1.1 200 OK\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(response_parser, invalid_version_digit) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.2 200 OK\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(response_parser, empty_content_length_rejected) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length:\r\n"
+        "\r\n",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(response_parser, trims_trailing_ows_in_header_value) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5 \t \r\n"
+        "\r\n"
+        "hello",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(resp.has_content_length);
+    CHECK_EQ(resp.content_length, 5u);
+
+    Str val;
+    CHECK(find_resp_header(resp, "Content-Length", &val));
+    CHECK_EQ(val.len, 1u);
+    CHECK_EQ(val.ptr[0], '5');
+}
+
+TEST(response_parser, malformed_reason_phrase_cr_without_lf) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    static const u8 raw[] = "HTTP/1.1 200 OK\rX";
+    auto s = parse_response_raw(raw, sizeof(raw) - 1, &resp, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(response_parser, malformed_header_terminator_cr_without_lf) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    static const u8 raw[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\rX";
+    auto s = parse_response_raw(raw, sizeof(raw) - 1, &resp, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
+TEST(response_parser, invalid_header_name_with_full_terminator_errors) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Bad Header\r\n"
+        "\r\n",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

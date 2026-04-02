@@ -5,6 +5,7 @@
 // Run:    ./build/bench/bench_connection
 
 #include "bench.h"
+#include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/slice_pool.h"

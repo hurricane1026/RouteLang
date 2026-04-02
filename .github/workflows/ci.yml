@@ -11,7 +11,7 @@ jobs:
     name: clang-format
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install clang-format (LLVM snapshot, v20)
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
@@ -32,7 +32,7 @@ jobs:
     name: clang-tidy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install tools
         run: |
           sudo apt-get update
@@ -61,7 +61,7 @@ jobs:
         compiler: [clang, gcc]
         build_type: [Debug, Release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install tools
         run: |
           sudo apt-get update
@@ -88,7 +88,7 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install tools
         run: |
           sudo apt-get update
@@ -145,10 +145,11 @@ jobs:
             --ignore-filename-regex='io_uring_backend|epoll_backend|socket\.cc|access_log\.cc|shard\.h|epoll_event_loop\.h|iouring_event_loop\.h' | tee build/coverage.txt
           # Note: test_traffic_capture, test_traffic_replay, test_sim, and
           # test_shard_control are excluded from the coverage report because
-          # they instantiate callbacks.h templates for SmallLoop/EpollEventLoop
-          # with proxy body streaming paths that require real upstream connections.
-          # These template instantiations add ~250 uncoverable lines to
-          # callbacks.h. The tests still run above for correctness validation.
+          # they instantiate callbacks_impl.h templates for test-only loop types
+          # in additional binaries. The production EpollEventLoop/IoUringEventLoop
+          # callbacks now live in callbacks.cc via explicit instantiation, so
+          # test_network is the primary binary for template coverage accounting.
+          # The excluded tests still run above for correctness validation.
 
           cat build/coverage.txt
 
@@ -164,8 +165,8 @@ jobs:
             exit 1
           fi
           # awk exit 0 = success (pass), exit 1 = fail
-          if ! awk "BEGIN { exit ($LINE_COV < 90) }"; then
-            echo "ERROR: Line coverage ${LINE_COV}% is below 90% threshold"
+          if ! awk "BEGIN { exit ($LINE_COV < 92) }"; then
+            echo "ERROR: Line coverage ${LINE_COV}% is below 92% threshold"
             exit 1
           fi
-          echo "Coverage OK: ${LINE_COV}% >= 90%"
+          echo "Coverage OK: ${LINE_COV}% >= 92%"

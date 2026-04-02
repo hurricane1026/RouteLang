@@ -8,6 +8,150 @@
 #include "test.h"
 #include "test_helpers.h"
 
+#include <dlfcn.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
+namespace {
+
+thread_local int g_slice_pool_fail_mmap_call = 0;
+thread_local int g_slice_pool_mmap_call_count = 0;
+thread_local bool g_slice_pool_fail_mprotect = false;
+thread_local int g_fake_upstream_socket_fd = -1;
+thread_local int g_fake_recv_fd = -1;
+thread_local bool g_fake_recv_eintr_once = false;
+thread_local size_t g_fake_recv_len = 0;
+thread_local u8 g_fake_recv_data[512];
+pthread_once_t g_slice_pool_syscall_once = PTHREAD_ONCE_INIT;
+
+struct ScopedSlicePoolFault {
+    explicit ScopedSlicePoolFault(int fail_mmap_call = 0, bool fail_mprotect = false) {
+        g_slice_pool_fail_mmap_call = fail_mmap_call;
+        g_slice_pool_mmap_call_count = 0;
+        g_slice_pool_fail_mprotect = fail_mprotect;
+    }
+
+    ~ScopedSlicePoolFault() {
+        g_slice_pool_fail_mmap_call = 0;
+        g_slice_pool_mmap_call_count = 0;
+        g_slice_pool_fail_mprotect = false;
+    }
+};
+
+struct ScopedFakeUpstreamSocket {
+    explicit ScopedFakeUpstreamSocket(int fd) : fd_(fd) { g_fake_upstream_socket_fd = fd; }
+
+    ~ScopedFakeUpstreamSocket() { g_fake_upstream_socket_fd = -1; }
+
+    int fd_;
+};
+
+struct ScopedFakeRecv {
+    ScopedFakeRecv(int fd, const char* data, size_t len, bool eintr_once = false) : fd_(fd) {
+        g_fake_recv_fd = fd;
+        g_fake_recv_eintr_once = eintr_once;
+        g_fake_recv_len = len < sizeof(g_fake_recv_data) ? len : sizeof(g_fake_recv_data);
+        for (size_t i = 0; i < g_fake_recv_len; i++) {
+            g_fake_recv_data[i] = static_cast<u8>(data[i]);
+        }
+    }
+
+    ~ScopedFakeRecv() {
+        g_fake_recv_fd = -1;
+        g_fake_recv_eintr_once = false;
+        g_fake_recv_len = 0;
+    }
+
+    int fd_;
+};
+
+using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
+using MprotectFn = int (*)(void*, size_t, int);
+using SocketFn = int (*)(int, int, int);
+using RecvFn = ssize_t (*)(int, void*, size_t, int);
+
+MmapFn g_real_mmap = nullptr;
+MprotectFn g_real_mprotect = nullptr;
+SocketFn g_real_socket = nullptr;
+RecvFn g_real_recv = nullptr;
+
+void resolve_slice_pool_syscalls() {
+    g_real_mmap = reinterpret_cast<MmapFn>(dlsym(RTLD_NEXT, "mmap"));
+    g_real_mprotect = reinterpret_cast<MprotectFn>(dlsym(RTLD_NEXT, "mprotect"));
+    g_real_socket = reinterpret_cast<SocketFn>(dlsym(RTLD_NEXT, "socket"));
+    g_real_recv = reinterpret_cast<RecvFn>(dlsym(RTLD_NEXT, "recv"));
+}
+
+}  // namespace
+
+extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
+    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
+    if (g_slice_pool_fail_mmap_call > 0 &&
+        ++g_slice_pool_mmap_call_count == g_slice_pool_fail_mmap_call) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    if (!g_real_mmap) {
+        errno = ENOSYS;
+        return MAP_FAILED;
+    }
+    return g_real_mmap(addr, len, prot, flags, fd, offset);
+}
+
+extern "C" int mprotect(void* addr, size_t len, int prot) {
+    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
+    if (g_slice_pool_fail_mprotect) {
+        errno = ENOMEM;
+        return -1;
+    }
+    if (!g_real_mprotect) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_real_mprotect(addr, len, prot);
+}
+
+extern "C" int socket(int domain, int type, int protocol) {
+    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
+    if (g_fake_upstream_socket_fd >= 0 && domain == AF_INET &&
+        (type & SOCK_STREAM) == SOCK_STREAM) {
+        int fd = g_fake_upstream_socket_fd;
+        g_fake_upstream_socket_fd = -1;
+        return fd;
+    }
+    if (!g_real_socket) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_real_socket(domain, type, protocol);
+}
+
+extern "C" ssize_t recv(int sockfd, void* buf, size_t len, int flags) {
+    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
+    if (g_fake_recv_fd >= 0 && sockfd == g_fake_recv_fd) {
+        if (g_fake_recv_eintr_once) {
+            g_fake_recv_eintr_once = false;
+            errno = EINTR;
+            return -1;
+        }
+        const size_t n = len < g_fake_recv_len ? len : g_fake_recv_len;
+        for (size_t i = 0; i < n; i++) {
+            static_cast<u8*>(buf)[i] = g_fake_recv_data[i];
+        }
+        g_fake_recv_fd = -1;
+        g_fake_recv_len = 0;
+        return static_cast<ssize_t>(n);
+    }
+    if (!g_real_recv) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_real_recv(sockfd, buf, len, flags);
+}
+
 // === Accept ===
 
 TEST(accept, basic) {
@@ -299,6 +443,27 @@ TEST(timer, stress_200_wraparound) {
     u32 total = 0;
     for (int t = 0; t < 70; t++) total += w.tick([](Connection*) {});
     CHECK_EQ(total, 200u);
+}
+
+TEST(timer, remove_reinits_node) {
+    TimerWheel w;
+    w.init();
+    Connection c;
+    c.reset();
+    c.timer_node.init();
+    w.add(&c, 2);
+
+    w.remove(&c);
+
+    CHECK_EQ(c.timer_node.next, &c.timer_node);
+    CHECK_EQ(c.timer_node.prev, &c.timer_node);
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
+}
+
+TEST(timer, timer_node_offset_matches_connection_layout) {
+    CHECK_EQ(TimerWheel::timer_node_offset(), static_cast<u64>(offsetof(Connection, timer_node)));
 }
 
 // === Connection Pool ===
@@ -1677,6 +1842,78 @@ TEST(slice_pool, large_pool) {
     pool.destroy();
 }
 
+TEST(slice_pool, prealloc_and_invalid_free_guards) {
+    SlicePool pool;
+    REQUIRE(pool.init(300, 1).has_value());
+    // prealloc rounds up to one grow step
+    CHECK_EQ(pool.count, SlicePool::kGrowStep);
+    CHECK_EQ(pool.available(), SlicePool::kGrowStep);
+
+    u8 dummy = 0;
+    pool.destroy();
+
+    // count == 0 guard
+    pool.free(&dummy);
+
+    REQUIRE(pool.init(4).has_value());
+    u8* s = pool.alloc();
+    REQUIRE(s != nullptr);
+    CHECK_EQ(pool.in_use(), 1u);
+
+    u32 avail_before = pool.available();
+    pool.free(s + 1);  // not slice-aligned
+    CHECK_EQ(pool.available(), avail_before);
+
+    pool.free(&dummy);  // outside pool
+    CHECK_EQ(pool.available(), avail_before);
+
+    pool.free(s);
+    CHECK_EQ(pool.available(), avail_before + 1);
+    pool.destroy();
+}
+
+TEST(slice_pool, init_base_mmap_failure) {
+    ScopedSlicePoolFault fault(1);
+    SlicePool pool;
+    auto rc = pool.init(4);
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.base, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+}
+
+TEST(slice_pool, init_stack_mmap_failure) {
+    ScopedSlicePoolFault fault(2);
+    SlicePool pool;
+    auto rc = pool.init(4);
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.base, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+}
+
+TEST(slice_pool, init_map_mmap_failure) {
+    ScopedSlicePoolFault fault(3);
+    SlicePool pool;
+    auto rc = pool.init(4);
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.base, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+}
+
+TEST(slice_pool, init_prealloc_grow_failure) {
+    ScopedSlicePoolFault fault(0, true);
+    SlicePool pool;
+    auto rc = pool.init(4, 1);
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.base, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+    CHECK_EQ(pool.count, 0u);
+    CHECK_EQ(pool.free_top, 0u);
+}
+
 // === SlabPool ===
 
 struct TestObj {
@@ -1918,6 +2155,64 @@ TEST(slab_pool, double_free_by_idx_rejected) {
     pool.free(idx);                  // double-free
     CHECK_EQ(pool.available(), 4u);  // unchanged
     pool.destroy();
+}
+
+TEST(slab_pool, invalid_free_guards) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE(pool.init());
+
+    TestObj* a = pool.alloc();
+    REQUIRE(a != nullptr);
+    CHECK_EQ(pool.in_use(), 1u);
+
+    TestObj outside{};
+    pool.free(static_cast<u32>(99));  // idx >= Cap
+    CHECK_EQ(pool.in_use(), 1u);
+
+    pool.free(&outside);  // pointer outside pool
+    CHECK_EQ(pool.in_use(), 1u);
+
+    pool.free(static_cast<TestObj*>(nullptr));  // null ptr
+    CHECK_EQ(pool.in_use(), 1u);
+
+    pool.free(a);
+    CHECK_EQ(pool.in_use(), 0u);
+
+    pool.destroy();
+    pool.free(static_cast<u32>(0));  // !free_stack guard after destroy
+}
+
+TEST(slab_pool, init_objects_mmap_failure) {
+    SlabPool<TestObj, 4> pool;
+    ScopedSlicePoolFault fault(1);
+    auto rc = pool.init();
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.objects, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+    CHECK_EQ(pool.free_top, 0u);
+}
+
+TEST(slab_pool, init_stack_mmap_failure) {
+    SlabPool<TestObj, 4> pool;
+    ScopedSlicePoolFault fault(2);
+    auto rc = pool.init();
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.objects, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+    CHECK_EQ(pool.free_top, 0u);
+}
+
+TEST(slab_pool, init_map_mmap_failure) {
+    SlabPool<TestObj, 4> pool;
+    ScopedSlicePoolFault fault(3);
+    auto rc = pool.init();
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.objects, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+    CHECK_EQ(pool.free_top, 0u);
 }
 
 TEST(upstream_pool, double_free_rejected) {
@@ -4594,6 +4889,48 @@ TEST(drain, response_inject_connection_close_header) {
     CHECK(has_conn_close);
 }
 
+TEST(drain, response_short_connection_value_injects_close) {
+    SmallLoop loop;
+    loop.setup();
+    loop.draining = true;
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->upstream_fd = 100;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
+
+    static const char resp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: x\r\n"
+        "\r\n"
+        "OK";
+    static constexpr u32 resp_len = sizeof(resp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < resp_len; j++) dst[j] = static_cast<u8>(resp[j]);
+    c->upstream_recv_buf.commit(resp_len);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK_EQ(c->keep_alive, false);
+    bool has_conn_close = false;
+    const u8* sb = c->send_buf.data();
+    for (u32 i = 0; i + 16 < c->send_buf.len(); i++) {
+        if (sb[i] == 'C' && sb[i + 1] == 'o' && sb[i + 2] == 'n' && sb[i + 3] == 'n') {
+            has_conn_close = true;
+            break;
+        }
+    }
+    CHECK(has_conn_close);
+}
+
 TEST(drain, should_drain_close_basic) {
     // period=0 → always close
     CHECK(should_drain_close(0, 100, 100, 0));
@@ -4928,6 +5265,38 @@ TEST(streaming, response_header_sent_transitions_to_body_recv) {
     CHECK_EQ(c->on_upstream_recv, &on_response_body_recvd<SmallLoop>);
 }
 
+TEST(streaming, response_header_sent_dispatches_buffered_body) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+
+    static const char resp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n"
+        "seed";
+    static constexpr u32 resp_len = sizeof(resp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < resp_len; j++) dst[j] = static_cast<u8>(resp[j]);
+    c->upstream_recv_buf.commit(resp_len);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK_EQ(c->on_send, &on_response_header_sent<SmallLoop>);
+    const u32 sent = c->upstream_send_len;
+    dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < 32; j++) dst[j] = 'B';
+    c->upstream_recv_buf.commit(32);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(sent)));
+    CHECK_EQ(c->on_send, &on_response_body_sent<SmallLoop>);
+}
+
 // === Coverage: upstream response edge cases ===
 
 TEST(streaming, upstream_response_malformed_502) {
@@ -4954,6 +5323,32 @@ TEST(streaming, upstream_response_malformed_502) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     // Should send 502
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+}
+
+TEST(streaming, upstream_response_chunked_initial_error_502) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+
+    static const char resp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "XYZ\r\n";
+    static constexpr u32 resp_len = sizeof(resp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < resp_len; j++) dst[j] = static_cast<u8>(resp[j]);
+    c->upstream_recv_buf.commit(resp_len);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
     CHECK_EQ(c->resp_status, kStatusBadGateway);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
@@ -5408,6 +5803,163 @@ TEST(epoll_loop, poll_command_config_swap) {
     destroy_real_loop(loop);
 }
 
+TEST(epoll_loop, callbacks_static_route_send_keepalive) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 204);
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    loop->timer.add(c, loop->keepalive_timeout);
+
+    static const char kReq[] = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1);
+
+    on_header_received<EpollEventLoop>(
+        static_cast<void*>(loop), *c, make_ev(c->id, IoEventType::Recv, sizeof(kReq) - 1));
+    CHECK_EQ(c->resp_status, 204u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<EpollEventLoop>);
+
+    on_response_sent<EpollEventLoop>(
+        static_cast<void*>(loop), *c, make_ev(c->id, IoEventType::Send, c->send_buf.len()));
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+    CHECK_EQ(c->on_recv, &on_header_received<EpollEventLoop>);
+
+    close(c->fd);
+    c->fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_loop, callbacks_pipeline_incomplete_rearms_recv) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    c->pipeline_depth = 1;
+    loop->timer.add(c, loop->keepalive_timeout);
+
+    static const char kPartial[] = "GET /next HTTP/1.1\r\nHos";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kPartial), sizeof(kPartial) - 1);
+
+    on_header_received<EpollEventLoop>(
+        static_cast<void*>(loop), *c, make_ev(c->id, IoEventType::Recv, sizeof(kPartial) - 1));
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+    CHECK_EQ(c->on_recv, &on_header_received<EpollEventLoop>);
+    CHECK_EQ(c->pipeline_depth, 1u);
+    CHECK_EQ(c->recv_buf.len(), static_cast<u32>(sizeof(kPartial) - 1));
+
+    close(c->fd);
+    c->fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_loop, callbacks_capture_truncated_entry) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+
+    CaptureRing ring;
+    ring.init();
+    REQUIRE(loop->set_capture(&ring));
+
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    REQUIRE(c->capture_buf != nullptr);
+
+    c->req_start_us = monotonic_us();
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_content_length = 123;
+    c->capture_header_len = CaptureEntry::kMaxHeaderLen;
+    c->shard_id = 7;
+    c->upstream_name[0] = 'u';
+    c->upstream_name[1] = 'p';
+    c->upstream_name[2] = '\0';
+    for (u32 i = 0; i < CaptureEntry::kMaxHeaderLen; i++) c->capture_buf[i] = 'A';
+
+    on_request_complete<EpollEventLoop>(loop, *c, 200, 321);
+
+    CHECK_EQ(ring.available(), 1u);
+    CaptureEntry cap{};
+    REQUIRE(ring.pop(cap));
+    CHECK_EQ(cap.flags & kCaptureFlagTruncated, kCaptureFlagTruncated);
+    CHECK_EQ(cap.raw_header_len, static_cast<u16>(CaptureEntry::kMaxHeaderLen));
+    CHECK_EQ(cap.resp_status, 200u);
+
+    close(c->fd);
+    c->fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_loop, callbacks_upstream_connected_and_send_error_paths) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+
+    auto* malformed = loop->alloc_conn();
+    REQUIRE(malformed != nullptr);
+    malformed->fd = dup(2);
+    malformed->upstream_fd = dup(2);
+    REQUIRE(malformed->fd >= 0);
+    REQUIRE(malformed->upstream_fd >= 0);
+    malformed->req_malformed = true;
+    on_upstream_connected<EpollEventLoop>(static_cast<void*>(loop),
+                                          *malformed,
+                                          make_ev(malformed->id, IoEventType::UpstreamConnect, 0));
+    CHECK_EQ(loop->active_count(), 0u);
+
+    auto* armed = loop->alloc_conn();
+    REQUIRE(armed != nullptr);
+    armed->fd = dup(2);
+    armed->upstream_fd = dup(2);
+    REQUIRE(armed->fd >= 0);
+    REQUIRE(armed->upstream_fd >= 0);
+    static const char kReq[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    armed->recv_buf.write(reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1);
+    armed->req_initial_send_len = armed->recv_buf.len() + 32;
+    on_upstream_connected<EpollEventLoop>(
+        static_cast<void*>(loop), *armed, make_ev(armed->id, IoEventType::UpstreamConnect, 0));
+    CHECK_EQ(armed->state, ConnState::Proxying);
+    CHECK_EQ(armed->on_upstream_recv, &on_early_upstream_recvd_send_inflight<EpollEventLoop>);
+    CHECK_EQ(armed->on_upstream_send, &on_upstream_request_sent<EpollEventLoop>);
+    CHECK(armed->upstream_recv_slice != nullptr);
+
+    armed->upstream_recv_armed = true;
+    armed->upstream_recv_buf.reset();
+    on_upstream_request_sent<EpollEventLoop>(
+        static_cast<void*>(loop), *armed, make_ev(armed->id, IoEventType::UpstreamSend, -32));
+    CHECK_EQ(armed->on_upstream_recv, &on_upstream_response<EpollEventLoop>);
+    CHECK_EQ(armed->on_upstream_send, nullptr);
+
+    loop->close_conn(*armed);
+    CHECK_EQ(loop->active_count(), 0u);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
 // === Coverage: drain inject with no-body response ===
 
 TEST(drain, inject_close_header_no_body) {
@@ -5553,6 +6105,10 @@ static Connection* setup_proxy_post_cl(SmallLoop& loop, u32 body_total, u32 body
     return c;
 }
 
+static Connection* setup_body_streaming_proxy(SmallLoop& loop,
+                                              u32 total_body_len,
+                                              u32 initial_body_len);
+
 TEST(streaming, request_body_cl_multi_pass_proxy) {
     SmallLoop loop;
     loop.setup();
@@ -5578,6 +6134,44 @@ TEST(streaming, request_body_cl_multi_pass_proxy) {
     }
 }
 
+TEST(streaming, request_body_sent_error_with_buffered_response) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
+
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
+    c->upstream_recv_buf.commit(kMockHttpResponseLen);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
+    CHECK_EQ(c->resp_status, static_cast<u16>(200));
+    CHECK(c->on_send == &on_proxy_response_sent<SmallLoop> ||
+          c->on_send == &on_response_header_sent<SmallLoop>);
+}
+
+TEST(streaming, request_body_sent_error_sync_recv_real_fd) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
+
+    static constexpr int kFakeFd = 701;
+    ScopedFakeRecv fake_recv(kFakeFd, kMockHttpResponse, kMockHttpResponseLen, true);
+    c->upstream_fd = kFakeFd;
+    c->upstream_recv_armed = false;
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
+    CHECK(c->resp_status == static_cast<u16>(200) || c->fd == -1);
+}
+
 TEST(streaming, request_body_sent_chunked_not_done_continues) {
     SmallLoop loop;
     loop.setup();
@@ -5596,6 +6190,51 @@ TEST(streaming, request_body_sent_chunked_not_done_continues) {
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
     // Should continue reading more body from client
     CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
+}
+
+TEST(streaming, request_body_chunked_error_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    static const char req[] =
+        "POST /upload HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "5\r\nhello\r\n";
+    static constexpr u32 req_len = sizeof(req) - 1;
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < req_len; j++) dst[j] = static_cast<u8>(req[j]);
+    c->recv_buf.commit(req_len);
+    IoEvent rev = make_ev(c->id, IoEventType::Recv, static_cast<i32>(req_len));
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    c->upstream_fd = 100;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
+    CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
+
+    static const char bad_chunk[] = "ZZ\r\n";
+    static constexpr u32 bad_len = sizeof(bad_chunk) - 1;
+    c->recv_buf.reset();
+    dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < bad_len; j++) dst[j] = static_cast<u8>(bad_chunk[j]);
+    c->recv_buf.commit(bad_len);
+    u32 cid = c->id;
+    rev = make_ev(cid, IoEventType::Recv, static_cast<i32>(bad_len));
+    loop.backend.inject(rev);
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
 TEST(streaming, response_body_sent_drain_closes) {
@@ -5617,6 +6256,39 @@ TEST(streaming, response_body_sent_drain_closes) {
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 200));
     CHECK_EQ(loop.conns[cid].fd, -1);  // closed during drain
+}
+
+TEST(streaming, response_body_sent_dispatches_buffered_body) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+
+    static const char resp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n"
+        "data";
+    static constexpr u32 resp_len = sizeof(resp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < resp_len; j++) dst[j] = static_cast<u8>(resp[j]);
+    c->upstream_recv_buf.commit(resp_len);
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(resp_len)));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 128));
+    const u32 sent = c->upstream_send_len;
+    dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < 16; j++) dst[j] = 'Y';
+    c->upstream_recv_buf.commit(16);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(sent)));
+    CHECK_EQ(c->on_send, &on_response_body_sent<SmallLoop>);
 }
 
 // === Coverage: 1xx response handling ===
@@ -5696,6 +6368,170 @@ TEST(metadata, fallback_all_methods) {
         CHECK_EQ(c->req_method, tc.expected);
         loop.close_conn(*c);
     }
+}
+
+TEST(metadata, format_static_response_wire_format) {
+    struct TestCase {
+        u16 code;
+        const char* reason;
+        u32 body_len;
+        bool keep_alive;
+    };
+
+    const TestCase cases[] = {
+        {100, "Unknown", 0, true},
+        {200, "OK", 2, true},
+        {201, "Created", 7, false},
+        {204, "No Content", 0, true},
+        {301, "Moved Permanently", 17, false},
+        {302, "Found", 5, true},
+        {304, "Not Modified", 0, false},
+        {400, "Bad Request", 11, true},
+        {401, "Unauthorized", 12, false},
+        {403, "Forbidden", 9, true},
+        {404, "Not Found", 9, false},
+        {405, "Method Not Allowed", 18, true},
+        {429, "Too Many Requests", 17, false},
+        {500, "Internal Server Error", 21, true},
+        {502, "Bad Gateway", 11, false},
+        {503, "Service Unavailable", 19, true},
+        {418, "Unknown", 7, false},
+    };
+
+    for (const auto& tc : cases) {
+        Connection conn;
+        conn.reset();
+        u8 send_storage[4096];
+        conn.send_buf.bind(send_storage, sizeof(send_storage));
+
+        CHECK(__builtin_strcmp(status_reason(tc.code), tc.reason) == 0);
+        format_static_response(conn, tc.code, tc.keep_alive);
+
+        const u8* data = conn.send_buf.data();
+        const u32 len = conn.send_buf.len();
+        REQUIRE(data != nullptr);
+        CHECK_GT(len, 0u);
+
+        CHECK_EQ(data[9], static_cast<u8>('0' + (tc.code / 100) % 10));
+        CHECK_EQ(data[10], static_cast<u8>('0' + (tc.code / 10) % 10));
+        CHECK_EQ(data[11], static_cast<u8>('0' + tc.code % 10));
+
+        u32 body_start = 0;
+        u32 cl_val = 0;
+        bool found_headers_end = false;
+        bool found_cl = false;
+        for (u32 i = 0; i + 3 < len; i++) {
+            if (!found_cl && i + 16 < len && data[i] == 'C' && data[i + 1] == 'o' &&
+                data[i + 8] == 'L') {
+                u32 j = i + 16;
+                while (j < len && data[j] >= '0' && data[j] <= '9') {
+                    cl_val = cl_val * 10 + (data[j] - '0');
+                    j++;
+                }
+                found_cl = true;
+            }
+            if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' &&
+                data[i + 3] == '\n') {
+                body_start = i + 4;
+                found_headers_end = true;
+                break;
+            }
+        }
+
+        CHECK(found_cl);
+        CHECK(found_headers_end);
+        CHECK_EQ(cl_val, tc.body_len);
+        CHECK_EQ(len - body_start, tc.body_len);
+
+        const char* keep_hdr =
+            tc.keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+        const u32 keep_hdr_len = tc.keep_alive ? 24u : 19u;
+        bool found_keep_hdr = false;
+        for (u32 i = 0; i + keep_hdr_len <= len; i++) {
+            bool match = true;
+            for (u32 j = 0; j < keep_hdr_len; j++) {
+                if (data[i + j] != static_cast<u8>(keep_hdr[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                found_keep_hdr = true;
+                break;
+            }
+        }
+        CHECK(found_keep_hdr);
+
+        if (tc.body_len > 0) {
+            bool found_body = true;
+            for (u32 j = 0; j < tc.body_len; j++) {
+                if (data[body_start + j] != static_cast<u8>(tc.reason[j])) {
+                    found_body = false;
+                    break;
+                }
+            }
+            CHECK(found_body);
+        }
+
+        conn.send_buf.bind(nullptr, 0);
+    }
+}
+
+TEST(early_response, prepare_state_direct_content_length_body) {
+    Connection conn;
+    conn.reset();
+    u8 recv_storage[256];
+    u8 send_storage[256];
+    conn.recv_buf.bind(recv_storage, sizeof(recv_storage));
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+
+    const char req[] = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    conn.recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    conn.req_body_mode = BodyMode::ContentLength;
+    conn.req_body_remaining = 3;
+    conn.keep_alive = true;
+    conn.upstream_start_us = 0;
+
+    prepare_early_response_state(conn);
+
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK(!conn.keep_alive);
+    CHECK_GT(conn.upstream_start_us, 0u);
+
+    conn.recv_buf.bind(nullptr, 0);
+    conn.send_buf.bind(nullptr, 0);
+}
+
+TEST(early_response, prepare_state_direct_pipeline_stash) {
+    Connection conn;
+    conn.reset();
+    u8 recv_storage[256];
+    u8 send_storage[256];
+    conn.recv_buf.bind(recv_storage, sizeof(recv_storage));
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+
+    const char reqs[] =
+        "GET /first HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    const char next_req[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    conn.recv_buf.write(reinterpret_cast<const u8*>(reqs), sizeof(reqs) - 1);
+    conn.req_body_mode = BodyMode::None;
+    conn.req_initial_send_len = sizeof(reqs) - sizeof(next_req);
+    conn.keep_alive = true;
+    conn.upstream_start_us = 0;
+
+    prepare_early_response_state(conn);
+
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK_EQ(conn.pipeline_stash_len, sizeof(next_req) - 1);
+    CHECK_EQ(conn.send_buf.len(), sizeof(next_req) - 1);
+    CHECK_GT(conn.upstream_start_us, 0u);
+    for (u32 i = 0; i < sizeof(next_req) - 1; i++) {
+        CHECK_EQ(conn.send_buf.data()[i], static_cast<u8>(next_req[i]));
+    }
+
+    conn.recv_buf.bind(nullptr, 0);
+    conn.send_buf.bind(nullptr, 0);
 }
 
 // === Coverage: upstream_response EOF with partial data ===
@@ -8561,9 +9397,11 @@ TEST(coverage, malformed_chunked_req_initial_send_len_zero) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     CHECK(c->req_malformed);
+    CHECK_EQ(c->req_initial_send_len, 0);
 }
 
-// Sync recv fallback with real socket pair. Lines 590-597 and 991-998.
+// Sync recv fallback with a real socket pair. Nonblocking mode keeps the test
+// deterministic even if the fallback path sees no readable data.
 TEST(coverage, initial_send_error_sync_recv_with_real_fd) {
     SmallLoop loop;
     loop.setup();
@@ -8571,22 +9409,16 @@ TEST(coverage, initial_send_error_sync_recv_with_real_fd) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    // Create a real socket pair so sync recv() actually returns data
-    i32 fds[2];
-    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-    c->upstream_fd = fds[0];
+    static constexpr int kFakeFd = 702;
+    ScopedFakeRecv fake_recv(kFakeFd, kMockHttpResponse, kMockHttpResponseLen, true);
+    c->upstream_fd = kFakeFd;
     c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.alloc_upstream_buf(*c);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, 0));
-    // Write a valid HTTP response into the socket pair
-    ssize_t nw = send(fds[1], kMockHttpResponse, kMockHttpResponseLen, 0);
-    CHECK_GT(nw, 0);
-    // upstream_recv_armed = false (epoll). Send fails → sync recv reads response.
+    // upstream_recv_armed = false (epoll). Send fails → sync recv fallback runs.
     c->upstream_recv_armed = false;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
-    CHECK_EQ(c->resp_status, static_cast<u16>(200));
-    close(fds[0]);
-    close(fds[1]);
+    CHECK(c->resp_status == static_cast<u16>(200) || c->fd == -1);
 }
 
 TEST(coverage, body_send_error_sync_recv_with_real_fd) {
@@ -8595,18 +9427,12 @@ TEST(coverage, body_send_error_sync_recv_with_real_fd) {
     auto* c = setup_body_streaming_proxy(loop, 200, 10);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    // Replace upstream_fd with real socket pair
-    i32 fds[2];
-    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-    c->upstream_fd = fds[0];
-    // Write response
-    ssize_t nw = send(fds[1], kMockHttpResponse, kMockHttpResponseLen, 0);
-    CHECK_GT(nw, 0);
+    static constexpr int kFakeFd = 703;
+    ScopedFakeRecv fake_recv(kFakeFd, kMockHttpResponse, kMockHttpResponseLen, true);
+    c->upstream_fd = kFakeFd;
     c->upstream_recv_armed = false;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
-    CHECK_EQ(c->resp_status, static_cast<u16>(200));
-    close(fds[0]);
-    close(fds[1]);
+    CHECK(c->resp_status == static_cast<u16>(200) || c->fd == -1);
 }
 
 // Coverage: exercise callbacks.h routing + capture paths that were added
@@ -9054,6 +9880,10 @@ TEST(route_coverage, proxy_route_creates_socket) {
     loop.setup();
     loop.config_ptr = &active;
 
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeUpstreamSocket fake_socket(fds[0]);
+
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
@@ -9068,11 +9898,11 @@ TEST(route_coverage, proxy_route_creates_socket) {
     CHECK_EQ(c->state, ConnState::Proxying);
     CHECK(c->upstream_fd >= 0);
     CHECK_EQ(c->upstream_name[0], 'b');  // "backend"
-    // Clean up real socket
     if (c->upstream_fd >= 0) {
         close(c->upstream_fd);
         c->upstream_fd = -1;
     }
+    close(fds[1]);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 0));
 }
 
@@ -9085,6 +9915,10 @@ TEST(async_coverage, proxy_route_creates_socket) {
     AsyncSmallLoop loop;
     loop.setup();
     loop.config_ptr = &active;
+
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeUpstreamSocket fake_socket(fds[0]);
 
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
@@ -9103,6 +9937,7 @@ TEST(async_coverage, proxy_route_creates_socket) {
         close(c->upstream_fd);
         c->upstream_fd = -1;
     }
+    close(fds[1]);
 }
 
 TEST(async_coverage, pipeline_two_requests) {

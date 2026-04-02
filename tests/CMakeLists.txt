@@ -207,6 +207,9 @@ target_include_directories(test_simulate_engine PRIVATE
     ${LLVM_INCLUDE_DIRS}
 )
 target_compile_definitions(test_simulate_engine PRIVATE ${LLVM_DEFINITIONS})
+target_compile_definitions(test_simulate_engine PRIVATE
+    RUT_SIMULATE_BIN_PATH="$<TARGET_FILE:rut-simulate>"
+)
 add_test(NAME test_simulate_engine COMMAND test_simulate_engine)
 set_tests_properties(test_simulate_engine PROPERTIES LABELS "unit;sim;jit")
 

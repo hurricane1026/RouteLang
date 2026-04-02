@@ -1,9 +1,11 @@
 #include "rut/sim/simulate_engine.h"
 #include "test.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 using namespace rut;
@@ -46,6 +48,84 @@ static bool load_manifest_text(const char* text, Manifest* manifest) {
     close(fd);
     unlink(path);
     return ok;
+}
+
+static bool read_all_fd(i32 fd, char* buf, u32 cap, u32* out_len) {
+    u32 pos = 0;
+    while (pos + 1 < cap) {
+        const ssize_t n = read(fd, buf + pos, cap - 1 - pos);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) break;
+        pos += static_cast<u32>(n);
+    }
+    buf[pos] = '\0';
+    *out_len = pos;
+    return true;
+}
+
+static bool run_simulate_cli(const char* arg1,
+                             const char* arg2,
+                             i32* exit_code,
+                             char* stdout_buf,
+                             u32 stdout_cap,
+                             char* stderr_buf,
+                             u32 stderr_cap) {
+    i32 out_pipe[2];
+    i32 err_pipe[2];
+    if (pipe(out_pipe) != 0) return false;
+    if (pipe(err_pipe) != 0) {
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        return false;
+    }
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        close(err_pipe[0]);
+        close(err_pipe[1]);
+        return false;
+    }
+
+    if (pid == 0) {
+        dup2(out_pipe[1], 1);
+        dup2(err_pipe[1], 2);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        close(err_pipe[0]);
+        close(err_pipe[1]);
+        if (arg1 && arg2) {
+            execl(RUT_SIMULATE_BIN_PATH,
+                  RUT_SIMULATE_BIN_PATH,
+                  arg1,
+                  arg2,
+                  static_cast<char*>(nullptr));
+        } else {
+            execl(RUT_SIMULATE_BIN_PATH, RUT_SIMULATE_BIN_PATH, static_cast<char*>(nullptr));
+        }
+        _exit(127);
+    }
+
+    close(out_pipe[1]);
+    close(err_pipe[1]);
+
+    u32 stdout_len = 0;
+    u32 stderr_len = 0;
+    const bool stdout_ok = read_all_fd(out_pipe[0], stdout_buf, stdout_cap, &stdout_len);
+    const bool stderr_ok = read_all_fd(err_pipe[0], stderr_buf, stderr_cap, &stderr_len);
+    close(out_pipe[0]);
+    close(err_pipe[0]);
+
+    i32 status = 0;
+    if (waitpid(pid, &status, 0) < 0) return false;
+    if (!stdout_ok || !stderr_ok) return false;
+    if (!WIFEXITED(status)) return false;
+    *exit_code = WEXITSTATUS(status);
+    return true;
 }
 
 }  // namespace
@@ -451,6 +531,25 @@ TEST(simulate_engine, format_result_uses_mismatch_label) {
     REQUIRE(len > 0);
     CHECK(strstr(buf, "MISMATCH") != nullptr);
     CHECK(strstr(buf, "MISS ") == nullptr);
+}
+
+TEST(simulate_engine, cli_usage_mentions_param_prefix_matching) {
+    char stdout_buf[64];
+    char stderr_buf[512];
+    i32 exit_code = -1;
+
+    REQUIRE(run_simulate_cli(nullptr,
+                             nullptr,
+                             &exit_code,
+                             stdout_buf,
+                             sizeof(stdout_buf),
+                             stderr_buf,
+                             sizeof(stderr_buf)));
+    CHECK_EQ(exit_code, 2);
+    CHECK_EQ(stdout_buf[0], '\0');
+    CHECK(strstr(stderr_buf, "Usage: rut-simulate") != nullptr);
+    CHECK(strstr(stderr_buf, "prefix-matched") != nullptr);
+    CHECK(strstr(stderr_buf, "':param'") != nullptr);
 }
 
 int main(int argc, char** argv) {

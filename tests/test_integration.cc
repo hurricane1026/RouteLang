@@ -126,6 +126,60 @@ struct TlsSendRetryCase {
     u32 payload_len = 0;
 };
 
+static constexpr TlsRecvRetryCase kTlsRecvRetryCases[] = {
+    {.handshake_first = false,
+     .first_error = SSL_ERROR_WANT_WRITE,
+     .first_wakeup_events = EPOLLOUT,
+     .final_read_rc = 3,
+     .expected_buf_len = 3},
+    {.handshake_first = false,
+     .first_error = SSL_ERROR_WANT_WRITE,
+     .first_wakeup_events = EPOLLIN | EPOLLOUT,
+     .final_read_rc = 2,
+     .expected_buf_len = 2},
+    {.handshake_first = false,
+     .first_error = SSL_ERROR_WANT_READ,
+     .first_wakeup_events = EPOLLIN,
+     .final_read_rc = 2,
+     .expected_buf_len = 2},
+    {.handshake_first = false,
+     .first_error = SSL_ERROR_WANT_READ,
+     .first_wakeup_events = EPOLLIN | EPOLLOUT,
+     .final_read_rc = 1,
+     .expected_buf_len = 1},
+    {.handshake_first = true,
+     .first_error = SSL_ERROR_WANT_WRITE,
+     .first_wakeup_events = EPOLLOUT,
+     .final_read_rc = 2,
+     .expected_buf_len = 2},
+    {.handshake_first = true,
+     .first_error = SSL_ERROR_WANT_WRITE,
+     .first_wakeup_events = EPOLLIN | EPOLLOUT,
+     .final_read_rc = 1,
+     .expected_buf_len = 1},
+    {.handshake_first = true,
+     .first_error = SSL_ERROR_WANT_READ,
+     .first_wakeup_events = EPOLLIN,
+     .final_read_rc = 1,
+     .expected_buf_len = 1},
+    {.handshake_first = true,
+     .first_error = SSL_ERROR_WANT_READ,
+     .first_wakeup_events = EPOLLIN | EPOLLOUT,
+     .final_read_rc = 3,
+     .expected_buf_len = 3},
+};
+
+static constexpr TlsSendRetryCase kTlsSendRetryCases[] = {
+    {.first_error = SSL_ERROR_WANT_READ, .second_wakeup_events = EPOLLIN, .payload_len = 4},
+    {.first_error = SSL_ERROR_WANT_READ,
+     .second_wakeup_events = EPOLLIN | EPOLLOUT,
+     .payload_len = 4},
+    {.first_error = SSL_ERROR_WANT_WRITE, .second_wakeup_events = EPOLLOUT, .payload_len = 4},
+    {.first_error = SSL_ERROR_WANT_WRITE,
+     .second_wakeup_events = EPOLLIN | EPOLLOUT,
+     .payload_len = 4},
+};
+
 static void run_tls_recv_retry_case(rut::test::TestCase* test_case,
                                     const TlsRecvRetryCase& tc_cfg) {
     auto* _tc = test_case;
@@ -1014,52 +1068,16 @@ TEST(partial_send, epollout_no_pending_switches_to_epollin) {
     backend.shutdown();
 }
 
-TEST(tls_state_machine, recv_want_write_retries_on_epollout) {
-    run_tls_recv_retry_case(_tc,
-                            {.handshake_first = false,
-                             .first_error = SSL_ERROR_WANT_WRITE,
-                             .first_wakeup_events = EPOLLOUT,
-                             .final_read_rc = 3,
-                             .expected_buf_len = 3});
+TEST(tls_state_machine, recv_retry_matrix) {
+    for (const auto& tc : kTlsRecvRetryCases) {
+        run_tls_recv_retry_case(_tc, tc);
+    }
 }
 
-TEST(tls_state_machine, recv_want_read_retries_on_epollin) {
-    run_tls_recv_retry_case(_tc,
-                            {.handshake_first = false,
-                             .first_error = SSL_ERROR_WANT_READ,
-                             .first_wakeup_events = EPOLLIN,
-                             .final_read_rc = 2,
-                             .expected_buf_len = 2});
-}
-
-TEST(tls_state_machine, handshake_want_write_retries_on_epollout) {
-    run_tls_recv_retry_case(_tc,
-                            {.handshake_first = true,
-                             .first_error = SSL_ERROR_WANT_WRITE,
-                             .first_wakeup_events = EPOLLOUT,
-                             .final_read_rc = 2,
-                             .expected_buf_len = 2});
-}
-
-TEST(tls_state_machine, handshake_want_read_retries_on_epollin) {
-    run_tls_recv_retry_case(_tc,
-                            {.handshake_first = true,
-                             .first_error = SSL_ERROR_WANT_READ,
-                             .first_wakeup_events = EPOLLIN,
-                             .final_read_rc = 1,
-                             .expected_buf_len = 1});
-}
-
-TEST(tls_state_machine, send_want_read_retries_on_epollin) {
-    run_tls_send_retry_case(
-        _tc,
-        {.first_error = SSL_ERROR_WANT_READ, .second_wakeup_events = EPOLLIN, .payload_len = 4});
-}
-
-TEST(tls_state_machine, send_want_write_retries_on_epollout) {
-    run_tls_send_retry_case(
-        _tc,
-        {.first_error = SSL_ERROR_WANT_WRITE, .second_wakeup_events = EPOLLOUT, .payload_len = 4});
+TEST(tls_state_machine, send_retry_matrix) {
+    for (const auto& tc : kTlsSendRetryCases) {
+        run_tls_send_retry_case(_tc, tc);
+    }
 }
 
 TEST(tls_state_machine, send_want_write_readable_wakeup_buffers_recv) {

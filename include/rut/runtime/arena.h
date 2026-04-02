@@ -138,12 +138,15 @@ struct Arena {
     // Array bump alloc, value-initialized via placement new.
     template <typename T>
     T* alloc_array(u32 count) {
-        T* const kType = nullptr;
-        if (count > 0 && sizeof(*kType) > static_cast<u64>(-1) / count) return nullptr;
-        void* p = alloc(static_cast<u64>(sizeof(*kType)) * count);
+        T* a = nullptr;
+        if (count > 0 && sizeof(a[0]) > static_cast<u64>(-1) / count) return nullptr;
+        void* p = alloc(static_cast<u64>(sizeof(a[0])) * count);
         if (!p) return nullptr;
-        auto* a = static_cast<T*>(p);
-        for (u32 i = 0; i < count; i++) ::new (static_cast<void*>(&a[i])) T{};
+        a = static_cast<T*>(p);
+        for (u32 i = 0; i < count; i++) {
+            void* slot = static_cast<void*>(a + i);
+            ::new (slot) T{};
+        }
         return a;
     }
 

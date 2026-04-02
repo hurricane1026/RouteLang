@@ -14,8 +14,8 @@
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
-#include "rut/runtime/tls.h"
 #include "rut/runtime/timer_wheel.h"
+#include "rut/runtime/tls.h"
 #include <atomic>
 
 #include <netinet/in.h>

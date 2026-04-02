@@ -46,7 +46,9 @@ static bool str_eq(const char* a, const char* b) {
     return *a == *b;
 }
 
-static bool starts_with_dash_dash(const char* s) { return s[0] == '-' && s[1] == '-'; }
+static bool starts_with_dash_dash(const char* s) {
+    return s[0] == '-' && s[1] == '-';
+}
 
 static bool detect_io_uring() {
     struct io_uring_params params;
@@ -377,17 +379,6 @@ int main(int argc, char** argv) {
     if (tls_server) {
         write_str("Backend: epoll (TLS)\n");
         rc = run_shards<EpollEventLoop>(port,
-                                      shard_count,
-                                      pin_cpus,
-                                      drain_secs,
-                                      pool_prealloc,
-                                      tls_server,
-                                      access_log_path,
-                                      access_log_compress,
-                                      access_log_level);
-    } else if (detect_io_uring()) {
-        write_str("Backend: io_uring\n");
-        rc = run_shards<IoUringEventLoop>(port,
                                         shard_count,
                                         pin_cpus,
                                         drain_secs,
@@ -396,17 +387,28 @@ int main(int argc, char** argv) {
                                         access_log_path,
                                         access_log_compress,
                                         access_log_level);
+    } else if (detect_io_uring()) {
+        write_str("Backend: io_uring\n");
+        rc = run_shards<IoUringEventLoop>(port,
+                                          shard_count,
+                                          pin_cpus,
+                                          drain_secs,
+                                          pool_prealloc,
+                                          tls_server,
+                                          access_log_path,
+                                          access_log_compress,
+                                          access_log_level);
     } else {
         write_str("Backend: epoll\n");
         rc = run_shards<EpollEventLoop>(port,
-                                      shard_count,
-                                      pin_cpus,
-                                      drain_secs,
-                                      pool_prealloc,
-                                      tls_server,
-                                      access_log_path,
-                                      access_log_compress,
-                                      access_log_level);
+                                        shard_count,
+                                        pin_cpus,
+                                        drain_secs,
+                                        pool_prealloc,
+                                        tls_server,
+                                        access_log_path,
+                                        access_log_compress,
+                                        access_log_level);
     }
     destroy_tls_server_context(tls_server);
     return rc;

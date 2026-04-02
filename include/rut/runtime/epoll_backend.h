@@ -55,6 +55,7 @@ struct EpollBackend {
         u32 remaining;
         IoEventType type;
         bool tls;
+        u32 tls_wait_events;
     };
     SendState send_state[kMaxFdMap];
 

@@ -1,5 +1,5 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
-#include "epoll_tls_test_hooks.h"
+#include "epoll_tls_hooks.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/shard.h"
@@ -236,6 +236,67 @@ static void run_tls_send_retry_case(rut::test::TestCase* test_case,
     CHECK_EQ(tls_state.write_calls, 2);
     CHECK_EQ(events[0].type, IoEventType::Send);
     CHECK_EQ(events[0].result, static_cast<i32>(tc_cfg.payload_len));
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+static void run_tls_send_readable_while_waiting_for_write_case(rut::test::TestCase* test_case) {
+    auto* _tc = test_case;
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    backend.downstream_fd_map[0] = fds[0];
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    tls_state.write_second_rc = 4;
+    tls_state.write_second_error = SSL_ERROR_NONE;
+    tls_state.read_first_rc = 2;
+    tls_state.read_first_error = SSL_ERROR_NONE;
+    ScopedTlsHooks hooks(tls_state);
+
+    static const u8 kPayload[] = {'p', 'i', 'n', 'g'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, sizeof(kPayload));
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.u64 = static_cast<u64>(IoEventType::Send);
+    REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
+    REQUIRE(send_all(fds[1], "r", 1));
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, 2);
+    CHECK_EQ(conn.recv_buf.len(), 2u);
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, sizeof(kPayload));
+
+    ev.events = EPOLLOUT;
+    ev.data.u64 = static_cast<u64>(IoEventType::Send);
+    REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
+
+    n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, 4);
+    CHECK_EQ(tls_state.write_calls, 2);
     CHECK_EQ(backend.send_state[0].remaining, 0u);
 
     close(fds[0]);
@@ -895,7 +956,8 @@ TEST(partial_send, state_zeroed_per_conn) {
 
 // Verify EPOLLOUT with no pending send switches back to EPOLLIN (no busy loop).
 // After a successful immediate send, send_state.remaining == 0.
-// If a spurious EPOLLOUT fires, wait() should switch to EPOLLIN and not spin.
+// If a spurious EPOLLOUT fires with no pending send, wait() should drop
+// EPOLLOUT, avoid a spin, and continue delivering Recv events.
 TEST(partial_send, epollout_no_pending_switches_to_epollin) {
     i32 fds[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
@@ -929,15 +991,19 @@ TEST(partial_send, epollout_no_pending_switches_to_epollin) {
     ev.data.u64 = (static_cast<u64>(0) << 8) | static_cast<u64>(IoEventType::Send);
     REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
 
-    // wait() should see EPOLLOUT with no pending send → switch to EPOLLIN, no event
-    // The timerfd will wake wait() within 1 second (bounded, no hang)
+    // wait() should see EPOLLOUT with no pending send and not emit a Send event.
     u32 n = backend.wait(events, 8, &conn, 1);
-    // Should get a Timeout event (from timerfd), not a Send event
     bool got_send = false;
     for (u32 i = 0; i < n; i++) {
         if (events[i].type == IoEventType::Send) got_send = true;
     }
-    CHECK(!got_send);  // no spurious Send completion
+    CHECK(!got_send);
+
+    REQUIRE(send_all(fds[1], "x", 1));
+    n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, 1);
 
     // Drain peer
     char buf[8];
@@ -996,6 +1062,10 @@ TEST(tls_state_machine, send_want_write_retries_on_epollout) {
         {.first_error = SSL_ERROR_WANT_WRITE, .second_wakeup_events = EPOLLOUT, .payload_len = 4});
 }
 
+TEST(tls_state_machine, send_want_write_readable_wakeup_buffers_recv) {
+    run_tls_send_readable_while_waiting_for_write_case(_tc);
+}
+
 TEST(tls_state_machine, spurious_epollout_with_empty_tls_send_state_is_ignored) {
     i32 fds[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
@@ -1046,6 +1116,15 @@ TEST(tls_state_machine, spurious_epollout_with_empty_tls_send_state_is_ignored) 
     CHECK(!got_send);
     CHECK_EQ(tls_state.write_calls, 1);
     CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    tls_state.read_first_rc = 1;
+    tls_state.read_first_error = SSL_ERROR_NONE;
+    REQUIRE(send_all(fds[1], "r", 1));
+
+    n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, 1);
 
     close(fds[0]);
     close(fds[1]);

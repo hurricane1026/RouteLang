@@ -137,7 +137,6 @@ target_link_libraries(rue_runtime
 
 # SIMD source needs to find simd.h and char_tables.h via "simd.h" include
 target_include_directories(rue_runtime PRIVATE
-    ${PROJECT_SOURCE_DIR}/testing
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/simd
 )

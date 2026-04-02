@@ -27,6 +27,7 @@ target_link_libraries(test_integration
 )
 target_include_directories(test_integration PRIVATE
     ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/runtime
     ${PROJECT_SOURCE_DIR}/testing
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

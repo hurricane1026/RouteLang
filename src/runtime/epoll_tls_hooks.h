@@ -6,7 +6,8 @@
 
 namespace rut {
 
-// Test-only seam for forcing specific TLS state-machine transitions in epoll.
+// Runtime-private seam for forcing specific TLS state-machine transitions in
+// epoll tests. Production code always uses the default OpenSSL/BoringSSL hooks.
 struct EpollTlsHooks {
     i32 (*ssl_accept)(SSL* ssl);
     i32 (*ssl_read)(SSL* ssl, void* buf, i32 len);

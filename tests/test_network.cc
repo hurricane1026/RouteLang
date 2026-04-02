@@ -1677,6 +1677,36 @@ TEST(slice_pool, large_pool) {
     pool.destroy();
 }
 
+TEST(slice_pool, prealloc_and_invalid_free_guards) {
+    SlicePool pool;
+    REQUIRE(pool.init(300, 1).has_value());
+    // prealloc rounds up to one grow step
+    CHECK_EQ(pool.count, SlicePool::kGrowStep);
+    CHECK_EQ(pool.available(), SlicePool::kGrowStep);
+
+    u8 dummy = 0;
+    pool.destroy();
+
+    // count == 0 guard
+    pool.free(&dummy);
+
+    REQUIRE(pool.init(4).has_value());
+    u8* s = pool.alloc();
+    REQUIRE(s != nullptr);
+    CHECK_EQ(pool.in_use(), 1u);
+
+    u32 avail_before = pool.available();
+    pool.free(s + 1);  // not slice-aligned
+    CHECK_EQ(pool.available(), avail_before);
+
+    pool.free(&dummy);  // outside pool
+    CHECK_EQ(pool.available(), avail_before);
+
+    pool.free(s);
+    CHECK_EQ(pool.available(), avail_before + 1);
+    pool.destroy();
+}
+
 // === SlabPool ===
 
 struct TestObj {
@@ -1918,6 +1948,31 @@ TEST(slab_pool, double_free_by_idx_rejected) {
     pool.free(idx);                  // double-free
     CHECK_EQ(pool.available(), 4u);  // unchanged
     pool.destroy();
+}
+
+TEST(slab_pool, invalid_free_guards) {
+    SlabPool<TestObj, 4> pool;
+    REQUIRE(pool.init());
+
+    TestObj* a = pool.alloc();
+    REQUIRE(a != nullptr);
+    CHECK_EQ(pool.in_use(), 1u);
+
+    TestObj outside{};
+    pool.free(static_cast<u32>(99));  // idx >= Cap
+    CHECK_EQ(pool.in_use(), 1u);
+
+    pool.free(&outside);  // pointer outside pool
+    CHECK_EQ(pool.in_use(), 1u);
+
+    pool.free(static_cast<TestObj*>(nullptr));  // null ptr
+    CHECK_EQ(pool.in_use(), 1u);
+
+    pool.free(a);
+    CHECK_EQ(pool.in_use(), 0u);
+
+    pool.destroy();
+    pool.free(static_cast<u32>(0));  // !free_stack guard after destroy
 }
 
 TEST(upstream_pool, double_free_rejected) {

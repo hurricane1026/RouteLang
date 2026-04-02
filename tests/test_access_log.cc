@@ -241,6 +241,39 @@ TEST(flusher, flush_empty_rings) {
     close(fd);
 }
 
+TEST(flusher, init_clamps_level_and_clears_slots) {
+    AccessLogFlusher flusher;
+    flusher.init(123, true, 99, 250);
+    CHECK_EQ(flusher.output_fd, 123);
+    CHECK(flusher.compress);
+    CHECK_EQ(flusher.compress_level, AccessLogFlusher::kMaxLevel);
+    CHECK_EQ(flusher.flush_interval_ms, 250u);
+    CHECK_EQ(flusher.ring_count, 0u);
+    CHECK(!flusher.running.load(std::memory_order_relaxed));
+    CHECK_EQ(flusher.zstd_ctx, nullptr);
+    for (u32 i = 0; i < AccessLogFlusher::kMaxRings; i++) CHECK_EQ(flusher.rings[i], nullptr);
+
+    flusher.init(456, false, -7, 10);
+    CHECK_EQ(flusher.output_fd, 456);
+    CHECK(!flusher.compress);
+    CHECK_EQ(flusher.compress_level, AccessLogFlusher::kMinLevel);
+    CHECK_EQ(flusher.flush_interval_ms, 10u);
+}
+
+TEST(flusher, add_ring_caps_at_max) {
+    AccessLogFlusher flusher;
+    flusher.init(-1);
+
+    AccessLogRing rings[AccessLogFlusher::kMaxRings + 1];
+    for (u32 i = 0; i < AccessLogFlusher::kMaxRings + 1; i++) {
+        rings[i].init();
+        flusher.add_ring(&rings[i]);
+    }
+
+    CHECK_EQ(flusher.ring_count, AccessLogFlusher::kMaxRings);
+    for (u32 i = 0; i < AccessLogFlusher::kMaxRings; i++) CHECK_EQ(flusher.rings[i], &rings[i]);
+}
+
 TEST(flusher, flush_text_to_fd) {
     AccessLogRing ring;
     ring.init();

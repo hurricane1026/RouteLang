@@ -8,6 +8,52 @@
 #include "test.h"
 #include "test_helpers.h"
 
+#include <dlfcn.h>
+
+namespace {
+
+thread_local int g_slice_pool_fail_mmap_call = 0;
+thread_local int g_slice_pool_mmap_call_count = 0;
+thread_local bool g_slice_pool_fail_mprotect = false;
+
+struct ScopedSlicePoolFault {
+    explicit ScopedSlicePoolFault(int fail_mmap_call = 0, bool fail_mprotect = false) {
+        g_slice_pool_fail_mmap_call = fail_mmap_call;
+        g_slice_pool_mmap_call_count = 0;
+        g_slice_pool_fail_mprotect = fail_mprotect;
+    }
+
+    ~ScopedSlicePoolFault() {
+        g_slice_pool_fail_mmap_call = 0;
+        g_slice_pool_mmap_call_count = 0;
+        g_slice_pool_fail_mprotect = false;
+    }
+};
+
+using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
+using MprotectFn = int (*)(void*, size_t, int);
+
+}  // namespace
+
+extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
+    static auto* real_mmap = reinterpret_cast<MmapFn>(dlsym(RTLD_NEXT, "mmap"));
+    if (g_slice_pool_fail_mmap_call > 0 &&
+        ++g_slice_pool_mmap_call_count == g_slice_pool_fail_mmap_call) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    return real_mmap(addr, len, prot, flags, fd, offset);
+}
+
+extern "C" int mprotect(void* addr, size_t len, int prot) {
+    static auto* real_mprotect = reinterpret_cast<MprotectFn>(dlsym(RTLD_NEXT, "mprotect"));
+    if (g_slice_pool_fail_mprotect) {
+        errno = ENOMEM;
+        return -1;
+    }
+    return real_mprotect(addr, len, prot);
+}
+
 // === Accept ===
 
 TEST(accept, basic) {
@@ -1726,6 +1772,48 @@ TEST(slice_pool, prealloc_and_invalid_free_guards) {
     pool.free(s);
     CHECK_EQ(pool.available(), avail_before + 1);
     pool.destroy();
+}
+
+TEST(slice_pool, init_base_mmap_failure) {
+    ScopedSlicePoolFault fault(1);
+    SlicePool pool;
+    auto rc = pool.init(4);
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.base, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+}
+
+TEST(slice_pool, init_stack_mmap_failure) {
+    ScopedSlicePoolFault fault(2);
+    SlicePool pool;
+    auto rc = pool.init(4);
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.base, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+}
+
+TEST(slice_pool, init_map_mmap_failure) {
+    ScopedSlicePoolFault fault(3);
+    SlicePool pool;
+    auto rc = pool.init(4);
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.base, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+}
+
+TEST(slice_pool, init_prealloc_grow_failure) {
+    ScopedSlicePoolFault fault(0, true);
+    SlicePool pool;
+    auto rc = pool.init(4, 1);
+    CHECK(!rc.has_value());
+    CHECK_EQ(pool.base, nullptr);
+    CHECK_EQ(pool.free_stack, nullptr);
+    CHECK_EQ(pool.in_use_map, nullptr);
+    CHECK_EQ(pool.count, 0u);
+    CHECK_EQ(pool.free_top, 0u);
 }
 
 // === SlabPool ===

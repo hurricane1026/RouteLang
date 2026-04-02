@@ -2,11 +2,26 @@
 set(SIMD_ARCH "auto" CACHE STRING "SIMD architecture: auto, scalar, sse2, avx2, avx512, neon, sve")
 set_property(CACHE SIMD_ARCH PROPERTY STRINGS auto scalar sse2 avx2 avx512 neon sve)
 
+# Temporarily disable testing while configuring BoringSSL so its internal
+# test targets do not affect the rest of the project.
+if(DEFINED BUILD_TESTING)
+    set(_BORINGSSL_PREV_BUILD_TESTING_DEFINED TRUE)
+    set(_BORINGSSL_PREV_BUILD_TESTING "${BUILD_TESTING}")
+else()
+    set(_BORINGSSL_PREV_BUILD_TESTING_DEFINED FALSE)
+endif()
 set(BUILD_TESTING OFF)
 add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/boringssl
     ${CMAKE_CURRENT_BINARY_DIR}/third_party/boringssl
     EXCLUDE_FROM_ALL
 )
+if(_BORINGSSL_PREV_BUILD_TESTING_DEFINED)
+    set(BUILD_TESTING "${_BORINGSSL_PREV_BUILD_TESTING}")
+else()
+    unset(BUILD_TESTING)
+endif()
+unset(_BORINGSSL_PREV_BUILD_TESTING_DEFINED)
+unset(_BORINGSSL_PREV_BUILD_TESTING)
 foreach(BORINGSSL_TARGET fipsmodule crypto ssl decrepit pki)
     if(TARGET ${BORINGSSL_TARGET})
         target_compile_options(${BORINGSSL_TARGET} PRIVATE
@@ -113,6 +128,7 @@ add_library(rue_runtime STATIC
 target_include_directories(rue_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
+target_compile_definitions(rue_runtime PRIVATE RUT_TESTING)
 target_link_libraries(rue_runtime
     zstd_compress
     ssl

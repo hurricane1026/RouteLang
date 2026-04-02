@@ -19,6 +19,15 @@ static constexpr u32 kTimerConnId = 0xFFFFFE;
 
 namespace {
 
+#if !defined(RUT_TESTING)
+struct EpollTlsHooks {
+    i32 (*ssl_accept)(SSL* ssl);
+    i32 (*ssl_read)(SSL* ssl, void* buf, i32 len);
+    i32 (*ssl_write)(SSL* ssl, const void* buf, i32 len);
+    i32 (*ssl_get_error)(SSL* ssl, i32 rc);
+};
+#endif
+
 i32 default_ssl_accept(SSL* ssl) {
     return SSL_accept(ssl);
 }
@@ -38,6 +47,7 @@ const EpollTlsHooks* active_tls_hooks = &default_tls_hooks;
 
 }  // namespace
 
+#if defined(RUT_TESTING)
 void set_epoll_tls_hooks_for_test(const EpollTlsHooks* hooks) {
     active_tls_hooks = hooks ? hooks : &default_tls_hooks;
 }
@@ -45,6 +55,7 @@ void set_epoll_tls_hooks_for_test(const EpollTlsHooks* hooks) {
 void reset_epoll_tls_hooks_for_test() {
     active_tls_hooks = &default_tls_hooks;
 }
+#endif
 
 static i32 map_tls_error(SSL* ssl, i32 rc) {
     i32 err = active_tls_hooks->ssl_get_error(ssl, rc);
@@ -260,6 +271,7 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
     SSL* ssl = c.tls;
     u32 sent = 0;
     while (sent < len) {
+        errno = 0;
         i32 nw = active_tls_hooks->ssl_write(ssl, buf + sent, static_cast<i32>(len - sent));
         if (nw > 0) {
             sent += static_cast<u32>(nw);
@@ -454,6 +466,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     result = -EINVAL;
                 } else {
                     if (!conn.tls_handshake_complete) {
+                        errno = 0;
                         i32 rc = active_tls_hooks->ssl_accept(ssl);
                         if (rc == 1) {
                             conn.tls_handshake_complete = true;
@@ -481,6 +494,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     if (avail == 0) {
                         result = -ENOBUFS;
                     } else {
+                        errno = 0;
                         i32 nr = active_tls_hooks->ssl_read(
                             ssl, buf.write_ptr(), static_cast<i32>(avail));
                         if (nr > 0) {
@@ -557,6 +571,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     result = -EINVAL;
                 } else {
                     while (ss.remaining > 0) {
+                        errno = 0;
                         i32 nw = active_tls_hooks->ssl_write(
                             ssl, ss.src + ss.offset, static_cast<i32>(ss.remaining));
                         if (nw > 0) {

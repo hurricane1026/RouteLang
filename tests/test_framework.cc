@@ -84,6 +84,21 @@ TEST(framework, merged_filters_keep_own_storage) {
     CHECK(!merged.matches(&miss));
 }
 
+TEST(framework, copied_filter_rebinds_internal_storage) {
+    rut::test::Filter copied;
+    copied = rut::test::parse_filter("framework.aliases,math.mul*");
+    const auto overwritten = rut::test::parse_filter("other.value");
+
+    auto aliases = make_test_case("framework", "aliases");
+    auto multiplication = make_test_case("math", "multiplication");
+    auto miss = make_test_case("framework", "check_pass");
+
+    CHECK_EQ(overwritten.filter_count, 1);
+    CHECK(copied.matches(&aliases));
+    CHECK(copied.matches(&multiplication));
+    CHECK(!copied.matches(&miss));
+}
+
 TEST(math, addition) {
     CHECK_EQ(1 + 1, 2);
     CHECK_EQ(0 + 0, 0);

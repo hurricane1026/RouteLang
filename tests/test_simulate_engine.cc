@@ -2,6 +2,7 @@
 #include "test.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,18 +60,134 @@ static bool load_manifest_text(const char* text, Manifest* manifest) {
 }
 
 static bool read_all_fd(i32 fd, char* buf, u32 cap, u32* out_len) {
+    if (out_len) *out_len = 0;
+    if (cap == 0) {
+        char discard[256];
+        for (;;) {
+            const ssize_t n = read(fd, discard, sizeof(discard));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            if (n == 0) return true;
+        }
+    }
+
     u32 pos = 0;
-    while (pos + 1 < cap) {
-        const ssize_t n = read(fd, buf + pos, cap - 1 - pos);
+    char discard[256];
+    for (;;) {
+        char* dst = discard;
+        u32 to_read = sizeof(discard);
+        if (pos + 1 < cap) {
+            dst = buf + pos;
+            to_read = cap - 1 - pos;
+        }
+
+        const ssize_t n = read(fd, dst, to_read);
         if (n < 0) {
             if (errno == EINTR) continue;
             return false;
         }
         if (n == 0) break;
-        pos += static_cast<u32>(n);
+
+        if (pos + 1 < cap) {
+            const u32 remaining = cap - 1 - pos;
+            const u32 stored = static_cast<u32>(n) > remaining ? remaining : static_cast<u32>(n);
+            pos += stored;
+        }
     }
     buf[pos] = '\0';
-    *out_len = pos;
+    if (out_len) *out_len = pos;
+    return true;
+}
+
+static bool read_ready_fd(i32 fd, char* buf, u32 cap, u32* pos, bool* done) {
+    if (*done) return true;
+
+    char discard[256];
+    char* dst = discard;
+    u32 to_read = sizeof(discard);
+    if (*pos + 1 < cap) {
+        dst = buf + *pos;
+        to_read = cap - 1 - *pos;
+    }
+
+    const ssize_t n = read(fd, dst, to_read);
+    if (n < 0) {
+        if (errno == EINTR || errno == EAGAIN) return true;
+        return false;
+    }
+    if (n == 0) {
+        *done = true;
+        return true;
+    }
+
+    if (*pos + 1 < cap) {
+        const u32 remaining = cap - 1 - *pos;
+        const u32 stored = static_cast<u32>(n) > remaining ? remaining : static_cast<u32>(n);
+        *pos += stored;
+        buf[*pos] = '\0';
+    }
+    return true;
+}
+
+static bool read_pipes_interleaved(i32 out_fd,
+                                   char* out_buf,
+                                   u32 out_cap,
+                                   u32* out_len,
+                                   i32 err_fd,
+                                   char* err_buf,
+                                   u32 err_cap,
+                                   u32* err_len) {
+    if (out_len) *out_len = 0;
+    if (err_len) *err_len = 0;
+    if (out_cap > 0) out_buf[0] = '\0';
+    if (err_cap > 0) err_buf[0] = '\0';
+
+    u32 out_pos = 0;
+    u32 err_pos = 0;
+    bool out_done = false;
+    bool err_done = false;
+    while (!out_done || !err_done) {
+        pollfd fds[2];
+        nfds_t nfds = 0;
+        if (!out_done) {
+            fds[nfds].fd = out_fd;
+            fds[nfds].events = POLLIN | POLLHUP;
+            fds[nfds].revents = 0;
+            nfds++;
+        }
+        if (!err_done) {
+            fds[nfds].fd = err_fd;
+            fds[nfds].events = POLLIN | POLLHUP;
+            fds[nfds].revents = 0;
+            nfds++;
+        }
+
+        const int poll_rc = poll(fds, nfds, -1);
+        if (poll_rc < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+
+        nfds_t idx = 0;
+        if (!out_done) {
+            if ((fds[idx].revents & (POLLIN | POLLHUP)) &&
+                !read_ready_fd(out_fd, out_buf, out_cap, &out_pos, &out_done)) {
+                return false;
+            }
+            idx++;
+        }
+        if (!err_done) {
+            if ((fds[idx].revents & (POLLIN | POLLHUP)) &&
+                !read_ready_fd(err_fd, err_buf, err_cap, &err_pos, &err_done)) {
+                return false;
+            }
+        }
+    }
+
+    if (out_len) *out_len = out_pos;
+    if (err_len) *err_len = err_pos;
     return true;
 }
 
@@ -123,14 +240,20 @@ static bool run_simulate_cli(const char* arg1,
 
     u32 stdout_len = 0;
     u32 stderr_len = 0;
-    const bool stdout_ok = read_all_fd(out_pipe[0], stdout_buf, stdout_cap, &stdout_len);
-    const bool stderr_ok = read_all_fd(err_pipe[0], stderr_buf, stderr_cap, &stderr_len);
+    const bool io_ok = read_pipes_interleaved(out_pipe[0],
+                                              stdout_buf,
+                                              stdout_cap,
+                                              &stdout_len,
+                                              err_pipe[0],
+                                              stderr_buf,
+                                              stderr_cap,
+                                              &stderr_len);
     close(out_pipe[0]);
     close(err_pipe[0]);
 
     i32 status = 0;
     if (waitpid(pid, &status, 0) < 0) return false;
-    if (!stdout_ok || !stderr_ok) return false;
+    if (!io_ok) return false;
     if (!WIFEXITED(status)) return false;
     *exit_code = WEXITSTATUS(status);
     return true;
@@ -618,6 +741,28 @@ TEST(simulate_engine, engine_init_can_reinitialize_existing_engine) {
     ctx_a.destroy();
 }
 
+TEST(simulate_engine, engine_init_clears_state_on_precondition_failure) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = 'G';
+    strcpy(manifest.routes[0].pattern, "/ok");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 200;
+
+    ModuleContext ctx{};
+    REQUIRE(build_module_from_manifest(manifest, ctx));
+
+    Engine engine;
+    REQUIRE(engine.init(ctx.module, manifest.upstreams, manifest.upstream_count));
+    CHECK_EQ(engine.route_count, 1u);
+
+    CHECK(!engine.init(ctx.module, manifest.upstreams, Engine::kMaxUpstreams + 1));
+    CHECK_EQ(engine.route_count, 0u);
+    CHECK_EQ(engine.upstream_count, 0u);
+
+    ctx.destroy();
+}
+
 TEST(simulate_engine, param_route_matching_matrix) {
     struct Case {
         const char* req;
@@ -808,6 +953,38 @@ TEST(simulate_engine, format_result_yield_uses_placeholders) {
     REQUIRE(len > 0);
     CHECK(strstr(buf, "yield - -> -") != nullptr);
     CHECK(strstr(buf, "204 ->") == nullptr);
+}
+
+TEST(simulate_engine, read_all_fd_drains_bytes_beyond_output_buffer) {
+    i32 pipefd[2];
+    REQUIRE(pipe(pipefd) == 0);
+
+    char payload[512];
+    for (u32 i = 0; i < sizeof(payload); i++) payload[i] = 'a';
+    REQUIRE(write(pipefd[1], payload, sizeof(payload)) == static_cast<ssize_t>(sizeof(payload)));
+    close(pipefd[1]);
+
+    char buf[32];
+    u32 out_len = 0;
+    REQUIRE(read_all_fd(pipefd[0], buf, sizeof(buf), &out_len));
+    CHECK_EQ(out_len, static_cast<u32>(sizeof(buf) - 1));
+
+    char tail[8];
+    const ssize_t tail_n = read(pipefd[0], tail, sizeof(tail));
+    CHECK_EQ(tail_n, 0);
+    close(pipefd[0]);
+}
+
+TEST(simulate_engine, read_all_fd_accepts_zero_capacity_buffer) {
+    i32 pipefd[2];
+    REQUIRE(pipe(pipefd) == 0);
+    REQUIRE(write(pipefd[1], "abc", 3) == 3);
+    close(pipefd[1]);
+
+    u32 out_len = 99;
+    REQUIRE(read_all_fd(pipefd[0], nullptr, 0, &out_len));
+    CHECK_EQ(out_len, 0u);
+    close(pipefd[0]);
 }
 
 TEST(simulate_engine, cli_usage_mentions_param_prefix_matching) {

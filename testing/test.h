@@ -11,15 +11,15 @@
 //       REQUIRE(ptr != nullptr);  // stops test on failure
 //   }
 //
-//   TEST_F(MyFixture, uses_state) {
-//       CHECK_EQ(self.value, 1);
-//   }
-//
 //   struct MyFixture {
 //       int value = 1;
 //       void SetUp() {}
 //       void TearDown() {}
 //   };
+//
+//   TEST_F(MyFixture, uses_state) {
+//       CHECK_EQ(self.value, 1);
+//   }
 //
 //   int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }
 //
@@ -299,6 +299,15 @@ struct Filter {
     char name_storage[kMaxFilters][kMaxTokenLen];
     int filter_count;
 
+    Filter() { clear(); }
+
+    Filter(const Filter& other) { copy_from(other); }
+
+    Filter& operator=(const Filter& other) {
+        if (this != &other) copy_from(other);
+        return *this;
+    }
+
     void clear() {
         filter_count = 0;
         for (int i = 0; i < kMaxFilters; i++) {
@@ -331,6 +340,18 @@ struct Filter {
             name_filter[idx] = name_storage[idx];
         } else {
             name_storage[idx][0] = '\0';
+        }
+    }
+
+    void copy_from(const Filter& other) {
+        filter_count = other.filter_count;
+        for (int i = 0; i < kMaxFilters; i++) {
+            for (int j = 0; j < kMaxTokenLen; j++) {
+                suite_storage[i][j] = other.suite_storage[i][j];
+                name_storage[i][j] = other.name_storage[i][j];
+            }
+            suite_filter[i] = other.suite_filter[i] ? suite_storage[i] : nullptr;
+            name_filter[i] = other.name_filter[i] ? name_storage[i] : nullptr;
         }
     }
 

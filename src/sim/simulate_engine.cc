@@ -517,8 +517,8 @@ bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
 bool Engine::init(const rir::Module& module,
                   const ManifestUpstream* upstream_list,
                   u32 upstreams_len) {
-    if (upstreams_len > kMaxUpstreams || module.func_count > kMaxRoutes) return false;
     shutdown();
+    if (upstreams_len > kMaxUpstreams || module.func_count > kMaxRoutes) return false;
 
     auto fail = [this]() {
         shutdown();

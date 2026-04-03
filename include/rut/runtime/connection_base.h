@@ -5,6 +5,8 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
 
+#include <openssl/base.h>
+
 namespace rut {
 
 enum class BodyMode : u8 {
@@ -72,6 +74,9 @@ struct ConnectionBase {
     void* handler_ctx;
 
     bool keep_alive;
+    bool tls_active;
+    bool tls_handshake_complete;
+    SSL* tls;
 
     // HTTP pipelining state
     u16 pipeline_depth;      // pipelined requests processed on this connection
@@ -169,6 +174,9 @@ struct ConnectionBase {
         handler_state = 0;
         handler_ctx = nullptr;
         keep_alive = false;
+        tls_active = false;
+        tls_handshake_complete = false;
+        tls = nullptr;
         pipeline_depth = 0;
         pipeline_stash_len = 0;
         req_header_end = 0;

@@ -2,6 +2,7 @@
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/socket.h"
+#include "rut/runtime/tls.h"
 
 #include <fcntl.h>
 #include <linux/io_uring.h>
@@ -45,6 +46,10 @@ static bool str_eq(const char* a, const char* b) {
     return *a == *b;
 }
 
+static bool starts_with_dash_dash(const char* s) {
+    return s[0] != '\0' && s[0] == '-' && s[1] == '-';
+}
+
 static bool detect_io_uring() {
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
@@ -73,6 +78,7 @@ static i32 run_shards(u16 port,
                       bool pin_cpus,
                       u32 drain_secs,
                       u32 pool_prealloc,
+                      TlsServerContext* tls_server,
                       const char* access_log_path,
                       bool access_log_compress,
                       i32 access_log_level) {
@@ -121,6 +127,9 @@ static i32 run_shards(u16 port,
                 shards[j].shutdown();
             }
             return 1;
+        }
+        if constexpr (requires { shards[i].loop->tls_server; }) {
+            shards[i].loop->tls_server = tls_server;
         }
     }
 
@@ -244,11 +253,14 @@ int main(int argc, char** argv) {
     bool pin_cpus = true;
     u32 drain_secs = kDefaultDrainSecs;
     u32 pool_prealloc = 0;  // 0 = fully lazy
+    const char* tls_cert_path = nullptr;
+    const char* tls_key_path = nullptr;
     const char* access_log_path = nullptr;
     bool access_log_compress = false;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
 
     // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
+    //                      [--tls-cert PATH] [--tls-key PATH]
     //                      [--access-log PATH] [--access-log-compress]
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] >= '0' && argv[i][0] <= '9') {
@@ -285,12 +297,26 @@ int main(int argc, char** argv) {
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                     pool_prealloc = pool_prealloc * 10 + static_cast<u32>(*p - '0');
             } else if (str_eq(argv[i], "--access-log")) {
-                if (argv[i + 1][0] == '-' && argv[i + 1][1] == '-') {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
                     write_str("--access-log requires a path argument\n");
                     return 1;
                 }
                 i++;
                 access_log_path = argv[i];
+            } else if (str_eq(argv[i], "--tls-cert")) {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
+                    write_str("--tls-cert requires a path argument\n");
+                    return 1;
+                }
+                i++;
+                tls_cert_path = argv[i];
+            } else if (str_eq(argv[i], "--tls-key")) {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
+                    write_str("--tls-key requires a path argument\n");
+                    return 1;
+                }
+                i++;
+                tls_key_path = argv[i];
             } else if (str_eq(argv[i], "--access-log-level")) {
                 if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
                     write_str("--access-log-level requires a numeric argument\n");
@@ -307,7 +333,8 @@ int main(int argc, char** argv) {
         // Catch flags that require a value but appear as the last argument.
         if (i + 1 >= argc) {
             if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
-                str_eq(argv[i], "--pool-prealloc") || str_eq(argv[i], "--access-log") ||
+                str_eq(argv[i], "--pool-prealloc") || str_eq(argv[i], "--tls-cert") ||
+                str_eq(argv[i], "--tls-key") || str_eq(argv[i], "--access-log") ||
                 str_eq(argv[i], "--access-log-level")) {
                 write_str(argv[i]);
                 write_str(" requires an argument\n");
@@ -332,24 +359,57 @@ int main(int argc, char** argv) {
     if (shard_count == 0) shard_count = detect_cpu_count();
     if (shard_count > kMaxShards) shard_count = kMaxShards;
 
-    if (detect_io_uring()) {
-        write_str("Backend: io_uring\n");
-        return run_shards<IoUringEventLoop>(port,
-                                            shard_count,
-                                            pin_cpus,
-                                            drain_secs,
-                                            pool_prealloc,
-                                            access_log_path,
-                                            access_log_compress,
-                                            access_log_level);
+    if ((tls_cert_path && !tls_key_path) || (!tls_cert_path && tls_key_path)) {
+        write_str("--tls-cert and --tls-key must be provided together\n");
+        return 1;
     }
-    write_str("Backend: epoll\n");
-    return run_shards<EpollEventLoop>(port,
-                                      shard_count,
-                                      pin_cpus,
-                                      drain_secs,
-                                      pool_prealloc,
-                                      access_log_path,
-                                      access_log_compress,
-                                      access_log_level);
+
+    TlsServerContext* tls_server = nullptr;
+    if (tls_cert_path && tls_key_path) {
+        auto tls_result = create_tls_server_context(tls_cert_path, tls_key_path);
+        if (!tls_result) {
+            write_error("Failed to initialize TLS", tls_result.error());
+            return 1;
+        }
+        tls_server = tls_result.value();
+        write_str("TLS: enabled\n");
+    }
+
+    i32 rc = 0;
+    if (tls_server) {
+        write_str("Backend: epoll (TLS)\n");
+        rc = run_shards<EpollEventLoop>(port,
+                                        shard_count,
+                                        pin_cpus,
+                                        drain_secs,
+                                        pool_prealloc,
+                                        tls_server,
+                                        access_log_path,
+                                        access_log_compress,
+                                        access_log_level);
+    } else if (detect_io_uring()) {
+        write_str("Backend: io_uring\n");
+        rc = run_shards<IoUringEventLoop>(port,
+                                          shard_count,
+                                          pin_cpus,
+                                          drain_secs,
+                                          pool_prealloc,
+                                          tls_server,
+                                          access_log_path,
+                                          access_log_compress,
+                                          access_log_level);
+    } else {
+        write_str("Backend: epoll\n");
+        rc = run_shards<EpollEventLoop>(port,
+                                        shard_count,
+                                        pin_cpus,
+                                        drain_secs,
+                                        pool_prealloc,
+                                        tls_server,
+                                        access_log_path,
+                                        access_log_compress,
+                                        access_log_level);
+    }
+    destroy_tls_server_context(tls_server);
+    return rc;
 }

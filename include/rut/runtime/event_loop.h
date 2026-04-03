@@ -13,6 +13,7 @@
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/timer_wheel.h"
+#include "rut/runtime/tls.h"
 #include <atomic>
 
 #include <netinet/in.h>
@@ -150,10 +151,12 @@ public:
     // batch finishes and reclaim_pending() frees slots.
     static constexpr u32 kMaxDeferredAccepts = 64;
     i32 deferred_accepts[kMaxDeferredAccepts];
+    u32 deferred_accept_addrs[kMaxDeferredAccepts];
     u32 deferred_accept_count;
 
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
     i32 listen_fd = -1;  // stored for drain: close to stop kernel routing new connections
+    TlsServerContext* tls_server = nullptr;
 
     // Per-shard access log ring. Set by Shard before run(). Null = no logging.
     AccessLogRing* access_log = nullptr;
@@ -494,6 +497,13 @@ public:
         }
     }
     void submit_send_impl(Connection& c, const u8* buf, u32 len) {
+        if constexpr (requires(Backend& be, Connection& conn, const u8* ptr, u32 n) {
+                          be.add_send_tls(conn, ptr, n);
+                      }) {
+            if (c.tls_active) {
+                if (backend.add_send_tls(c, buf, len)) return;
+            }
+        }
         if (backend.add_send(c.fd, c.id, buf, len)) {
             if constexpr (Backend::kAsyncIo) {
                 c.pending_ops++;
@@ -549,6 +559,12 @@ public:
         if (c.fd >= 0) {
             ::close(c.fd);
             c.fd = -1;
+        }
+        if (c.tls_active && c.tls) {
+            destroy_tls_server_ssl(c.tls);
+            c.tls = nullptr;
+            c.tls_active = false;
+            c.tls_handshake_complete = false;
         }
         if (c.upstream_fd >= 0) {
             ::close(c.upstream_fd);
@@ -637,6 +653,14 @@ private:
 
     void on_accept(const IoEvent& ev) {
         if (ev.result < 0) return;
+        i32 fd = ev.result;
+        u32 peer_addr = 0;
+        struct sockaddr_in peer = {};
+        socklen_t peer_len = sizeof(peer);
+        if (::getpeername(fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0 &&
+            peer.sin_family == AF_INET) {
+            peer_addr = peer.sin_addr.s_addr;
+        }
         Connection* c = this->alloc_conn();
         if (!c) {
             if constexpr (Backend::kAsyncIo) {
@@ -647,23 +671,31 @@ private:
                     // Still no slot — a later CQE in this batch may free one.
                     // Defer the accept fd and retry after the batch finishes.
                     if (deferred_accept_count < kMaxDeferredAccepts) {
-                        deferred_accepts[deferred_accept_count++] = ev.result;
+                        deferred_accepts[deferred_accept_count] = fd;
+                        deferred_accept_addrs[deferred_accept_count] = peer_addr;
+                        deferred_accept_count++;
                     } else {
-                        ::close(ev.result);
+                        ::close(fd);
                     }
                     return;
                 }
             } else {
-                ::close(ev.result);
+                ::close(fd);
                 return;
             }
         }
-        c->fd = ev.result;
-        struct sockaddr_in peer = {};
-        socklen_t peer_len = sizeof(peer);
-        if (::getpeername(c->fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0 &&
-            peer.sin_family == AF_INET) {
-            c->peer_addr = peer.sin_addr.s_addr;
+        c->fd = fd;
+        c->peer_addr = peer_addr;
+        if (tls_server) {
+            auto tls_result = create_tls_server_ssl(tls_server, fd);
+            if (!tls_result) {
+                ::close(fd);
+                this->free_conn(*c);
+                return;
+            }
+            c->tls_active = true;
+            c->tls_handshake_complete = false;
+            c->tls = tls_result.value();
         }
         c->state = ConnState::ReadingHeader;
         // During drain: mark new connections for close after first response.
@@ -686,11 +718,18 @@ private:
                 continue;
             }
             c->fd = fd;
-            struct sockaddr_in peer = {};
-            socklen_t peer_len = sizeof(peer);
-            if (::getpeername(c->fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0 &&
-                peer.sin_family == AF_INET) {
-                c->peer_addr = peer.sin_addr.s_addr;
+            c->peer_addr = deferred_accept_addrs[i];
+            if (tls_server) {
+                auto tls_result = create_tls_server_ssl(tls_server, fd);
+                if (!tls_result) {
+                    ::close(fd);
+                    c->fd = -1;
+                    this->free_conn(*c);
+                    continue;
+                }
+                c->tls_active = true;
+                c->tls_handshake_complete = false;
+                c->tls = tls_result.value();
             }
             c->state = ConnState::ReadingHeader;
             c->keep_alive = !draining_.load(std::memory_order_relaxed);

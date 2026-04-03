@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - name: Install clang-format (LLVM snapshot, v20)
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
@@ -33,6 +35,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - name: Install tools
         run: |
           sudo apt-get update
@@ -62,6 +66,8 @@ jobs:
         build_type: [Debug, Release]
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - name: Install tools
         run: |
           sudo apt-get update
@@ -89,6 +95,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - name: Install tools
         run: |
           sudo apt-get update

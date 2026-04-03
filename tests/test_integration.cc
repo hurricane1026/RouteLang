@@ -1,9 +1,14 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
+#include "epoll_tls_test_hooks.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/shard.h"
+#include "rut/runtime/tls.h"
 #include "test.h"
 #include "test_helpers.h"
+
+#include <openssl/ssl.h>
+#include <stdlib.h>
 
 // Helper: Connection with local buffer storage (for tests that use raw backends).
 static constexpr u32 kTestBufSize = 4096;
@@ -23,6 +28,368 @@ struct TestConn {
         conn.send_buf.bind(send_storage, kTestBufSize);
     }
 };
+
+namespace {
+
+struct ScriptedTlsState {
+    i32 accept_calls = 0;
+    i32 read_calls = 0;
+    i32 write_calls = 0;
+    i32 last_error = SSL_ERROR_SSL;
+    i32 accept_first_rc = -1;
+    i32 accept_second_rc = -1;
+    i32 accept_first_error = SSL_ERROR_SSL;
+    i32 accept_second_error = SSL_ERROR_SSL;
+    i32 read_first_rc = -1;
+    i32 read_second_rc = -1;
+    i32 read_first_error = SSL_ERROR_WANT_WRITE;
+    i32 read_second_error = SSL_ERROR_NONE;
+    i32 write_first_rc = -1;
+    i32 write_second_rc = -1;
+    i32 write_first_error = SSL_ERROR_WANT_READ;
+    i32 write_second_error = SSL_ERROR_NONE;
+};
+
+ScriptedTlsState* g_scripted_tls = nullptr;
+
+i32 scripted_ssl_accept(SSL* /*ssl*/) {
+    if (!g_scripted_tls) return -1;
+    g_scripted_tls->accept_calls++;
+    if (g_scripted_tls->accept_calls == 1) {
+        g_scripted_tls->last_error = g_scripted_tls->accept_first_error;
+        return g_scripted_tls->accept_first_rc;
+    }
+    g_scripted_tls->last_error = g_scripted_tls->accept_second_error;
+    return g_scripted_tls->accept_second_rc;
+}
+
+i32 scripted_ssl_read(SSL* /*ssl*/, void* buf, i32 len) {
+    if (!g_scripted_tls) return -1;
+    g_scripted_tls->read_calls++;
+    i32 rc = g_scripted_tls->read_second_rc;
+    i32 err = g_scripted_tls->read_second_error;
+    if (g_scripted_tls->read_calls == 1) {
+        rc = g_scripted_tls->read_first_rc;
+        err = g_scripted_tls->read_first_error;
+    }
+
+    if (rc > 0 && len >= rc) {
+        for (i32 i = 0; i < rc; i++) static_cast<char*>(buf)[i] = static_cast<char>('A' + i);
+    }
+    g_scripted_tls->last_error = err;
+    return rc;
+}
+
+i32 scripted_ssl_write(SSL* /*ssl*/, const void* /*buf*/, i32 /*len*/) {
+    if (!g_scripted_tls) return -1;
+    g_scripted_tls->write_calls++;
+    if (g_scripted_tls->write_calls == 1) {
+        g_scripted_tls->last_error = g_scripted_tls->write_first_error;
+        return g_scripted_tls->write_first_rc;
+    }
+    g_scripted_tls->last_error = g_scripted_tls->write_second_error;
+    return g_scripted_tls->write_second_rc;
+}
+
+i32 scripted_ssl_get_error(SSL* /*ssl*/, i32 /*rc*/) {
+    if (!g_scripted_tls) return SSL_ERROR_SSL;
+    return g_scripted_tls->last_error;
+}
+
+struct ScopedTlsHooks {
+    explicit ScopedTlsHooks(ScriptedTlsState& state) {
+        g_scripted_tls = &state;
+        hooks_ = {
+            scripted_ssl_accept, scripted_ssl_read, scripted_ssl_write, scripted_ssl_get_error};
+        set_epoll_tls_hooks_for_test(&hooks_);
+    }
+
+    ~ScopedTlsHooks() {
+        reset_epoll_tls_hooks_for_test();
+        g_scripted_tls = nullptr;
+    }
+
+    EpollTlsHooks hooks_{};
+};
+
+struct TlsRecvRetryCase {
+    bool handshake_first = false;
+    i32 first_error = SSL_ERROR_WANT_READ;
+    u32 first_wakeup_events = EPOLLIN;
+    i32 final_read_rc = 0;
+    u32 expected_buf_len = 0;
+};
+
+struct TlsSendRetryCase {
+    i32 first_error = SSL_ERROR_WANT_READ;
+    u32 second_wakeup_events = EPOLLIN;
+    u32 payload_len = 0;
+};
+
+static constexpr TlsRecvRetryCase kTlsRecvRetryCases[] = {
+    {.handshake_first = false,
+     .first_error = SSL_ERROR_WANT_WRITE,
+     .first_wakeup_events = EPOLLOUT,
+     .final_read_rc = 3,
+     .expected_buf_len = 3},
+    {.handshake_first = false,
+     .first_error = SSL_ERROR_WANT_WRITE,
+     .first_wakeup_events = EPOLLIN | EPOLLOUT,
+     .final_read_rc = 2,
+     .expected_buf_len = 2},
+    {.handshake_first = false,
+     .first_error = SSL_ERROR_WANT_READ,
+     .first_wakeup_events = EPOLLIN,
+     .final_read_rc = 2,
+     .expected_buf_len = 2},
+    {.handshake_first = false,
+     .first_error = SSL_ERROR_WANT_READ,
+     .first_wakeup_events = EPOLLIN | EPOLLOUT,
+     .final_read_rc = 1,
+     .expected_buf_len = 1},
+    {.handshake_first = true,
+     .first_error = SSL_ERROR_WANT_WRITE,
+     .first_wakeup_events = EPOLLOUT,
+     .final_read_rc = 2,
+     .expected_buf_len = 2},
+    {.handshake_first = true,
+     .first_error = SSL_ERROR_WANT_WRITE,
+     .first_wakeup_events = EPOLLIN | EPOLLOUT,
+     .final_read_rc = 1,
+     .expected_buf_len = 1},
+    {.handshake_first = true,
+     .first_error = SSL_ERROR_WANT_READ,
+     .first_wakeup_events = EPOLLIN,
+     .final_read_rc = 1,
+     .expected_buf_len = 1},
+    {.handshake_first = true,
+     .first_error = SSL_ERROR_WANT_READ,
+     .first_wakeup_events = EPOLLIN | EPOLLOUT,
+     .final_read_rc = 3,
+     .expected_buf_len = 3},
+};
+
+static constexpr TlsSendRetryCase kTlsSendRetryCases[] = {
+    {.first_error = SSL_ERROR_WANT_READ, .second_wakeup_events = EPOLLIN, .payload_len = 4},
+    {.first_error = SSL_ERROR_WANT_READ,
+     .second_wakeup_events = EPOLLIN | EPOLLOUT,
+     .payload_len = 4},
+    {.first_error = SSL_ERROR_WANT_WRITE, .second_wakeup_events = EPOLLOUT, .payload_len = 4},
+    {.first_error = SSL_ERROR_WANT_WRITE,
+     .second_wakeup_events = EPOLLIN | EPOLLOUT,
+     .payload_len = 4},
+};
+
+static void run_tls_recv_retry_case(rut::test::TestCase* test_case,
+                                    const TlsRecvRetryCase& tc_cfg) {
+    auto* _tc = test_case;
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = !tc_cfg.handshake_first;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    if (tc_cfg.handshake_first) {
+        tls_state.accept_first_rc = -1;
+        tls_state.accept_first_error = tc_cfg.first_error;
+        tls_state.accept_second_rc = 1;
+        tls_state.accept_second_error = SSL_ERROR_NONE;
+        tls_state.read_first_rc = tc_cfg.final_read_rc;
+        tls_state.read_first_error = SSL_ERROR_NONE;
+    } else {
+        tls_state.read_first_rc = -1;
+        tls_state.read_first_error = tc_cfg.first_error;
+        tls_state.read_second_rc = tc_cfg.final_read_rc;
+        tls_state.read_second_error = SSL_ERROR_NONE;
+    }
+    ScopedTlsHooks hooks(tls_state);
+
+    backend.add_recv(fds[0], 0);
+    REQUIRE(send_all(fds[1], "x", 1));
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
+    CHECK_EQ(n, 0u);
+
+    struct epoll_event ev;
+    ev.events = tc_cfg.first_wakeup_events;
+    ev.data.u64 = static_cast<u64>(IoEventType::Recv);
+    REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
+    if ((tc_cfg.first_wakeup_events & EPOLLIN) != 0) {
+        REQUIRE(send_all(fds[1], "r", 1));
+    }
+
+    n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, tc_cfg.final_read_rc);
+    CHECK_EQ(conn.recv_buf.len(), tc_cfg.expected_buf_len);
+    CHECK(conn.tls_handshake_complete);
+    if (tc_cfg.handshake_first) {
+        CHECK_EQ(tls_state.accept_calls, 2);
+        CHECK_EQ(tls_state.read_calls, 1);
+    } else {
+        CHECK_EQ(tls_state.read_calls, 2);
+    }
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+static void run_tls_send_retry_case(rut::test::TestCase* test_case,
+                                    const TlsSendRetryCase& tc_cfg) {
+    auto* _tc = test_case;
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    backend.downstream_fd_map[0] = fds[0];
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = tc_cfg.first_error;
+    tls_state.write_second_rc = static_cast<i32>(tc_cfg.payload_len);
+    tls_state.write_second_error = SSL_ERROR_NONE;
+    ScopedTlsHooks hooks(tls_state);
+
+    static const u8 kPayload[] = {'p', 'i', 'n', 'g'};
+    REQUIRE(tc_cfg.payload_len <= sizeof(kPayload));
+    REQUIRE(backend.add_send_tls(conn, kPayload, tc_cfg.payload_len));
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, tc_cfg.payload_len);
+    CHECK(backend.send_state[0].tls);
+
+    struct epoll_event ev;
+    ev.events = tc_cfg.second_wakeup_events;
+    ev.data.u64 = static_cast<u64>(IoEventType::Send);
+    REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
+    if ((tc_cfg.second_wakeup_events & EPOLLIN) != 0) {
+        REQUIRE(send_all(fds[1], "r", 1));
+    }
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(tls_state.write_calls, 2);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, static_cast<i32>(tc_cfg.payload_len));
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+static void run_tls_send_readable_while_waiting_for_write_case(rut::test::TestCase* test_case) {
+    auto* _tc = test_case;
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    backend.downstream_fd_map[0] = fds[0];
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    tls_state.write_second_rc = 4;
+    tls_state.write_second_error = SSL_ERROR_NONE;
+    tls_state.read_first_rc = 2;
+    tls_state.read_first_error = SSL_ERROR_NONE;
+    ScopedTlsHooks hooks(tls_state);
+
+    static const u8 kPayload[] = {'p', 'i', 'n', 'g'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, sizeof(kPayload));
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.u64 = static_cast<u64>(IoEventType::Send);
+    REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
+    REQUIRE(send_all(fds[1], "r", 1));
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, 2);
+    CHECK_EQ(conn.recv_buf.len(), 2u);
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, sizeof(kPayload));
+
+    ev.events = EPOLLOUT;
+    ev.data.u64 = static_cast<u64>(IoEventType::Send);
+    REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
+
+    n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, 4);
+    CHECK_EQ(tls_state.write_calls, 2);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+}  // namespace
+
+#ifndef RUT_TESTDATA_DIR
+#error "RUT_TESTDATA_DIR must be defined for test_integration"
+#endif
+
+static constexpr char kTestCertPath[] = RUT_TESTDATA_DIR "/localhost_cert.pem";
+static constexpr char kTestKeyPath[] = RUT_TESTDATA_DIR "/localhost_key.pem";
+
+static bool ssl_write_all(SSL* ssl, const char* data, u32 len) {
+    u32 sent = 0;
+    while (sent < len) {
+        i32 n = SSL_write(ssl, data + sent, static_cast<i32>(len - sent));
+        if (n <= 0) return false;
+        sent += static_cast<u32>(n);
+    }
+    return true;
+}
+
+static void set_socket_timeouts(i32 fd, i32 secs) {
+    struct timeval tv;
+    tv.tv_sec = secs;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static SSL_CTX* create_test_client_ctx() {
+    SSL_CTX* client_ctx = SSL_CTX_new(TLS_client_method());
+    if (client_ctx) SSL_CTX_set_verify(client_ctx, SSL_VERIFY_NONE, nullptr);
+    return client_ctx;
+}
 
 // === Socket Setup (libuv: test-tcp-bind-error, test-tcp-flags, test-tcp-reuseport) ===
 
@@ -549,7 +916,8 @@ TEST(partial_send, state_zeroed_per_conn) {
 
 // Verify EPOLLOUT with no pending send switches back to EPOLLIN (no busy loop).
 // After a successful immediate send, send_state.remaining == 0.
-// If a spurious EPOLLOUT fires, wait() should switch to EPOLLIN and not spin.
+// If a spurious EPOLLOUT fires with no pending send, wait() should drop
+// EPOLLOUT, avoid a spin, and continue delivering Recv events.
 TEST(partial_send, epollout_no_pending_switches_to_epollin) {
     i32 fds[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
@@ -583,19 +951,330 @@ TEST(partial_send, epollout_no_pending_switches_to_epollin) {
     ev.data.u64 = (static_cast<u64>(0) << 8) | static_cast<u64>(IoEventType::Send);
     REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
 
-    // wait() should see EPOLLOUT with no pending send → switch to EPOLLIN, no event
-    // The timerfd will wake wait() within 1 second (bounded, no hang)
+    // wait() should see EPOLLOUT with no pending send and not emit a Send event.
     u32 n = backend.wait(events, 8, &conn, 1);
-    // Should get a Timeout event (from timerfd), not a Send event
     bool got_send = false;
     for (u32 i = 0; i < n; i++) {
         if (events[i].type == IoEventType::Send) got_send = true;
     }
-    CHECK(!got_send);  // no spurious Send completion
+    CHECK(!got_send);
+
+    REQUIRE(send_all(fds[1], "x", 1));
+    n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, 1);
 
     // Drain peer
     char buf[8];
     (void)recv(fds[1], buf, sizeof(buf), MSG_DONTWAIT);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(partial_send, non_tls_send_completes_with_smaller_conn_table) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    i32 sndbuf = 2048;
+    REQUIRE_EQ(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
+    i32 rcvbuf = 2048;
+    REQUIRE_EQ(setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    static constexpr u32 kConnId = 7;
+    backend.downstream_fd_map[kConnId] = fds[0];
+
+    TestConn tc;
+    tc.init(kConnId, fds[0]);
+    Connection& conn = tc.conn;
+
+    u8 fill_data[4096];
+    for (u32 j = 0; j < sizeof(fill_data); j++) fill_data[j] = static_cast<u8>(j & 0xFF);
+    conn.send_buf.write(fill_data, sizeof(fill_data));
+
+    backend.add_send(fds[0], kConnId, conn.send_buf.data(), conn.send_buf.len());
+
+    IoEvent events[16];
+    bool got_full_send = false;
+    if (backend.pending_count > 0) {
+        u32 n = backend.wait(events, 16, &conn, 1);
+        for (u32 i = 0; i < n; i++) {
+            if (events[i].type == IoEventType::Send && events[i].conn_id == kConnId &&
+                events[i].result == 4096) {
+                got_full_send = true;
+            }
+        }
+    }
+
+    if (!got_full_send) {
+        char drain[8192];
+        for (int attempt = 0; attempt < 20; attempt++) {
+            for (;;) {
+                ssize_t nr = recv(fds[1], drain, sizeof(drain), MSG_DONTWAIT);
+                if (nr <= 0) break;
+            }
+            usleep(1000);
+
+            u32 n = backend.wait(events, 16, &conn, 1);
+            for (u32 i = 0; i < n; i++) {
+                if (events[i].type == IoEventType::Send && events[i].conn_id == kConnId &&
+                    events[i].result == 4096) {
+                    got_full_send = true;
+                }
+            }
+            if (got_full_send) break;
+        }
+    }
+    CHECK(got_full_send);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(tls_state_machine, recv_retry_matrix) {
+    for (const auto& tc : kTlsRecvRetryCases) {
+        run_tls_recv_retry_case(_tc, tc);
+    }
+}
+
+TEST(tls_state_machine, send_retry_matrix) {
+    for (const auto& tc : kTlsSendRetryCases) {
+        run_tls_send_retry_case(_tc, tc);
+    }
+}
+
+TEST(tls_state_machine, send_want_write_readable_wakeup_buffers_recv) {
+    run_tls_send_readable_while_waiting_for_write_case(_tc);
+}
+
+TEST(tls_state_machine, send_rejects_out_of_range_conn_id) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    TestConn tc;
+    tc.init(EpollBackend::kMaxFdMap, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    ScopedTlsHooks hooks(tls_state);
+
+    static const u8 kPayload[] = {'b', 'a', 'd'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    REQUIRE_EQ(backend.pending_count, 1u);
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].conn_id, EpollBackend::kMaxFdMap);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, -EINVAL);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(tls_state_machine, send_arm_failure_returns_error_completion) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    ScopedTlsHooks hooks(tls_state);
+
+    close(fds[0]);
+    conn.fd = fds[0];
+
+    static const u8 kPayload[] = {'f', 'a', 'i', 'l'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+    CHECK_EQ(backend.send_state[0].fd, -1);
+    REQUIRE_EQ(backend.pending_count, 1u);
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].conn_id, 0u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, -EBADF);
+
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(tls_state_machine, send_rejects_out_of_range_conn_id_with_full_pending_ring) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    for (u32 i = 0; i < 64; i++) {
+        backend.pending_completions[i].conn_id = i;
+        backend.pending_completions[i].type = IoEventType::Recv;
+        backend.pending_completions[i].result = static_cast<i32>(i);
+        backend.pending_completions[i].buf_id = 0;
+        backend.pending_completions[i].has_buf = 0;
+        backend.pending_completions[i].more = 0;
+    }
+    backend.pending_count = 64;
+
+    TestConn tc;
+    tc.init(EpollBackend::kMaxFdMap, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    ScopedTlsHooks hooks(tls_state);
+
+    static const u8 kPayload[] = {'f', 'u', 'l', 'l'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    REQUIRE_EQ(backend.pending_count, 64u);
+    CHECK_EQ(backend.pending_completions[63].conn_id, EpollBackend::kMaxFdMap);
+    CHECK_EQ(backend.pending_completions[63].type, IoEventType::Send);
+    CHECK_EQ(backend.pending_completions[63].result, -EINVAL);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(tls_state_machine, send_arm_failure_returns_error_with_full_pending_ring) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    for (u32 i = 0; i < 64; i++) {
+        backend.pending_completions[i].conn_id = i;
+        backend.pending_completions[i].type = IoEventType::Recv;
+        backend.pending_completions[i].result = static_cast<i32>(i);
+        backend.pending_completions[i].buf_id = 0;
+        backend.pending_completions[i].has_buf = 0;
+        backend.pending_completions[i].more = 0;
+    }
+    backend.pending_count = 64;
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    ScopedTlsHooks hooks(tls_state);
+
+    close(fds[0]);
+    conn.fd = fds[0];
+
+    static const u8 kPayload[] = {'f', 'a', 'i', 'l'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+    CHECK_EQ(backend.send_state[0].fd, -1);
+    REQUIRE_EQ(backend.pending_count, 64u);
+    CHECK_EQ(backend.pending_completions[63].conn_id, 0u);
+    CHECK_EQ(backend.pending_completions[63].type, IoEventType::Send);
+    CHECK_EQ(backend.pending_completions[63].result, -EBADF);
+
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(tls_state_machine, spurious_epollout_with_empty_tls_send_state_is_ignored) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    backend.downstream_fd_map[0] = fds[0];
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = 4;
+    tls_state.write_first_error = SSL_ERROR_NONE;
+    ScopedTlsHooks hooks(tls_state);
+
+    static const u8 kPayload[] = {'p', 'o', 'n', 'g'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    IoEvent events[8];
+    if (backend.pending_count > 0) {
+        u32 n = backend.wait(events, 8, &conn, 1);
+        REQUIRE_EQ(n, 1u);
+        CHECK_EQ(events[0].type, IoEventType::Send);
+        CHECK_EQ(events[0].result, 4);
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLOUT;
+    ev.data.u64 = static_cast<u64>(IoEventType::Send);
+    i32 rc = epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev);
+    if (rc < 0 && errno == ENOENT) {
+        rc = epoll_ctl(backend.epoll_fd, EPOLL_CTL_ADD, fds[0], &ev);
+    }
+    REQUIRE_EQ(rc, 0);
+
+    u32 n = backend.wait(events, 8, &conn, 1);
+    bool got_send = false;
+    for (u32 i = 0; i < n; i++) {
+        if (events[i].type == IoEventType::Send) got_send = true;
+    }
+    CHECK(!got_send);
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    tls_state.read_first_rc = 1;
+    tls_state.read_first_error = SSL_ERROR_NONE;
+    REQUIRE(send_all(fds[1], "r", 1));
+
+    n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, 1);
 
     close(fds[0]);
     close(fds[1]);
@@ -698,6 +1377,153 @@ TEST(shard, serves_requests) {
     shard.join();
     shard.shutdown();
     close(lfd);
+}
+
+TEST(shard, serves_https_requests) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+    REQUIRE(ssl_write_all(ssl, HTTP_REQ, HTTP_REQ_LEN));
+
+    char buf[4096];
+    i32 n = SSL_read(ssl, buf, sizeof(buf));
+    CHECK(n > 0);
+    if (n > 0) CHECK(has_200(buf, n));
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+TEST(tls, rejects_invalid_private_key_file) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestCertPath);
+    CHECK(!tls_ctx.has_value());
+}
+
+TEST(shard, serves_https_keepalive_requests) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+
+    for (int i = 0; i < 3; i++) {
+        REQUIRE(ssl_write_all(ssl, HTTP_REQ, HTTP_REQ_LEN));
+        char buf[4096];
+        i32 n = SSL_read(ssl, buf, sizeof(buf));
+        CHECK(n > 0);
+        if (n > 0) CHECK(has_200(buf, n));
+    }
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+TEST(shard, recovers_after_failed_tls_handshake) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+
+    usleep(50000);
+
+    i32 bad = connect_to(port);
+    REQUIRE(bad >= 0);
+    set_socket_timeouts(bad, 1);
+    REQUIRE(send_all(bad, HTTP_REQ, HTTP_REQ_LEN));
+    char drain[64];
+    recv_timeout(bad, drain, sizeof(drain), 200);
+    close(bad);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+    REQUIRE(ssl_write_all(ssl, HTTP_REQ, HTTP_REQ_LEN));
+
+    char buf[4096];
+    i32 n = SSL_read(ssl, buf, sizeof(buf));
+    CHECK(n > 0);
+    if (n > 0) CHECK(has_200(buf, n));
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
 }
 
 // Two shards on same port (SO_REUSEPORT)

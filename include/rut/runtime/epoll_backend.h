@@ -53,6 +53,9 @@ struct EpollBackend {
         i32 fd;         // fd to send on (may differ from fd_map for upstream)
         u32 offset;
         u32 remaining;
+        IoEventType type;
+        bool tls;
+        u32 tls_wait_events;
     };
     SendState send_state[kMaxFdMap];
 
@@ -71,6 +74,7 @@ struct EpollBackend {
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    bool add_send_tls(Connection& c, const u8* buf, u32 len);
 
     // Register fd for connect completion (EPOLLOUT).
     bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);

@@ -11,6 +11,16 @@
 //       REQUIRE(ptr != nullptr);  // stops test on failure
 //   }
 //
+//   TEST_F(MyFixture, uses_state) {
+//       CHECK_EQ(self.value, 1);
+//   }
+//
+//   class MyFixture {
+//       int value = 1;
+//       void SetUp() {}
+//       void TearDown() {}
+//   };
+//
 //   int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }
 //
 // Filtering:
@@ -18,6 +28,8 @@
 //   ./test_foo timer                 # run tests where suite or name contains "timer"
 //   ./test_foo timer.refresh         # run suite "timer", test "refresh"
 //   ./test_foo -l                    # list all tests without running
+//   ./test_foo --filter=timer,math.addition # allow-list filter
+//   ./test_foo --help                # show usage
 
 #include <unistd.h>  // write
 
@@ -52,6 +64,15 @@ inline void out_int(int v) {
     for (int i = n - 1; i >= 0; i--) (void)::write(1, &buf[i], 1);
 }
 
+inline bool str_starts_with(const char* s, const char* prefix) {
+    while (*prefix) {
+        if (*s == '\0' || *s != *prefix) return false;
+        s++;
+        prefix++;
+    }
+    return true;
+}
+
 // --- String helpers (no stdlib) ---
 
 inline bool str_eq(const char* a, const char* b) {
@@ -59,6 +80,12 @@ inline bool str_eq(const char* a, const char* b) {
         if (*a != *b) return false;
         if (*a == '\0') return true;
     }
+}
+
+inline bool str_eq_safe(const char* a, const char* b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    return str_eq(a, b);
 }
 
 inline bool str_contains(const char* haystack, const char* needle) {
@@ -88,6 +115,9 @@ struct TestCase {
     const char* fail_file;
     int fail_line;
     const char* fail_expr;
+    bool skipped;
+    const char* skip_reason;
+    bool use_fixture;
 };
 
 inline TestCase* g_head = nullptr;
@@ -101,16 +131,30 @@ inline void register_test(TestCase* tc) {
 
 // --- Check macros ---
 
-#define CHECK(expr)                    \
-    do {                               \
-        if (expr) {                    \
-            _tc->checks_passed++;      \
-        } else {                       \
-            _tc->checks_failed++;      \
-            _tc->fail_file = __FILE__; \
-            _tc->fail_line = __LINE__; \
-            _tc->fail_expr = #expr;    \
-        }                              \
+#define RUT_TEST_REPORT_FAILURE(kind, expr_str) \
+    do {                                        \
+        _tc->checks_failed++;                   \
+        _tc->fail_file = __FILE__;              \
+        _tc->fail_line = __LINE__;              \
+        _tc->fail_expr = expr_str;              \
+        ::rut::test::out("    ");               \
+        ::rut::test::out(kind);                 \
+        ::rut::test::out(": ");                 \
+        ::rut::test::out(__FILE__);             \
+        ::rut::test::out(":");                  \
+        ::rut::test::out_int(__LINE__);         \
+        ::rut::test::out(" -> ");               \
+        ::rut::test::out(expr_str);             \
+        ::rut::test::out("\n");                 \
+    } while (0)
+
+#define CHECK(expr)                                  \
+    do {                                             \
+        if (expr) {                                  \
+            _tc->checks_passed++;                    \
+        } else {                                     \
+            RUT_TEST_REPORT_FAILURE("check", #expr); \
+        }                                            \
     } while (0)
 
 #define CHECK_EQ(a, b) CHECK((a) == (b))
@@ -119,70 +163,279 @@ inline void register_test(TestCase* tc) {
 #define CHECK_GE(a, b) CHECK((a) >= (b))
 #define CHECK_LT(a, b) CHECK((a) < (b))
 #define CHECK_LE(a, b) CHECK((a) <= (b))
+#define CHECK_TRUE(v) CHECK((v))
+#define CHECK_FALSE(v) CHECK(!(v))
+#define CHECK_STREQ(a, b) CHECK(::rut::test::str_eq_safe((a), (b)))
+#define CHECK_MSG(expr, msg)                       \
+    do {                                           \
+        if (expr) {                                \
+            _tc->checks_passed++;                  \
+        } else {                                   \
+            RUT_TEST_REPORT_FAILURE("check", msg); \
+        }                                          \
+    } while (0)
 
-#define REQUIRE(expr)                  \
-    do {                               \
-        if (expr) {                    \
-            _tc->checks_passed++;      \
-        } else {                       \
-            _tc->checks_failed++;      \
-            _tc->fail_file = __FILE__; \
-            _tc->fail_line = __LINE__; \
-            _tc->fail_expr = #expr;    \
-            return;                    \
-        }                              \
+#define REQUIRE(expr)                                  \
+    do {                                               \
+        if (expr) {                                    \
+            _tc->checks_passed++;                      \
+        } else {                                       \
+            RUT_TEST_REPORT_FAILURE("require", #expr); \
+            return;                                    \
+        }                                              \
     } while (0)
 
 #define REQUIRE_EQ(a, b) REQUIRE((a) == (b))
 #define REQUIRE_NE(a, b) REQUIRE((a) != (b))
+#define REQUIRE_LT(a, b) REQUIRE((a) < (b))
+#define REQUIRE_LE(a, b) REQUIRE((a) <= (b))
+#define REQUIRE_GT(a, b) REQUIRE((a) > (b))
+#define REQUIRE_GE(a, b) REQUIRE((a) >= (b))
+#define REQUIRE_TRUE(v) REQUIRE((v))
+#define REQUIRE_FALSE(v) REQUIRE(!(v))
+#define REQUIRE_STREQ(a, b) REQUIRE(::rut::test::str_eq_safe((a), (b)))
+#define REQUIRE_MSG(expr, msg)                       \
+    do {                                             \
+        if (expr) {                                  \
+            _tc->checks_passed++;                    \
+        } else {                                     \
+            RUT_TEST_REPORT_FAILURE("require", msg); \
+            return;                                  \
+        }                                            \
+    } while (0)
+
+#define EXPECT(expr) CHECK(expr)
+#define EXPECT_EQ(a, b) CHECK_EQ((a), (b))
+#define EXPECT_NE(a, b) CHECK_NE((a), (b))
+#define EXPECT_GT(a, b) CHECK_GT((a), (b))
+#define EXPECT_GE(a, b) CHECK_GE((a), (b))
+#define EXPECT_LT(a, b) CHECK_LT((a), (b))
+#define EXPECT_LE(a, b) CHECK_LE((a), (b))
+#define EXPECT_TRUE(v) CHECK_TRUE(v)
+#define EXPECT_FALSE(v) CHECK_FALSE(v)
+#define EXPECT_STREQ(a, b) CHECK_STREQ((a), (b))
+#define EXPECT_MSG(expr, msg) CHECK_MSG((expr), (msg))
+
+#define ASSERT(expr) REQUIRE(expr)
+#define ASSERT_EQ(a, b) REQUIRE_EQ((a), (b))
+#define ASSERT_NE(a, b) REQUIRE_NE((a), (b))
+#define ASSERT_GT(a, b) REQUIRE_GT((a), (b))
+#define ASSERT_GE(a, b) REQUIRE_GE((a), (b))
+#define ASSERT_LT(a, b) REQUIRE_LT((a), (b))
+#define ASSERT_LE(a, b) REQUIRE_LE((a), (b))
+#define ASSERT_TRUE(v) REQUIRE_TRUE(v)
+#define ASSERT_FALSE(v) REQUIRE_FALSE(v)
+#define ASSERT_STREQ(a, b) REQUIRE_STREQ((a), (b))
+#define ASSERT_MSG(expr, msg) REQUIRE_MSG((expr), (msg))
+
+#define FAIL(msg) REQUIRE_MSG(false, msg)
+
+#define SKIP(msg)                 \
+    do {                          \
+        _tc->skipped = true;      \
+        _tc->skip_reason = (msg); \
+        return;                   \
+    } while (0)
 
 // --- Test definition ---
 
-#define TEST(suite, name)                                                          \
-    static void test_##suite##_##name(rut::test::TestCase*);                       \
-    static rut::test::TestCase tc_##suite##_##name = {                             \
-        #suite, #name, test_##suite##_##name, nullptr, 0, 0, nullptr, 0, nullptr}; \
-    __attribute__((constructor)) static void reg_##suite##_##name() {              \
-        rut::test::register_test(&tc_##suite##_##name);                            \
-    }                                                                              \
+#define TEST(suite, name)                                                    \
+    static void test_##suite##_##name(rut::test::TestCase*);                 \
+    static rut::test::TestCase tc_##suite##_##name = {#suite,                \
+                                                      #name,                 \
+                                                      test_##suite##_##name, \
+                                                      nullptr,               \
+                                                      0,                     \
+                                                      0,                     \
+                                                      nullptr,               \
+                                                      0,                     \
+                                                      nullptr,               \
+                                                      false,                 \
+                                                      nullptr,               \
+                                                      false};                \
+    __attribute__((constructor)) static void reg_##suite##_##name() {        \
+        rut::test::register_test(&tc_##suite##_##name);                      \
+    }                                                                        \
     static void test_##suite##_##name([[maybe_unused]] rut::test::TestCase* _tc)
+
+#define TEST_F(Suite, name)                                                          \
+    static void test_##Suite##_##name##_impl(Suite& self, rut::test::TestCase* _tc); \
+    static void test_##Suite##_##name(rut::test::TestCase* _tc);                     \
+    static rut::test::TestCase tc_##Suite##_##name = {#Suite,                        \
+                                                      #name,                         \
+                                                      test_##Suite##_##name,         \
+                                                      nullptr,                       \
+                                                      0,                             \
+                                                      0,                             \
+                                                      nullptr,                       \
+                                                      0,                             \
+                                                      nullptr,                       \
+                                                      false,                         \
+                                                      nullptr,                       \
+                                                      true};                         \
+    __attribute__((constructor)) static void reg_##Suite##_##name() {                \
+        rut::test::register_test(&tc_##Suite##_##name);                              \
+    }                                                                                \
+    static void test_##Suite##_##name(rut::test::TestCase* _tc) {                    \
+        Suite self;                                                                  \
+        self.SetUp();                                                                \
+        if (!_tc->skipped) {                                                         \
+            test_##Suite##_##name##_impl(self, _tc);                                 \
+        }                                                                            \
+        self.TearDown();                                                             \
+    }                                                                                \
+    static void test_##Suite##_##name##_impl(Suite& self, [[maybe_unused]] rut::test::TestCase* _tc)
 
 // --- Filter matching ---
 // "timer"         → suite or name contains "timer"
 // "timer.refresh" → suite contains "timer" AND name contains "refresh"
 
 struct Filter {
-    const char* suite_filter;  // nullptr = match all
-    const char* name_filter;   // nullptr = match all
+    static constexpr int kMaxFilters = 8;
+    const char* suite_filter[kMaxFilters];
+    const char* name_filter[kMaxFilters];
+    int filter_count;
+
+    bool token_match(const char* value, const char* token) const {
+        if (!value || !token) return false;
+
+        bool has_star = false;
+        for (int i = 0; token[i]; i++) {
+            if (token[i] == '*') {
+                has_star = true;
+                break;
+            }
+        }
+        if (!has_star) return str_contains(value, token);
+
+        int len = 0;
+        while (token[len]) len++;
+
+        if (len == 1) return true;
+
+        if (token[0] == '*' && token[len - 1] == '*') {
+            // *abc*
+            char core[128];
+            int n = 0;
+            for (int i = 1; i + 1 < len && n < 127; i++) core[n++] = token[i];
+            core[n] = '\0';
+            return str_contains(value, core);
+        }
+
+        if (token[0] == '*') {
+            // *abc
+            int suffix_len = 0;
+            while (token[1 + suffix_len]) suffix_len++;
+            int vlen = 0;
+            while (value[vlen]) vlen++;
+            if (suffix_len > vlen) return false;
+            for (int i = 0; i < suffix_len; i++) {
+                if (token[1 + i] != value[vlen - suffix_len + i]) return false;
+            }
+            return true;
+        }
+
+        if (token[len - 1] == '*') {
+            // abc*
+            for (int i = 0; i < len - 1; i++) {
+                if (token[i] != value[i]) return false;
+                if (value[i] == '\0') return false;
+            }
+            return value[len - 1] != '\0';
+        }
+
+        return str_contains(value, token);
+    }
 
     bool matches(const TestCase* tc) const {
-        if (!suite_filter && !name_filter) return true;
-        if (suite_filter && name_filter) {
-            return str_contains(tc->suite, suite_filter) && str_contains(tc->name, name_filter);
+        if (filter_count == 0) return true;
+        for (int i = 0; i < filter_count; i++) {
+            const char* sf = suite_filter[i];
+            const char* nf = name_filter[i];
+            if (sf && nf) {
+                if (token_match(tc->suite, sf) && token_match(tc->name, nf)) return true;
+                continue;
+            }
+            const char* token = sf ? sf : nf;
+            if (token_match(tc->suite, token) || token_match(tc->name, token)) return true;
         }
-        const char* f = suite_filter ? suite_filter : name_filter;
-        return str_contains(tc->suite, f) || str_contains(tc->name, f);
+        return false;
     }
 };
 
 inline Filter parse_filter(const char* arg) {
-    // Find '.' separator
-    for (int i = 0; arg[i]; i++) {
-        if (arg[i] == '.') {
-            // Split: suite = arg[0..i-1], name = arg[i+1..]
-            // We need null-terminated strings, use static buffers
-            static char sbuf[128];
-            static char nbuf[128];
-            int j = 0;
-            for (; j < i && j < 127; j++) sbuf[j] = arg[j];
-            sbuf[j] = '\0';
-            j = 0;
-            for (int k = i + 1; arg[k] && j < 127; k++, j++) nbuf[j] = arg[k];
-            nbuf[j] = '\0';
-            return {sbuf, nbuf};
+    Filter filter;
+    filter.filter_count = 0;
+    if (!arg || !arg[0]) return filter;
+
+    // "a,b,c" as allow-list.
+    static char token_storage[Filter::kMaxFilters][128];
+    int token_count = 0;
+
+    int start = 0;
+    for (int i = 0;; i++) {
+        if (arg[i] == ',' || arg[i] == '\0') {
+            if (token_count >= Filter::kMaxFilters) break;
+
+            int len = i - start;
+            if (len > 127) len = 127;
+            if (len > 0) {
+                for (int j = 0; j < len; j++) token_storage[token_count][j] = arg[start + j];
+                token_storage[token_count][len] = '\0';
+
+                int split = -1;
+                for (int k = 0; token_storage[token_count][k]; k++) {
+                    if (token_storage[token_count][k] == '.') {
+                        split = k;
+                        break;
+                    }
+                }
+
+                if (split >= 0) {
+                    static char suite_storage[Filter::kMaxFilters][128];
+                    static char name_storage[Filter::kMaxFilters][128];
+                    int si = 0;
+                    for (; si < split && si < 127; si++)
+                        suite_storage[token_count][si] = token_storage[token_count][si];
+                    suite_storage[token_count][si] = '\0';
+                    int ni = 0;
+                    for (int k = split + 1; token_storage[token_count][k] && ni < 127; k++) {
+                        name_storage[token_count][ni++] = token_storage[token_count][k];
+                    }
+                    name_storage[token_count][ni] = '\0';
+                    filter.suite_filter[token_count] = suite_storage[token_count];
+                    filter.name_filter[token_count] = name_storage[token_count];
+                } else {
+                    filter.suite_filter[token_count] = nullptr;
+                    filter.name_filter[token_count] = token_storage[token_count];
+                }
+
+                filter.filter_count++;
+                token_count++;
+            }
+
+            if (arg[i] == '\0') break;
+            start = i + 1;
         }
     }
-    return {nullptr, arg};  // no dot: match against both suite and name
+    return filter;
+}
+
+inline Filter merge_filter(const Filter& a, const Filter& b) {
+    Filter merged = a;
+    if (merged.filter_count == 0) {
+        return b;
+    }
+    if (b.filter_count == 0) {
+        return a;
+    }
+
+    for (int i = 0; i < b.filter_count && merged.filter_count < Filter::kMaxFilters; i++) {
+        merged.suite_filter[merged.filter_count] = b.suite_filter[i];
+        merged.name_filter[merged.filter_count] = b.name_filter[i];
+        merged.filter_count++;
+    }
+    return merged;
 }
 
 // --- Runner ---
@@ -190,14 +443,31 @@ inline Filter parse_filter(const char* arg) {
 inline int run_all(int argc = 0, char** argv = nullptr) {
     // Parse args
     bool list_only = false;
-    Filter filter = {nullptr, nullptr};
+    bool ask_help = false;
+    Filter filter{};
 
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] == '-' && argv[i][1] == 'l') {
+        if (str_eq(argv[i], "-l") || str_eq(argv[i], "--list")) {
             list_only = true;
+        } else if (str_eq(argv[i], "--help") || str_eq(argv[i], "-h")) {
+            ask_help = true;
+        } else if (str_starts_with(argv[i], "--filter=")) {
+            filter = merge_filter(filter, parse_filter(argv[i] + 9));
         } else {
-            filter = parse_filter(argv[i]);
+            filter = merge_filter(filter, parse_filter(argv[i]));
         }
+    }
+
+    if (ask_help) {
+        out("Usage: ");
+        out(argv[0]);
+        out(" [options]\n");
+        out("  -h, --help           print this message\n");
+        out("  -l, --list           list matching tests and exit\n");
+        out("  --filter=<expr>      allow-list filter by suite/name or suite.name\n");
+        out("                       comma-separated, e.g. framework.aliases,math.*\n");
+        out("  <expr>               filter by suite/name or suite.name\n");
+        return 0;
     }
 
     // List mode
@@ -217,12 +487,22 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
     int total_pass = 0;
     int total_fail = 0;
     int total_skip = 0;
+    int total_checks = 0;
+    int total_check_fail = 0;
     const char* prev_suite = nullptr;
 
     for (TestCase* tc = g_head; tc; tc = tc->next) {
         if (!filter.matches(tc)) {
             total_skip++;
             continue;
+        }
+
+        if (str_starts_with(tc->name, "DISABLED_")) {
+            tc->skipped = true;
+            tc->skip_reason = "disabled";
+        } else {
+            tc->skipped = false;
+            tc->skip_reason = nullptr;
         }
 
         // Suite header
@@ -236,10 +516,25 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
         tc->checks_passed = 0;
         tc->checks_failed = 0;
         tc->fail_file = nullptr;
+        tc->fail_line = 0;
+        if (!str_starts_with(tc->name, "DISABLED_")) tc->skip_reason = nullptr;
 
-        tc->fn(tc);
+        if (!tc->skipped) tc->fn(tc);
+        total_checks += tc->checks_passed;
+        total_check_fail += tc->checks_failed;
+        total_checks += tc->checks_failed;
 
-        if (tc->checks_failed == 0) {
+        if (tc->skipped) {
+            out("  SKIP: ");
+            out(tc->name);
+            if (tc->skip_reason) {
+                out(" (");
+                out(tc->skip_reason);
+                out(")");
+            }
+            out("\n");
+            total_skip++;
+        } else if (tc->checks_failed == 0) {
             out("  PASS: ");
             out(tc->name);
             out("\n");
@@ -265,7 +560,11 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
     out_int(total_pass);
     out(" passed, ");
     out_int(total_fail);
-    out(" failed");
+    out(" failed, ");
+    out_int(total_checks);
+    out(" checks, ");
+    out_int(total_check_fail);
+    out(" failed checks");
     if (total_skip > 0) {
         out(", ");
         out_int(total_skip);

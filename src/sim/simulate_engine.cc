@@ -531,11 +531,8 @@ bool Engine::init(const rir::Module& module,
             jit.shutdown();
             return false;
         }
-        char symbol[256] = "handler_";
-        u32 pos = 8;
-        for (u32 j = 0; j < fn.name.len && pos + 1 < sizeof(symbol); j++)
-            symbol[pos++] = fn.name.ptr[j];
-        symbol[pos] = '\0';
+        char symbol[256];
+        jit::format_handler_symbol(fn.name, symbol, sizeof(symbol));
 
         void* addr = jit.lookup(symbol);
         if (!addr) {
@@ -543,11 +540,16 @@ bool Engine::init(const rir::Module& module,
             return false;
         }
 
+        if (fn.route_pattern.len >= sizeof(routes[0].pattern)) {
+            jit.shutdown();
+            route_count = 0;
+            upstream_count = 0;
+            return false;
+        }
+
         auto& route = routes[route_count++];
         route.method = fn.http_method;
         route.pattern_len = fn.route_pattern.len;
-        if (route.pattern_len >= sizeof(route.pattern))
-            route.pattern_len = sizeof(route.pattern) - 1;
         for (u32 j = 0; j < route.pattern_len; j++) route.pattern[j] = fn.route_pattern.ptr[j];
         route.pattern[route.pattern_len] = '\0';
         route.fn = reinterpret_cast<jit::HandlerFn>(addr);

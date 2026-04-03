@@ -27,6 +27,10 @@ struct CodegenResult {
     bool ok;
 };
 
+// Format the JIT handler symbol for an RIR function name.
+// Returns the output length excluding the trailing '\0'.
+u32 format_handler_symbol(Str name, char* out, u32 out_size);
+
 // Translate all functions in the RIR module to LLVM IR.
 // Returns {module, context, true} on success, {null, null, false} on error.
 CodegenResult codegen(const rir::Module& rir_mod);

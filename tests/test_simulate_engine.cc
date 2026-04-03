@@ -38,6 +38,14 @@ static bool init_engine(const Manifest& manifest, ModuleContext& ctx, Engine& en
     return engine.init(ctx.module, manifest.upstreams, manifest.upstream_count);
 }
 
+static Str arena_copy(MmapArena& arena, const char* src, u32 len) {
+    char* mem = arena.alloc_array<char>(len + 1);
+    if (!mem) __builtin_trap();
+    for (u32 i = 0; i < len; i++) mem[i] = src[i];
+    mem[len] = '\0';
+    return {mem, len};
+}
+
 static bool load_manifest_text(const char* text, Manifest* manifest) {
     char path[] = "/tmp/rut_sim_manifest_XXXXXX";
     const i32 fd = mkstemp(path);
@@ -465,6 +473,58 @@ TEST(simulate_engine, build_module_rejects_invalid_route_count_without_init) {
     CHECK_EQ(ctx.arena.current, nullptr);
     CHECK_EQ(ctx.module.arena, nullptr);
     CHECK_EQ(ctx.module.functions, nullptr);
+}
+
+TEST(simulate_engine, engine_init_accepts_codegen_truncated_handler_symbol_names) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = 'G';
+    strcpy(manifest.routes[0].pattern, "/long-name");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 204;
+
+    ModuleContext ctx{};
+    REQUIRE(build_module_from_manifest(manifest, ctx));
+
+    char long_name[248];
+    for (u32 i = 0; i < 247; i++) long_name[i] = 'a';
+    long_name[247] = '\0';
+    ctx.module.functions[0].name = arena_copy(ctx.arena, long_name, 247);
+
+    Engine engine;
+    REQUIRE(engine.init(ctx.module, manifest.upstreams, manifest.upstream_count));
+
+    const auto result =
+        simulate_one(engine, make_entry("GET /long-name HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
+TEST(simulate_engine, engine_init_rejects_overlong_compiled_route_patterns) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = 'G';
+    strcpy(manifest.routes[0].pattern, "/ok");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 200;
+
+    ModuleContext ctx{};
+    REQUIRE(build_module_from_manifest(manifest, ctx));
+
+    char pattern[129];
+    pattern[0] = '/';
+    for (u32 i = 1; i < 128; i++) pattern[i] = 'p';
+    pattern[128] = '\0';
+    ctx.module.functions[0].route_pattern = arena_copy(ctx.arena, pattern, 128);
+
+    Engine engine;
+    CHECK(!engine.init(ctx.module, manifest.upstreams, manifest.upstream_count));
+    CHECK_EQ(engine.route_count, 0u);
+    CHECK_EQ(engine.upstream_count, 0u);
+
+    ctx.destroy();
 }
 
 TEST(simulate_engine, param_route_matching_matrix) {

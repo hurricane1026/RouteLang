@@ -6,6 +6,26 @@
 
 namespace rut::jit {
 
+u32 format_handler_symbol(Str name, char* out, u32 out_size) {
+    if (!out || out_size == 0) return 0;
+
+    static constexpr char kPrefix[] = "handler_";
+    u32 pos = 0;
+    while (kPrefix[pos] && pos + 1 < out_size) {
+        out[pos] = kPrefix[pos];
+        pos++;
+    }
+
+    u32 max_pos = 0;
+    if (out_size > 1) max_pos = out_size - 2;
+    if (max_pos > 254) max_pos = 254;
+    for (u32 i = 0; i < name.len && pos < max_pos; i++) {
+        out[pos++] = name.ptr[i];
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
 // ── Codegen Context ────────────────────────────────────────────────
 // Per-compilation state. Holds LLVM context, module, builder, and
 // mapping tables from RIR IDs to LLVM values/blocks.
@@ -558,12 +578,8 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.cur_fn = &fn;
 
     // Build function name: "handler_<name>"
-    char fname[256] = "handler_";
-    u32 pos = 8;
-    for (u32 i = 0; i < fn.name.len && pos < 254; i++) {
-        fname[pos++] = fn.name.ptr[i];
-    }
-    fname[pos] = '\0';
+    char fname[256];
+    format_handler_symbol(fn.name, fname, sizeof(fname));
 
     LLVMValueRef func = LLVMAddFunction(c.llvm_mod, fname, c.handler_fn_ty);
 

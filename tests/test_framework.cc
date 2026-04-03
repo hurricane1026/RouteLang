@@ -88,7 +88,7 @@ TEST(framework, wildcard_with_extra_edge_stars_is_rejected) {
 }
 
 static rut::test::TestCase make_test_case(const char* suite, const char* name) {
-    return {suite, name, nullptr, nullptr, 0, 0, nullptr, 0, nullptr, false, nullptr, false};
+    return {suite, name, nullptr, nullptr, 0, 0, nullptr, 0, nullptr, false, nullptr};
 }
 
 TEST(framework, merged_filters_keep_own_storage) {

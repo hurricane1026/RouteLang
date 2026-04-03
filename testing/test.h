@@ -117,7 +117,6 @@ struct TestCase {
     const char* fail_expr;
     bool skipped;
     const char* skip_reason;
-    bool use_fixture;
 };
 
 inline TestCase* g_head = nullptr;
@@ -251,8 +250,7 @@ inline void register_test(TestCase* tc) {
                                                       0,                     \
                                                       nullptr,               \
                                                       false,                 \
-                                                      nullptr,               \
-                                                      false};                \
+                                                      nullptr};              \
     __attribute__((constructor)) static void reg_##suite##_##name() {        \
         rut::test::register_test(&tc_##suite##_##name);                      \
     }                                                                        \
@@ -271,8 +269,7 @@ inline void register_test(TestCase* tc) {
                                                       0,                             \
                                                       nullptr,                       \
                                                       false,                         \
-                                                      nullptr,                       \
-                                                      true};                         \
+                                                      nullptr};                      \
     __attribute__((constructor)) static void reg_##Suite##_##name() {                \
         rut::test::register_test(&tc_##Suite##_##name);                              \
     }                                                                                \

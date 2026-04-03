@@ -279,23 +279,29 @@ static void put_name(char* buf, u32 buf_size, u32* pos, const char* s) {
 }  // namespace
 
 bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
+    destroy();
+
     if (!arena.init(4096)) return false;
-    module.name = {"simulate_manifest", 17};
-    module.arena = &arena;
-    module.functions = arena.alloc_array<rir::Function>(func_cap == 0 ? 1 : func_cap);
-    if (!module.functions) {
+
+    rir::Module next{};
+    next.name = {"simulate_manifest", 17};
+    next.arena = &arena;
+    next.func_cap = func_cap == 0 ? 1 : func_cap;
+    next.functions = arena.alloc_array<rir::Function>(next.func_cap);
+    if (!next.functions) {
         arena.destroy();
+        module = {};
         return false;
     }
-    module.func_count = 0;
-    module.func_cap = func_cap == 0 ? 1 : func_cap;
-    module.struct_defs = arena.alloc_array<rir::StructDef*>(struct_cap == 0 ? 1 : struct_cap);
-    if (!module.struct_defs) {
+    next.struct_cap = struct_cap == 0 ? 1 : struct_cap;
+    next.struct_defs = arena.alloc_array<rir::StructDef*>(next.struct_cap);
+    if (!next.struct_defs) {
         arena.destroy();
+        module = {};
         return false;
     }
-    module.struct_count = 0;
-    module.struct_cap = struct_cap == 0 ? 1 : struct_cap;
+
+    module = next;
     return true;
 }
 
@@ -511,10 +517,10 @@ bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
 bool Engine::init(const rir::Module& module,
                   const ManifestUpstream* upstream_list,
                   u32 upstreams_len) {
-    if (upstreams_len > kMaxUpstreams || module.func_count > kMaxRoutes) return false;
     shutdown();
+    if (upstreams_len > kMaxUpstreams || module.func_count > kMaxRoutes) return false;
 
-    const auto fail = [this]() {
+    auto fail = [this]() {
         shutdown();
         return false;
     };

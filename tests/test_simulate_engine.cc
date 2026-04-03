@@ -2,6 +2,7 @@
 #include "test.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +60,19 @@ static bool load_manifest_text(const char* text, Manifest* manifest) {
 }
 
 static bool read_all_fd(i32 fd, char* buf, u32 cap, u32* out_len) {
+    if (out_len) *out_len = 0;
+    if (cap == 0) {
+        char discard[256];
+        for (;;) {
+            const ssize_t n = read(fd, discard, sizeof(discard));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            if (n == 0) return true;
+        }
+    }
+
     u32 pos = 0;
     char discard[256];
     for (;;) {
@@ -77,15 +91,105 @@ static bool read_all_fd(i32 fd, char* buf, u32 cap, u32* out_len) {
         if (n == 0) break;
 
         if (pos + 1 < cap) {
-            const u32 kRemaining = cap - 1 - pos;
-            const u32 kStored = static_cast<u32>(n) > kRemaining ? kRemaining : static_cast<u32>(n);
-            pos += kStored;
+            const u32 remaining = cap - 1 - pos;
+            const u32 stored = static_cast<u32>(n) > remaining ? remaining : static_cast<u32>(n);
+            pos += stored;
         }
     }
-    if (cap > 0) {
-        buf[pos < cap ? pos : cap - 1] = '\0';
+    buf[pos] = '\0';
+    if (out_len) *out_len = pos;
+    return true;
+}
+
+static bool read_ready_fd(i32 fd, char* buf, u32 cap, u32* pos, bool* done) {
+    if (*done) return true;
+
+    char discard[256];
+    char* dst = discard;
+    u32 to_read = sizeof(discard);
+    if (*pos + 1 < cap) {
+        dst = buf + *pos;
+        to_read = cap - 1 - *pos;
     }
-    *out_len = pos;
+
+    const ssize_t n = read(fd, dst, to_read);
+    if (n < 0) {
+        if (errno == EINTR || errno == EAGAIN) return true;
+        return false;
+    }
+    if (n == 0) {
+        *done = true;
+        return true;
+    }
+
+    if (*pos + 1 < cap) {
+        const u32 remaining = cap - 1 - *pos;
+        const u32 stored = static_cast<u32>(n) > remaining ? remaining : static_cast<u32>(n);
+        *pos += stored;
+        buf[*pos] = '\0';
+    }
+    return true;
+}
+
+static bool read_pipes_interleaved(i32 out_fd,
+                                   char* out_buf,
+                                   u32 out_cap,
+                                   u32* out_len,
+                                   i32 err_fd,
+                                   char* err_buf,
+                                   u32 err_cap,
+                                   u32* err_len) {
+    if (out_len) *out_len = 0;
+    if (err_len) *err_len = 0;
+    if (out_cap > 0) out_buf[0] = '\0';
+    if (err_cap > 0) err_buf[0] = '\0';
+
+    u32 out_pos = 0;
+    u32 err_pos = 0;
+    bool out_done = false;
+    bool err_done = false;
+    while (!out_done || !err_done) {
+        pollfd fds[2];
+        nfds_t nfds = 0;
+        if (!out_done) {
+            fds[nfds].fd = out_fd;
+            fds[nfds].events = POLLIN | POLLHUP;
+            fds[nfds].revents = 0;
+            nfds++;
+        }
+        if (!err_done) {
+            fds[nfds].fd = err_fd;
+            fds[nfds].events = POLLIN | POLLHUP;
+            fds[nfds].revents = 0;
+            nfds++;
+        }
+
+        const int poll_rc = poll(fds, nfds, -1);
+        if (poll_rc < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+
+        nfds_t idx = 0;
+        if (!out_done) {
+            if (fds[idx].revents & (POLLERR | POLLNVAL)) return false;
+            if ((fds[idx].revents & (POLLIN | POLLHUP)) &&
+                !read_ready_fd(out_fd, out_buf, out_cap, &out_pos, &out_done)) {
+                return false;
+            }
+            idx++;
+        }
+        if (!err_done) {
+            if (fds[idx].revents & (POLLERR | POLLNVAL)) return false;
+            if ((fds[idx].revents & (POLLIN | POLLHUP)) &&
+                !read_ready_fd(err_fd, err_buf, err_cap, &err_pos, &err_done)) {
+                return false;
+            }
+        }
+    }
+
+    if (out_len) *out_len = out_pos;
+    if (err_len) *err_len = err_pos;
     return true;
 }
 
@@ -138,14 +242,20 @@ static bool run_simulate_cli(const char* arg1,
 
     u32 stdout_len = 0;
     u32 stderr_len = 0;
-    const bool stdout_ok = read_all_fd(out_pipe[0], stdout_buf, stdout_cap, &stdout_len);
-    const bool stderr_ok = read_all_fd(err_pipe[0], stderr_buf, stderr_cap, &stderr_len);
+    const bool io_ok = read_pipes_interleaved(out_pipe[0],
+                                              stdout_buf,
+                                              stdout_cap,
+                                              &stdout_len,
+                                              err_pipe[0],
+                                              stderr_buf,
+                                              stderr_cap,
+                                              &stderr_len);
     close(out_pipe[0]);
     close(err_pipe[0]);
 
     i32 status = 0;
     if (waitpid(pid, &status, 0) < 0) return false;
-    if (!stdout_ok || !stderr_ok) return false;
+    if (!io_ok) return false;
     if (!WIFEXITED(status)) return false;
     *exit_code = WEXITSTATUS(status);
     return true;
@@ -344,6 +454,7 @@ TEST(simulate_engine, colon_inside_segment_matches_literal_colon) {
     engine.shutdown();
     ctx.destroy();
 }
+
 TEST(simulate_engine, make_entry_clamps_long_headers) {
     char req[CaptureEntry::kMaxHeaderLen + 32];
     for (u32 i = 0; i + 1 < sizeof(req); i++) req[i] = 'a';
@@ -504,6 +615,30 @@ TEST(simulate_engine, module_context_destroy_resets_state) {
     CHECK_EQ(ctx.module.arena, nullptr);
 }
 
+TEST(simulate_engine, module_context_init_clears_stale_state_before_reuse) {
+    ModuleContext ctx{};
+    ctx.module.name = {"stale", 5};
+    ctx.module.arena = reinterpret_cast<MmapArena*>(1);
+    ctx.module.functions = reinterpret_cast<rir::Function*>(1);
+    ctx.module.func_count = 99;
+    ctx.module.func_cap = 99;
+    ctx.module.struct_defs = reinterpret_cast<rir::StructDef**>(1);
+    ctx.module.struct_count = 88;
+    ctx.module.struct_cap = 88;
+
+    REQUIRE(ctx.init(2, 3));
+    CHECK_EQ(ctx.module.name.len, 17u);
+    CHECK(ctx.module.arena == &ctx.arena);
+    CHECK(ctx.module.functions != nullptr);
+    CHECK_EQ(ctx.module.func_count, 0u);
+    CHECK_EQ(ctx.module.func_cap, 2u);
+    CHECK(ctx.module.struct_defs != nullptr);
+    CHECK_EQ(ctx.module.struct_count, 0u);
+    CHECK_EQ(ctx.module.struct_cap, 3u);
+
+    ctx.destroy();
+}
+
 TEST(simulate_engine, build_module_rejects_invalid_route_count_without_init) {
     Manifest manifest{};
     manifest.route_count = Manifest::kMaxRoutes + 1;
@@ -544,9 +679,6 @@ TEST(simulate_engine, engine_init_accepts_codegen_truncated_handler_symbol_names
 
 TEST(simulate_engine, engine_init_rejects_overlong_compiled_route_patterns) {
     Manifest manifest{};
-    manifest.upstream_count = 1;
-    manifest.upstreams[0].id = 7;
-    strcpy(manifest.upstreams[0].name, "api-v1");
     manifest.route_count = 1;
     manifest.routes[0].method = 'G';
     strcpy(manifest.routes[0].pattern, "/ok");
@@ -563,11 +695,70 @@ TEST(simulate_engine, engine_init_rejects_overlong_compiled_route_patterns) {
     ctx.module.functions[0].route_pattern = arena_copy(ctx.arena, pattern, 128);
 
     Engine engine;
-    engine.route_count = 3;
-    engine.upstream_count = 2;
-    engine.upstreams[0].id = 99;
-    strcpy(engine.upstreams[0].name, "stale");
+    engine.route_count = 7;
+    engine.upstream_count = 5;
     CHECK(!engine.init(ctx.module, manifest.upstreams, manifest.upstream_count));
+    CHECK_EQ(engine.route_count, 0u);
+    CHECK_EQ(engine.upstream_count, 0u);
+
+    ctx.destroy();
+}
+
+TEST(simulate_engine, engine_init_can_reinitialize_existing_engine) {
+    Manifest manifest_a{};
+    manifest_a.route_count = 1;
+    manifest_a.routes[0].method = 'G';
+    strcpy(manifest_a.routes[0].pattern, "/first");
+    manifest_a.routes[0].action = ManifestAction::ReturnStatus;
+    manifest_a.routes[0].status_code = 201;
+
+    Manifest manifest_b{};
+    manifest_b.route_count = 1;
+    manifest_b.routes[0].method = 'G';
+    strcpy(manifest_b.routes[0].pattern, "/second");
+    manifest_b.routes[0].action = ManifestAction::ReturnStatus;
+    manifest_b.routes[0].status_code = 202;
+
+    ModuleContext ctx_a{};
+    ModuleContext ctx_b{};
+    REQUIRE(build_module_from_manifest(manifest_a, ctx_a));
+    REQUIRE(build_module_from_manifest(manifest_b, ctx_b));
+
+    Engine engine;
+    REQUIRE(engine.init(ctx_a.module, manifest_a.upstreams, manifest_a.upstream_count));
+    REQUIRE(engine.init(ctx_b.module, manifest_b.upstreams, manifest_b.upstream_count));
+
+    const auto first_after_reinit =
+        simulate_one(engine, make_entry("GET /first HTTP/1.1\r\nHost: x\r\n\r\n", 200));
+    CHECK_EQ(first_after_reinit.verdict, Verdict::Match);
+    CHECK_EQ(first_after_reinit.actual_status, 200u);
+
+    const auto second_after_reinit =
+        simulate_one(engine, make_entry("GET /second HTTP/1.1\r\nHost: x\r\n\r\n", 202));
+    CHECK_EQ(second_after_reinit.verdict, Verdict::Match);
+    CHECK_EQ(second_after_reinit.actual_status, 202u);
+
+    engine.shutdown();
+    ctx_b.destroy();
+    ctx_a.destroy();
+}
+
+TEST(simulate_engine, engine_init_clears_state_on_precondition_failure) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = 'G';
+    strcpy(manifest.routes[0].pattern, "/ok");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 200;
+
+    ModuleContext ctx{};
+    REQUIRE(build_module_from_manifest(manifest, ctx));
+
+    Engine engine;
+    REQUIRE(engine.init(ctx.module, manifest.upstreams, manifest.upstream_count));
+    CHECK_EQ(engine.route_count, 1u);
+
+    CHECK(!engine.init(ctx.module, manifest.upstreams, Engine::kMaxUpstreams + 1));
     CHECK_EQ(engine.route_count, 0u);
     CHECK_EQ(engine.upstream_count, 0u);
 
@@ -784,6 +975,90 @@ TEST(simulate_engine, read_all_fd_drains_bytes_beyond_output_buffer) {
     const ssize_t tail_n = read(pipefd[0], tail, sizeof(tail));
     CHECK_EQ(tail_n, 0);
     close(pipefd[0]);
+}
+
+TEST(simulate_engine, read_all_fd_accepts_zero_capacity_buffer) {
+    i32 pipefd[2];
+    REQUIRE(pipe(pipefd) == 0);
+    REQUIRE(write(pipefd[1], "abc", 3) == 3);
+    close(pipefd[1]);
+
+    u32 out_len = 99;
+    REQUIRE(read_all_fd(pipefd[0], nullptr, 0, &out_len));
+    CHECK_EQ(out_len, 0u);
+    close(pipefd[0]);
+}
+
+TEST(simulate_engine, read_all_fd_preserves_terminator_for_exact_fit) {
+    i32 pipefd[2];
+    REQUIRE(pipe(pipefd) == 0);
+    REQUIRE(write(pipefd[1], "abcd", 4) == 4);
+    close(pipefd[1]);
+
+    char buf[5];
+    u32 out_len = 0;
+    REQUIRE(read_all_fd(pipefd[0], buf, sizeof(buf), &out_len));
+    CHECK_EQ(out_len, 4u);
+    CHECK_STREQ(buf, "abcd");
+    close(pipefd[0]);
+}
+
+TEST(simulate_engine, read_pipes_interleaved_fails_on_poll_error_event) {
+    i32 out_pipe[2];
+    i32 err_pipe[2];
+    REQUIRE(pipe(out_pipe) == 0);
+    REQUIRE(pipe(err_pipe) == 0);
+
+    close(out_pipe[0]);
+    close(out_pipe[1]);
+
+    char stdout_buf[16];
+    char stderr_buf[16];
+    u32 stdout_len = 0;
+    u32 stderr_len = 0;
+    CHECK(!read_pipes_interleaved(out_pipe[0],
+                                  stdout_buf,
+                                  sizeof(stdout_buf),
+                                  &stdout_len,
+                                  err_pipe[0],
+                                  stderr_buf,
+                                  sizeof(stderr_buf),
+                                  &stderr_len));
+
+    close(err_pipe[0]);
+    close(err_pipe[1]);
+}
+
+TEST(simulate_engine, read_pipes_interleaved_collects_both_streams) {
+    i32 out_pipe[2];
+    i32 err_pipe[2];
+    REQUIRE(pipe(out_pipe) == 0);
+    REQUIRE(pipe(err_pipe) == 0);
+
+    REQUIRE(write(out_pipe[1], "stdout-data", 11) == 11);
+    REQUIRE(write(err_pipe[1], "stderr-data", 11) == 11);
+    close(out_pipe[1]);
+    close(err_pipe[1]);
+
+    char stdout_buf[32];
+    char stderr_buf[32];
+    u32 stdout_len = 0;
+    u32 stderr_len = 0;
+    REQUIRE(read_pipes_interleaved(out_pipe[0],
+                                   stdout_buf,
+                                   sizeof(stdout_buf),
+                                   &stdout_len,
+                                   err_pipe[0],
+                                   stderr_buf,
+                                   sizeof(stderr_buf),
+                                   &stderr_len));
+    CHECK_EQ(stdout_len, 11u);
+    CHECK_EQ(stderr_len, 11u);
+    CHECK_STREQ(stdout_buf, "stdout-data");
+    CHECK_STREQ(stderr_buf, "stderr-data");
+
+    close(out_pipe[0]);
+    close(err_pipe[0]);
 }
 
 TEST(simulate_engine, cli_usage_mentions_param_prefix_matching) {

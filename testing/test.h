@@ -360,11 +360,13 @@ struct Filter {
 
         int first_star = -1;
         int last_star = -1;
+        int star_count = 0;
         int len = 0;
         for (int i = 0; token[i]; i++) {
             if (token[i] == '*') {
                 if (first_star < 0) first_star = i;
                 last_star = i;
+                star_count++;
             }
             len++;
         }
@@ -376,9 +378,11 @@ struct Filter {
         const bool kSuffixStar = last_star == len - 1;
         const bool kWrappedStar = kPrefixStar && kSuffixStar;
         if (!kPrefixStar && !kSuffixStar) return false;
-        if (kWrappedStar && first_star != 0) return false;
-        if (kPrefixStar && !kSuffixStar && first_star != last_star) return false;
-        if (!kPrefixStar && kSuffixStar && first_star != last_star) return false;
+        if (kWrappedStar) {
+            if (star_count != 2) return false;
+        } else if (star_count != 1) {
+            return false;
+        }
 
         if (token[0] == '*' && token[len - 1] == '*') {
             char core[128];

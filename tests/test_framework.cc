@@ -68,6 +68,13 @@ TEST(framework, wildcard_with_middle_star_is_rejected) {
     CHECK(!filter.token_match("abxcd", "ab*cd"));
 }
 
+TEST(framework, wildcard_with_extra_edge_stars_is_rejected) {
+    rut::test::Filter filter{};
+    filter.clear();
+    CHECK(!filter.token_match("abc", "*abc**"));
+    CHECK(!filter.token_match("abc", "**abc*"));
+}
+
 static rut::test::TestCase make_test_case(const char* suite, const char* name) {
     return {suite, name, nullptr, nullptr, 0, 0, nullptr, 0, nullptr, false, nullptr, false};
 }

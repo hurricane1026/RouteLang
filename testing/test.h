@@ -358,19 +358,27 @@ struct Filter {
     bool token_match(const char* value, const char* token) const {
         if (!value || !token) return false;
 
-        bool has_star = false;
+        int first_star = -1;
+        int last_star = -1;
+        int len = 0;
         for (int i = 0; token[i]; i++) {
             if (token[i] == '*') {
-                has_star = true;
-                break;
+                if (first_star < 0) first_star = i;
+                last_star = i;
             }
+            len++;
         }
-        if (!has_star) return str_contains(value, token);
-
-        int len = 0;
-        while (token[len]) len++;
+        if (first_star < 0) return str_contains(value, token);
 
         if (len == 1) return true;
+
+        const bool kPrefixStar = first_star == 0;
+        const bool kSuffixStar = last_star == len - 1;
+        const bool kWrappedStar = kPrefixStar && kSuffixStar;
+        if (!kPrefixStar && !kSuffixStar) return false;
+        if (kWrappedStar && first_star != 0) return false;
+        if (kPrefixStar && !kSuffixStar && first_star != last_star) return false;
+        if (!kPrefixStar && kSuffixStar && first_star != last_star) return false;
 
         if (token[0] == '*' && token[len - 1] == '*') {
             char core[128];

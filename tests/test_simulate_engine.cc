@@ -172,6 +172,7 @@ static bool read_pipes_interleaved(i32 out_fd,
 
         nfds_t idx = 0;
         if (!out_done) {
+            if (fds[idx].revents & (POLLERR | POLLNVAL)) return false;
             if ((fds[idx].revents & (POLLIN | POLLHUP)) &&
                 !read_ready_fd(out_fd, out_buf, out_cap, &out_pos, &out_done)) {
                 return false;
@@ -179,6 +180,7 @@ static bool read_pipes_interleaved(i32 out_fd,
             idx++;
         }
         if (!err_done) {
+            if (fds[idx].revents & (POLLERR | POLLNVAL)) return false;
             if ((fds[idx].revents & (POLLIN | POLLHUP)) &&
                 !read_ready_fd(err_fd, err_buf, err_cap, &err_pos, &err_done)) {
                 return false;
@@ -985,6 +987,32 @@ TEST(simulate_engine, read_all_fd_accepts_zero_capacity_buffer) {
     REQUIRE(read_all_fd(pipefd[0], nullptr, 0, &out_len));
     CHECK_EQ(out_len, 0u);
     close(pipefd[0]);
+}
+
+TEST(simulate_engine, read_pipes_interleaved_fails_on_poll_error_event) {
+    i32 out_pipe[2];
+    i32 err_pipe[2];
+    REQUIRE(pipe(out_pipe) == 0);
+    REQUIRE(pipe(err_pipe) == 0);
+
+    close(out_pipe[0]);
+    close(out_pipe[1]);
+
+    char stdout_buf[16];
+    char stderr_buf[16];
+    u32 stdout_len = 0;
+    u32 stderr_len = 0;
+    CHECK(!read_pipes_interleaved(out_pipe[0],
+                                  stdout_buf,
+                                  sizeof(stdout_buf),
+                                  &stdout_len,
+                                  err_pipe[0],
+                                  stderr_buf,
+                                  sizeof(stderr_buf),
+                                  &stderr_len));
+
+    close(err_pipe[0]);
+    close(err_pipe[1]);
 }
 
 TEST(simulate_engine, cli_usage_mentions_param_prefix_matching) {

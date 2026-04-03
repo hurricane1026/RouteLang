@@ -61,6 +61,13 @@ TEST(framework, wildcard_prefix_filter_matches_exact_prefix) {
     CHECK(!filter.token_match("ab", "abc*"));
 }
 
+TEST(framework, wildcard_with_middle_star_is_rejected) {
+    rut::test::Filter filter{};
+    filter.clear();
+    CHECK(!filter.token_match("abcd", "ab*cd"));
+    CHECK(!filter.token_match("abxcd", "ab*cd"));
+}
+
 static rut::test::TestCase make_test_case(const char* suite, const char* name) {
     return {suite, name, nullptr, nullptr, 0, 0, nullptr, 0, nullptr, false, nullptr, false};
 }

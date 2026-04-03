@@ -177,7 +177,9 @@ static bool route_matches(const Engine::CompiledRoute& route, const char* path, 
     u32 pi = 0;
     u32 ri = 0;
     while (ri < route.pattern_len) {
-        if (route.pattern[ri] == ':') {
+        const bool kParamSegment =
+            route.pattern[ri] == ':' && (ri == 0 || route.pattern[ri - 1] == '/');
+        if (kParamSegment) {
             ri++;
             while (ri < route.pattern_len && route.pattern[ri] != '/') ri++;
             const u32 param_start = pi;
@@ -516,6 +518,7 @@ bool Engine::init(const rir::Module& module,
                   const ManifestUpstream* upstream_list,
                   u32 upstreams_len) {
     if (upstreams_len > kMaxUpstreams || module.func_count > kMaxRoutes) return false;
+    shutdown();
 
     auto fail = [this]() {
         shutdown();

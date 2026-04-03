@@ -304,6 +304,32 @@ TEST(simulate_engine, param_route_rejects_empty_segment) {
     ctx.destroy();
 }
 
+TEST(simulate_engine, colon_inside_segment_matches_literal_colon) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = 'G';
+    strcpy(manifest.routes[0].pattern, "/v1:beta");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 201;
+
+    ModuleContext ctx;
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+
+    const auto literal_match =
+        simulate_one(engine, make_entry("GET /v1:beta HTTP/1.1\r\nHost: x\r\n\r\n", 201));
+    CHECK_EQ(literal_match.verdict, Verdict::Match);
+    CHECK_EQ(literal_match.actual_status, 201u);
+
+    const auto literal_miss =
+        simulate_one(engine, make_entry("GET /v1x HTTP/1.1\r\nHost: x\r\n\r\n", 200));
+    CHECK_EQ(literal_miss.verdict, Verdict::Match);
+    CHECK_EQ(literal_miss.actual_status, 200u);
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
 TEST(simulate_engine, make_entry_clamps_long_headers) {
     char req[CaptureEntry::kMaxHeaderLen + 32];
     for (u32 i = 0; i + 1 < sizeof(req); i++) req[i] = 'a';
@@ -551,6 +577,45 @@ TEST(simulate_engine, engine_init_rejects_overlong_compiled_route_patterns) {
     CHECK_EQ(engine.upstream_count, 0u);
 
     ctx.destroy();
+}
+
+TEST(simulate_engine, engine_init_can_reinitialize_existing_engine) {
+    Manifest manifest_a{};
+    manifest_a.route_count = 1;
+    manifest_a.routes[0].method = 'G';
+    strcpy(manifest_a.routes[0].pattern, "/first");
+    manifest_a.routes[0].action = ManifestAction::ReturnStatus;
+    manifest_a.routes[0].status_code = 201;
+
+    Manifest manifest_b{};
+    manifest_b.route_count = 1;
+    manifest_b.routes[0].method = 'G';
+    strcpy(manifest_b.routes[0].pattern, "/second");
+    manifest_b.routes[0].action = ManifestAction::ReturnStatus;
+    manifest_b.routes[0].status_code = 202;
+
+    ModuleContext ctx_a{};
+    ModuleContext ctx_b{};
+    REQUIRE(build_module_from_manifest(manifest_a, ctx_a));
+    REQUIRE(build_module_from_manifest(manifest_b, ctx_b));
+
+    Engine engine;
+    REQUIRE(engine.init(ctx_a.module, manifest_a.upstreams, manifest_a.upstream_count));
+    REQUIRE(engine.init(ctx_b.module, manifest_b.upstreams, manifest_b.upstream_count));
+
+    const auto first_after_reinit =
+        simulate_one(engine, make_entry("GET /first HTTP/1.1\r\nHost: x\r\n\r\n", 200));
+    CHECK_EQ(first_after_reinit.verdict, Verdict::Match);
+    CHECK_EQ(first_after_reinit.actual_status, 200u);
+
+    const auto second_after_reinit =
+        simulate_one(engine, make_entry("GET /second HTTP/1.1\r\nHost: x\r\n\r\n", 202));
+    CHECK_EQ(second_after_reinit.verdict, Verdict::Match);
+    CHECK_EQ(second_after_reinit.actual_status, 202u);
+
+    engine.shutdown();
+    ctx_b.destroy();
+    ctx_a.destroy();
 }
 
 TEST(simulate_engine, param_route_matching_matrix) {

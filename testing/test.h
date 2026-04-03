@@ -238,49 +238,31 @@ inline void register_test(TestCase* tc) {
 
 // --- Test definition ---
 
-#define TEST(suite, name)                                                    \
-    static void test_##suite##_##name(rut::test::TestCase*);                 \
-    static rut::test::TestCase tc_##suite##_##name = {#suite,                \
-                                                      #name,                 \
-                                                      test_##suite##_##name, \
-                                                      nullptr,               \
-                                                      0,                     \
-                                                      0,                     \
-                                                      nullptr,               \
-                                                      0,                     \
-                                                      nullptr,               \
-                                                      false,                 \
-                                                      nullptr};              \
-    __attribute__((constructor)) static void reg_##suite##_##name() {        \
-        rut::test::register_test(&tc_##suite##_##name);                      \
-    }                                                                        \
+#define TEST(suite, name)                                                                          \
+    static void test_##suite##_##name(rut::test::TestCase*);                                       \
+    static rut::test::TestCase tc_##suite##_##name = {                                             \
+        #suite, #name, test_##suite##_##name, nullptr, 0, 0, nullptr, 0, nullptr, false, nullptr}; \
+    __attribute__((constructor)) static void reg_##suite##_##name() {                              \
+        rut::test::register_test(&tc_##suite##_##name);                                            \
+    }                                                                                              \
     static void test_##suite##_##name([[maybe_unused]] rut::test::TestCase* _tc)
 
-#define TEST_F(Suite, name)                                                          \
-    static void test_##Suite##_##name##_impl(Suite& self, rut::test::TestCase* _tc); \
-    static void test_##Suite##_##name(rut::test::TestCase* _tc);                     \
-    static rut::test::TestCase tc_##Suite##_##name = {#Suite,                        \
-                                                      #name,                         \
-                                                      test_##Suite##_##name,         \
-                                                      nullptr,                       \
-                                                      0,                             \
-                                                      0,                             \
-                                                      nullptr,                       \
-                                                      0,                             \
-                                                      nullptr,                       \
-                                                      false,                         \
-                                                      nullptr};                      \
-    __attribute__((constructor)) static void reg_##Suite##_##name() {                \
-        rut::test::register_test(&tc_##Suite##_##name);                              \
-    }                                                                                \
-    static void test_##Suite##_##name(rut::test::TestCase* _tc) {                    \
-        Suite self;                                                                  \
-        self.SetUp();                                                                \
-        if (!_tc->skipped) {                                                         \
-            test_##Suite##_##name##_impl(self, _tc);                                 \
-        }                                                                            \
-        self.TearDown();                                                             \
-    }                                                                                \
+#define TEST_F(Suite, name)                                                                        \
+    static void test_##Suite##_##name##_impl(Suite& self, rut::test::TestCase* _tc);               \
+    static void test_##Suite##_##name(rut::test::TestCase* _tc);                                   \
+    static rut::test::TestCase tc_##Suite##_##name = {                                             \
+        #Suite, #name, test_##Suite##_##name, nullptr, 0, 0, nullptr, 0, nullptr, false, nullptr}; \
+    __attribute__((constructor)) static void reg_##Suite##_##name() {                              \
+        rut::test::register_test(&tc_##Suite##_##name);                                            \
+    }                                                                                              \
+    static void test_##Suite##_##name(rut::test::TestCase* _tc) {                                  \
+        Suite self;                                                                                \
+        self.SetUp();                                                                              \
+        if (!_tc->skipped) {                                                                       \
+            test_##Suite##_##name##_impl(self, _tc);                                               \
+        }                                                                                          \
+        self.TearDown();                                                                           \
+    }                                                                                              \
     static void test_##Suite##_##name##_impl(Suite& self, [[maybe_unused]] rut::test::TestCase* _tc)
 
 // --- Filter matching ---

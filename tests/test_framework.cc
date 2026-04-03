@@ -91,6 +91,24 @@ static rut::test::TestCase make_test_case(const char* suite, const char* name) {
     return {suite, name, nullptr, nullptr, 0, 0, nullptr, 0, nullptr, false, nullptr};
 }
 
+TEST(framework, dotted_filter_with_empty_name_preserves_suite_semantics) {
+    const auto filter = rut::test::parse_filter("framework.");
+    auto suite_match = make_test_case("framework", "aliases");
+    auto suite_miss = make_test_case("math", "framework");
+
+    CHECK(filter.matches(&suite_match));
+    CHECK(!filter.matches(&suite_miss));
+}
+
+TEST(framework, dotted_filter_with_empty_suite_preserves_name_semantics) {
+    const auto filter = rut::test::parse_filter(".aliases");
+    auto name_match = make_test_case("framework", "aliases");
+    auto name_miss = make_test_case("aliases", "other");
+
+    CHECK(filter.matches(&name_match));
+    CHECK(!filter.matches(&name_miss));
+}
+
 TEST(framework, merged_filters_keep_own_storage) {
     const auto merged = rut::test::merge_filter(
         rut::test::parse_filter("math.addition"),

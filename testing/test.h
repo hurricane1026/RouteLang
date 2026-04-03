@@ -303,7 +303,7 @@ struct Filter {
         suite_filter[idx] = nullptr;
         name_filter[idx] = nullptr;
 
-        if (suite && suite_len > 0) {
+        if (suite) {
             int copy_len = suite_len < (kMaxTokenLen - 1) ? suite_len : (kMaxTokenLen - 1);
             for (int i = 0; i < copy_len; i++) suite_storage[idx][i] = suite[i];
             suite_storage[idx][copy_len] = '\0';
@@ -312,7 +312,7 @@ struct Filter {
             suite_storage[idx][0] = '\0';
         }
 
-        if (name && name_len > 0) {
+        if (name) {
             int copy_len = name_len < (kMaxTokenLen - 1) ? name_len : (kMaxTokenLen - 1);
             for (int i = 0; i < copy_len; i++) name_storage[idx][i] = name[i];
             name_storage[idx][copy_len] = '\0';

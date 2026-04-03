@@ -177,7 +177,9 @@ static bool route_matches(const Engine::CompiledRoute& route, const char* path, 
     u32 pi = 0;
     u32 ri = 0;
     while (ri < route.pattern_len) {
-        if (route.pattern[ri] == ':') {
+        const bool kParamSegment =
+            route.pattern[ri] == ':' && (ri == 0 || route.pattern[ri - 1] == '/');
+        if (kParamSegment) {
             ri++;
             while (ri < route.pattern_len && route.pattern[ri] != '/') ri++;
             const u32 param_start = pi;
@@ -510,44 +512,35 @@ bool Engine::init(const rir::Module& module,
                   const ManifestUpstream* upstream_list,
                   u32 upstreams_len) {
     if (upstreams_len > kMaxUpstreams || module.func_count > kMaxRoutes) return false;
-    route_count = 0;
-    upstream_count = upstreams_len;
-    for (u32 i = 0; i < upstreams_len; i++) upstreams[i] = upstream_list[i];
+    shutdown();
+
+    const auto fail = [this]() {
+        shutdown();
+        return false;
+    };
 
     if (!jit.init()) return false;
     auto cg = jit::codegen(module);
-    if (!cg.ok) {
-        jit.shutdown();
-        return false;
-    }
-    if (!jit.compile(cg.mod, cg.ctx)) {
-        jit.shutdown();
-        return false;
-    }
+    if (!cg.ok) return fail();
+    if (!jit.compile(cg.mod, cg.ctx)) return fail();
+
+    CompiledRoute next_routes[kMaxRoutes]{};
+    ManifestUpstream next_upstreams[kMaxUpstreams]{};
+    u32 next_route_count = 0;
+    for (u32 i = 0; i < upstreams_len; i++) next_upstreams[i] = upstream_list[i];
 
     for (u32 i = 0; i < module.func_count; i++) {
         const auto& fn = module.functions[i];
-        if (route_count >= kMaxRoutes) {
-            jit.shutdown();
-            return false;
-        }
+        if (next_route_count >= kMaxRoutes) return fail();
         char symbol[256];
         jit::format_handler_symbol(fn.name, symbol, sizeof(symbol));
 
         void* addr = jit.lookup(symbol);
-        if (!addr) {
-            jit.shutdown();
-            return false;
-        }
+        if (!addr) return fail();
 
-        if (fn.route_pattern.len >= sizeof(routes[0].pattern)) {
-            jit.shutdown();
-            route_count = 0;
-            upstream_count = 0;
-            return false;
-        }
+        if (fn.route_pattern.len >= sizeof(next_routes[0].pattern)) return fail();
 
-        auto& route = routes[route_count++];
+        auto& route = next_routes[next_route_count++];
         route.method = fn.http_method;
         route.pattern_len = fn.route_pattern.len;
         for (u32 j = 0; j < route.pattern_len; j++) route.pattern[j] = fn.route_pattern.ptr[j];
@@ -555,6 +548,10 @@ bool Engine::init(const rir::Module& module,
         route.fn = reinterpret_cast<jit::HandlerFn>(addr);
     }
 
+    for (u32 i = 0; i < next_route_count; i++) routes[i] = next_routes[i];
+    for (u32 i = 0; i < upstreams_len; i++) upstreams[i] = next_upstreams[i];
+    route_count = next_route_count;
+    upstream_count = upstreams_len;
     return true;
 }
 

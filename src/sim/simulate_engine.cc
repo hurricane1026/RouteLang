@@ -277,23 +277,29 @@ static void put_name(char* buf, u32 buf_size, u32* pos, const char* s) {
 }  // namespace
 
 bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
+    destroy();
+
     if (!arena.init(4096)) return false;
-    module.name = {"simulate_manifest", 17};
-    module.arena = &arena;
-    module.functions = arena.alloc_array<rir::Function>(func_cap == 0 ? 1 : func_cap);
-    if (!module.functions) {
+
+    rir::Module next{};
+    next.name = {"simulate_manifest", 17};
+    next.arena = &arena;
+    next.func_cap = func_cap == 0 ? 1 : func_cap;
+    next.functions = arena.alloc_array<rir::Function>(next.func_cap);
+    if (!next.functions) {
         arena.destroy();
+        module = {};
         return false;
     }
-    module.func_count = 0;
-    module.func_cap = func_cap == 0 ? 1 : func_cap;
-    module.struct_defs = arena.alloc_array<rir::StructDef*>(struct_cap == 0 ? 1 : struct_cap);
-    if (!module.struct_defs) {
+    next.struct_cap = struct_cap == 0 ? 1 : struct_cap;
+    next.struct_defs = arena.alloc_array<rir::StructDef*>(next.struct_cap);
+    if (!next.struct_defs) {
         arena.destroy();
+        module = {};
         return false;
     }
-    module.struct_count = 0;
-    module.struct_cap = struct_cap == 0 ? 1 : struct_cap;
+
+    module = next;
     return true;
 }
 
@@ -510,44 +516,34 @@ bool Engine::init(const rir::Module& module,
                   const ManifestUpstream* upstream_list,
                   u32 upstreams_len) {
     if (upstreams_len > kMaxUpstreams || module.func_count > kMaxRoutes) return false;
-    route_count = 0;
-    upstream_count = upstreams_len;
-    for (u32 i = 0; i < upstreams_len; i++) upstreams[i] = upstream_list[i];
+
+    auto fail = [this]() {
+        shutdown();
+        return false;
+    };
 
     if (!jit.init()) return false;
     auto cg = jit::codegen(module);
-    if (!cg.ok) {
-        jit.shutdown();
-        return false;
-    }
-    if (!jit.compile(cg.mod, cg.ctx)) {
-        jit.shutdown();
-        return false;
-    }
+    if (!cg.ok) return fail();
+    if (!jit.compile(cg.mod, cg.ctx)) return fail();
+
+    CompiledRoute next_routes[kMaxRoutes]{};
+    ManifestUpstream next_upstreams[kMaxUpstreams]{};
+    u32 next_route_count = 0;
+    for (u32 i = 0; i < upstreams_len; i++) next_upstreams[i] = upstream_list[i];
 
     for (u32 i = 0; i < module.func_count; i++) {
         const auto& fn = module.functions[i];
-        if (route_count >= kMaxRoutes) {
-            jit.shutdown();
-            return false;
-        }
+        if (next_route_count >= kMaxRoutes) return fail();
         char symbol[256];
         jit::format_handler_symbol(fn.name, symbol, sizeof(symbol));
 
         void* addr = jit.lookup(symbol);
-        if (!addr) {
-            jit.shutdown();
-            return false;
-        }
+        if (!addr) return fail();
 
-        if (fn.route_pattern.len >= sizeof(routes[0].pattern)) {
-            jit.shutdown();
-            route_count = 0;
-            upstream_count = 0;
-            return false;
-        }
+        if (fn.route_pattern.len >= sizeof(next_routes[0].pattern)) return fail();
 
-        auto& route = routes[route_count++];
+        auto& route = next_routes[next_route_count++];
         route.method = fn.http_method;
         route.pattern_len = fn.route_pattern.len;
         for (u32 j = 0; j < route.pattern_len; j++) route.pattern[j] = fn.route_pattern.ptr[j];
@@ -555,6 +551,10 @@ bool Engine::init(const rir::Module& module,
         route.fn = reinterpret_cast<jit::HandlerFn>(addr);
     }
 
+    for (u32 i = 0; i < next_route_count; i++) routes[i] = next_routes[i];
+    for (u32 i = 0; i < upstreams_len; i++) upstreams[i] = next_upstreams[i];
+    route_count = next_route_count;
+    upstream_count = upstreams_len;
     return true;
 }
 

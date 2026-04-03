@@ -15,7 +15,7 @@
 //       CHECK_EQ(self.value, 1);
 //   }
 //
-//   class MyFixture {
+//   struct MyFixture {
 //       int value = 1;
 //       void SetUp() {}
 //       void TearDown() {}
@@ -292,9 +292,47 @@ inline void register_test(TestCase* tc) {
 
 struct Filter {
     static constexpr int kMaxFilters = 8;
+    static constexpr int kMaxTokenLen = 128;
     const char* suite_filter[kMaxFilters];
     const char* name_filter[kMaxFilters];
+    char suite_storage[kMaxFilters][kMaxTokenLen];
+    char name_storage[kMaxFilters][kMaxTokenLen];
     int filter_count;
+
+    void clear() {
+        filter_count = 0;
+        for (int i = 0; i < kMaxFilters; i++) {
+            suite_filter[i] = nullptr;
+            name_filter[i] = nullptr;
+            suite_storage[i][0] = '\0';
+            name_storage[i][0] = '\0';
+        }
+    }
+
+    void set_filter(int idx, const char* suite, int suite_len, const char* name, int name_len) {
+        if (idx < 0 || idx >= kMaxFilters) return;
+
+        suite_filter[idx] = nullptr;
+        name_filter[idx] = nullptr;
+
+        if (suite && suite_len > 0) {
+            int copy_len = suite_len < (kMaxTokenLen - 1) ? suite_len : (kMaxTokenLen - 1);
+            for (int i = 0; i < copy_len; i++) suite_storage[idx][i] = suite[i];
+            suite_storage[idx][copy_len] = '\0';
+            suite_filter[idx] = suite_storage[idx];
+        } else {
+            suite_storage[idx][0] = '\0';
+        }
+
+        if (name && name_len > 0) {
+            int copy_len = name_len < (kMaxTokenLen - 1) ? name_len : (kMaxTokenLen - 1);
+            for (int i = 0; i < copy_len; i++) name_storage[idx][i] = name[i];
+            name_storage[idx][copy_len] = '\0';
+            name_filter[idx] = name_storage[idx];
+        } else {
+            name_storage[idx][0] = '\0';
+        }
+    }
 
     bool token_match(const char* value, const char* token) const {
         if (!value || !token) return false;
@@ -314,7 +352,6 @@ struct Filter {
         if (len == 1) return true;
 
         if (token[0] == '*' && token[len - 1] == '*') {
-            // *abc*
             char core[128];
             int n = 0;
             for (int i = 1; i + 1 < len && n < 127; i++) core[n++] = token[i];
@@ -323,7 +360,6 @@ struct Filter {
         }
 
         if (token[0] == '*') {
-            // *abc
             int suffix_len = 0;
             while (token[1 + suffix_len]) suffix_len++;
             int vlen = 0;
@@ -336,12 +372,11 @@ struct Filter {
         }
 
         if (token[len - 1] == '*') {
-            // abc*
             for (int i = 0; i < len - 1; i++) {
                 if (token[i] != value[i]) return false;
                 if (value[i] == '\0') return false;
             }
-            return value[len - 1] != '\0';
+            return true;
         }
 
         return str_contains(value, token);
@@ -365,49 +400,30 @@ struct Filter {
 
 inline Filter parse_filter(const char* arg) {
     Filter filter;
-    filter.filter_count = 0;
+    filter.clear();
     if (!arg || !arg[0]) return filter;
 
-    // "a,b,c" as allow-list.
-    static char token_storage[Filter::kMaxFilters][128];
     int token_count = 0;
-
     int start = 0;
     for (int i = 0;; i++) {
         if (arg[i] == ',' || arg[i] == '\0') {
             if (token_count >= Filter::kMaxFilters) break;
 
-            int len = i - start;
-            if (len > 127) len = 127;
+            const int len = i - start;
             if (len > 0) {
-                for (int j = 0; j < len; j++) token_storage[token_count][j] = arg[start + j];
-                token_storage[token_count][len] = '\0';
-
                 int split = -1;
-                for (int k = 0; token_storage[token_count][k]; k++) {
-                    if (token_storage[token_count][k] == '.') {
+                for (int k = 0; k < len; k++) {
+                    if (arg[start + k] == '.') {
                         split = k;
                         break;
                     }
                 }
 
                 if (split >= 0) {
-                    static char suite_storage[Filter::kMaxFilters][128];
-                    static char name_storage[Filter::kMaxFilters][128];
-                    int si = 0;
-                    for (; si < split && si < 127; si++)
-                        suite_storage[token_count][si] = token_storage[token_count][si];
-                    suite_storage[token_count][si] = '\0';
-                    int ni = 0;
-                    for (int k = split + 1; token_storage[token_count][k] && ni < 127; k++) {
-                        name_storage[token_count][ni++] = token_storage[token_count][k];
-                    }
-                    name_storage[token_count][ni] = '\0';
-                    filter.suite_filter[token_count] = suite_storage[token_count];
-                    filter.name_filter[token_count] = name_storage[token_count];
+                    filter.set_filter(
+                        token_count, arg + start, split, arg + start + split + 1, len - split - 1);
                 } else {
-                    filter.suite_filter[token_count] = nullptr;
-                    filter.name_filter[token_count] = token_storage[token_count];
+                    filter.set_filter(token_count, nullptr, 0, arg + start, len);
                 }
 
                 filter.filter_count++;
@@ -422,23 +438,24 @@ inline Filter parse_filter(const char* arg) {
 }
 
 inline Filter merge_filter(const Filter& a, const Filter& b) {
-    Filter merged = a;
-    if (merged.filter_count == 0) {
-        return b;
-    }
-    if (b.filter_count == 0) {
-        return a;
-    }
+    Filter merged;
+    merged.clear();
 
-    for (int i = 0; i < b.filter_count && merged.filter_count < Filter::kMaxFilters; i++) {
-        merged.suite_filter[merged.filter_count] = b.suite_filter[i];
-        merged.name_filter[merged.filter_count] = b.name_filter[i];
-        merged.filter_count++;
+    for (int src = 0; src < 2; src++) {
+        const Filter& cur = src == 0 ? a : b;
+        for (int i = 0; i < cur.filter_count && merged.filter_count < Filter::kMaxFilters; i++) {
+            const char* sf = cur.suite_filter[i];
+            const char* nf = cur.name_filter[i];
+            int slen = 0;
+            int nlen = 0;
+            while (sf && sf[slen]) slen++;
+            while (nf && nf[nlen]) nlen++;
+            merged.set_filter(merged.filter_count, sf, slen, nf, nlen);
+            merged.filter_count++;
+        }
     }
     return merged;
 }
-
-// --- Runner ---
 
 inline int run_all(int argc = 0, char** argv = nullptr) {
     // Parse args

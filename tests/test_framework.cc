@@ -53,6 +53,37 @@ TEST(framework, DISABLED_skip_by_name) {
     CHECK(false);
 }
 
+TEST(framework, wildcard_prefix_filter_matches_exact_prefix) {
+    rut::test::Filter filter{};
+    filter.clear();
+    CHECK(filter.token_match("abc", "abc*"));
+    CHECK(filter.token_match("abcd", "abc*"));
+    CHECK(!filter.token_match("ab", "abc*"));
+}
+
+static rut::test::TestCase make_test_case(const char* suite, const char* name) {
+    return {suite, name, nullptr, nullptr, 0, 0, nullptr, 0, nullptr, false, nullptr, false};
+}
+
+TEST(framework, merged_filters_keep_own_storage) {
+    const auto merged = rut::test::merge_filter(
+        rut::test::parse_filter("math.addition"),
+        rut::test::merge_filter(rut::test::parse_filter("framework.aliases"),
+                                rut::test::parse_filter("math.mul*")));
+    const auto overwritten = rut::test::parse_filter("other.value,another.case");
+
+    auto addition = make_test_case("math", "addition");
+    auto aliases = make_test_case("framework", "aliases");
+    auto multiplication = make_test_case("math", "multiplication");
+    auto miss = make_test_case("framework", "check_pass");
+
+    CHECK_EQ(overwritten.filter_count, 2);
+    CHECK(merged.matches(&addition));
+    CHECK(merged.matches(&aliases));
+    CHECK(merged.matches(&multiplication));
+    CHECK(!merged.matches(&miss));
+}
+
 TEST(math, addition) {
     CHECK_EQ(1 + 1, 2);
     CHECK_EQ(0 + 0, 0);

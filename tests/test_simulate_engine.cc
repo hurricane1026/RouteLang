@@ -464,6 +464,30 @@ TEST(simulate_engine, module_context_destroy_resets_state) {
     CHECK_EQ(ctx.module.arena, nullptr);
 }
 
+TEST(simulate_engine, module_context_init_clears_stale_state_before_reuse) {
+    ModuleContext ctx{};
+    ctx.module.name = {"stale", 5};
+    ctx.module.arena = reinterpret_cast<MmapArena*>(1);
+    ctx.module.functions = reinterpret_cast<rir::Function*>(1);
+    ctx.module.func_count = 99;
+    ctx.module.func_cap = 99;
+    ctx.module.struct_defs = reinterpret_cast<rir::StructDef**>(1);
+    ctx.module.struct_count = 88;
+    ctx.module.struct_cap = 88;
+
+    REQUIRE(ctx.init(2, 3));
+    CHECK_EQ(ctx.module.name.len, 17u);
+    CHECK(ctx.module.arena == &ctx.arena);
+    CHECK(ctx.module.functions != nullptr);
+    CHECK_EQ(ctx.module.func_count, 0u);
+    CHECK_EQ(ctx.module.func_cap, 2u);
+    CHECK(ctx.module.struct_defs != nullptr);
+    CHECK_EQ(ctx.module.struct_count, 0u);
+    CHECK_EQ(ctx.module.struct_cap, 3u);
+
+    ctx.destroy();
+}
+
 TEST(simulate_engine, build_module_rejects_invalid_route_count_without_init) {
     Manifest manifest{};
     manifest.route_count = Manifest::kMaxRoutes + 1;
@@ -520,6 +544,8 @@ TEST(simulate_engine, engine_init_rejects_overlong_compiled_route_patterns) {
     ctx.module.functions[0].route_pattern = arena_copy(ctx.arena, pattern, 128);
 
     Engine engine;
+    engine.route_count = 7;
+    engine.upstream_count = 5;
     CHECK(!engine.init(ctx.module, manifest.upstreams, manifest.upstream_count));
     CHECK_EQ(engine.route_count, 0u);
     CHECK_EQ(engine.upstream_count, 0u);

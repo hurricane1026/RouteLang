@@ -200,6 +200,7 @@ add_test(NAME test_sim COMMAND test_sim)
 set_tests_properties(test_sim PROPERTIES LABELS "integration;sim")
 
 add_executable(test_simulate_engine test_simulate_engine.cc)
+add_dependencies(test_simulate_engine rut-simulate)
 target_link_libraries(test_simulate_engine rue_simulate)
 target_include_directories(test_simulate_engine PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -232,6 +233,6 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_traffic_replay>
     COMMAND $<TARGET_FILE:test_sim>
     COMMAND $<TARGET_FILE:test_simulate_engine>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_drain test_access_log test_metrics test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim test_simulate_engine
+    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_drain test_access_log test_metrics test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine
     COMMENT "Running all tests..."
 )

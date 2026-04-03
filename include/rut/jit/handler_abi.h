@@ -103,7 +103,7 @@ struct HandlerCtx {
     T load_slot(u32 idx) const {
         static_assert(sizeof(T) <= 8, "Slot values must be <= 8 bytes");
         T val{};
-        const u8* src = slots() + idx * 8;
+        const u8* src = slots() + static_cast<size_t>(idx) * 8;
         __builtin_memcpy(&val, src, sizeof(T));
         return val;
     }
@@ -111,7 +111,7 @@ struct HandlerCtx {
     template <typename T>
     void store_slot(u32 idx, T val) {
         static_assert(sizeof(T) <= 8, "Slot values must be <= 8 bytes");
-        u8* dst = slots() + idx * 8;
+        u8* dst = slots() + static_cast<size_t>(idx) * 8;
         u64 zero = 0;
         __builtin_memcpy(dst, &zero, 8);
         __builtin_memcpy(dst, &val, sizeof(T));

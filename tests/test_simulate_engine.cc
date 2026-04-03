@@ -989,6 +989,20 @@ TEST(simulate_engine, read_all_fd_accepts_zero_capacity_buffer) {
     close(pipefd[0]);
 }
 
+TEST(simulate_engine, read_all_fd_preserves_terminator_for_exact_fit) {
+    i32 pipefd[2];
+    REQUIRE(pipe(pipefd) == 0);
+    REQUIRE(write(pipefd[1], "abcd", 4) == 4);
+    close(pipefd[1]);
+
+    char buf[5];
+    u32 out_len = 0;
+    REQUIRE(read_all_fd(pipefd[0], buf, sizeof(buf), &out_len));
+    CHECK_EQ(out_len, 4u);
+    CHECK_STREQ(buf, "abcd");
+    close(pipefd[0]);
+}
+
 TEST(simulate_engine, read_pipes_interleaved_fails_on_poll_error_event) {
     i32 out_pipe[2];
     i32 err_pipe[2];
@@ -1013,6 +1027,38 @@ TEST(simulate_engine, read_pipes_interleaved_fails_on_poll_error_event) {
 
     close(err_pipe[0]);
     close(err_pipe[1]);
+}
+
+TEST(simulate_engine, read_pipes_interleaved_collects_both_streams) {
+    i32 out_pipe[2];
+    i32 err_pipe[2];
+    REQUIRE(pipe(out_pipe) == 0);
+    REQUIRE(pipe(err_pipe) == 0);
+
+    REQUIRE(write(out_pipe[1], "stdout-data", 11) == 11);
+    REQUIRE(write(err_pipe[1], "stderr-data", 11) == 11);
+    close(out_pipe[1]);
+    close(err_pipe[1]);
+
+    char stdout_buf[32];
+    char stderr_buf[32];
+    u32 stdout_len = 0;
+    u32 stderr_len = 0;
+    REQUIRE(read_pipes_interleaved(out_pipe[0],
+                                   stdout_buf,
+                                   sizeof(stdout_buf),
+                                   &stdout_len,
+                                   err_pipe[0],
+                                   stderr_buf,
+                                   sizeof(stderr_buf),
+                                   &stderr_len));
+    CHECK_EQ(stdout_len, 11u);
+    CHECK_EQ(stderr_len, 11u);
+    CHECK_STREQ(stdout_buf, "stdout-data");
+    CHECK_STREQ(stderr_buf, "stderr-data");
+
+    close(out_pipe[0]);
+    close(err_pipe[0]);
 }
 
 TEST(simulate_engine, cli_usage_mentions_param_prefix_matching) {

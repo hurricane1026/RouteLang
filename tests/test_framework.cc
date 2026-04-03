@@ -61,6 +61,16 @@ TEST(framework, wildcard_prefix_filter_matches_exact_prefix) {
     CHECK(!filter.token_match("ab", "abc*"));
 }
 
+TEST(framework, wildcard_suffix_and_wrapped_match_expected_shapes) {
+    rut::test::Filter filter{};
+    filter.clear();
+    CHECK(filter.token_match("alphabet", "*bet"));
+    CHECK(!filter.token_match("alpha", "*bet"));
+    CHECK(filter.token_match("alphabet", "*pha*"));
+    CHECK(filter.token_match("pha", "*pha*"));
+    CHECK(!filter.token_match("zzz", "*pha*"));
+}
+
 TEST(framework, wildcard_with_middle_star_is_rejected) {
     rut::test::Filter filter{};
     filter.clear();
@@ -73,6 +83,8 @@ TEST(framework, wildcard_with_extra_edge_stars_is_rejected) {
     filter.clear();
     CHECK(!filter.token_match("abc", "*abc**"));
     CHECK(!filter.token_match("abc", "**abc*"));
+    CHECK(!filter.token_match("abc", "***"));
+    CHECK(!filter.token_match("alphabet", "*pha**"));
 }
 
 static rut::test::TestCase make_test_case(const char* suite, const char* name) {
@@ -108,6 +120,21 @@ TEST(framework, copied_filter_rebinds_internal_storage) {
     auto miss = make_test_case("framework", "check_pass");
 
     CHECK_EQ(overwritten.filter_count, 1);
+    CHECK(copied.matches(&aliases));
+    CHECK(copied.matches(&multiplication));
+    CHECK(!copied.matches(&miss));
+}
+
+TEST(framework, copy_constructed_filter_rebinds_internal_storage) {
+    const auto parsed = rut::test::parse_filter("framework.aliases,*lication");
+    const rut::test::Filter copied(parsed);
+    const auto overwritten = rut::test::parse_filter("other.value,third.case");
+
+    auto aliases = make_test_case("framework", "aliases");
+    auto multiplication = make_test_case("math", "multiplication");
+    auto miss = make_test_case("framework", "check_pass");
+
+    CHECK_EQ(overwritten.filter_count, 2);
     CHECK(copied.matches(&aliases));
     CHECK(copied.matches(&multiplication));
     CHECK(!copied.matches(&miss));

@@ -269,7 +269,8 @@ TEST(drain_callback, close_after_drain_response_sent) {
 TEST_F(DrainProxyF, upstream_response_rewrites_connection_header) {
     REQUIRE(self.wire_proxy());
     inject_custom_upstream_resp(
-        self.loop, *self.c,
+        self.loop,
+        *self.c,
         "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK");
     CHECK(buf_contains(self.c->upstream_recv_buf, "Connection: clo"));
 }
@@ -277,7 +278,8 @@ TEST_F(DrainProxyF, upstream_response_rewrites_connection_header) {
 TEST_F(DrainProxyF, upstream_response_rewrites_lowercase_connection_header) {
     REQUIRE(self.wire_proxy());
     inject_custom_upstream_resp(
-        self.loop, *self.c,
+        self.loop,
+        *self.c,
         "HTTP/1.1 200 OK\r\nconnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK");
     CHECK(buf_contains(self.c->upstream_recv_buf, "connection: close"));
 }
@@ -285,8 +287,7 @@ TEST_F(DrainProxyF, upstream_response_rewrites_lowercase_connection_header) {
 TEST_F(DrainProxyF, upstream_response_injects_close_when_missing) {
     REQUIRE(self.wire_proxy());
     inject_custom_upstream_resp(
-        self.loop, *self.c,
-        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+        self.loop, *self.c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
     CHECK(!self.c->keep_alive);
 }
 
@@ -309,8 +310,7 @@ TEST(drain_proxy, upstream_status_parsed) {
         make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
 
     inject_custom_upstream_resp(
-        loop, *c,
-        "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found");
+        loop, *c, "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found");
     CHECK_EQ(c->resp_status, static_cast<rut::u16>(404));
 }
 

@@ -271,9 +271,10 @@ TEST_F(MetricsLoopF, requests_active_unchanged_on_wrong_event) {
 
 TEST_F(MetricsLoopF, upstream_connect_success) {
     REQUIRE(self.wire_proxy());
+    u32 sends_before = self.loop.backend.count_ops(MockOp::Send);
     self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamConnect, 0));
     CHECK_EQ(self.c->state, ConnState::Proxying);
-    CHECK(self.loop.backend.count_ops(MockOp::Send) > 0);
+    CHECK(self.loop.backend.count_ops(MockOp::Send) > sends_before);
 }
 
 TEST_F(MetricsLoopF, upstream_connect_fail_502) {
@@ -293,10 +294,11 @@ TEST_F(MetricsLoopF, upstream_connect_wrong_event_ignored) {
 TEST_F(MetricsLoopF, upstream_request_sent_success) {
     REQUIRE(self.wire_proxy());
     self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamConnect, 0));
+    u32 recvs_before = self.loop.backend.count_ops(MockOp::Recv);
     u32 req_len = self.c->recv_buf.len();
     self.loop.inject_and_dispatch(
         make_ev(self.cid, IoEventType::UpstreamSend, static_cast<i32>(req_len)));
-    CHECK(self.loop.backend.count_ops(MockOp::Recv) > 0);
+    CHECK(self.loop.backend.count_ops(MockOp::Recv) > recvs_before);
 }
 
 TEST_F(MetricsLoopF, upstream_request_sent_error) {

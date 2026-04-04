@@ -35,6 +35,8 @@ static void inject_custom_upstream_resp(SmallLoop& loop, Connection& c, const ch
     c.upstream_recv_buf.reset();
     rut::u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
+    rut::u32 avail = c.upstream_recv_buf.write_avail();
+    if (resp_len > avail) resp_len = avail;
     rut::u8* dst = c.upstream_recv_buf.write_ptr();
     for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
     c.upstream_recv_buf.commit(resp_len);
@@ -55,7 +57,6 @@ struct DrainProxyF {
     SmallLoop loop;
     Connection* c = nullptr;
     rut::u32 cid = 0;
-    bool ok = false;
 
     void SetUp() {
         loop.setup();
@@ -272,7 +273,7 @@ TEST_F(DrainProxyF, upstream_response_rewrites_connection_header) {
         self.loop,
         *self.c,
         "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK");
-    CHECK(buf_contains(self.c->upstream_recv_buf, "Connection: clo"));
+    CHECK(buf_contains(self.c->upstream_recv_buf, "Connection: close"));
 }
 
 TEST_F(DrainProxyF, upstream_response_rewrites_lowercase_connection_header) {

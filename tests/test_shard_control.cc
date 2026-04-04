@@ -1059,11 +1059,10 @@ TEST_F(ShardF, capture_shutdown_cleans_up) {
     REQUIRE(self.ok);
     self.shard.enable_capture();
     CHECK(self.shard.capture_ring != nullptr);
-    // TearDown calls shutdown(), which should clean up capture_ring.
-    // Manually call to verify the behavior, then mark as already shut down.
+    // Manually call to verify the behavior, then avoid a double-close of
+    // the listen fd during fixture cleanup by invalidating it here.
     self.shard.shutdown();
     CHECK(self.shard.capture_ring == nullptr);
-    // Prevent double shutdown in TearDown by closing lfd here.
     close(self.lfd);
     self.lfd = -1;
 }

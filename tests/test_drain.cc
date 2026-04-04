@@ -4,6 +4,82 @@
 #include "test.h"
 #include "test_helpers.h"
 
+// ============================================================
+// Helpers
+// ============================================================
+
+// Search for a substring in a Buffer's data.
+static bool buf_contains(const Buffer& buf, const char* needle) {
+    const char* data = reinterpret_cast<const char*>(buf.data());
+    rut::u32 len = buf.len();
+    rut::u32 nlen = 0;
+    while (needle[nlen]) nlen++;
+    if (nlen == 0 || nlen > len) return false;
+    for (rut::u32 i = 0; i + nlen <= len; i++) {
+        bool match = true;
+        for (rut::u32 j = 0; j < nlen; j++) {
+            if (data[i + j] != needle[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+// Write an HTTP response string into conn's upstream_recv_buf and dispatch
+// the UpstreamRecv event. Unlike inject_upstream_response() in test_helpers.h,
+// this takes an arbitrary response string (for testing header rewriting).
+static void inject_custom_upstream_resp(SmallLoop& loop, Connection& c, const char* resp) {
+    c.upstream_recv_buf.reset();
+    rut::u32 resp_len = 0;
+    while (resp[resp_len]) resp_len++;
+    rut::u8* dst = c.upstream_recv_buf.write_ptr();
+    for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
+    c.upstream_recv_buf.commit(resp_len);
+
+    IoEvent ev = make_ev(c.id, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    rut::u32 n = loop.backend.wait(events, 8);
+    for (rut::u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+}
+
+// ============================================================
+// Fixture: SmallLoop wired for drain + proxy
+// ============================================================
+
+// Covers: accept → recv → proxy wire → connect → forward request.
+struct DrainProxyF {
+    SmallLoop loop;
+    Connection* c = nullptr;
+    rut::u32 cid = 0;
+    bool ok = false;
+
+    void SetUp() {
+        loop.setup();
+        loop.draining = true;
+    }
+    void TearDown() {}
+
+    // Wire the proxy path. Returns false if accept/recv failed.
+    bool wire_proxy() {
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        c = loop.find_fd(42);
+        if (!c) return false;
+        cid = c->id;
+        loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+        c->upstream_fd = 99;
+        c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+        loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
+        rut::u32 req_len = c->recv_buf.len();
+        loop.inject_and_dispatch(
+            make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
+        return true;
+    }
+};
+
 // === DrainConfig defaults ===
 
 TEST(drain_config, defaults) {
@@ -141,41 +217,21 @@ TEST(drain_callback, response_has_connection_close) {
     loop.setup();
     loop.draining = true;
 
-    // Accept a connection
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-
-    // The accept should have set keep_alive = false since draining
-    // Note: SmallLoop::dispatch doesn't check draining for accept (it's manual),
-    // but callbacks check loop->is_draining() on header received.
     loop.backend.clear_ops();
 
-    // Simulate recv (header received)
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
 
-    // Connection should be marked for close
     CHECK(!c->keep_alive);
     CHECK_EQ(c->state, ConnState::Sending);
-
-    // Verify send_buf contains "close" (from "Connection: close")
-    const char* data = reinterpret_cast<const char*>(c->send_buf.data());
-    rut::u32 len = c->send_buf.len();
-    bool found_close = false;
-    for (rut::u32 i = 0; i + 5 <= len; i++) {
-        if (data[i] == 'c' && data[i + 1] == 'l' && data[i + 2] == 'o' && data[i + 3] == 's' &&
-            data[i + 4] == 'e') {
-            found_close = true;
-            break;
-        }
-    }
-    CHECK(found_close);
+    CHECK(buf_contains(c->send_buf, "close"));
 }
 
 TEST(drain_callback, non_drain_response_has_keep_alive) {
     SmallLoop loop;
     loop.setup();
-    // Not draining — default
 
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
@@ -185,18 +241,7 @@ TEST(drain_callback, non_drain_response_has_keep_alive) {
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
 
     CHECK(c->keep_alive);
-
-    // Verify send_buf contains "keep-alive"
-    const char* data = reinterpret_cast<const char*>(c->send_buf.data());
-    rut::u32 len = c->send_buf.len();
-    bool found_ka = false;
-    for (rut::u32 i = 0; i + 10 <= len; i++) {
-        if (data[i] == 'k' && data[i + 1] == 'e' && data[i + 2] == 'e' && data[i + 3] == 'p') {
-            found_ka = true;
-            break;
-        }
-    }
-    CHECK(found_ka);
+    CHECK(buf_contains(c->send_buf, "keep-alive"));
 }
 
 TEST(drain_callback, close_after_drain_response_sent) {
@@ -221,147 +266,32 @@ TEST(drain_callback, close_after_drain_response_sent) {
 
 // === Proxy drain: upstream response rewrite ===
 
-TEST(drain_proxy, upstream_response_rewrites_connection_header) {
-    SmallLoop loop;
-    loop.setup();
-    loop.draining = true;
-
-    // Accept + recv + set up proxy path
-    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
-    auto* c = loop.find_fd(42);
-    REQUIRE(c != nullptr);
-    rut::u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-
-    // Wire to proxy: upstream connect
-    c->upstream_fd = 99;
-    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    // Forward request to upstream
-    rut::u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(
-        make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
-
-    // Now inject upstream response with Connection: keep-alive header
-    // Manually write HTTP response into upstream_recv_buf
-    c->upstream_recv_buf.reset();
-    const char* resp = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK";
-    rut::u32 resp_len = 0;
-    while (resp[resp_len]) resp_len++;
-    rut::u8* dst = c->upstream_recv_buf.write_ptr();
-    for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
-    c->upstream_recv_buf.commit(resp_len);
-
-    // Inject the recv event manually (bypass inject_and_dispatch mock data fill)
-    IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
-    loop.backend.inject(ev);
-    IoEvent events[8];
-    rut::u32 n = loop.backend.wait(events, 8);
-    for (rut::u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-
-    // The Connection header should have been rewritten to "close" in upstream_recv_buf
-    const char* data = reinterpret_cast<const char*>(c->upstream_recv_buf.data());
-    rut::u32 len = c->upstream_recv_buf.len();
-    bool found_close = false;
-    for (rut::u32 i = 0; i + 15 <= len; i++) {
-        if (data[i] == 'C' && data[i + 1] == 'o' && data[i + 2] == 'n' && data[i + 3] == 'n' &&
-            data[i + 4] == 'e' && data[i + 5] == 'c' && data[i + 6] == 't' && data[i + 7] == 'i' &&
-            data[i + 8] == 'o' && data[i + 9] == 'n' && data[i + 10] == ':' &&
-            data[i + 11] == ' ' && data[i + 12] == 'c' && data[i + 13] == 'l' &&
-            data[i + 14] == 'o') {
-            found_close = true;
-            break;
-        }
-    }
-    CHECK(found_close);
+TEST_F(DrainProxyF, upstream_response_rewrites_connection_header) {
+    REQUIRE(self.wire_proxy());
+    inject_custom_upstream_resp(
+        self.loop, *self.c,
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK");
+    CHECK(buf_contains(self.c->upstream_recv_buf, "Connection: clo"));
 }
 
-TEST(drain_proxy, upstream_response_rewrites_lowercase_connection_header) {
-    SmallLoop loop;
-    loop.setup();
-    loop.draining = true;
-
-    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
-    auto* c = loop.find_fd(42);
-    REQUIRE(c != nullptr);
-    rut::u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-
-    c->upstream_fd = 99;
-    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    rut::u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(
-        make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
-
-    c->upstream_recv_buf.reset();
-    const char* resp = "HTTP/1.1 200 OK\r\nconnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK";
-    rut::u32 resp_len = 0;
-    while (resp[resp_len]) resp_len++;
-    rut::u8* dst = c->upstream_recv_buf.write_ptr();
-    for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
-    c->upstream_recv_buf.commit(resp_len);
-
-    IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
-    loop.backend.inject(ev);
-    IoEvent events[8];
-    rut::u32 n = loop.backend.wait(events, 8);
-    for (rut::u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-
-    const char* data = reinterpret_cast<const char*>(c->upstream_recv_buf.data());
-    bool found_close = false;
-    for (rut::u32 i = 0; i + 18 <= c->upstream_recv_buf.len(); i++) {
-        if (data[i] == 'c' && data[i + 1] == 'o' && data[i + 2] == 'n' && data[i + 3] == 'n' &&
-            data[i + 4] == 'e' && data[i + 5] == 'c' && data[i + 6] == 't' && data[i + 7] == 'i' &&
-            data[i + 8] == 'o' && data[i + 9] == 'n' && data[i + 10] == ':' &&
-            data[i + 11] == ' ' && data[i + 12] == 'c' && data[i + 13] == 'l' &&
-            data[i + 14] == 'o' && data[i + 15] == 's' && data[i + 16] == 'e') {
-            found_close = true;
-            break;
-        }
-    }
-    CHECK(found_close);
+TEST_F(DrainProxyF, upstream_response_rewrites_lowercase_connection_header) {
+    REQUIRE(self.wire_proxy());
+    inject_custom_upstream_resp(
+        self.loop, *self.c,
+        "HTTP/1.1 200 OK\r\nconnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK");
+    CHECK(buf_contains(self.c->upstream_recv_buf, "connection: close"));
 }
 
-TEST(drain_proxy, upstream_response_injects_close_when_missing) {
-    SmallLoop loop;
-    loop.setup();
-    loop.draining = true;
-
-    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
-    auto* c = loop.find_fd(42);
-    REQUIRE(c != nullptr);
-    rut::u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-
-    c->upstream_fd = 99;
-    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    rut::u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(
-        make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
-
-    // Upstream response WITHOUT Connection header
-    c->upstream_recv_buf.reset();
-    const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-    rut::u32 resp_len = 0;
-    while (resp[resp_len]) resp_len++;
-    rut::u8* dst = c->upstream_recv_buf.write_ptr();
-    for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
-    c->upstream_recv_buf.commit(resp_len);
-
-    IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
-    loop.backend.inject(ev);
-    IoEvent events[8];
-    rut::u32 n = loop.backend.wait(events, 8);
-    for (rut::u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-
-    // Should have been routed through send_buf with Connection: close injected
-    // The on_send should now be on_response_sent (rebuilt in send_buf path)
-    CHECK(!c->keep_alive);
+TEST_F(DrainProxyF, upstream_response_injects_close_when_missing) {
+    REQUIRE(self.wire_proxy());
+    inject_custom_upstream_resp(
+        self.loop, *self.c,
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+    CHECK(!self.c->keep_alive);
 }
 
 TEST(drain_proxy, upstream_status_parsed) {
+    // Non-draining proxy — tests status code parsing only.
     SmallLoop loop;
     loop.setup();
 
@@ -378,21 +308,9 @@ TEST(drain_proxy, upstream_status_parsed) {
     loop.inject_and_dispatch(
         make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
 
-    // Upstream 404 response
-    c->upstream_recv_buf.reset();
-    const char* resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
-    rut::u32 resp_len = 0;
-    while (resp[resp_len]) resp_len++;
-    rut::u8* dst = c->upstream_recv_buf.write_ptr();
-    for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
-    c->upstream_recv_buf.commit(resp_len);
-
-    IoEvent ev = make_ev(cid, IoEventType::UpstreamRecv, static_cast<rut::i32>(resp_len));
-    loop.backend.inject(ev);
-    IoEvent events[8];
-    rut::u32 n = loop.backend.wait(events, 8);
-    for (rut::u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-
+    inject_custom_upstream_resp(
+        loop, *c,
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found");
     CHECK_EQ(c->resp_status, static_cast<rut::u16>(404));
 }
 

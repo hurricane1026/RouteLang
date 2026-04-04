@@ -170,27 +170,65 @@ TEST(aggregate, empty) {
     CHECK_EQ(agg.connections_total, 0u);
 }
 
-// === Callback integration ===
+// === Callback + proxy integration ===
 
-TEST(callback_metrics, records_on_response) {
+// Fixture: SmallLoop with ShardMetrics wired. Provides helpers for
+// proxy setup at various stages.
+struct MetricsLoopF {
     SmallLoop loop;
-    loop.setup();
-
     ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
+    Connection* c = nullptr;
+    u32 cid = 0;
 
-    // Accept → recv → send
-    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
-    auto* c = loop.find_fd(42);
-    REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    u32 send_len = c->send_buf.len();
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(send_len)));
+    void SetUp() {
+        loop.setup();
+        m.init();
+        loop.metrics = &m;
+    }
+    void TearDown() {}
 
-    CHECK_EQ(m.requests_total, 1u);
-    CHECK_EQ(m.request_latency.count, 1u);
-    CHECK(m.request_latency.sum_us < 1000000u);  // < 1 second
+    // Accept fd=42, recv header → connection ready for response or proxy.
+    bool accept_and_recv() {
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        c = loop.find_fd(42);
+        if (!c) return false;
+        cid = c->id;
+        loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+        return true;
+    }
+
+    // accept_and_recv + wire proxy + upstream connect.
+    bool wire_proxy() {
+        if (!accept_and_recv()) return false;
+        c->upstream_fd = 99;
+        c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+        return true;
+    }
+
+    // wire_proxy + upstream connect success + forward request → ready for upstream response.
+    bool advance_to_upstream_response() {
+        if (!wire_proxy()) return false;
+        loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
+        u32 req_len = c->recv_buf.len();
+        loop.inject_and_dispatch(
+            make_ev(cid, IoEventType::UpstreamSend, static_cast<i32>(req_len)));
+        return true;
+    }
+
+    // Complete a direct (non-proxy) request cycle: accept → recv → send.
+    bool complete_direct_request() {
+        if (!accept_and_recv()) return false;
+        u32 send_len = c->send_buf.len();
+        loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(send_len)));
+        return true;
+    }
+};
+
+TEST_F(MetricsLoopF, records_on_response) {
+    REQUIRE(self.complete_direct_request());
+    CHECK_EQ(self.m.requests_total, 1u);
+    CHECK_EQ(self.m.request_latency.count, 1u);
+    CHECK(self.m.request_latency.sum_us < 1000000u);
 }
 
 TEST(callback_metrics, no_crash_without_metrics) {
@@ -207,339 +245,156 @@ TEST(callback_metrics, no_crash_without_metrics) {
     CHECK(true);  // no crash
 }
 
-TEST(callback_metrics, requests_active_decremented_on_send_error) {
-    SmallLoop loop;
-    loop.setup();
-    ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
-
-    // Accept → recv (starts request) → send error (close_conn should decrement)
-    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
-    auto* c = loop.find_fd(42);
-    REQUIRE(c != nullptr);
-    u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-    CHECK_EQ(m.requests_active, 1u);
-
-    // Send error: ev.result < 0
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -1));
-    CHECK_EQ(m.requests_active, 0u);  // decremented by close_conn_impl
+TEST_F(MetricsLoopF, requests_active_decremented_on_send_error) {
+    REQUIRE(self.accept_and_recv());
+    CHECK_EQ(self.m.requests_active, 1u);
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, -1));
+    CHECK_EQ(self.m.requests_active, 0u);
 }
 
-TEST(callback_metrics, requests_active_decremented_on_partial_send) {
-    SmallLoop loop;
-    loop.setup();
-    ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
-
-    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
-    auto* c = loop.find_fd(42);
-    REQUIRE(c != nullptr);
-    u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-    CHECK_EQ(m.requests_active, 1u);
-
-    // Partial send: result != send_buf.len()
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));
-    CHECK_EQ(m.requests_active, 0u);
+TEST_F(MetricsLoopF, requests_active_decremented_on_partial_send) {
+    REQUIRE(self.accept_and_recv());
+    CHECK_EQ(self.m.requests_active, 1u);
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, 1));
+    CHECK_EQ(self.m.requests_active, 0u);
 }
 
-TEST(callback_metrics, requests_active_decremented_on_wrong_event) {
-    SmallLoop loop;
-    loop.setup();
-    ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
-
-    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
-    auto* c = loop.find_fd(42);
-    REQUIRE(c != nullptr);
-    u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-    CHECK_EQ(m.requests_active, 1u);
-
-    // With slot dispatch, misrouted events are ignored (null slot).
+TEST_F(MetricsLoopF, requests_active_unchanged_on_wrong_event) {
+    REQUIRE(self.accept_and_recv());
+    CHECK_EQ(self.m.requests_active, 1u);
     // UpstreamConnect → on_upstream_send (null) → ignored, conn stays alive.
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    CHECK_EQ(m.requests_active, 1u);  // still active
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamConnect, 0));
+    CHECK_EQ(self.m.requests_active, 1u);
 }
 
 // === Proxy callback tests ===
 
-// Helper: set up a connection in proxy state, ready for on_upstream_connected
-static void setup_proxy_conn(SmallLoop& loop, Connection*& c, u32& cid) {
-    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
-    c = loop.find_fd(42);
-    cid = c->id;
-    // Simulate recv to start request timing
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-    // Now manually set up for proxy: wire to upstream_connected callback
-    c->upstream_fd = 99;
-    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+TEST_F(MetricsLoopF, upstream_connect_success) {
+    REQUIRE(self.wire_proxy());
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamConnect, 0));
+    CHECK_EQ(self.c->state, ConnState::Proxying);
+    CHECK(self.loop.backend.count_ops(MockOp::Send) > 0);
 }
 
-TEST(proxy_callback, upstream_connect_success) {
-    SmallLoop loop;
-    loop.setup();
-    ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    setup_proxy_conn(loop, c, cid);
-
-    // Upstream connect succeeds → should forward request to upstream
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    CHECK_EQ(c->state, ConnState::Proxying);
-    // Should have submitted a send to upstream
-    CHECK(loop.backend.count_ops(MockOp::Send) > 0);
+TEST_F(MetricsLoopF, upstream_connect_fail_502) {
+    REQUIRE(self.wire_proxy());
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamConnect, -1));
+    CHECK_EQ(self.c->resp_status, static_cast<u16>(502));
+    CHECK(!self.c->keep_alive);
 }
 
-TEST(proxy_callback, upstream_connect_fail_502) {
-    SmallLoop loop;
-    loop.setup();
-    ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    setup_proxy_conn(loop, c, cid);
-
-    // Upstream connect fails → should send 502
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, -1));
-    CHECK_EQ(c->resp_status, static_cast<u16>(502));
-    CHECK(!c->keep_alive);
+TEST_F(MetricsLoopF, upstream_connect_wrong_event_ignored) {
+    REQUIRE(self.wire_proxy());
+    // Recv EOF → handle_unhandled_recv → tolerate
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Recv, 0));
+    CHECK(self.loop.conns[self.cid].fd >= 0);
 }
 
-TEST(proxy_callback, upstream_connect_wrong_event_ignored) {
-    SmallLoop loop;
-    loop.setup();
-    ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    setup_proxy_conn(loop, c, cid);
-
-    // With slot dispatch, Recv EOF → handle_unhandled_recv → tolerate
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 0));
-    CHECK(loop.conns[cid].fd >= 0);
+TEST_F(MetricsLoopF, upstream_request_sent_success) {
+    REQUIRE(self.wire_proxy());
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamConnect, 0));
+    u32 req_len = self.c->recv_buf.len();
+    self.loop.inject_and_dispatch(
+        make_ev(self.cid, IoEventType::UpstreamSend, static_cast<i32>(req_len)));
+    CHECK(self.loop.backend.count_ops(MockOp::Recv) > 0);
 }
 
-TEST(proxy_callback, upstream_request_sent_success) {
-    SmallLoop loop;
-    loop.setup();
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    setup_proxy_conn(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    // Now at on_upstream_request_sent. Simulate full send of recv_buf.
-    u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, static_cast<i32>(req_len)));
-    // Should now be waiting for upstream response (recv on upstream)
-    CHECK(loop.backend.count_ops(MockOp::Recv) > 0);
+TEST_F(MetricsLoopF, upstream_request_sent_error) {
+    REQUIRE(self.wire_proxy());
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamConnect, 0));
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamSend, -1));
+    CHECK_EQ(self.loop.conns[self.cid].fd, -1);
 }
 
-TEST(proxy_callback, upstream_request_sent_error) {
-    SmallLoop loop;
-    loop.setup();
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    setup_proxy_conn(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    // Send error
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, -1));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+TEST_F(MetricsLoopF, upstream_request_sent_any_positive_succeeds) {
+    REQUIRE(self.wire_proxy());
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamConnect, 0));
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamSend, 1));
+    CHECK(self.loop.conns[self.cid].fd >= 0);
 }
 
-TEST(proxy_callback, upstream_request_sent_any_positive_succeeds) {
-    // Backends guarantee full sends. Any positive result is success.
-    SmallLoop loop;
-    loop.setup();
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    setup_proxy_conn(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, 1));
-    // Should proceed to upstream response phase, not close.
-    CHECK(loop.conns[cid].fd >= 0);
+TEST_F(MetricsLoopF, upstream_request_sent_wrong_event) {
+    REQUIRE(self.wire_proxy());
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamConnect, 0));
+    // Recv → on_recv (null) → handle_unhandled_recv → tolerate
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Recv, 1));
+    CHECK(self.loop.conns[self.cid].fd >= 0);
 }
 
-TEST(proxy_callback, upstream_request_sent_wrong_event) {
-    SmallLoop loop;
-    loop.setup();
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    setup_proxy_conn(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    // With slot dispatch, Recv → on_recv (null) → handle_unhandled_recv → tolerate
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 1));
-    CHECK(loop.conns[cid].fd >= 0);
+TEST_F(MetricsLoopF, upstream_response_success) {
+    REQUIRE(self.advance_to_upstream_response());
+    inject_upstream_response(self.loop, *self.c);
+    CHECK_EQ(self.c->state, ConnState::Sending);
 }
 
-// Helper: advance proxy conn to the upstream-response stage
-static void advance_to_upstream_response(SmallLoop& loop, Connection*& c, u32& cid) {
-    setup_proxy_conn(loop, c, cid);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
-    u32 req_len = c->recv_buf.len();
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, static_cast<i32>(req_len)));
-    // recv_buf was reset by on_upstream_request_sent, ready for upstream response
+TEST_F(MetricsLoopF, upstream_response_error) {
+    REQUIRE(self.advance_to_upstream_response());
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamRecv, -1));
+    CHECK_EQ(self.loop.conns[self.cid].fd, -1);
 }
 
-TEST(proxy_callback, upstream_response_success) {
-    SmallLoop loop;
-    loop.setup();
-    ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    advance_to_upstream_response(loop, c, cid);
-
-    // Simulate upstream response data in recv_buf
-    inject_upstream_response(loop, *c);
-    CHECK_EQ(c->state, ConnState::Sending);
+TEST_F(MetricsLoopF, upstream_response_wrong_event) {
+    REQUIRE(self.advance_to_upstream_response());
+    // Send → on_send (null) → ignored
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, 1));
+    CHECK(self.loop.conns[self.cid].fd >= 0);
 }
 
-TEST(proxy_callback, upstream_response_error) {
-    SmallLoop loop;
-    loop.setup();
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    advance_to_upstream_response(loop, c, cid);
-
-    // Upstream recv error
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, -1));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+TEST_F(MetricsLoopF, proxy_response_sent_success) {
+    REQUIRE(self.advance_to_upstream_response());
+    inject_upstream_response(self.loop, *self.c);
+    u32 resp_len = self.c->upstream_recv_buf.len();
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, static_cast<i32>(resp_len)));
+    CHECK_EQ(self.m.requests_total, 1u);
+    CHECK_EQ(self.c->state, ConnState::ReadingHeader);
 }
 
-TEST(proxy_callback, upstream_response_wrong_event) {
-    SmallLoop loop;
-    loop.setup();
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    advance_to_upstream_response(loop, c, cid);
-
-    // With slots, Send → on_send (null) → ignored
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));
-    CHECK(loop.conns[cid].fd >= 0);
+TEST_F(MetricsLoopF, proxy_response_sent_error) {
+    REQUIRE(self.advance_to_upstream_response());
+    inject_upstream_response(self.loop, *self.c);
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, -1));
+    CHECK_EQ(self.loop.conns[self.cid].fd, -1);
 }
 
-TEST(proxy_callback, proxy_response_sent_success) {
-    SmallLoop loop;
-    loop.setup();
-    ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    advance_to_upstream_response(loop, c, cid);
-    inject_upstream_response(loop, *c);
-    // Now at on_proxy_response_sent, send the proxied response to client
-    u32 resp_len = c->upstream_recv_buf.len();
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(resp_len)));
-    // Should have completed the request cycle
-    CHECK_EQ(m.requests_total, 1u);
-    CHECK_EQ(c->state, ConnState::ReadingHeader);
+TEST_F(MetricsLoopF, proxy_response_sent_any_positive_succeeds) {
+    REQUIRE(self.advance_to_upstream_response());
+    inject_upstream_response(self.loop, *self.c);
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, 1));
+    CHECK_EQ(self.loop.conns[self.cid].state, ConnState::ReadingHeader);
 }
 
-TEST(proxy_callback, proxy_response_sent_error) {
-    SmallLoop loop;
-    loop.setup();
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    advance_to_upstream_response(loop, c, cid);
-    inject_upstream_response(loop, *c);
-    // Send error
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -1));
-    CHECK_EQ(loop.conns[cid].fd, -1);
+TEST_F(MetricsLoopF, proxy_response_sent_wrong_event) {
+    REQUIRE(self.advance_to_upstream_response());
+    inject_upstream_response(self.loop, *self.c);
+    // Recv → on_recv (null) → handle_unhandled_recv → tolerate
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Recv, 1));
+    CHECK(self.loop.conns[self.cid].fd >= 0);
 }
 
-TEST(proxy_callback, proxy_response_sent_any_positive_succeeds) {
-    // Backends guarantee full sends. Any positive result is success.
-    SmallLoop loop;
-    loop.setup();
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    advance_to_upstream_response(loop, c, cid);
-    inject_upstream_response(loop, *c);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));
-    // Should complete the request, not close on "partial".
-    CHECK_EQ(loop.conns[cid].state, ConnState::ReadingHeader);
-}
-
-TEST(proxy_callback, proxy_response_sent_wrong_event) {
-    SmallLoop loop;
-    loop.setup();
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    advance_to_upstream_response(loop, c, cid);
-    inject_upstream_response(loop, *c);
-    // With slots, Recv → on_recv (null) → handle_unhandled_recv → tolerate
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 1));
-    CHECK(loop.conns[cid].fd >= 0);
-}
-
-TEST(proxy_callback, proxy_response_sent_draining_closes) {
-    SmallLoop loop;
-    loop.setup();
-    loop.draining = true;
-    ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
-
-    Connection* c = nullptr;
-    u32 cid = 0;
-    advance_to_upstream_response(loop, c, cid);
-    inject_upstream_response(loop, *c);
-    // During drain with no Connection header, on_upstream_response rebuilds
-    // the response in send_buf with "Connection: close" injected, and routes
-    // through on_response_sent. Use send_buf.len() for the send result.
-    u32 resp_len = c->send_buf.len();
+TEST_F(MetricsLoopF, proxy_response_sent_draining_closes) {
+    self.loop.draining = true;
+    REQUIRE(self.advance_to_upstream_response());
+    inject_upstream_response(self.loop, *self.c);
+    // During drain, on_upstream_response rebuilds response in send_buf with
+    // "Connection: close" injected.
+    u32 resp_len = self.c->send_buf.len();
     CHECK_GT(resp_len, 0u);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(resp_len)));
-    // During drain, connections should be closed after send
-    CHECK_EQ(loop.conns[cid].fd, -1);
-    CHECK_EQ(m.requests_total, 1u);
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, static_cast<i32>(resp_len)));
+    CHECK_EQ(self.loop.conns[self.cid].fd, -1);
+    CHECK_EQ(self.m.requests_total, 1u);
 }
 
-TEST(proxy_callback, 502_response_records_correct_status) {
-    SmallLoop loop;
-    loop.setup();
-    ShardMetrics m;
-    m.init();
-    loop.metrics = &m;
+TEST_F(MetricsLoopF, 502_response_records_correct_status) {
     AccessLogRing ring;
     ring.init();
-    loop.access_log = &ring;
+    self.loop.access_log = &ring;
 
-    Connection* c = nullptr;
-    u32 cid = 0;
-    setup_proxy_conn(loop, c, cid);
-    // Upstream connect fails → 502
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, -1));
-    // Complete the 502 send
-    u32 send_len = c->send_buf.len();
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(send_len)));
+    REQUIRE(self.wire_proxy());
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::UpstreamConnect, -1));
+    u32 send_len = self.c->send_buf.len();
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, static_cast<i32>(send_len)));
 
-    CHECK_EQ(m.requests_total, 1u);
-    // Access log should have status 502
+    CHECK_EQ(self.m.requests_total, 1u);
     AccessLogEntry entry{};
     CHECK(ring.pop(entry));
     CHECK_EQ(entry.status, static_cast<u16>(502));

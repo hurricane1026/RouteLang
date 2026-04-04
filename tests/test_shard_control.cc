@@ -67,7 +67,7 @@ struct ShardF {
         ok = shard.init(0, lfd).has_value();
     }
     void TearDown() {
-        shard.shutdown();
+        if (ok) shard.shutdown();
         if (lfd >= 0) close(lfd);
     }
 };
@@ -1059,12 +1059,15 @@ TEST_F(ShardF, capture_shutdown_cleans_up) {
     REQUIRE(self.ok);
     self.shard.enable_capture();
     CHECK(self.shard.capture_ring != nullptr);
-    // Manually call to verify the behavior, then avoid a double-close of
-    // the listen fd during fixture cleanup by invalidating it here.
+    // Manually call shutdown to verify cleanup, then update fixture-owned
+    // state so TearDown() does not attempt to clean up the same resources.
     self.shard.shutdown();
     CHECK(self.shard.capture_ring == nullptr);
-    close(self.lfd);
-    self.lfd = -1;
+    if (self.lfd >= 0) {
+        close(self.lfd);
+        self.lfd = -1;
+    }
+    self.ok = false;
 }
 
 int main(int argc, char** argv) {

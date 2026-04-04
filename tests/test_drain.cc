@@ -31,12 +31,12 @@ static bool buf_contains(const Buffer& buf, const char* needle) {
 // Write an HTTP response string into conn's upstream_recv_buf and dispatch
 // the UpstreamRecv event. Unlike inject_upstream_response() in test_helpers.h,
 // this takes an arbitrary response string (for testing header rewriting).
-static void inject_custom_upstream_resp(SmallLoop& loop, Connection& c, const char* resp) {
+// Returns false if the response doesn't fit in the buffer.
+static bool inject_custom_upstream_resp(SmallLoop& loop, Connection& c, const char* resp) {
     c.upstream_recv_buf.reset();
     rut::u32 resp_len = 0;
     while (resp[resp_len]) resp_len++;
-    rut::u32 avail = c.upstream_recv_buf.write_avail();
-    if (resp_len > avail) resp_len = avail;
+    if (resp_len > c.upstream_recv_buf.write_avail()) return false;
     rut::u8* dst = c.upstream_recv_buf.write_ptr();
     for (rut::u32 i = 0; i < resp_len; i++) dst[i] = static_cast<rut::u8>(resp[i]);
     c.upstream_recv_buf.commit(resp_len);
@@ -46,6 +46,7 @@ static void inject_custom_upstream_resp(SmallLoop& loop, Connection& c, const ch
     IoEvent events[8];
     rut::u32 n = loop.backend.wait(events, 8);
     for (rut::u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    return true;
 }
 
 // ============================================================
@@ -269,26 +270,26 @@ TEST(drain_callback, close_after_drain_response_sent) {
 
 TEST_F(DrainProxyF, upstream_response_rewrites_connection_header) {
     REQUIRE(self.wire_proxy());
-    inject_custom_upstream_resp(
+    REQUIRE(inject_custom_upstream_resp(
         self.loop,
         *self.c,
-        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK");
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK"));
     CHECK(buf_contains(self.c->upstream_recv_buf, "Connection: close"));
 }
 
 TEST_F(DrainProxyF, upstream_response_rewrites_lowercase_connection_header) {
     REQUIRE(self.wire_proxy());
-    inject_custom_upstream_resp(
+    REQUIRE(inject_custom_upstream_resp(
         self.loop,
         *self.c,
-        "HTTP/1.1 200 OK\r\nconnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK");
+        "HTTP/1.1 200 OK\r\nconnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK"));
     CHECK(buf_contains(self.c->upstream_recv_buf, "connection: close"));
 }
 
 TEST_F(DrainProxyF, upstream_response_injects_close_when_missing) {
     REQUIRE(self.wire_proxy());
-    inject_custom_upstream_resp(
-        self.loop, *self.c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+    REQUIRE(inject_custom_upstream_resp(
+        self.loop, *self.c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"));
     CHECK(!self.c->keep_alive);
 }
 
@@ -310,8 +311,8 @@ TEST(drain_proxy, upstream_status_parsed) {
     loop.inject_and_dispatch(
         make_ev(cid, IoEventType::UpstreamSend, static_cast<rut::i32>(req_len)));
 
-    inject_custom_upstream_resp(
-        loop, *c, "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found");
+    REQUIRE(inject_custom_upstream_resp(
+        loop, *c, "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found"));
     CHECK_EQ(c->resp_status, static_cast<rut::u16>(404));
 }
 

@@ -585,109 +585,112 @@ struct PoolCtx {
     void destroy() { pool.destroy(); }
 };
 
-TEST(slice_arena, basic_alloc) {
+// Fixture: manages PoolCtx + SliceArena lifecycle.
+// Tests that need custom pool sizes or pre-init pool counts stay as TEST().
+struct SliceArenaF {
     PoolCtx pc;
-    REQUIRE(pc.init());
-
     SliceArena a;
-    REQUIRE(a.init(&pc.pool).has_value());
-    CHECK(a.current != nullptr);
+    bool ok;
 
-    void* p = a.alloc(64);
+    void SetUp() {
+        ok = pc.init();
+        if (ok) ok = a.init(&pc.pool).has_value();
+    }
+    void TearDown() {
+        a.destroy();
+        pc.destroy();
+    }
+};
+
+TEST_F(SliceArenaF, basic_alloc) {
+    REQUIRE(self.ok);
+    CHECK(self.a.current != nullptr);
+
+    void* p = self.a.alloc(64);
     CHECK(p != nullptr);
-
-    a.destroy();
-    pc.destroy();
 }
 
-TEST(slice_arena, alloc_t) {
-    PoolCtx pc;
-    REQUIRE(pc.init());
-
-    SliceArena a;
-    REQUIRE(a.init(&pc.pool).has_value());
+TEST_F(SliceArenaF, alloc_t) {
+    REQUIRE(self.ok);
 
     struct Foo {
         u32 x;
         u32 y;
     };
-    auto* f = a.alloc_t<Foo>(42, 99);
+    auto* f = self.a.alloc_t<Foo>(42, 99);
     REQUIRE(f != nullptr);
     CHECK_EQ(f->x, 42u);
     CHECK_EQ(f->y, 99u);
-
-    a.destroy();
-    pc.destroy();
 }
 
-TEST(slice_arena, alloc_array) {
-    PoolCtx pc;
-    REQUIRE(pc.init());
+TEST_F(SliceArenaF, alloc_array) {
+    REQUIRE(self.ok);
 
-    SliceArena a;
-    REQUIRE(a.init(&pc.pool).has_value());
-
-    auto* arr = a.alloc_array<u64>(100);
+    auto* arr = self.a.alloc_array<u64>(100);
     REQUIRE(arr != nullptr);
-    // Value-initialized to zero
     for (u32 i = 0; i < 100; i++) CHECK_EQ(arr[i], 0ull);
 
-    // Write and read back
     arr[0] = 42;
     arr[99] = 99;
     CHECK_EQ(arr[0], 42ull);
     CHECK_EQ(arr[99], 99ull);
-
-    a.destroy();
-    pc.destroy();
 }
 
-TEST(slice_arena, chain_to_second_slice) {
-    PoolCtx pc;
-    REQUIRE(pc.init());
+TEST_F(SliceArenaF, chain_to_second_slice) {
+    REQUIRE(self.ok);
 
-    SliceArena a;
-    REQUIRE(a.init(&pc.pool).has_value());
-
-    auto* first_block = a.current;
+    auto* first_block = self.a.current;
     u64 cap = first_block->capacity();
 
-    // Fill the first slice almost completely
-    void* p1 = a.alloc(cap - 8);
+    void* p1 = self.a.alloc(cap - 8);
     REQUIRE(p1 != nullptr);
-    CHECK(a.current == first_block);  // still on first slice
+    CHECK(self.a.current == first_block);
 
-    // This allocation should overflow to a second slice
-    void* p2 = a.alloc(64);
+    void* p2 = self.a.alloc(64);
     REQUIRE(p2 != nullptr);
-    CHECK(a.current != first_block);         // new slice
-    CHECK_EQ(a.current->prev, first_block);  // chained
-
-    a.destroy();
-    pc.destroy();
+    CHECK(self.a.current != first_block);
+    CHECK_EQ(self.a.current->prev, first_block);
 }
 
-TEST(slice_arena, chain_three_slices) {
-    PoolCtx pc;
-    REQUIRE(pc.init());
+TEST_F(SliceArenaF, chain_three_slices) {
+    REQUIRE(self.ok);
 
-    SliceArena a;
-    REQUIRE(a.init(&pc.pool).has_value());
+    u64 cap = self.a.current->capacity();
 
-    u64 cap = a.current->capacity();
-
-    // Force 3 slices
-    a.alloc(cap);  // fill slice 0
-    auto* s1 = a.current;
-    a.alloc(cap);  // fill slice 1 → allocates slice 2
-    auto* s2 = a.current;
+    self.a.alloc(cap);
+    auto* s1 = self.a.current;
+    self.a.alloc(cap);
+    auto* s2 = self.a.current;
 
     CHECK_NE(s1, s2);
     CHECK_EQ(s2->prev, s1);
-
-    a.destroy();
-    pc.destroy();
 }
+
+TEST_F(SliceArenaF, single_alloc_exceeding_slice_fails) {
+    REQUIRE(self.ok);
+
+    // 16KB slice minus header ≈ 16368 bytes usable.
+    void* p = self.a.alloc(SlicePool::kSliceSize);  // 16384 > usable capacity
+    CHECK(p == nullptr);
+
+    // Arena should still be usable after failed alloc
+    void* p2 = self.a.alloc(32);
+    CHECK(p2 != nullptr);
+}
+
+TEST_F(SliceArenaF, reset_then_reuse) {
+    REQUIRE(self.ok);
+
+    // Alloc, reset, alloc again — simulates request cycle
+    for (int cycle = 0; cycle < 10; cycle++) {
+        auto* v = self.a.alloc_t<u32>(static_cast<u32>(cycle));
+        REQUIRE(v != nullptr);
+        CHECK_EQ(*v, static_cast<u32>(cycle));
+        self.a.reset();
+    }
+}
+
+// --- Tests that need pre-init pool counts or custom pool configs stay as TEST() ---
 
 TEST(slice_arena, reset_returns_slices_to_pool) {
     PoolCtx pc;
@@ -697,31 +700,24 @@ TEST(slice_arena, reset_returns_slices_to_pool) {
 
     SliceArena a;
     REQUIRE(a.init(&pc.pool).has_value());
-    u32 after_init = pc.pool.available();
-    CHECK_EQ(after_init, free_before - 1);  // took 1 slice
+    CHECK_EQ(pc.pool.available(), free_before - 1);
 
-    // Force overflow to a second slice
     u64 cap = a.current->capacity();
-    a.alloc(cap);  // fills slice 0 exactly
-    a.alloc(64);   // overflows → takes slice 1
-    u32 after_chain = pc.pool.available();
-    CHECK_EQ(after_chain, free_before - 2);  // 2 slices total
+    a.alloc(cap);
+    a.alloc(64);
+    CHECK_EQ(pc.pool.available(), free_before - 2);
 
-    // Reset should return extra slices, keep first
     a.reset();
-    u32 after_reset = pc.pool.available();
-    CHECK_EQ(after_reset, free_before - 1);  // back to 1 slice
+    CHECK_EQ(pc.pool.available(), free_before - 1);
     CHECK(a.current != nullptr);
     CHECK(a.current->prev == nullptr);
     CHECK_EQ(a.current->used, 0ull);
 
-    // Can still alloc after reset
     void* p = a.alloc(32);
     CHECK(p != nullptr);
 
     a.destroy();
-    u32 after_destroy = pc.pool.available();
-    CHECK_EQ(after_destroy, free_before);  // all returned
+    CHECK_EQ(pc.pool.available(), free_before);
     pc.destroy();
 }
 
@@ -737,32 +733,11 @@ TEST(slice_arena, destroy_returns_all_slices) {
     u64 cap = a.current->capacity();
     a.alloc(cap);
     a.alloc(64);
-    // 3 slices in use
 
     a.destroy();
-    CHECK_EQ(pc.pool.available(), free_before);  // all returned
+    CHECK_EQ(pc.pool.available(), free_before);
     CHECK(a.current == nullptr);
 
-    pc.destroy();
-}
-
-TEST(slice_arena, single_alloc_exceeding_slice_fails) {
-    PoolCtx pc;
-    REQUIRE(pc.init());
-
-    SliceArena a;
-    REQUIRE(a.init(&pc.pool).has_value());
-
-    // 16KB slice minus header ≈ 16368 bytes usable.
-    // Allocating more than that in one call should fail.
-    void* p = a.alloc(SlicePool::kSliceSize);  // 16384 > usable capacity
-    CHECK(p == nullptr);
-
-    // Arena should still be usable after failed alloc
-    void* p2 = a.alloc(32);
-    CHECK(p2 != nullptr);
-
-    a.destroy();
     pc.destroy();
 }
 
@@ -772,15 +747,14 @@ TEST(slice_arena, pool_exhaustion) {
     REQUIRE(pool.init(2, 2).has_value());
 
     SliceArena a;
-    REQUIRE(a.init(&pool).has_value());  // takes slice 1
+    REQUIRE(a.init(&pool).has_value());
 
     u64 cap = a.current->capacity();
-    a.alloc(cap);           // fill slice 1
-    void* p = a.alloc(64);  // overflows → takes slice 2
+    a.alloc(cap);
+    void* p = a.alloc(64);
     CHECK(p != nullptr);
 
-    // Slice 2 has cap-64 remaining. Fill it to force next overflow.
-    a.alloc(cap - 64);       // fill slice 2 completely
+    a.alloc(cap - 64);
     void* p2 = a.alloc(64);  // pool empty → nullptr
     CHECK(p2 == nullptr);
 
@@ -796,7 +770,6 @@ TEST(slice_arena, multiple_arenas_same_pool) {
     REQUIRE(a1.init(&pc.pool).has_value());
     REQUIRE(a2.init(&pc.pool).has_value());
 
-    // Both arenas can alloc independently
     auto* p1 = a1.alloc_t<u64>(111);
     auto* p2 = a2.alloc_t<u64>(222);
     REQUIRE(p1 != nullptr);
@@ -804,31 +777,11 @@ TEST(slice_arena, multiple_arenas_same_pool) {
     CHECK_EQ(*p1, 111ull);
     CHECK_EQ(*p2, 222ull);
 
-    // They don't interfere
     a1.reset();
     CHECK_EQ(*p2, 222ull);  // a2's data still valid
 
     a1.destroy();
     a2.destroy();
-    pc.destroy();
-}
-
-TEST(slice_arena, reset_then_reuse) {
-    PoolCtx pc;
-    REQUIRE(pc.init());
-
-    SliceArena a;
-    REQUIRE(a.init(&pc.pool).has_value());
-
-    // Alloc, reset, alloc again — simulates request cycle
-    for (int cycle = 0; cycle < 10; cycle++) {
-        auto* v = a.alloc_t<u32>(static_cast<u32>(cycle));
-        REQUIRE(v != nullptr);
-        CHECK_EQ(*v, static_cast<u32>(cycle));
-        a.reset();
-    }
-
-    a.destroy();
     pc.destroy();
 }
 

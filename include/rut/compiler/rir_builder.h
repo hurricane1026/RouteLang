@@ -631,8 +631,7 @@ struct Builder {
     VoidResult emit_ret_forward(ValueId upstream, SourceLoc loc = {}) {
         if (!valid_val(upstream)) return err(RirError::InvalidState);
         // Upstream operand must be an integer type (upstream id).
-        if (!val_has_type(upstream, TypeKind::I32) &&
-            !val_has_type(upstream, TypeKind::U32))
+        if (!val_has_type(upstream, TypeKind::I32) && !val_has_type(upstream, TypeKind::U32))
             return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetForward, nullptr, loc));
         r.inst->operands[0] = upstream;

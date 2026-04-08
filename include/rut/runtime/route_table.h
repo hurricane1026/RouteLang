@@ -63,7 +63,7 @@ struct RouteEntry {
 // on hot reload (RCU pattern: new config built, atomic swap, old reclaimed).
 //
 // Phase 2: simple linear scan (adequate for <100 routes).
-// Phase 3: radix trie from Rue compiler (O(path_length) lookup).
+// Phase 3: radix trie from Rutlang compiler (O(path_length) lookup).
 struct RouteConfig {
     static constexpr u32 kMaxRoutes = 128;
     static constexpr u32 kMaxUpstreams = 64;

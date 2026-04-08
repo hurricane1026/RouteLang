@@ -4,7 +4,7 @@
 
 namespace rut {
 
-// Token types for the .rue language
+// Token types for the .rut language
 enum class TokenType : u8 {
     // Literals
     Ident,
@@ -16,10 +16,10 @@ enum class TokenType : u8 {
     KwFunc,
     KwLet,
     KwVar,
+    KwConst,
     KwGuard,
     KwStruct,
     KwRoute,
-    KwUse,
     KwMatch,
     KwIf,
     KwElse,
@@ -28,11 +28,30 @@ enum class TokenType : u8 {
     KwReturn,
     KwUpstream,
     KwListen,
-    KwProxy,
-    KwExtern,
+    KwTls,
+    KwDefaults,
+    KwForward,
+    KwWebsocket,
     KwImport,
+    KwUsing,
+    KwAs,
     KwFire,
-    KwGroup,
+    KwNotify,
+    KwDefer,
+    KwSubmit,
+    KwWait,
+    KwTimer,
+    KwInit,
+    KwShutdown,
+    KwFirewall,
+    KwThrottle,
+    KwPer,
+    KwAnd,
+    KwOr,
+    KwNot,
+    KwNil,
+    KwTrue,
+    KwFalse,
 
     // HTTP methods
     KwGet,
@@ -42,7 +61,9 @@ enum class TokenType : u8 {
     KwPatch,
     KwHead,
     KwOptions,
-    KwAny,
+
+    // Regex literal
+    RegexLit,   // re"pattern"
 
     // Symbols
     LParen,
@@ -54,7 +75,7 @@ enum class TokenType : u8 {
     Colon,
     Comma,
     Dot,
-    Arrow,      // =>
+    Arrow,      // => (single expression, implicit return)
     ThinArrow,  // ->
     Eq,
     EqEq,
@@ -74,6 +95,7 @@ enum class TokenType : u8 {
     Tilde,
     Bang,
     Question,
+    DoubleQuestion,  // ?? (null coalescing)
     At,
     DoubleStar,  // **
     Underscore,  // _

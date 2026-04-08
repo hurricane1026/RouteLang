@@ -36,7 +36,7 @@ struct TestContext {
 
     bool init() {
         if (!arena.init(4096)) return false;
-        mod.name = lit("test_jit.rue");
+        mod.name = lit("test_jit.rut");
         mod.arena = &arena;
 
         static constexpr u32 kMaxFuncs = 8;
@@ -1091,12 +1091,12 @@ TEST(jit, lookup_nonexistent) {
     engine.shutdown();
 }
 
-// ── Codegen: RetProxy ─────────────────────────────────────────────
+// ── Codegen: RetForward ─────────────────────────────────────────────
 
 // handler:
 //   %upstream = const.i32 3
-//   ret.proxy %upstream
-TEST(jit, ret_proxy) {
+//   ret.forward %upstream
+TEST(jit, ret_forward) {
     TestContext tc;
     REQUIRE(tc.init());
 
@@ -1108,7 +1108,7 @@ TEST(jit, ret_proxy) {
 
     b.set_insert_point(fn, entry);
     auto upstream = V(b.emit_const_i32(3));
-    VOK(b.emit_ret_proxy(upstream));
+    VOK(b.emit_ret_forward(upstream));
 
     auto cg = codegen(tc.mod);
     REQUIRE(cg.ok);

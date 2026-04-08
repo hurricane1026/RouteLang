@@ -15,7 +15,7 @@ target_compile_options(llhttp PRIVATE -O2 -DNDEBUG)
 
 # Benchmark executables
 add_executable(bench_http_parser bench_http_parser.cc)
-target_link_libraries(bench_http_parser rue_runtime llhttp)
+target_link_libraries(bench_http_parser rut_runtime llhttp)
 target_include_directories(bench_http_parser PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -23,7 +23,7 @@ target_include_directories(bench_http_parser PRIVATE
 )
 
 add_executable(bench_connection bench_connection.cc)
-target_link_libraries(bench_connection rue_runtime)
+target_link_libraries(bench_connection rut_runtime)
 target_include_directories(bench_connection PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing

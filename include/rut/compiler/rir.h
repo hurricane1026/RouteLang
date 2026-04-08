@@ -25,7 +25,7 @@ struct SourceLoc {
 };
 
 // ── Type System ─────────────────────────────────────────────────────
-// Mirrors Rue language types. Domain types are first-class so that
+// Mirrors Rutlang language types. Domain types are first-class so that
 // RIR-level optimizations can reason about them (e.g., CIDR containment
 // folding, Duration comparison strength reduction).
 
@@ -175,9 +175,6 @@ enum class Opcode : u8 {
     HashHmacSha256,  // %r = hash.hmac_sha256 %k,%d → Bytes
     BytesHex,        // %r = bytes.hex %b            → str
 
-    // ── External calls ──
-    CallExtern,  // %r = call.name %args...         → T
-
     // ── Counter ──
     CounterIncr,  // %r = counter.incr %key, window → i32
 
@@ -205,13 +202,12 @@ enum class Opcode : u8 {
     Br,         // br %cond, then_block, else_block
     Jmp,        // jmp target_block
     RetStatus,  // ret.status code [, headers/body]
-    RetProxy,   // ret.proxy upstream [, options]
+    RetForward, // ret.forward upstream [, options]
 
     // ── Yield (I/O suspend → state machine boundary) ──
     YieldHttpGet,   // %r = yield.http_get url, headers
     YieldHttpPost,  // %r = yield.http_post url, headers, body
-    YieldProxy,     // %r = yield.proxy upstream
-    YieldExtern,    // %r = yield.extern "name", %args
+    YieldForward,   // %r = yield.forward upstream
 };
 
 // ── Instruction ─────────────────────────────────────────────────────
@@ -242,7 +238,6 @@ struct Instruction {
         bool bool_val;             // ConstBool
         u8 method_val;             // ConstMethod (HTTP method enum)
         BlockId block_targets[2];  // Br: [then, else]; Jmp: [target, _]
-        Str extern_name;           // CallExtern, YieldExtern
         struct {
             Str name;
             const Type* type;
@@ -267,8 +262,7 @@ struct Instruction {
         switch (op) {
             case Opcode::YieldHttpGet:
             case Opcode::YieldHttpPost:
-            case Opcode::YieldProxy:
-            case Opcode::YieldExtern:
+            case Opcode::YieldForward:
                 return true;
             default:
                 return false;
@@ -282,7 +276,7 @@ struct Instruction {
             case Opcode::Br:
             case Opcode::Jmp:
             case Opcode::RetStatus:
-            case Opcode::RetProxy:
+            case Opcode::RetForward:
                 return true;
             default:
                 return is_yield();
@@ -340,7 +334,7 @@ struct Function {
 };
 
 // ── Module ──────────────────────────────────────────────────────────
-// Top-level container: all route handler functions from one .rue file.
+// Top-level container: all route handler functions from one .rut file.
 
 struct Module {
     Str name;  // source file name

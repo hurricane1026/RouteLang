@@ -542,7 +542,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildRet(c.builder, result);
             break;
         }
-        case rir::Opcode::RetProxy: {
+        case rir::Opcode::RetForward: {
             // Pack: action=1 (Proxy), upstream_id from operand or immediate.
             LLVMValueRef upstream;
             if (inst.operand_count > 0) {

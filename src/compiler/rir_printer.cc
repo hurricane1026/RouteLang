@@ -208,7 +208,6 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::BytesHex:
             buf.put_cstr("bytes.hex");
             break;
-        case Opcode::CallExtern:
             buf.put_cstr("call");
             break;
         case Opcode::CounterIncr:
@@ -265,8 +264,8 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::RetStatus:
             buf.put_cstr("ret.status");
             break;
-        case Opcode::RetProxy:
-            buf.put_cstr("ret.proxy");
+        case Opcode::RetForward:
+            buf.put_cstr("ret.forward");
             break;
         case Opcode::YieldHttpGet:
             buf.put_cstr("yield.http_get");
@@ -274,10 +273,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::YieldHttpPost:
             buf.put_cstr("yield.http_post");
             break;
-        case Opcode::YieldProxy:
-            buf.put_cstr("yield.proxy");
+        case Opcode::YieldForward:
+            buf.put_cstr("yield.forward");
             break;
-        case Opcode::YieldExtern:
             buf.put_cstr("yield.extern");
             break;
     }
@@ -542,9 +540,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_i64(inst.imm.i64_val);
             buf.put('s');
             break;
-        case Opcode::CallExtern:
             buf.put('.');
-            buf.put_str(inst.imm.extern_name);
             if (inst.operand_count > 0) {
                 buf.put(' ');
                 for (u32 i = 0; i < inst.operand_count; i++) {
@@ -577,7 +573,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             buf.put_i32(inst.imm.i32_val);
             break;
-        case Opcode::RetProxy:
+        case Opcode::RetForward:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
             break;
@@ -599,13 +595,11 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
                 print_value_ref(buf, inst.operand(i));
             }
             break;
-        case Opcode::YieldProxy:
+        case Opcode::YieldForward:
             buf.put(' ');
             if (inst.operand_count > 0) print_value_ref(buf, inst.operands[0]);
             break;
-        case Opcode::YieldExtern:
             buf.put(' ');
-            print_quoted_str(buf, inst.imm.extern_name);
             for (u32 i = 0; i < inst.operand_count; i++) {
                 buf.put_cstr(", ");
                 print_value_ref(buf, inst.operand(i));

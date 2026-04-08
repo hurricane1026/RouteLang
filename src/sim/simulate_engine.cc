@@ -507,7 +507,7 @@ bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
         } else {
             auto upstream = b.emit_const_i32(manifest.routes[i].upstream_id);
             if (!upstream) return fail();
-            if (!b.emit_ret_proxy(upstream.value())) return fail();
+            if (!b.emit_ret_forward(upstream.value())) return fail();
         }
     }
 

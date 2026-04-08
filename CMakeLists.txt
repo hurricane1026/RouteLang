@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 include(CheckIPOSupported)
 
-project(rue
+project(rut
     VERSION 0.1.0
     DESCRIPTION "A strongly-typed DSL and high-performance HTTP gateway runtime"
     LANGUAGES CXX C
@@ -35,7 +35,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
 
 # LLVM — required for JIT compilation (ORC JIT via C API).
-# Only the rue_jit library links LLVM; rue_runtime stays LLVM-free.
+# Only the rut_jit library links LLVM; rut_runtime stays LLVM-free.
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")

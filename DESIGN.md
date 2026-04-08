@@ -1,6 +1,6 @@
-# Rue: Design Document
+# Rutlang: Design Document
 
-> A strongly-typed DSL and high-performance HTTP gateway runtime replacing nginx + OpenResty.
+> A strongly-typed DSL and high-performance L7 ingress runtime. API gateway, WAF, reverse proxy, mesh sidecar, CDN edge — one language, one binary.
 
 ## 1. Project Overview
 
@@ -26,7 +26,7 @@
 
 ```
                         ┌─────────────────────────────┐
-  .rue source ───▶ │  Compiler (embedded in proc) │
+  .rut source ───▶ │  Compiler (embedded in proc) │
                         │  parse → type check → IR     │
                         └──────────┬──────────────────┘
                                    │
@@ -37,7 +37,7 @@
                                    │ native function pointers
                                    ▼
   ┌────────────────────────────────────────────────────────┐
-  │                    Rue Runtime                   │
+  │                    Rutlang Runtime                   │
   │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
   │  │  Shard 0  │ │  Shard 1  │ │  Shard 2  │ │  Shard N  │  │
   │  │ io_uring  │ │ io_uring  │ │ io_uring  │ │ io_uring  │  │
@@ -64,39 +64,176 @@
 
 ---
 
-## 3. The Rue Language
+## 3. The Rutlang Language
 
 ### 3.1 Design Principles
 
-- **Swift-inspired syntax**: guard statements, named parameters, trailing closures, optional chaining, string interpolation — clean and readable, high LLM generation accuracy
+- **Swift-inspired syntax**: guard statements, named parameters, optional chaining, string interpolation — clean and readable, high LLM generation accuracy
 - **HTTP concepts are native objects**: methods, status codes, headers, URLs, CIDR, media types are first-class language constructs, not strings
 - **All functions inline at compile time**: no runtime function calls, each route compiles to a single flat state machine
 - **Async is invisible**: no async/await/future/promise — user writes sequential code, compiler finds I/O points and generates state machines automatically
 - **Strong typing with domain types**: Duration, ByteSize, StatusCode, IP, CIDR, MediaType with compile-time validation
 - **Middleware = ordinary functions**: return a status code to reject, return nothing to pass through
-- **Minimal keyword set**: `func`, `let`, `var`, `guard`, `struct`, `route`, `use`, `match`, `if`, `else`, `for`, `in`, `return`, `upstream`, `listen`, `proxy`, `extern`, `import`
+- **Bounded execution**: no `while`, no recursion, `for` only iterates finite collections — every handler has a compile-time execution bound, cannot stall a shard
+- **Three-layer model**: `listen` (downstream/client) → .rut file (gateway logic) → `upstream` (backend). No `gateway` or `downstream` keyword — the .rut file IS the gateway, `listen` IS the downstream config
+- **Minimal keyword set**: `func`, `let`, `var`, `const`, `guard`, `struct`, `route`, `match`, `if`, `else`, `for`, `in`, `return`, `defer`, `upstream`, `listen`, `tls`, `defaults`, `forward`, `websocket`, `fire`, `submit`, `wait`, `timer`, `init`, `shutdown`, `firewall`, `throttle`, `per`, `notify`, `import`, `using`, `as`, `and`, `or`, `not`, `nil`, `true`, `false`
 
 ### 3.2 File Extension
 
-`.rue`
+`.rut`
+
+### 3.2.1 Lexical Conventions
+
+```swift
+// Comments — line comments only, no block comments
+// This is a comment
+
+// Strings — double-quoted, with escape sequences
+"hello world"
+"line one\nline two"           // \n \t \r \\ \" supported
+"\(req.path)/\(req.method)"    // string interpolation with \()
+
+// Regex literals — re prefix
+re"^/api/v\d+/"
+
+// Number literals
+42                              // i32
+3.14                            // f64
+0xFF                            // hex integer
+1_000_000                       // underscores for readability
+
+// Duration / ByteSize literals (domain types)
+500ms    1s    5m    1h    1d   // Duration
+64b    1kb    16kb    1mb    1gb // ByteSize
+
+// Statements separated by newlines — no semicolons
+let x = 42
+let y = "hello"
+
+// Long expressions: wrap in parentheses for continuation
+let result = (
+    someVeryLongFunction(req, arg1: value1, arg2: value2)
+)
+
+// Boolean
+true   false   nil
+
+// Operators
+and   or   not                  // boolean (keywords)
+&   |   ^   ~   <<   >>        // bitwise (symbols)
++   -   *   /   %              // arithmetic
+==  !=  <  >  <=  >=           // comparison
+=                               // assignment
+?                               // nil check postfix (x?)
+?.                              // optional chaining (x?.method)
+??                              // null coalescing (x ?? default)
+!                               // logical not (alias for not)
+@                               // decorator prefix
+=>                              // single expression, implicit return
+->                              // function return type
+```
 
 ### 3.3 Type System
 
 #### 3.3.1 Built-in Domain Types
 
-HTTP concepts are native types, not strings:
+HTTP concepts are native types with member functions. All implemented as runtime
+C++ builtin structs — compile-time validated literals, zero-overhead access.
+
+**IP** — IPv4/IPv6 address
 
 ```swift
-// Scalar domain types — compile-time validated
-Duration      // 1s, 500ms, 1m, 5m, 1h, 1d — arithmetic supported
-ByteSize      // 64b, 1kb, 16kb, 1mb, 1gb — arithmetic supported
-StatusCode    // 100..599 with names: 200 OK, 404 Not-Found, etc.
-Method        // GET POST PUT DELETE PATCH HEAD OPTIONS ANY — keywords
-IP            // v4/v6, compile-time format validation
-CIDR          // 10.0.0.0/8, 172.16.0.0/12 — native syntax
-Port          // 1..65535
-MediaType     // application/json, text/html — native syntax
-Time          // timestamp type, now() returns this
+let ip = req.remoteAddr              // IP
+ip.v4?                               // bool — is IPv4
+ip.v6?                               // bool — is IPv6
+ip.isPrivate                         // bool — RFC1918 (10.x, 172.16.x, 192.168.x)
+ip.isLoopback                        // bool — 127.0.0.0/8 or ::1
+ip.in(10.0.0.0/8)                    // bool — CIDR containment
+ip.octets                            // [u8] — 4 or 16 bytes
+ip as string                         // "10.0.0.1"
+"10.0.0.1" as IP                     // Result<IP>
+```
+
+**CIDR** — network range
+
+```swift
+let cidr = 10.0.0.0/8               // CIDR literal
+cidr.network                         // IP — network address
+cidr.prefix                          // i32 — prefix length (8)
+cidr.contains(req.remoteAddr)        // bool
+cidr as string                       // "10.0.0.0/8"
+```
+
+**Duration** — time interval
+
+```swift
+let d = 30s                          // Duration literal (also: ms, m, h, d)
+d.ms                                 // i64 — 30000
+d.seconds                           // i64 — 30
+d.minutes                            // f64 — 0.5
+// Arithmetic: d + 1s, d - 500ms, d * 2, d > 1m, d == 30s
+```
+
+**ByteSize** — data size
+
+```swift
+let b = 16kb                         // ByteSize literal (also: b, mb, gb)
+b.bytes                              // i64 — 16384
+b.kb                                 // f64 — 16.0
+b.mb                                 // f64 — 0.015625
+// Arithmetic: b + 1kb, b > 1mb, b == 16kb
+```
+
+**StatusCode** — HTTP status
+
+```swift
+let s = resp.status                  // StatusCode
+s.code                               // i32 — 200
+s.isSuccess                          // bool — 2xx
+s.isRedirect                         // bool — 3xx
+s.isClientError                      // bool — 4xx
+s.isServerError                      // bool — 5xx
+```
+
+**Method** — HTTP method
+
+```swift
+req.method                           // Method
+req.method == .GET                   // bool
+req.method as string                 // "GET"
+```
+
+**MediaType** — content type
+
+```swift
+let mt = req.contentType             // MediaType
+mt.type                              // string — "application"
+mt.subtype                           // string — "json"
+mt as string                         // "application/json"
+```
+
+**Time** — timestamp
+
+```swift
+let t = now()                        // Time
+t.unix                               // i64 — epoch seconds
+t.unixMs                             // i64 — epoch milliseconds
+t as string                          // ISO 8601
+now() - t                            // Duration — time difference
+t + 1h                               // Time — add duration
+```
+
+**Regex** — compiled pattern
+
+```swift
+let r = re"^/api/v\d+"              // Regex literal, compile-time validated
+```
+
+**Port** — 1..65535
+
+```swift
+let p = :8080                        // Port literal
+p.number                             // i32 — 8080
 ```
 
 #### 3.3.2 User-Defined Types
@@ -120,7 +257,26 @@ struct OrderItem {
 }
 ```
 
-#### 3.3.3 Request Object
+#### 3.3.3 Tuple
+
+Ordered, fixed-size, heterogeneous collection. Compile-time known layout.
+
+```swift
+let pair = (200, "ok")                       // (i32, string)
+let triple = (user, orders, stock)           // (User, [Order], Stock)
+
+// Destructuring
+let (status, msg) = pair
+
+// Index access
+let first = pair.0                           // i32
+let second = pair.1                          // string
+```
+
+Used as return type for `wait()` with multiple handles. Arena-allocated,
+zero heap overhead.
+
+#### 3.3.4 Request Object
 
 Request is a built-in type. Standard HTTP headers are native properties with correct types:
 
@@ -152,59 +308,458 @@ req.X-Request-ID = uuid()
 req.id                  // string (from :id)
 req.postId              // string (from :postId)
 
+// Query string
+req.queryString         // string? — raw query string: "page=1&limit=20"
+req.query("page")       // string? — single query parameter
+req.query("tags")       // [string]? — multi-value parameter (?tags=a&tags=b)
+
 // Body
-req.body(User)          // parse body as User struct (type-checked)
-req.bodyRaw             // raw bytes
+req.body(User)          // parse body as User struct → Result<User>
+req.bodyRaw             // raw body as string → Result<string>
+req.bodyRaw = newBody   // replace body before forward (recomputes Content-Length)
 
 // Cookies
 req.cookie("session_id") // string?
+
+// Multi-value headers
+req.getAll("Accept")    // [string] — all values for a header
+req.add("X-Tag", "a")   // append (doesn't replace existing)
+
+// Request-level context — typed struct, shared across middleware and handler
+req.ctx.userId          // fields from user-declared Ctx struct
+req.ctx.startTime       // set by decorators, read by handler
 ```
 
-#### 3.3.4 Response — Just Status Codes
+The request context `req.ctx` requires a user-declared `Ctx` struct:
 
 ```swift
-// Response is implicit — just return a status code
+struct Ctx {
+    userId: string
+    userRole: string
+    startTime: Time
+}
+```
+
+The compiler verifies that fields read in a handler were set by a decorator in
+the chain. Accessing an unset field is a compile error.
+
+#### 3.3.5 Response Object
+
+```swift
+// Simple responses
 return 200                           // empty body
-return 401                           // short form
-return 401, "custom message"         // with body
-return 413                           // short form
+return 401, "custom message"         // with body string
+return 200, json(data)               // with JSON body
 
-// With headers — trailing block, no commas (Swift style)
-return 429 {
-    Retry-After: window
-    X-RateLimit-Remaining: 0
-}
+// With headers — build response object, no { } ambiguity
+let resp = response(429)
+resp.Retry-After = "60"
+return resp
 
-// With headers and body
-return 200 {
-    Content-Type: application/json
-    Body: json(stats())
-}
+let resp = response(200)
+resp.Content-Type = "application/json"
+resp.body = json(stats())
+return resp
+
+// Redirect
+let resp = response(301)
+resp.Location = "https://example.com\(req.path)"
+return resp
+
+// Multi-value headers on response
+resp.add("Set-Cookie", "a=1; Path=/")
+resp.add("Set-Cookie", "b=2; Path=/")
+
+// Delete header
+resp.Server = nil
 ```
 
-#### 3.3.5 State Types
+`response(status)` is a built-in function that creates a Response object.
+`{ }` is only used for code blocks — never for response construction.
+
+#### 3.3.6 State Types
+
+All persistent state is declared as top-level typed containers with compile-time
+capacity bounds. Inspired by eBPF maps: typed, bounded, per-shard by default.
+
+**Hash<K, V>** — general key-value store.
 
 ```swift
-// Counters — built-in state, per-shard, for rate limiting and concurrency control
-counter.incr(key, window: window)   // increment counter for key within time window (sliding window)
-counter.get(key)                     // read current count
-counter.active(key)                  // active count: +1 on request start, auto -1 on request end
-                                     // used for concurrency limiting (different from incr)
+let sessions = Hash<string, Session>(capacity: 50000, ttl: 30m)
+
+sessions.set(sid, user)
+let user = sessions.get(sid)       // V?
+sessions.delete(sid)
+sessions.contains(sid)             // bool
 ```
+
+**LRU<K, V>** — key-value with LRU eviction when full.
+
+```swift
+let responseCache = LRU<string, CachedResponse>(capacity: 10000, ttl: 5m)
+
+responseCache.set(key, resp)
+let cached = responseCache.get(key)   // V? — hit refreshes access time
+```
+
+Optional `coalesce: true` — request coalescing (singleflight). Prevents thundering
+herd on cache miss: only one request fetches from upstream, others wait for the result.
+Same pattern as nginx `proxy_cache_lock`.
+
+```swift
+let cache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
+
+get /users/:id {
+    let key = "/users/\(req.id)"
+    let cached = cache.get(key)      // miss + in-flight → auto wait for first request
+    if cached? { return 200, cached }
+    let resp = forward(userService, buffered: true)
+    cache.set(key, resp.body)        // stores result + wakes all waiting connections
+    return resp
+}
+```
+
+Implementation: per-shard, single-threaded. On `cache.get()` miss with pending
+in-flight request for same key, the runtime suspends the connection (adds to
+intrusive linked list). On `cache.set()`, resumes all waiters with the value.
+No mutex needed — single thread per shard.
+
+**Set\<T>** — membership testing.
+
+```swift
+let blacklist = Set<IP>(capacity: 100000)
+let trustedNets = Set<CIDR>(capacity: 1000)
+
+blacklist.contains(req.remoteAddr)     // bool
+trustedNets.contains(req.remoteAddr)   // bool — CIDR set does longest prefix match on IP
+blacklist.add(ip)
+blacklist.remove(ip)
+```
+
+Compiler picks implementation by element type: `Set<IP>` / `Set<string>` → hash set,
+`Set<CIDR>` → LPM trie (longest prefix match tree).
+
+**Counter\<K>** — rate limiting counters. Two algorithms:
+
+```swift
+// Sliding window (default) — "max N requests per window"
+let apiLimits = Counter<IP>(capacity: 100000, window: 1m)
+apiLimits.incr(req.remoteAddr)         // +1, returns current count in window
+apiLimits.get(req.remoteAddr)          // current count in window
+guard apiLimits.get(req.remoteAddr) <= 1000 else { return 429 }
+
+// Token bucket — "rate N/min, allow burst of B"
+let burstLimits = Counter<IP>(capacity: 100000, rate: 100, burst: 20)
+guard burstLimits.take(req.remoteAddr) else { return 429 }
+// take: consume 1 token, returns false if empty
+// refills at 100/min, max 20 tokens accumulated
+```
+
+Compiler detects algorithm by parameters: `window:` → sliding window,
+`rate:` + `burst:` → token bucket.
+
+**Bloom\<T>** — probabilistic set, memory-efficient for large cardinalities.
+No false negatives; possible false positives.
+
+```swift
+let seenRequests = Bloom<string>(capacity: 1000000, errorRate: 0.01)
+
+seenRequests.add(key)
+seenRequests.mayContain(key)           // bool — "not in" is certain, "in" may be false positive
+```
+
+Use cases: request deduplication, cache penetration defense, large-scale blacklists.
+
+**Bitmap** — fixed-size bit array.
+
+```swift
+let features = Bitmap(size: 256)
+
+features.set(12)                       // set bit
+features.clear(12)                     // clear bit
+features.test(12)                      // bool
+features.count()                       // popcount — number of set bits
+```
+
+Use cases: feature flags, upstream health status, compact boolean arrays.
+
+**Common parameters:**
+
+| Parameter | Applies to | Description |
+|-----------|-----------|-------------|
+| `capacity:` | all (required) | Max entries, compile-time bound |
+| `ttl:` | Hash, LRU, Counter | Entry expiry time; Counter's ttl is the sliding window |
+| `window:` | Counter (required) | Alias for ttl, preferred for Counter |
+| `errorRate:` | Bloom (required) | False positive rate, determines memory usage |
+| `size:` | Bitmap (required) | Number of bits |
+| `persist: true` | all | Preserve data across hot reload; compile error if struct layout changed |
+| `consistent: true` | Hash, Set, Counter | Route ops to owner shard by key hash; strong consistency, SPSC round-trip cost; compiler warning, suppress with `// rut:allow(consistent)` |
+| `coalesce: true` | LRU | Request coalescing — on cache miss with in-flight request for same key, suspend and wait instead of sending duplicate upstream request |
+| `backend: .redis(addr)` | Hash, Counter, Set | Cross-node state sync via external storage; per-shard state becomes a local cache with Redis as source of truth |
+
+**All state is per-shard by default.** Each shard owns an independent copy, single-threaded access,
+zero locking. Per-shard counters are approximate (effective limit ≈ `limit × shard_count`).
+
+**Cross-shard communication: `notify`**
+
+`notify` is Rutlang's only cross-shard primitive. Two forms:
+
+```swift
+notify all expr                    // all shards — eventual consistency
+notify(key) expr                   // hash(key) → owner shard — targeted
+
+let blacklist = Set<IP>(capacity: 100000)
+
+post /admin/ban {
+    let ip = req.body(IP)
+    guard let ip else { return 400 }
+    blacklist.add(ip)              // local shard — immediate
+    notify all blacklist.add(ip)   // all other shards — next event loop tick
+    return 200
+}
+```
+
+- `notify all` — fan-out to N-1 shards, eventual consistency
+- `notify(key)` — hash(key) to determine owner shard, send to that shard only
+
+Implementation: each shard pair has a wait-free SPSC (single-producer single-consumer)
+ring buffer. `notify` enqueues the operation using `relaxed` stores with `release`
+on the tail pointer. Receiving shards drain their queues on each event loop tick
+with `acquire` on the tail read. No `seq_cst`, no full barrier, no cache line
+contention (head and tail on separate cache lines).
+
+Cost: `notify all` = N-1 relaxed writes. `notify(key)` = 1 relaxed write.
+Propagation latency is one event loop tick (~microseconds).
+
+**Strong consistency: `consistent: true`**
+
+For exact global rate limiting or other strongly consistent state, declare with
+`consistent: true`. Operations route to the owner shard (determined by key hash),
+processed sequentially — no locks, just SPSC message round-trip.
+
+```swift
+// rut:allow(consistent)
+let exactLimits = Counter<IP>(capacity: 100000, window: 1m, consistent: true)
+
+get /api/*path {
+    // Compiler generates: hash(remoteAddr) → owner shard → SPSC send → yield → receive
+    exactLimits.incr(req.remoteAddr)
+    guard exactLimits.get(req.remoteAddr) <= 1000 else { return 429 }
+    return forward(userService)
+}
+```
+
+Cost: 1 SPSC round-trip when current shard != owner shard (local ops are free).
+Compiler emits a warning — user must acknowledge with `// rut:allow(consistent)`.
+
+**Three-tier cost model:**
+
+| Mode | Declaration | Cost | Consistency |
+|------|-------------|------|-------------|
+| per-shard | default | zero | approximate |
+| notify all | `notify all expr` | N-1 SPSC writes | eventual |
+| notify(key) | `notify(key) expr` | 1 SPSC write | eventual, targeted |
+| consistent | `consistent: true` | 1 SPSC round-trip | strong |
+
+All three use SPSC message passing. No atomics, no STM, no locks.
+
+**Cross-node state: `backend:` parameter**
+
+Per-shard and cross-shard state only works within a single Rut process. When
+multiple Rut instances need shared state (e.g., cluster-wide rate limiting),
+use `backend:` to sync via external storage:
+
+```swift
+// Per-process only (default) — fast, approximate
+let limits = Counter<IP>(capacity: 100000, window: 1m)
+
+// Cross-node via Redis — exact cluster-wide counting
+let globalLimits = Counter<IP>(capacity: 100000, window: 1m, backend: .redis("redis:6379"))
+
+// Cross-node session store
+let sessions = Hash<string, Session>(capacity: 100000, ttl: 30m, backend: .redis("redis:6379"))
+```
+
+With `backend:`, per-shard state acts as a local cache. Writes go to both
+local state and Redis (async via TCP). Reads check local first, fall back
+to Redis on miss. The runtime handles connection pooling and serialization.
+
+Cost: ~100μs per Redis round-trip vs ~10ns for local state. Use only when
+cluster-wide consistency is required.
+
+#### 3.3.7 Error Handling: Result and guard
+
+No exceptions. No try/catch. Every fallible operation returns `Result<T>`, which
+carries either a value or an error message. The caller **must** use `guard let` to
+unwrap a Result — the compiler rejects code that ignores a Result value.
+
+**Result vs Optional:**
+- `string?` (Optional) — value may be absent, not an error. E.g., optional header.
+- `Result<User>` — operation may fail with an error message. E.g., body parse.
+
+**Nil handling — four operators:**
+
+| Syntax | Name | Returns | Meaning |
+|--------|------|---------|---------|
+| `x?` | nil check | `bool` | `x != nil` |
+| `x?.method` | optional chaining | `T?` | if x is nil → nil, else → x.method |
+| `x ?? default` | null coalescing | `T` | if x is nil → default, else → x |
+| `guard let x else { return N }` | unwrap or reject | `T` | if x is nil → exit handler |
+
+```swift
+// x? — check existence (bool)
+guard req.authorization? else { return 401 }
+if req.origin? {
+    resp.Vary = "Origin"
+}
+
+// x?.method — optional chaining (nil propagation)
+let len = req.authorization?.len               // i32? — nil if no header
+let ok = req.authorization?.hasPrefix("Bearer") // bool? — nil if no header
+
+// x ?? default — null coalescing (provide default)
+let name = req.query("name") ?? "anonymous"
+let page = parseInt(req.query("page") ?? "1")
+
+// guard let — unwrap or reject (early return)
+guard let token = req.authorization else { return 401 }
+// token is now a string, usable below
+
+// Result — operation can fail with an error
+let user = req.body(User)                  // Result<User>
+guard let user else { return 400 }         // discard error message
+guard let user else { return 400, user.error }  // include error in response
+guard let user else {
+    log.warn("bad body", { error: user.error })
+    return 400, "invalid request body"
+}
+```
+
+**Result types by operation:**
+
+| Operation | Return type | Typical guard |
+|-----------|-------------|---------------|
+| `req.body(T)` | `Result<T>` | `guard let x else { return 400 }` |
+| `get/post http://...` | `Result<Response>` | `guard let res else { return 502 }` |
+| `jwtDecode(token, secret:)` | `Result<Claims>` | `guard let claims else { return 401 }` |
+| `forward(upstream)` | built-in, returns 502 on failure | no guard needed |
+| `req.authorization` | `string?` (Optional) | `guard let x else { return 401 }` |
+| `req.query("key")` | `string?` (Optional) | `guard let x else { return 400 }` |
+
+**Compile-time enforcement:** if a Result is assigned to `let` without a subsequent
+`guard let ... else`, the compiler emits an error:
+
+```swift
+let user = req.body(User)
+forward(users)
+// ERROR: Result<User> must be unwrapped with 'guard let user else { return ... }'
+```
+
+**Runtime errors** (division by zero, array out of bounds) are programming bugs —
+they return 500 immediately. No recovery mechanism.
+
+#### 3.3.8 Compile-Time Constants
+
+`const` declares a value that **must** be computed at compile time. The result is
+embedded directly in the binary. No runtime cost.
+
+```swift
+const secretHash = sha256(env("STATIC_SECRET"))
+const jwtPublicKey = env("JWT_PUBLIC_KEY")
+const maxItems = 100
+const apiPrefix = "/api/v1"
+```
+
+`const` expressions can only contain: literals, `env()`, pure functions (sha256,
+base64, string operations), and other `const` values. I/O is a compile error:
+
+```swift
+const x = sha256(env("KEY"))              // ✅ pure function + env
+const y = get http://config/value         // ❌ compile error: I/O in const
+```
+
+`let` without `const` is also evaluated at compile time when possible — the
+compiler optimizes pure expressions automatically. `const` is an explicit
+assertion: "this must be compile-time; error if it can't be."
+
+#### 3.3.9 Control Flow Constraints
+
+Rutlang guarantees bounded execution — every handler has a finite execution bound
+at compile time. This prevents a buggy handler from stalling a shard.
+
+- **`let`** — immutable binding (default).
+- **`var`** — mutable binding, **handler-local only**. Not allowed at top level.
+  Protects share-nothing: no global mutable state, no cross-shard mutation.
+- **`for ... in` only** — iterates finite collections (arrays, struct fields). No `while`, no `loop`.
+- **No `break` / `continue`** — every iteration runs to completion.
+- **No recursion** — all functions inline at compile time. A function calling itself is a compile error.
+- **No closures** — no first-class functions, no callbacks. No implicit variables.
+
+```swift
+// var — handler-local mutable variable
+get /api/data {
+    var score = 0                          // ✅ local, any type
+    var msg = "violations:"
+    if input.matches(re"(?i)UNION\s+SELECT") {
+        score += 5
+        msg = "\(msg) sql_injection"
+    }
+    guard score <= 10 else { return 403, msg }
+    return forward(userService)
+}
+
+// ❌ top-level var — compile error
+var globalCounter = 0                      // ERROR: var not allowed at top level
+
+// OK — bounded iteration over array
+for item in order.items {
+    guard item.qty > 0 else { return 400 }
+}
+
+// Compile error — while not supported
+while queue.hasNext() { ... }
+
+// Compile error — recursion not supported
+func foo(_ req: Request) {
+    foo(req)    // ERROR: recursive call detected
+}
+```
+
+**`defer` — cleanup on any exit path:**
+
+`defer` registers a statement to execute when the handler exits, regardless of
+which `return` is taken. Multiple `defer` statements execute in reverse order (LIFO).
+Inspired by Go/Swift/Zig.
+
+```swift
+get /api/data {
+    activeConns.incr(req.remoteAddr)
+    defer activeConns.decr(req.remoteAddr)     // runs on ANY exit
+
+    let start = now()
+    defer log.info("done", duration: now() - start)  // runs after decr (LIFO)
+
+    guard req.authorization? else { return 401 }      // defer still runs
+    guard req.contentLength <= 1mb else { return 413 } // defer still runs
+    return forward(userService)                        // defer still runs
+}
+```
+
+Compiler inlines `defer` statements at every `return` site. No runtime stack,
+no allocation — pure compile-time code duplication.
 
 ### 3.4 Syntax
 
-#### 3.4.1 Listening and Upstream
+#### 3.4.1 Listening, TLS, and Upstream
+
+**Listening**
 
 ```swift
 // Simple
-listen :80, redirect: :443
-
-// With TLS
-listen :443, tls(cert: env("CERT"), key: env("KEY"))
+listen :80
 
 // With connection-level security (anti-DDoS / slowloris)
-listen :443, tls(cert: env("CERT"), key: env("KEY")) {
+listen :443 {
     maxConns: 100000             // global max connections
     maxConnsPerIP: 256           // per-IP connection limit
     headerTimeout: 10s           // header must arrive within this
@@ -218,18 +773,266 @@ listen :443, tls(cert: env("CERT"), key: env("KEY")) {
 }
 
 // Internal port for metrics/admin
-listen :9090, internal: true
+listen :9090
 
+// PROXY Protocol — parse HAProxy PROXY v1/v2 to get real client IP behind L4 LBs
+// After parsing, req.remoteAddr reflects the original client IP, not the LB's IP
+listen :443, proxyProtocol: true
+```
+
+**TLS Certificates (SNI)**
+
+TLS certificate declarations are top-level, separate from routing. The compiler generates
+an SNI callback table from these declarations. Priority: exact domain > wildcard > default.
+
+```swift
+// Per-domain certificates — compiler builds SNI lookup table
+tls "api.example.com",   cert: env("API_CERT"),      key: env("API_KEY")
+tls "admin.example.com", cert: env("ADMIN_CERT"),     key: env("ADMIN_KEY")
+
+// Wildcard — matches *.example.com not matched by an exact entry
+tls "*.example.com",     cert: env("WILDCARD_CERT"),  key: env("WILDCARD_KEY")
+
+// Default — used when SNI doesn't match any domain, or client sends no SNI
+tls default,             cert: env("DEFAULT_CERT"),   key: env("DEFAULT_KEY")
+
+// Single-domain shorthand (when only one cert is needed)
+tls cert: env("CERT"), key: env("KEY")
+
+// OCSP stapling — runtime periodically fetches OCSP response from CA,
+// staples it in TLS handshake for client certificate revocation checking
+tls "api.example.com", cert: env("CERT"), key: env("KEY"), ocsp: true
+```
+
+**Global Defaults**
+
+Shared configuration inherited by all routes. Per-upstream or per-proxy values override.
+
+```swift
+defaults {
+    forwardBufferSize: 16kb      // per-connection forward buffer size
+    clientMaxBodySize: 10mb      // default max body size
+    compress: .auto(             // response compression
+        types: [text/html, text/css, application/json, application/javascript]
+        minSize: 256b
+        level: 4
+    )
+    errorPages: "/var/www/errors/"   // custom error pages: {dir}/{status}.html
+    tracing: .otlp(endpoint: "http://collector:4318")  // or .zipkin(...) or .off
+    cache: .auto(capacity: 10000, maxSize: 10mb)       // RFC 7234 auto caching
+}
+```
+
+**Error pages:** when a handler returns status >= 400, runtime looks up
+`{errorPages}/{status}.html`. If found, serves its content as response body.
+If not found, sends default plain text. One line config, zero Rutlang code.
+
+**Request priority:** under high load, the runtime can shed low-priority requests
+first. Configured via `@priority` decorator on routes or groups:
+
+```swift
+route {
+    @priority(.high)
+    api.example.com/payments { ... }
+
+    @priority(.normal)                    // default
+    api.example.com/users { ... }
+
+    @priority(.low)
+    api.example.com/analytics { ... }
+}
+```
+
+When the accept queue or per-shard connection count exceeds a threshold, the runtime
+rejects new `.low` priority connections with 503, then `.normal` if load continues.
+`.high` priority routes are shed last.
+
+Compression is applied automatically based on `Accept-Encoding` header and
+the `types` list. To opt-out for a specific route (e.g., already-compressed
+images or streaming responses), use `compress: .off` in the response:
+
+```swift
+get /files/:id {
+    forward(storageService, compress: .off)          // skip compression for this proxy
+}
+
+get /images/*path {
+    read(root: "/var/www/images", compress: .off)  // images are already compressed
+}
+```
+
+**Upstream**
+
+```swift
 let users = upstream {
     "10.0.0.1:8080", weight: 3
     "10.0.0.2:8080"
     balance: .leastConn
-    health: .get("/ping", every: 5s)
+    health: .active(get: "/ping", every: 5s)              // active — timer probes
+    health: .passive(failures: 5, recover: 30s)            // passive — mark unhealthy after consecutive errors
     breaker: .consecutive(failures: 5, recover: 30s)
     retry: .on([502, 503, 504], count: 2, backoff: 100ms)
+    connectTimeout: 3s           // override default
+    readTimeout: 30s             // per-upstream read timeout
+    sendTimeout: 10s             // per-upstream send timeout
+    keepalive: 64                // max idle connections per shard
+}
+
+// Upstream with mTLS — present client cert when connecting
+let internalService = upstream {
+    "10.0.0.5:8443"
+    tls: .mtls(cert: env("CLIENT_CERT"), key: env("CLIENT_KEY"), ca: env("CA_CERT"))
 }
 
 let orders = upstream { "10.0.1.1:8080" }
+```
+
+**Load balancing algorithms:**
+
+All standard algorithms are built-in. The runtime tracks per-target state
+(connection count, latency, weight) per shard.
+
+| Algorithm | Declaration | Description |
+|-----------|-------------|-------------|
+| Round Robin | `balance: .roundRobin` | Sequential rotation (default) |
+| Weighted Round Robin | `balance: .weightedRoundRobin` | Distribute proportional to `weight:` |
+| Least Connections | `balance: .leastConn` | Target with fewest active connections |
+| Random | `balance: .random` | Uniform random selection |
+| Power of Two (P2C) | `balance: .powerOfTwo` | Random 2 targets, pick the one with fewer connections |
+| IP Hash | `balance: .ipHash` | Consistent hash on client IP (session affinity) |
+| Consistent Hash | `balance: .hash(expr)` | Consistent hash on arbitrary field (e.g., `req.X-User-ID`) |
+| EWMA | `balance: .ewma` | Lowest exponential weighted moving average latency |
+
+**Custom load balancing:**
+
+Users can implement custom algorithms in Rutlang. Instead of `forward(upstream)`,
+select a target manually using `upstream.servers` and `forward` to a specific address:
+
+```swift
+// Custom: route to the target whose name matches a header
+func selectByHeader(_ req: Request, up: Upstream) -> Server {
+    for server in up.servers {
+        if server.addr == req.X-Target-Server {
+            return server
+        }
+    }
+    return up.servers[0]    // fallback to first
+}
+
+get /custom {
+    let target = selectByHeader(req, up: users)
+    return forward(target)
+}
+```
+
+`upstream.servers` exposes the target list as `[Server]`. `Server` has fields:
+`addr` (string), `weight` (i32), `healthy` (bool), `activeConns` (i32),
+`latencyEwma` (Duration). The user can read these to implement any selection logic.
+
+**Health check modes:**
+
+- `.active(get: path, every: Duration)` — timer-driven HTTP probe to each target
+- `.passive(failures: N, recover: Duration)` — runtime tracks forward() errors per
+  target; after N consecutive failures, marks unhealthy; recovers after Duration
+
+**Slow start:**
+
+```swift
+let backend = upstream {
+    "10.0.0.1:8080"
+    slowStart: 30s    // newly healthy target ramps weight from 0 to configured over 30s
+}
+```
+
+When a target recovers from unhealthy, its effective weight increases linearly
+from 0 to its configured `weight:` over the `slowStart:` duration. Prevents
+overwhelming a freshly started server with full traffic.
+
+**Outlier detection:**
+
+More sophisticated than passive health checks — tracks per-target success rate
+over time, ejects targets that perform worse than average.
+
+```swift
+let backend = upstream {
+    "10.0.0.1:8080"
+    "10.0.0.2:8080"
+    outlier: .successRate(
+        threshold: 0.9,         // eject if success rate < 90%
+        interval: 30s,          // evaluation window
+        minRequests: 100        // minimum samples before evaluating
+    )
+}
+```
+
+**Retry budget:**
+
+Prevents retry storms — limits total retries as a percentage of normal traffic.
+
+```swift
+let backend = upstream {
+    retry: .on([502, 503], count: 2, backoff: 100ms)
+    retryBudget: .percent(20)   // retries cannot exceed 20% of total requests
+}
+```
+
+**Locality-aware routing:**
+
+Prefer upstreams in the same zone/region. Reduces cross-zone latency and egress costs.
+
+```swift
+let backend = upstream {
+    "10.0.0.1:8080", zone: "us-east-1a"
+    "10.0.0.2:8080", zone: "us-east-1b"
+    "10.0.0.3:8080", zone: "us-west-2a"
+    locality: .preferLocal      // prefer targets in same zone as this shard
+}
+```
+
+**Happy Eyeballs (RFC 8305):**
+
+Dual-stack connect racing — try IPv4 and IPv6 simultaneously, use first to connect.
+
+```swift
+let backend = upstream {
+    "api.example.com:8080"      // DNS returns A + AAAA records
+    happyEyeballs: true         // race IPv4/IPv6 connect, use winner
+}
+```
+
+**Cluster warming:**
+
+New target waits for first health check to pass before receiving any traffic.
+
+```swift
+let backend = upstream {
+    health: .active(get: "/ping", every: 5s)
+    warming: true               // don't route until health check passes
+}
+```
+
+**Full upstream example:**
+
+```swift
+let userService = upstream {
+    "10.0.0.1:8080", weight: 3, zone: "us-east-1a"
+    "10.0.0.2:8080", weight: 1, zone: "us-east-1b"
+    balance: .ewma
+    health: .active(get: "/ping", every: 5s)
+    health: .passive(failures: 5, recover: 30s)
+    outlier: .successRate(threshold: 0.9, interval: 30s, minRequests: 100)
+    breaker: .consecutive(failures: 5, recover: 30s)
+    retry: .on([502, 503], count: 2, backoff: 100ms)
+    retryBudget: .percent(20)
+    connectTimeout: 3s
+    readTimeout: 30s
+    keepalive: 64
+    slowStart: 30s
+    warming: true
+    locality: .preferLocal
+    happyEyeballs: true
+    tls: .mtls(cert: env("CLIENT_CERT"), key: env("CLIENT_KEY"), ca: env("CA_CERT"))
+}
 ```
 
 #### 3.4.2 Functions (Middleware and Helpers)
@@ -257,13 +1060,9 @@ func auth(_ req: Request, role: string) -> User {
     return User(id: claims.sub, role: claims.role)
 }
 
-func rateLimit(_ req: Request, limit: i32, window: Duration) {
-    let count = counter.incr(req.remoteAddr, window: window)
-    guard count <= limit else {
-        return 429 {
-            Retry-After: window
-        }
-    }
+func rateLimit(_ req: Request, limits: Counter<IP>, max: i32) {
+    let count = limits.incr(req.remoteAddr)
+    guard count <= max else { return 429 }
 }
 
 func requestId(_ req: Request) {
@@ -280,12 +1079,12 @@ func cors(_ req: Request, origins: [string]) {
     }
 
     if req.method == .OPTIONS {
-        return 204 {
-            Access-Control-Allow-Origin: origin
-            Access-Control-Allow-Methods: "GET, POST, PUT, DELETE"
-            Access-Control-Allow-Headers: "Content-Type, Authorization"
-            Access-Control-Max-Age: 86400
-        }
+        let resp = response(204)
+        resp.Access-Control-Allow-Origin = origin
+        resp.Access-Control-Allow-Methods = "GET, POST, PUT, DELETE"
+        resp.Access-Control-Allow-Headers = "Content-Type, Authorization"
+        resp.Access-Control-Max-Age = "86400"
+        return resp
     }
 
     req.Access-Control-Allow-Origin = origin
@@ -303,7 +1102,7 @@ func verifySig(_ req: Request, secret: string) {
 }
 
 func ipAllow(_ req: Request, cidrs: [CIDR]) {
-    guard cidrs.contains(where: { req.remoteAddr.in($0) }) else {
+    guard cidrs.contains(req.remoteAddr) else {
         return 403
     }
 }
@@ -312,9 +1111,8 @@ func maxBody(_ req: Request, limit: ByteSize) {
     guard req.contentLength <= limit else { return 413 }
 }
 
-func concurrencyLimit(_ req: Request, key: string, limit: i32) {
-    guard counter.active(key) < limit else { return 503, "overloaded" }
-    // counter.active: +1 on request start, auto -1 on request end
+func concurrencyLimit(_ req: Request, active: Counter<string>, limit: i32) {
+    guard active.get(req.remoteAddr) < limit else { return 503, "overloaded" }
 }
 
 // --- Response middleware (takes both Request and Response) ---
@@ -330,9 +1128,9 @@ func securityHeaders(_ req: Request, _ resp: Response) {
 
 // --- Security middleware examples ---
 
-func antiFlood(_ req: Request) {
-    guard counter.incr(req.remoteAddr, window: 1s) <= 50 else { return 429 }
-    guard counter.incr("global", window: 1s) <= 10000 else { return 503 }
+func antiFlood(_ req: Request, perIP: Counter<IP>, global: Counter<string>) {
+    guard perIP.incr(req.remoteAddr) <= 50 else { return 429 }
+    guard global.incr("total") <= 10000 else { return 503 }
 }
 
 func waf(_ req: Request) {
@@ -340,13 +1138,10 @@ func waf(_ req: Request) {
     guard !path.contains("/../") else { return 403, "path traversal" }
     guard !urlDecode(path).contains("/../") else { return 403, "encoded traversal" }
 
-    let dangerous = ["UNION SELECT", "DROP TABLE", "<script", "javascript:"]
-    let input = "\(path) \(req.queryString ?? "")".upper()
-    for pattern in dangerous {
-        guard !input.contains(pattern) else {
-            log.warn("waf blocked", { pattern: pattern, addr: req.remoteAddr })
-            return 403
-        }
+    let input = "\(path) \(req.queryString ?? "")"
+    guard !input.matches(re"(?i)UNION\s+SELECT|DROP\s+TABLE|<script|javascript:") else {
+        log.warn("waf blocked", { addr: req.remoteAddr })
+        return 403
     }
 }
 
@@ -360,133 +1155,328 @@ func blockBots(_ req: Request) {
 }
 ```
 
-#### 3.4.3 Route Definition
+#### 3.4.3 UFCS (Uniform Function Call Syntax)
 
-Routes use trailing closure syntax. No commas between block items (Swift style).
+Any function whose first parameter is type `T` can be called as `t.func(remaining args)`.
+The compiler rewrites `t.func(args)` to `func(t, args)`. Pure syntax sugar, zero overhead.
+
+```swift
+// These are equivalent:
+auth(req, role: "user")
+req.auth(role: "user")
+
+// Chaining reads naturally:
+req.requestId()
+req.auth(role: "user")
+req.rateLimit(limits: apiLimits, max: 1000)
+
+// Works for any type, not just Request:
+let clean = req.path.replace(re"/+", "/")    // replace(req.path, re"/+", "/")
+```
+
+UFCS does not add methods to types — it's a calling convention. The function must
+exist and its first parameter type must match.
+
+#### 3.4.4 Route Definition
+
+`route` is pattern matching on requests. The block has two sections:
+
+1. **Middleware bindings** (top) — `@decorator pattern` declarations
+2. **Route entries** (below) — `method path { handler }` or `method path => expr`
+
+No commas between items (Swift style).
+
+**Middleware bindings:**
+
+At the top of a `route` block (before any route entry), `@decorator pattern`
+binds a middleware function to all routes matching the pattern. `*` matches all.
 
 ```swift
 route {
+    // Middleware bindings — top of block
+    @requestId *                           // all routes
+    @waf *                                 // all routes
+    @apiGuard api.example.com              // scoped to host
+    @adminGuard admin.example.com          // scoped to host
+    @maxBody(limit: 1mb) api.example.com/orders  // scoped to host + path
+
+    // Route entries below...
+}
+```
+
+`@decorator` can also be placed directly on a route entry or group for one-off cases:
+
+```swift
+route {
+    @requestId *
+
+    @maxBody(limit: 100mb)                  // only this route
+    post /files/upload => forward(storageService, streaming: true)
+
+    get /users/:id => forward(userService)  // gets @requestId from binding
+}
+```
+
+**Pre vs post middleware — inferred from function signature:**
+
+The compiler determines when a middleware runs by its first parameter type:
+- First parameter is `Request` → **pre-middleware** (before handler)
+- First parameter is `Response` → **post-middleware** (after handler)
+
+```swift
+// Pre — first param is Request
+func requestId(_ req: Request) { ... }
+
+// Post — first param is Response
+func addSecurityHeaders(_ resp: Response) {
+    resp.Server = nil
+    resp.X-Content-Type-Options = "nosniff"
+}
+
+// Same @ syntax for both — compiler infers from signature
+route {
+    @requestId *                // Request → pre
+    @addSecurityHeaders *       // Response → post
+
+    get /users/:id => forward(userService)
+}
+
+// Expands to:
+//   requestId(req)              ← pre
+//   handler                     ← forward
+//   addSecurityHeaders(resp)    ← post
+```
+
+**Post-middleware forces buffered mode.** When a post-middleware is bound to a
+route that uses zero-copy `forward`, the compiler automatically switches to
+buffered mode and emits a warning:
+
+```
+⚠ warning: post-middleware @addSecurityHeaders forces buffered mode for
+            'get /users/:id => forward(userService)'. Zero-copy disabled.
+            To silence: use forward(userService, buffered: true) explicitly.
+```
+
+**Conditional decorators: `@if`**
+
+`@if(expr)` conditionally applies the decorator below it. The expression is
+evaluated at compile time (`env()` values resolved when .rut is compiled).
+If false, the decorator binding is eliminated — zero runtime cost.
+
+```swift
+route {
+    @requestId *
+
+    @if(env("ENABLE_WAF") == "true")
+    @waf *
+
+    @if(env("ENV") == "production")
+    @addSecurityHeaders *
+
+    api.example.com {
+        get /users/:id => forward(userService)
+    }
+}
+```
+
+**Route parameters** support optional type constraints:
+
+```swift
+//   :name          — captures any segment as string
+//   :name(i32)     — captures only if segment is a valid i32
+//   :name(i64)     — captures only if segment is a valid i64
+//   :name(uuid)    — captures only if segment is a valid UUID
+//   *rest          — captures remaining path segments as string (must be last)
+
+get /users/:id(i64) {         // req.id is i64, returns 404 if not numeric
+    return forward(userService)
+}
+
+get /files/*path {            // req.path captures "docs/2024/readme.md"
+    return read(root: "/var/www")
+}
+```
+
+**Pattern prefix grouping:**
+
+A host name or path prefix followed by `{ }` groups routes sharing that prefix.
+Groups can nest.
+
+```swift
+route {
+    api.example.com {
+        /v1 {
+            get /users/:id => forward(usersV1)
+        }
+        /v2 {
+            get /users/:id => forward(usersV2)
+        }
+    }
+
+    *.example.com {
+        get|post /** {
+            let resp = response(301)
+            resp.Location = "https://www.example.com\(req.path)"
+            return resp
+        }
+    }
+
+    _ => 444
+}
+```
+
+Parser rule: inside `route { }`:
+- `@decorator pattern` (no `{` or `=>` after pattern) → middleware binding
+- `@decorator` + route entry or group `{` → direct decorator
+- `identifier.identifier... {` → host group
+- `/path {` without method keyword → path group
+- method keyword (`get`, `post`, `get|post`, ...) → route entry
+- `_` → catch-all
+
+**Full route example:**
+
+```swift
+route {
+    // Middleware bindings
+    @requestId *
+    @apiGuard api.example.com
+    @adminGuard admin.example.com
+
+    // Routes
     get /health => 200
 
-    // Global middleware — applied to all routes below
-    use requestId
-    use cors(origins: ["https://app.example.com"])
+    api.example.com {
+        get /users/:id(i64) => forward(userService)
 
-    get /users/:id { req in
-        let user = auth(req, role: "user")
-        rateLimit(req, limit: 100, window: 1m)
-        req.X-User-ID = req.id
-        proxy(users, timeout: 10s)
-    }
-
-    post /users { req in
-        auth(req, role: "admin")
-        maxBody(req, limit: 1mb)
-        proxy(users, timeout: 30s)
-    }
-
-    post /orders { req in
-        let user = auth(req, role: "user")
-        let order = req.body(Order)
-        guard !order.items.isEmpty else {
-            return 400, "order must have items"
-        }
-        for item in order.items {
-            guard item.qty > 0 else { return 400, "invalid quantity" }
-            guard item.price >= 0 else { return 400, "invalid price" }
-        }
-        req.X-User-ID = user.id
-        proxy(orders, timeout: 30s)
-    }
-
-    post /webhook { req in
-        verifySig(req, secret: env("WEBHOOK_SECRET"))
-        maxBody(req, limit: 1mb)
-        proxy(webhookService)
-    }
-
-    // Route group with shared prefix and middleware
-    group /admin { req in
-        ipAllow(req, cidrs: [10.0.0.0/8, 172.16.0.0/12])
-        auth(req, role: "admin")
-
-        match req.path {
-            /admin/stats  => 200, json(stats())
-            /admin/reload => do { reload(); return 200 }
-            _             => 404
+        post /orders {
+            let order = req.body(Order)
+            guard let order else { return 400 }
+            for item in order.items {
+                guard item.qty > 0 else { return 400, "invalid quantity" }
+            }
+            return forward(orderService)
         }
     }
 
-    any ** => 404
+    /admin {
+        get /stats => 200, json(stats())
+        post /reload {
+            reload()
+            return 200
+        }
+    }
+
+    _ => 404
 }
 ```
 
-#### 3.4.4 Response Callbacks
+#### 3.4.5 Response Modification
 
-Proxy accepts a trailing closure to inspect and modify the upstream response before sending it to the client.
+`forward` has two modes:
+
+- **Zero-copy** — `return forward(upstream)`. Data spliced directly between sockets,
+  never enters userspace. No response modification possible.
+- **Buffered** — `forward(upstream, buffered: true)`. Response read into memory,
+  returned as `Response` object. Full modification, then explicit `return`.
 
 ```swift
-get /users/:id { req in
-    auth(req, role: "user")
-    proxy(users, timeout: 10s) { resp in
-        // Modify response headers
-        resp.Server = "gateway"
-        resp.X-Powered-By = nil           // remove header (assign nil)
-        resp.X-Request-ID = req.X-Request-ID
+// Zero-copy — no modification, maximum performance
+get /users/:id => forward(userService)
 
-        // Log upstream errors
-        if resp.status >= 500 {
-            log.error("upstream error", {
-                status: resp.status
-                path: req.path
-                upstream: "users"
-            })
-        }
+// Buffered — modify headers
+get /users/:id {
+    let resp = forward(userService, buffered: true)
+    resp.Server = nil
+    resp.X-Request-ID = req.X-Request-ID
+    return resp
+}
 
-        // Rewrite error response body
-        if resp.status == 404 {
-            resp.status = 200
-            resp.body = json({ users: [], total: 0 })
-        }
+// Buffered — modify body, log errors
+get /users/:id {
+    let resp = forward(userService, buffered: true)
+    if resp.status >= 500 {
+        log.error("upstream error", { status: resp.status, path: req.path })
     }
+    if resp.status == 404 {
+        resp.status = 200
+        resp.body = json({ users: [], total: 0 })
+    }
+    return resp
 }
 ```
 
-#### 3.4.5 Response Caching
+The compiler detects which mode to use:
+- `return forward(x)` or `=> forward(x)` → zero-copy
+- `let resp = forward(x, buffered: true)` → buffered, `resp` is a regular variable
 
-Cache upstream responses with declarative syntax:
+**Bandwidth limiting** — see §3.4.10 Throttle.
+
+**Response object members (buffered mode):**
 
 ```swift
-get /users/:id { req in
-    auth(req, role: "user")
-    cache(key: "/users/\(req.id)", ttl: 5m) {
-        proxy(users)
-    }
-}
+let resp = forward(userService, buffered: true)
+resp.status                   // StatusCode — read/write
+resp.body                     // string — read/write
+resp.Server                   // string? — header read/write
+resp.add("Set-Cookie", val)   // append multi-value header
+resp.getAll("Set-Cookie")     // [string] — all values
+resp.cookie("session")        // string? — read a Set-Cookie value by name
+resp.upstream                 // string — which target served this ("10.0.0.1:8080")
+```
 
-// Cache with more options
-get /products { req in
-    cache(
-        key: "\(req.path)?\(req.queryString)",
-        ttl: 10m,
-        staleWhileRevalidate: 30s,     // serve stale while refreshing
-        varyBy: [req.Accept-Language],  // vary cache by header
-        unless: { $0.status >= 400 }    // don't cache errors
-    ) {
-        proxy(productService)
-    }
-}
+`resp.cookie()` and `resp.upstream` enable session persistence "learn" mode:
 
-// Cache invalidation via internal endpoint
-post /internal/cache/purge { req in
-    ipAllow(req, cidrs: [10.0.0.0/8])
-    let pattern = req.body(PurgeRequest).pattern
-    cache.purge(pattern: pattern)       // purge by glob pattern
-    return 200
+```swift
+let sessionMap = Hash<string, string>(capacity: 100000, ttl: 1h)
+
+get /api/*path {
+    // Sticky session — route to previously learned upstream
+    let sid = req.cookie("session")
+    if sid? {
+        let target = sessionMap.get(sid)
+        if target? {
+            return forward(target)
+        }
+    }
+    // First request — forward normally, learn the session
+    let resp = forward(userService, buffered: true)
+    let newSid = resp.cookie("session")
+    if newSid? {
+        sessionMap.set(newSid, resp.upstream)
+    }
+    return resp
 }
 ```
 
-#### 3.4.6 Traffic Mirroring
+#### 3.4.6 Response Caching
+
+Standard HTTP response caching (RFC 7234) is handled automatically by the runtime,
+configured in `defaults`:
+
+```swift
+defaults {
+    cache: .auto(capacity: 10000, maxSize: 10mb)  // runtime respects Cache-Control headers
+}
+```
+
+For custom caching logic, use `LRU` state type + `forward(buffered: true)`:
+
+```swift
+let responseCache = LRU<string, string>(capacity: 10000, ttl: 5m)
+
+get /users/:id {
+    let key = "/users/\(req.id)"
+    let cached = responseCache.get(key)
+    if cached? {
+        return 200, cached
+    }
+    let resp = forward(userService, buffered: true)
+    responseCache.set(key, resp.body)
+    return resp
+}
+```
+
+#### 3.4.7 Traffic Mirroring
 
 `fire` sends a request without waiting for the response (fire-and-forget). Useful for traffic shadowing, async logging, webhooks.
 
@@ -500,55 +1490,369 @@ func mirror(_ req: Request, to: string) {
 }
 
 // Usage: mirror production traffic to staging
-post /api/orders { req in
+post /api/orders {
     auth(req, role: "user")
     mirror(req, to: "staging-gateway:8080")   // fire-and-forget
-    proxy(orders, timeout: 30s)               // actual request
+    forward(orderService)               // actual request
 }
 ```
 
-#### 3.4.7 WebSocket Proxying
+#### 3.4.8 WebSocket Proxying
+
+Transparent WebSocket proxy with optional per-frame inspection and modification.
+Ping/pong handled automatically by runtime (RFC 6455).
+
+**Basic — transparent proxy:**
 
 ```swift
-get /ws/chat { req in
+get /ws/chat {
     auth(req, role: "user")
     guard req.upgrade == .websocket else { return 400 }
-    websocket(chatService)        // transparent WebSocket proxy
+    return websocket(chatService)
 }
+```
 
-// With message inspection (optional)
-get /ws/events { req in
+**With options:**
+
+```swift
+get /ws/graphql {
     guard req.upgrade == .websocket else { return 400 }
-    websocket(eventService) { frame in
-        // Inspect/filter WebSocket frames
-        if frame.isText {
-            let msg = frame.text
-            guard !msg.contains("forbidden") else {
-                return .close(reason: "policy violation")
+    return websocket(graphqlService,
+        subprotocol: "graphql-ws",     // Sec-WebSocket-Protocol negotiation
+        maxMessageSize: 1mb             // reject frames larger than this
+    )
+}
+```
+
+**Frame inspection and modification:**
+
+Trailing block runs per frame. `frame` is the implicit variable.
+
+```swift
+get /ws/events {
+    guard req.upgrade == .websocket else { return 400 }
+    websocket(eventService, maxMessageSize: 64kb) {
+        // --- frame properties ---
+        // frame.isText       bool
+        // frame.isBinary     bool
+        // frame.isPing       bool
+        // frame.isPong       bool
+        // frame.text         string (for text frames)
+        // frame.bytes        [u8] (for binary frames)
+        // frame.direction    .client or .upstream
+
+        // --- actions ---
+        // return .forward                   pass through unchanged
+        // return .drop                      silently discard this frame
+        // return .close(reason: "...")       close the connection
+        // return .send("modified text")     replace content, then forward
+        // return .sendBytes(bytes)          replace with binary, then forward
+        // return .inject("extra message")   forward original + inject extra frame
+
+        // Example: filter profanity from client messages
+        if frame.direction == .client and frame.isText {
+            guard not frame.text.matches(re"(?i)badword|profanity") else {
+                return .drop
             }
         }
-        return .forward     // pass through
+
+        // Example: inject metadata into upstream messages
+        if frame.direction == .upstream and frame.isText {
+            return .send("\(frame.text)\n<!-- gateway: \(now()) -->")
+        }
+
+        return .forward
     }
 }
 ```
 
-#### 3.4.8 Streaming Proxy
+**Frame action summary:**
+
+| Action | Effect |
+|--------|--------|
+| `.forward` | Pass frame unchanged to other side |
+| `.drop` | Silently discard, other side sees nothing |
+| `.close(reason:)` | Close WebSocket connection with reason |
+| `.send(text)` | Replace frame content with text, then forward |
+| `.sendBytes(bytes)` | Replace frame content with binary, then forward |
+| `.inject(text)` | Forward original frame AND send an additional text frame |
+
+#### 3.4.9 Streaming Proxy
 
 For large bodies (file uploads, downloads), stream without buffering:
 
 ```swift
-post /upload { req in
+post /upload {
     auth(req, role: "user")
     guard req.contentLength <= 100mb else { return 413 }
-    proxy(storageService, streaming: true)    // body streams through, not buffered
+    forward(storageService, streaming: true)    // body streams through, not buffered
 }
 
-get /download/:fileId { req in
-    proxy(storageService, streaming: true)    // response streams to client
+get /download/:fileId {
+    forward(storageService, streaming: true)    // response streams to client
 }
 ```
 
-#### 3.4.9 Conditional Routing
+#### 3.4.10 Throttle (Bandwidth Limiting)
+
+`throttle` sets per-connection transfer rate. Applies to all subsequent I/O
+in the handler. Two directions: `downstream` (gateway → client) and
+`upstream` (gateway → backend).
+
+**Syntax:**
+
+```swift
+throttle(downstream: ByteSize per Duration)
+throttle(upstream: ByteSize per Duration)
+throttle(downstream: ByteSize per Duration, upstream: ByteSize per Duration)
+```
+
+`per` is a keyword that connects ByteSize and Duration into a Rate,
+evaluated at compile time.
+
+**Scenarios:**
+
+```swift
+// File download — limit per-user download speed
+get /files/:id {
+    throttle(downstream: 100kb per 1s)
+    return forward(storageService)
+}
+
+// Video streaming — pace to match playback rate
+get /video/:id {
+    throttle(downstream: 5mb per 1s)
+    return forward(cdnService, streaming: true)
+}
+
+// Upload protection — don't overwhelm slow upstream
+post /upload {
+    throttle(upstream: 500kb per 1s)
+    return forward(legacyService, streaming: true)
+}
+
+// Anti-scraping — slow down data extraction
+@auth(role: "user")
+get /api/products/:id {
+    throttle(downstream: 50kb per 1s)
+    return forward(productService, buffered: true)
+}
+
+// Tiered service — different speeds per plan
+get /data/*path {
+    match req.ctx.userPlan {
+        "enterprise" => throttle(downstream: 10mb per 1s)
+        "pro" => throttle(downstream: 1mb per 1s)
+        _ => throttle(downstream: 100kb per 1s)
+    }
+    return forward(storageService)
+}
+
+// Both directions
+post /sync {
+    throttle(downstream: 1mb per 1s, upstream: 500kb per 1s)
+    return forward(syncService, streaming: true)
+}
+```
+
+**Optional burst:**
+
+```swift
+throttle(downstream: 100kb per 1s, burst: 256kb)
+// Burst allows initial fast transfer, then settles to rate
+// Default burst = 2x rate (e.g., 200kb for 100kb/s)
+```
+
+**Implementation — two tiers, runtime auto-selects:**
+
+| Tier | Mechanism | When used | Overhead |
+|------|-----------|-----------|----------|
+| 1. Kernel | `SO_MAX_PACING_RATE` socket option | Linux with FQ qdisc enabled | zero userspace |
+| 2. Userspace | Token bucket in shard's timer wheel | always available (fallback) | timer tick per 10ms |
+
+eBPF (XDP/TC) cannot do per-route throttling — it operates at L3/L4 and
+doesn't know which HTTP route a connection belongs to. Throttle decisions
+come from L7 handlers, so execution is kernel socket option or userspace
+token bucket.
+
+**Token bucket** is the primary implementation (same approach as Envoy's
+`bandwidth_limit` filter):
+- Per-connection bucket: capacity = burst, refill rate = throttle rate
+- Timer wheel tick every 10ms refills tokens
+- send(): consume tokens for bytes sent; no tokens → yield, wait for refill
+- Still zero-copy with sendfile/splice — just paced into chunks
+- Always available, no kernel requirements, no special capabilities
+
+**SO_MAX_PACING_RATE** is an optimization when available:
+- Requires FQ qdisc on network interface (`tc qdisc show dev eth0 | grep fq`)
+- Zero userspace overhead — kernel paces packets using departure timestamps
+- Runtime detects FQ at startup (no root needed to check)
+- Enabling FQ requires CAP_NET_ADMIN (Node Agent can do this)
+
+**Deployment scenarios:**
+
+| Environment | FQ available? | Throttle implementation |
+|-------------|--------------|------------------------|
+| Edge gateway (bare metal, root) | Yes — Node Agent enables FQ | SO_MAX_PACING_RATE |
+| Edge gateway (cloud VM, root) | Likely — GCP enables BBR+FQ by default | SO_MAX_PACING_RATE |
+| K8s sidecar (unprivileged pod) | Depends on node OS | Token bucket (same as Envoy) |
+| K8s with Rut Node Agent | Yes — Agent enables FQ on node | SO_MAX_PACING_RATE |
+| Serverless (Fargate, Cloud Run) | No — can't modify qdisc | Token bucket |
+
+Token bucket is the core — works everywhere. SO_MAX_PACING_RATE is a
+zero-cost upgrade when the infrastructure supports it.
+
+**Compile-time checks:**
+
+| Check | Example | Error |
+|-------|---------|-------|
+| throttle outside handler | top-level `throttle(...)` | "throttle only valid inside handler" |
+| missing per | `throttle(downstream: 100kb)` | "expected 'per Duration'" |
+| burst < rate | `throttle(downstream: 100kb per 1s, burst: 50kb)` | warning: "burst smaller than rate" |
+
+#### 3.4.11 File and Pipe I/O
+
+`read` is a unified built-in function for files, pipes, and devices. Two modes
+determined by usage, same as `forward`:
+
+- `return read(...)` or `=> read(...)` → **zero-copy** (sendfile/splice)
+- `let content = read(...)` → **buffered**, returns `Result<string>`
+
+```swift
+// Zero-copy — static file serving, data goes directly to client socket
+get /static/*path => read(root: "/var/www")
+get /favicon.ico => read(path: "/var/www/favicon.ico")
+
+// SPA fallback
+get /*path => read(root: "/var/www/dist", fallback: "index.html")
+
+// Cache control via route pattern matching
+/static {
+    get re".*\.(css|js|woff2)$" => read(root: "/var/www", maxAge: 30d)
+    get re".*\.html$"           => read(root: "/var/www", maxAge: 0s)
+    get /*path                   => read(root: "/var/www", maxAge: 1d)
+}
+
+// Pipe — same interface
+get /stream => read(path: "/tmp/data_pipe")
+
+// Buffered — read into memory for modification
+get /index.html {
+    let content = read(path: "/var/www/index.html")
+    guard let content else { return 404 }
+    let html = content.replace("{{VERSION}}", env("APP_VERSION"))
+    let resp = response(200)
+    resp.Content-Type = "text/html"
+    resp.body = html
+    return resp
+    }
+}
+```
+
+Parameters:
+- `read(root:)` — directory mode: joins `root + *path` capture
+- `read(path:)` — specific file/pipe/device
+- `fallback:` — file served when target not found (SPA)
+- `index:` — default `"index.html"` for directory requests
+- `maxAge:` — sets `Cache-Control: max-age=N`
+- `maxSize:` — buffered mode only, defaults to 10mb, exceeding returns error
+
+Behavior:
+- Auto-sets `Content-Type` by file extension
+- Auto-sets `Last-Modified` and `ETag` (regular files only)
+- Rejects path traversal (`/../`) → 403
+- Does not follow symlinks outside root
+- Compiler chooses I/O backend: sendfile (regular file), splice (pipe), io_uring read (buffered)
+
+#### 3.4.12 TCP/UDP I/O
+
+Raw TCP and UDP access for protocols beyond HTTP (Redis, StatsD, syslog, etc.).
+Same async safety model — compiler generates yield points, io_uring/epoll backend.
+
+**TCP — connection-oriented, stream:**
+
+```swift
+let conn = tcp("redis:6379")           // Result<TcpConn>, compiler yields
+guard let conn else { return 502 }
+defer conn.close()
+
+conn.send("PING\r\n")                  // send data
+let data = conn.recv(maxSize: 4kb)     // Result<string>, compiler yields
+guard let data else { return 502 }
+
+// With timeout
+let h = submit conn.recv(maxSize: 4kb)
+let data = any(wait(h, 1s))
+guard let data else { return 504 }
+```
+
+`TcpConn` members:
+- `.send(data)` — send data, returns `Result<i32>` (bytes sent)
+- `.recv(maxSize:)` — receive data, returns `Result<string>`
+- `.close()` — close connection
+- `.remoteAddr` — `IP`
+- `.localAddr` — `IP`
+
+**UDP — connectionless, datagrams:**
+
+```swift
+let sock = udp()
+guard let sock else { return 500 }
+defer sock.close()
+
+// Send (fire-and-forget, typical for metrics/logging)
+sock.sendTo("10.0.0.1:8125", "myapp.requests:1|c")
+
+// Receive
+let data = sock.recvFrom(maxSize: 4kb)   // Result<(string, IP)>
+guard let data else { return 502 }
+let (payload, sender) = data
+```
+
+**Safety:** same as HTTP calls — no blocking (io_uring async), timeout via
+`any(wait(h, Duration))`, memory bounded by `maxSize:`, connection cleanup
+via `defer`. No `while` loops prevent unbounded read loops.
+
+**Typical use — Redis client in stdlib:**
+
+```swift
+// stdlib/redis.rut
+func redisGet(_ req: Request, addr: string, key: string) -> string? {
+    let conn = tcp(addr)
+    guard let conn else { return nil }
+    defer conn.close()
+    conn.send("GET \(key)\r\n")
+    let resp = conn.recv(maxSize: 16kb)
+    guard let resp else { return nil }
+    return parseRedisReply(resp)
+}
+```
+
+#### 3.4.13 Terminal Statements
+
+These statements end the handler — code after them is unreachable. The compiler
+reports an error if it finds code after a terminal statement.
+
+| Statement | Effect |
+|-----------|--------|
+| `return N` | Send HTTP response with status code N |
+| `return forward(upstream)` | Forward request to upstream (zero-copy) |
+| `return read(root:)` | Serve static file/pipe (zero-copy) |
+| `return websocket(upstream)` | Upgrade to WebSocket and proxy |
+
+All terminal statements use `return`. `forward`, `read`, `websocket` without
+`return` (assigned to `let`) are non-terminal buffered operations.
+
+```swift
+get /users/:id {
+    return forward(userService)
+    log.info("done")   // compile error: unreachable code after return
+}
+```
+
+`fire` is NOT terminal — it's non-blocking and execution continues after it.
+
+#### 3.4.14 Conditional Routing
 
 Route to different upstreams based on request attributes:
 
@@ -559,29 +1863,29 @@ let canary  = upstream { "10.0.0.3:8080" }
 let stable  = upstream { "10.0.0.4:8080" }
 
 // By header
-get /api/users/:id { req in
+get /api/users/:id {
     let target = match req.X-API-Version {
-        "v2" => usersV2
-        _    => usersV1
+        "v2" { usersV2 }
+        _    { usersV1 }
     }
-    proxy(target)
+    forward(target)
 }
 
 // Canary release: percentage-based
-get /api/** { req in
+get /api/** {
     let hash = fnv32(req.remoteAddr)
     let target = hash % 100 < 10 ? canary : stable   // 10% canary
-    proxy(target)
+    forward(target)
 }
 
 // Blue-green via environment variable
-get /api/** { req in
+get /api/** {
     let target = env("DEPLOY_GROUP") == "blue" ? blueUpstream : greenUpstream
-    proxy(target)
+    forward(target)
 }
 ```
 
-#### 3.4.10 HTTP Calls (Native Syntax)
+#### 3.4.15 HTTP Calls (Native Syntax)
 
 HTTP requests use native method + URL syntax. The compiler automatically handles async — no await needed. User writes sequential code.
 
@@ -603,37 +1907,320 @@ guard res.status == 200 else { return 502 }
 let user = res.body(User)
 
 // Fire-and-forget (non-blocking, don't wait for response)
+// On failure (connect refused, DNS error, timeout): auto log.warn, never affects caller.
 fire post http://audit-service/log {
     Body: json({ action: "login", userId: user.id, time: now() })
 }
 ```
 
-#### 3.4.11 Module System
+#### 3.4.16 Regex
+
+Native regex support with `re"pattern"` literals. Backed by Vectorscan (Hyperscan fork
+with ARM support). Patterns are compiled at .rut compile time — invalid regex is a compile
+error. The compiler auto-merges multiple patterns in the same scope into a single Vectorscan
+database for one-pass scanning.
 
 ```swift
-import "middleware/auth.rue"
-import "middleware/ratelimit.rue"
+// Matching
+guard req.path.matches(re"^/api/v\d+/") else { return 404 }
+
+// Capture groups — returns Result<Match>
+let m = req.path.match(re"^/api/v(\d+)/(.*)")
+guard let m else { return 404 }
+let version = m[1]    // "2"
+let rest = m[2]       // "users/123"
+
+// Replace
+let clean = req.path.replace(re"/+", "/")
+
+// In match expressions
+match req.userAgent {
+    re"(?i)mobile|android|iphone" { forward(mobileBackend) }
+    re"(?i)bot|spider"            { return 403 }
+    _                              { forward(desktopBackend) }
+}
 ```
 
-#### 3.4.12 External Functions (FFI Escape Hatch)
-
-For rare cases where built-in HTTP calls are insufficient (e.g., direct Redis/database protocol):
+**Multi-pattern optimization:** when the compiler sees multiple regex checks in the
+same function, it merges them into a single Vectorscan pattern database. One scan
+matches all patterns simultaneously.
 
 ```swift
-// Declare external function — implementation registered in C++ runtime
-extern func redisGet(key: string) -> string?
-extern func redisSet(key: string, value: string)
+// User writes N separate checks:
+func waf(_ req: Request) {
+    let input = "\(req.path) \(req.queryString ?? "")"
+    guard !input.matches(re"(?i)UNION\s+SELECT") else { return 403 }
+    guard !input.matches(re"(?i)DROP\s+TABLE") else { return 403 }
+    guard !input.matches(re"<script") else { return 403 }
+    guard !input.matches(re"javascript:") else { return 403 }
+}
 
-// Usage (compiler knows the types, auto-handles async)
-guard let data = redisGet(key: "sess:\(sid)") else { return 401 }
+// Compiler merges into one Vectorscan database, one scan → O(input_length),
+// regardless of how many patterns.
 ```
 
-C++ side:
-```cpp
-engine.RegisterExtern("redisGet", [&redis](Str key) -> AsyncResult<Str> {
-    return redis.get(key);
-});
+#### 3.4.17 Module System
+
+All top-level `func` and `struct` in a file can be imported by other files.
+File name automatically becomes the namespace.
+
+```swift
+// Import — file name becomes namespace
+import "middleware/auth.rut"            // auth.jwtAuth, auth.basicAuth
+import "middleware/security.rut"        // security.cors, security.waf
+
+// Selective import — symbols brought into current scope, no prefix
+import { cors, securityHeaders } from "stdlib/security.rut"
+
+// using — create alias for namespaced symbol
+import "middleware/v1.rut"
+import "middleware/v2.rut"
+using authV1 = v1.jwtAuth              // short alias
+using authV2 = v2.jwtAuth
 ```
+
+Rules:
+- File name is the namespace: `"path/foo.rut"` → `foo.symbol`
+- Selective import (`import { x } from`) puts symbols in current scope without prefix
+- `using name = module.symbol` creates an alias
+- Circular imports are a compile error
+- Importing a symbol that doesn't exist is a compile error
+- Duplicate imports of the same file are silently deduplicated
+
+#### 3.4.18 Type Conversion
+
+`as` converts between types. Returns `Result<T>` when conversion can fail
+(string → number), returns `T` directly when it cannot fail (number → string).
+
+```swift
+// String → number (fallible → Result)
+let page = "42" as i32                        // Result<i32>
+guard let page else { return 400 }
+
+let weight = "3.14" as f64                    // Result<f64>
+guard let weight else { return 400 }
+
+// With ?? for defaults
+let limit = (req.query("limit") ?? "20") as i32
+guard let limit else { return 400 }
+
+// Number → string (infallible)
+let s = 200 as string                         // "200"
+let s = 3.14 as string                        // "3.14"
+
+// Domain type parsing (fallible → Result)
+let ip = "10.0.0.1" as IP                     // Result<IP>
+let cidr = "10.0.0.0/8" as CIDR               // Result<CIDR>
+let dur = "30s" as Duration                    // Result<Duration>
+```
+
+**Standard library:**
+
+Rutlang ships with a standard library of common middleware and utility functions.
+All are regular `.rut` files — users can read, modify, or replace them. No magic.
+
+```
+stdlib/
+├── ratelimit.rut      // rateLimit, rateLimitByKey
+├── auth.rut           // basicAuth, jwtAuth, apiKeyAuth
+├── security.rut       // cors, securityHeaders, ipAllow, waf
+├── request.rut        // requestId, maxBody
+└── fault.rut          // faultInject (delay + error injection for chaos testing)
+```
+
+```swift
+import { rateLimit } from "stdlib/ratelimit.rut"
+import { cors, securityHeaders } from "stdlib/security.rut"
+```
+
+#### 3.4.19 No FFI
+
+Rutlang has no `extern func` or FFI mechanism. The gateway only communicates via
+HTTP. External systems (Redis, databases, LDAP, HSM) are accessed through HTTP
+calls to proxy services.
+
+Rationale: FFI breaks all compile-time guarantees — bounded execution, memory
+safety, share-nothing isolation. A single C++ function call could block, malloc,
+segfault, or access shared memory.
+
+#### 3.4.20 Concurrent I/O
+
+`submit` starts an async I/O operation without waiting. `wait` collects results.
+Maps directly to io_uring batched submission.
+
+```swift
+// Submit — non-blocking, returns handle
+let h1 = submit get http://user-service/users/1
+let h2 = submit get http://order-service/orders?user=1
+
+// Wait all — single yield point, one io_uring_enter syscall
+let (r1, r2) = wait(h1, h2)           // (Result<Response>, Result<Response>)
+guard let r1 else { return 502 }
+guard let r2 else { return 502 }
+return 200, json({ user: r1.body, orders: r2.body })
+
+// Wait any — first response wins, cancel rest
+let first = any(wait(h1, h2))         // Result<Response>
+
+// All — wait all, fail-fast on first error (cancel rest)
+let (r1, r2) = all(h1, h2)            // both succeed or first error
+guard let r1, r2 else { return 502 }
+```
+
+`wait` also accepts a Duration — compiler generates `IORING_OP_TIMEOUT`:
+
+```swift
+// Sleep — pause handler for a duration
+wait(2s)
+
+// Timeout — race I/O against deadline, cancel loser
+let h = submit get http://slow-service/data
+let result = any(wait(h, 5s))     // first to complete wins
+guard let result else { return 504, "timeout" }
+
+// Custom timeout on any I/O (alternative to per-call timeout: parameter)
+let h1 = submit forward(userService, buffered: true)
+let resp = any(wait(h1, 30s))
+guard let resp else { return 504 }
+return resp
+```
+
+Compiler optimizations:
+- Multiple `submit` → batched into single `io_uring_enter` syscall
+- `wait(h1,h2,h3)` → single yield point, not three
+- `wait(Duration)` → `IORING_OP_TIMEOUT`, single timerfd
+- `any(...)` → cancel pending SQEs/timers on first CQE
+- `all(...)` → cancel remaining on first failure
+
+For dynamic-length fan-out, use `for` + `submit`:
+```swift
+for host in healthCheckHosts {
+    submit get http://\(host)/health
+}
+```
+
+#### 3.4.21 Timers
+
+Background periodic tasks. Top-level declaration alongside `listen`, `upstream`, `route`.
+
+```swift
+// Health check — runs on shard 0 only, broadcasts results
+timer checkHealth, every: 5s, shard: 0 {
+    for server in userService.servers {
+        let res = get http://\(server)/health
+        if not res? or res.status != 200 {
+            userService.mark(server, healthy: false)
+        }
+    }
+}
+
+// Per-shard cleanup — runs on every shard independently
+timer cleanExpired, every: 1m {
+    sessions.evictExpired()
+}
+
+// Metrics push
+timer pushMetrics, every: 60s, shard: 0 {
+    fire post http://metrics-collector/push {
+        Body: json(metrics())
+    }
+}
+```
+
+Parameters:
+- `every:` (required) — interval as Duration
+- `shard: N` (optional) — run on specific shard only; default is every shard
+
+Timer body can use I/O (`get http://`, `fire`, `submit`/`wait`). The compiler
+generates a state machine per timer, scheduled by the shard's event loop.
+
+#### 3.4.22 Lifecycle Hooks
+
+`init` runs once per shard at startup, **before** accepting connections.
+`shutdown` runs once per shard on graceful shutdown, **after** all connections drain.
+Both can use I/O.
+
+```swift
+init {
+    let resp = get http://config-service/warmup
+    guard let resp else {
+        log.error("warmup failed")
+        return
+    }
+    userCache.set("config", resp.body)
+    log.info("shard ready")
+}
+
+shutdown {
+    fire post http://metrics-collector/flush {
+        Body: json(metrics())
+    }
+    log.info("shard stopped")
+}
+```
+
+Execution order:
+```
+process start
+  → shard threads created
+  → each shard: init block runs (blocking, sequential)
+  → each shard: start accepting connections
+  → ... serve requests ...
+  → SIGTERM received
+  → each shard: stop accepting new connections
+  → each shard: drain in-flight requests
+  → each shard: shutdown block runs
+  → process exit
+```
+
+#### 3.4.23 Distributed Tracing
+
+Automatic runtime behavior — the compiler instruments every `forward`, `submit`,
+`get http://` call. Users write zero tracing code.
+
+**How it works:**
+
+1. Request arrives → runtime parses `traceparent` / `tracestate` headers (W3C).
+   If absent, generates new trace ID.
+2. Creates a span for the handler (records start time, route pattern, method).
+3. On `forward` / `submit` / `get http://` → injects `traceparent` into upstream
+   request headers, creates child span.
+4. On response → records status code, duration, closes span.
+5. Span exported asynchronously (fire-and-forget) to collector. Per-shard ring
+   buffer batches spans before export. Zero hot-path impact.
+
+**Configuration (in defaults):**
+
+```swift
+defaults {
+    tracing: .otlp(endpoint: "http://collector:4318")
+    // or .zipkin(endpoint: "http://zipkin:9411")
+    // or .off (default)
+}
+```
+
+**Concurrent I/O — automatic child spans:**
+
+```swift
+let h1 = submit get http://user-service/users/1      // child span: "GET user-service"
+let h2 = submit get http://order-service/orders       // child span: "GET order-service"
+let (r1, r2) = wait(h1, h2)
+// both child spans auto-closed with independent durations
+```
+
+**Optional: custom span attributes**
+
+Most handlers need nothing. If custom attributes are needed:
+
+```swift
+get /users/:id {
+    auth(req, role: "user")
+    req.span.set("userId", req.ctx.userId)    // add attribute to current span
+    return forward(userService)
+}
+```
+
+`req.span` is the current request's span, with a single method: `.set(key, value)`.
 
 ### 3.5 Built-in Capabilities
 
@@ -643,28 +2230,122 @@ Everything a gateway needs, with zero external dependencies:
 // --- I/O ---
 get/post/put/delete url { }   // HTTP calls to external services
 fire post url { }             // fire-and-forget HTTP (traffic mirroring, async logging)
-proxy(upstream)                // forward to upstream, with optional response callback
-proxy(upstream, streaming:)   // streaming proxy (large body, no buffering)
+forward(upstream)                // forward to upstream, with optional response callback
+forward(upstream, streaming:)   // streaming proxy (large body, no buffering)
 websocket(upstream)           // WebSocket transparent proxy
-counter.incr(key, window:)   // rate limiting counter (per-shard, sliding window)
-counter.active(key)          // concurrency counter (auto-decrement on request end)
+read(root:, fallback:)        // file/pipe I/O: zero-copy (return) or buffered (let)
+tcp(addr) -> TcpConn          // TCP connection (Redis, custom protocols)
+udp() -> UdpSock              // UDP socket (StatsD, syslog, DNS)
+
+// --- State (per-shard by default, all bounded) ---
+Hash<K,V>(capacity:, ttl:)    // key-value store
+LRU<K,V>(capacity:, ttl:)     // key-value with LRU eviction
+Set<T>(capacity:)              // membership testing (CIDR → auto LPM trie)
+Counter<K>(capacity:, window:) // sliding window counters
+Bloom<T>(capacity:, errorRate:) // probabilistic set, memory-efficient
+Bitmap(size:)                  // fixed-size bit array
 
 // --- Traffic Control ---
-cache(key:, ttl:) { }        // response caching (per-shard LRU + optional shared)
+// Response caching: runtime auto (RFC 7234) + LRU state type for custom logic
 upstream { breaker: ... }     // circuit breaker (consecutive failures → open → half-open → closed)
 upstream { retry: ... }       // retry policy (on specific status codes, with backoff)
 
-// --- Data ---
-String:   split, contains, replace, slice, trim, hasPrefix, hasSuffix, upper, lower, isEmpty
-JSON:     req.body(Type), json(value), resp.body
-Regex:    match(pattern, string)
+// --- Request ---
+req.query("key")              // query string parameter access
+req.queryString               // raw query string
+req.cookie("name")            // cookie access
 
-// --- Security ---
-Hash:     md5, sha256, sha1, fnv32
-HMAC:     hmacSha256, hmacSha1
-Encoding: base64, base64url, hex, urlEncode, urlDecode
-JWT:      jwtDecode(token, secret:) -> Claims?
-Crypto:   aesEncrypt, aesDecrypt
+// --- String (runtime C++ built-in functions, not keywords) ---
+s.len                             // i32
+s.isEmpty                        // bool
+s.hasPrefix(prefix)               // bool
+s.hasSuffix(suffix)               // bool
+s.contains(sub)                   // bool
+s.upper()                         // string
+s.lower()                         // string
+s.trim()                          // string
+s.trimPrefix(prefix)              // string
+s.trimSuffix(suffix)              // string
+s.replace(old, new)               // string
+s.split(sep)                      // [string]
+s.slice(start, end)               // string
+s.matches(re"pattern")            // bool (Vectorscan)
+s.match(re"pattern")              // Result<Match> (capture groups)
+
+// --- Type Conversion (runtime C++ built-in, via `as` keyword) ---
+"42" as i32                       // Result<i32>
+"3.14" as f64                     // Result<f64>
+42 as string                      // string (infallible)
+"10.0.0.1" as IP                  // Result<IP>
+
+// --- JSON ---
+req.body(Type)                    // parse body → Result<T>
+json(value)                       // serialize to JSON string
+resp.body                         // response body string
+
+// --- Regex (Vectorscan) ---
+re"pattern"                       // compile-time validated regex literal
+s.matches(re"pat")                // bool
+s.match(re"(group)")              // Result<Match>, m[1] for captures
+s.replace(re"pat", replacement)   // string
+
+// --- Hash ---
+md5(data)                     // string (hex)
+sha1(data)                    // string (hex)
+sha256(data)                  // string (hex)
+sha384(data)                  // string (hex)
+sha512(data)                  // string (hex)
+fnv32(data)                   // u32 (non-crypto, for load balancing)
+
+// --- HMAC ---
+hmacSha256(key, data)         // string (hex)
+hmacSha384(key, data)         // string (hex)
+hmacSha512(key, data)         // string (hex)
+
+// --- JWT (multi-algorithm, backed by BoringSSL) ---
+jwtDecode(token, secret: key)               // Result<Claims> — HS256/384/512
+jwtDecode(token, publicKey: pem)            // Result<Claims> — RS256/384/512, ES256/384/512
+jwtEncode(claims, secret: key, alg: .HS256) // string — sign with HMAC
+jwtEncode(claims, privateKey: pem, alg: .RS256)  // string — sign with RSA/ECDSA
+
+// --- Encryption ---
+aesGcmEncrypt(key, plaintext, nonce)        // [u8] — AES-256-GCM authenticated encryption
+aesGcmDecrypt(key, ciphertext)              // Result<[u8]> — decrypt + verify tag
+
+// --- Random ---
+randomBytes(n)                // [u8] — cryptographically secure random
+uuid()                        // string — UUID v4
+
+// --- Encoding / Decoding ---
+base64(data)                  // string
+base64url(data)               // string
+hex(data)                     // string
+urlEncode(data)               // string
+urlDecode(data)               // Result<string>
+htmlDecode(data)              // string — &#x3C; → <, &amp; → &, etc.
+unicodeNormalize(data)        // string — \u003C → <, NFC normalization
+
+// --- Request Body ---
+req.body(Type)                // typed parse → Result<T>
+req.bodyRaw                   // raw body → Result<string> (auto-decompresses)
+req.bodyJson()                // dynamic JSON → Result<Json>
+req.multipart()               // multipart/form-data → Result<[Part]>
+
+// Json — dynamic JSON access (no struct required)
+let j = req.bodyJson()
+guard let j else { return 400 }
+j.field("name")              // Json? — nested access
+j.string()                   // Result<string> — extract as string
+j.int()                      // Result<i32> — extract as number
+j.array()                    // Result<[Json]> — extract as array
+j.allValues()                // [string] — all leaf values (for WAF scanning)
+j.allKeys()                  // [string] — all keys
+
+// Part — multipart form part
+// part.name                  // string — field name
+// part.filename              // string? — uploaded file name
+// part.contentType            // MediaType? — part content type
+// part.body                   // string — part body
 
 // --- Time ---
 now()                         // current Time
@@ -672,10 +2353,16 @@ time(string)                  // parse time string
 Duration arithmetic           // now() - req.ifModifiedSince > 1h
 
 // --- Utility ---
-uuid()                        // generate UUID
-env(key)                      // environment variable
-log(level, msg)               // structured logging
+env(key)                      // environment variable (compile-time resolved)
+log.info(msg, key: val)       // structured logging (named parameters)
+log.warn(msg, key: val)
+log.error(msg, key: val)
 json(value)                   // serialize to JSON string
+
+// --- Admin Introspection (runtime built-in functions) ---
+upstream_status()             // string (JSON) — all upstreams: targets, health, connections
+config_dump()                 // string (JSON) — current compiled config: routes, middleware, TLS
+shard_stats()                 // string (JSON) — per-shard: requests, connections, memory, latency
 
 // --- Numeric ---
 i8, i16, i32, i64             // signed integers, wrapping overflow
@@ -689,12 +2376,13 @@ Bit operations: & | ^ << >> ~
 | Check | Example | Error |
 |-------|---------|-------|
 | Route conflict | `get /users/:id` + `get /users/:name` | "conflicting route patterns" |
-| Route param | `get /users/:id { req in req.name }` | "route has no param :name" |
+| Route param | `get /users/:id { forward(req.name) }` | "route has no param :name" |
+| Param type | `get /users/:id(i64)` with non-numeric path | returns 404 at runtime; type-checked at use site |
 | Type error | `User(id: 123)` | "id expects string, got i32" |
 | Domain value | `listen :70000` | "port range 1-65535" |
 | Duration unit | `timeout: 30x` | "unknown Duration unit" |
 | StatusCode range | `return 999` | "invalid status code" |
-| Unreachable route | `any **` then `get /after` | "unreachable route" |
+| Unreachable route | `_ { 404 }` then `get /after` | "unreachable route after catch-all" |
 | Header type | `req.contentLength = "abc"` | "contentLength is ByteSize, not string" |
 | MediaType | `req.contentType == text/lol` | "unknown media type" |
 | CIDR format | `req.remoteAddr.in(999.0.0.0/8)` | "invalid IP in CIDR" |
@@ -703,10 +2391,29 @@ Bit operations: & | ^ << >> ~
 | guard exhaustive | `guard let x = opt` (no else) | "guard must have else clause" |
 | Optional access | `req.authorization.hasPrefix("B")` | "value is optional, use guard let or ??" |
 | Response middleware | `func f(_ req: Request, _ resp: Response)` used as request-only `use` | "this is a response middleware, will run after handler" (info) |
+| TLS without host | `tls "x.com"` but no `x.com { }` in route | warning: "TLS cert declared but no routes for x.com" |
+| Host without TLS | `x.com { }` in route but no `tls "x.com"` and listen uses TLS | "no TLS certificate for host x.com" |
+| Duplicate TLS | two `tls "x.com"` declarations | "duplicate TLS declaration for x.com" |
+| Host pattern | `x.y.z { }` in route with invalid domain chars | "invalid host pattern" |
+| Result unused | `let x = req.body(User)` without `guard let` | "Result\<User\> must be unwrapped with guard let" |
+| Result as Optional | `if x != nil` on a Result value | "use guard let to unwrap Result, not nil check" |
+| Regex syntax | `re"[unclosed"` | "invalid regex: unclosed bracket" |
+| Regex capture | `m[3]` but pattern has 2 groups | "regex has 2 capture groups, index 3 out of range" |
+| Recursion | `func foo() { foo() }` | "recursive call detected: foo → foo" |
+| While loop | `while cond { }` | "while loops not supported, use for...in" |
+| Consistent cost | `Counter<IP>(..., consistent: true)` | warning: "cross-shard round-trip on every op, suppress with // rut:allow(consistent)" |
+| Consistent unnecessary | `Counter<IP>(window: 10s, consistent: true)` | warning: "window >= 1s, per-shard approximation error < 10%, consider removing consistent" |
+| Consistent read-only | `Set<IP>(..., consistent: true)` with only `.contains()` | warning: "reads are local, consistent only affects writes, use notify all for rare writes" |
+| Broadcast in handler | `notify` inside a route handler | warning: "executes on every request, did you mean to put this in an admin endpoint?" |
+| Post-middleware + zero-copy | `@addSecurityHeaders *` bound to `=> forward(x)` | warning: "post-middleware forces buffered mode, zero-copy disabled" |
+| State key type | `Hash<Order, string>` | "Hash key must be scalar type" |
+| State no capacity | `Hash<string, User>()` | "capacity is required" |
+| Counter no window | `Counter<IP>(capacity: N)` | "Counter requires window" |
+| Persist layout change | hot reload + struct field changed | "persistent state 'sessions': layout changed" |
 
 ### 3.7 Async Transparency
 
-The language has no `async`, `await`, `future`, or `promise` keywords. User writes sequential code. The compiler identifies I/O operations (HTTP calls, extern functions, proxy) and automatically generates state machines.
+The language has no `async`, `await`, `future`, or `promise` keywords. User writes sequential code. The compiler identifies I/O operations (HTTP calls, forward) and automatically generates state machines.
 
 ```swift
 // User writes:
@@ -715,8 +2422,10 @@ func auth(_ req: Request, role: string) -> User {
     let res = get http://auth/verify {     // compiler knows: I/O point
         Authorization: token
     }
+    guard let res else { return 502 }      // Result<Response> — must guard
     guard res.status == 200 else { return 401 }
     let user = res.body(User)
+    guard let user else { return 401 }     // Result<User> — must guard
     guard user.role == role else { return 403 }
     req.X-User-ID = user.id
     return user
@@ -745,10 +2454,8 @@ func auth(_ req: Request, role: string) -> User {
 | `guard ... else` | `guard let token = req.authorization else { return 401 }` | Perfect for middleware "reject or continue" pattern |
 | Named parameters | `auth(req, role: "user")` | Self-documenting calls, LLMs generate correct argument order |
 | `_` unlabeled param | `func auth(_ req: Request, role: string)` | First param (always req) doesn't need label |
-| Trailing closure | `get /users/:id { req in ... }` | Clean route handler syntax |
-| `$0` shorthand | `cidrs.contains(where: { req.remoteAddr.in($0) })` | Concise closures |
 | Optional chaining | `req.authorization?.hasPrefix("Bearer ")` | Safe navigation on nullable headers |
-| `let` / `var` | `let x = ...` / `var count = 0` | Immutable by default |
+| `let` / `var` | `let x = ...` (immutable), `var x = ...` (mutable) | `var` only inside func/handler, not at top level |
 | String interpolation | `"\(req.method)\n\(req.path)"` | Cleaner than concatenation |
 | `.enumCase` | `balance: .leastConn` | Concise enum values |
 | No commas in blocks | Multi-line blocks don't need commas | Cleaner, less noise |
@@ -756,32 +2463,53 @@ func auth(_ req: Request, role: string) -> User {
 ### 3.9 Complete Example
 
 ```swift
-// production.rue
+// production.rut
 
-import "middleware/auth.rue"
-import "middleware/security.rue"
+import { rateLimit } from "stdlib/ratelimit.rut"
+import { cors, securityHeaders, ipAllow, waf } from "stdlib/security.rut"
+import { requestId } from "stdlib/request.rut"
 
-listen :443, tls(cert: env("CERT"), key: env("KEY"))
-listen :80, redirect: :443
-listen :9090, internal: true    // metrics + admin
+// ---------- Infrastructure ----------
+
+listen :443
+listen :80
+listen :9090
+
+tls "api.example.com",   cert: env("API_CERT"),   key: env("API_KEY")
+tls "admin.example.com", cert: env("ADMIN_CERT"),  key: env("ADMIN_KEY")
+tls default,             cert: env("DEFAULT_CERT"), key: env("DEFAULT_KEY"), ocsp: true
+
+defaults {
+    clientMaxBodySize: 10mb
+    compress: .auto(types: [text/html, application/json], minSize: 256b)
+    errorPages: "/var/www/errors/"
+    tracing: .otlp(endpoint: "http://collector:4318")
+    cache: .auto(capacity: 10000, maxSize: 10mb)
+}
 
 // ---------- Upstreams ----------
 
-let users = upstream {
+let userService = upstream {
     "10.0.0.1:8080", weight: 3
     "10.0.0.2:8080"
-    balance: .leastConn
-    health: .get("/ping", every: 5s)
+    balance: .ewma
+    health: .active(get: "/ping", every: 5s)
+    health: .passive(failures: 5, recover: 30s)
     breaker: .consecutive(failures: 5, recover: 30s)
     retry: .on([502, 503], count: 2, backoff: 100ms)
+    slowStart: 30s
 }
 
-let orders = upstream { "10.0.1.1:8080" }
+let orderService = upstream { "10.0.1.1:8080" }
 let storageService = upstream { "10.0.2.1:9000" }
 let chatService = upstream { "10.0.3.1:8080" }
-let stagingMirror = upstream { "staging:8080" }
 
 // ---------- Types ----------
+
+struct Ctx {
+    userId: string
+    userRole: string
+}
 
 struct User {
     id: string
@@ -798,9 +2526,15 @@ struct OrderItem {
     price: f64
 }
 
+// ---------- State ----------
+
+let apiLimits = Counter<IP>(capacity: 100000, window: 1m)
+let blacklist = Set<IP>(capacity: 100000)
+let userCache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
+
 // ---------- Middleware ----------
 
-func auth(_ req: Request, role: string) -> User {
+func auth(_ req: Request, role: string) {
     guard let token = req.authorization else { return 401 }
     guard token.hasPrefix("Bearer ") else { return 401 }
 
@@ -809,144 +2543,109 @@ func auth(_ req: Request, role: string) -> User {
     guard claims.exp >= now() else { return 401, "token expired" }
     guard claims.role == role else { return 403 }
 
-    req.X-User-ID = claims.sub
-    req.X-User-Role = claims.role
-    return User(id: claims.sub, role: claims.role)
+    req.ctx.userId = claims.sub
+    req.ctx.userRole = claims.role
 }
 
-func rateLimit(_ req: Request, limit: i32, window: Duration) {
-    let count = counter.incr(req.remoteAddr, window: window)
-    guard count <= limit else {
-        return 429 { Retry-After: window }
-    }
+func addSecHeaders(_ resp: Response) {
+    resp.Strict-Transport-Security = "max-age=31536000"
+    resp.X-Content-Type-Options = "nosniff"
+    resp.Server = nil
 }
 
-func requestId(_ req: Request) {
-    if req.X-Request-ID.isEmpty {
-        req.X-Request-ID = uuid()
-    }
-}
+// ---------- Timers ----------
 
-func cors(_ req: Request, origins: [string]) {
-    let origin = req.origin
-    guard origins.contains(origin) else {
-        if req.method == .OPTIONS { return 403 }
-        return
-    }
-    if req.method == .OPTIONS {
-        return 204 {
-            Access-Control-Allow-Origin: origin
-            Access-Control-Allow-Methods: "GET, POST, PUT, DELETE"
-            Access-Control-Allow-Headers: "Content-Type, Authorization"
-            Access-Control-Max-Age: 86400
+timer checkHealth, every: 10s, shard: 0 {
+    for server in userService.servers {
+        let res = get http://\(server.addr)/ping
+        if not res? or res.status != 200 {
+            userService.mark(server, healthy: false)
         }
     }
-    req.Access-Control-Allow-Origin = origin
-    req.Vary = "Origin"
-}
-
-// ---------- Access Log ----------
-
-accessLog {
-    format: .json
-    output: .stdout
-    filter: { $0.duration > 100ms || $0.status >= 400 }
 }
 
 // ---------- Routes ----------
 
 route {
+    // Middleware bindings
+    @requestId *
+    @waf *
+    @addSecHeaders *
+
+    @if(env("ENABLE_CORS") == "true")
+    @cors *
+
+    @auth(role: "user") api.example.com
+    @rateLimit(limits: apiLimits, max: 1000) api.example.com
+    @ipAllow(cidrs: [10.0.0.0/8, 172.16.0.0/12]) admin.example.com
+    @auth(role: "admin") admin.example.com
+
+    // --- Health ---
     get /health => 200
 
-    // Request middleware (runs before handler)
-    use requestId
-    use antiFlood
-    use waf
-    use blockBots
-    use cors(origins: ["https://app.example.com"])
-    use rateLimit(limit: 1000, window: 1m)
+    // --- API domain ---
+    @priority(.high)
+    api.example.com {
+        get /users/:id(i64) {
+            guard not blacklist.contains(req.remoteAddr) else { return 403 }
 
-    // Response middleware (runs after handler, before sending to client)
-    use securityHeaders
-
-    // --- Users (with caching + response rewrite) ---
-
-    get /users/:id { req in
-        let user = auth(req, role: "user")
-        cache(key: "/users/\(req.id)", ttl: 5m) {
-            proxy(users, timeout: 10s) { resp in
-                resp.X-Request-ID = req.X-Request-ID
-                resp.X-Powered-By = nil
+            let cached = userCache.get("/users/\(req.id)")
+            if cached? {
+                return 200, cached
             }
+
+            let resp = forward(userService, buffered: true)
+            resp.X-Request-ID = req.X-Request-ID
+            resp.X-Powered-By = nil
+            userCache.set("/users/\(req.id)", resp.body)
+            return resp
         }
-    }
 
-    post /users { req in
-        auth(req, role: "admin")
-        guard req.contentLength <= 1mb else { return 413 }
-        // mirror to staging for testing
-        fire post http://staging:8080\(req.path) {
-            Headers: req.headers
-            Body: req.bodyRaw
-        }
-        proxy(users, timeout: 30s)
-    }
-
-    // --- Orders (with validation) ---
-
-    post /orders { req in
-        let user = auth(req, role: "user")
-        let order = req.body(Order)
-        guard !order.items.isEmpty else {
-            return 400, "order must have items"
-        }
-        for item in order.items {
-            guard item.qty > 0 else { return 400, "invalid quantity" }
-            guard item.price >= 0 else { return 400, "invalid price" }
-        }
-        req.X-User-ID = user.id
-        proxy(orders, timeout: 30s)
-    }
-
-    // --- File upload (streaming) ---
-
-    post /files/upload { req in
-        auth(req, role: "user")
-        guard req.contentLength <= 100mb else { return 413 }
-        proxy(storageService, streaming: true)
-    }
-
-    get /files/:fileId { req in
-        auth(req, role: "user")
-        proxy(storageService, streaming: true)
-    }
-
-    // --- WebSocket ---
-
-    get /ws/chat { req in
-        auth(req, role: "user")
-        guard req.upgrade == .websocket else { return 400 }
-        websocket(chatService)
-    }
-
-    // --- Admin (internal) ---
-
-    group /admin { req in
-        ipAllow(req, cidrs: [10.0.0.0/8, 172.16.0.0/12])
-        auth(req, role: "admin")
-
-        match req.path {
-            /admin/stats     => 200, json(stats())
-            /admin/reload    => do { reload(); return 200 }
-            /admin/cache/purge => do {
-                cache.purge(pattern: req.body(PurgeRequest).pattern)
-                return 200
+        post /orders {
+            let order = req.body(Order)
+            guard let order else { return 400 }
+            for item in order.items {
+                guard item.qty > 0 else { return 400, "invalid quantity" }
             }
-            _                => 404
+            return forward(orderService)
+        }
+
+        post /files/upload {
+            guard req.contentLength <= 100mb else { return 413 }
+            return forward(storageService, streaming: true)
+        }
+
+        get /files/:fileId => forward(storageService, streaming: true)
+
+        get /ws/chat {
+            guard req.upgrade == .websocket else { return 400 }
+            return websocket(chatService)
         }
     }
 
-    any ** => 404
+    // --- Admin domain ---
+    admin.example.com {
+        get /stats => 200, json(stats())
+        post /reload {
+            reload()
+            return 200
+        }
+        post /ban {
+            let ip = req.body(IP)
+            guard let ip else { return 400 }
+            blacklist.add(ip)
+            notify all blacklist.add(ip)
+            return 200
+        }
+    }
+
+    // --- Static files ---
+    /static {
+        get /*path => read(root: "/var/www/static", maxAge: 30d)
+    }
+
+    // --- Catch-all ---
+    _ => 444
 }
 ```
 
@@ -968,25 +2667,25 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 | IP restriction | `req.remoteAddr.in(CIDR)` native |
 | UA restriction | `req.userAgent.contains()` |
 | CORS | `guard` + header assignment |
-| Rate limiting | `counter.incr()` built-in (sliding window) |
+| Rate limiting | `Counter<K>` state type (sliding window) |
 | Request size limiting | `req.contentLength` comparison |
 | Request ID / Correlation ID | `uuid()` built-in |
 | Header add/remove/modify | `req.Header = val` / `= nil` |
 | URL rewriting | `req.path` assignment |
-| Response header rewrite | `proxy() { resp in resp.Header = val }` |
-| Response body rewrite | `proxy() { resp in resp.body = ... }` |
+| Response header rewrite | `let resp = forward(x, buffered: true); resp.Header = val` |
+| Response body rewrite | `let resp = forward(x, buffered: true); resp.body = ...` |
 | Request termination (maintenance) | `return 503` |
 | Canary release / A/B testing | conditional routing + `fnv32` hash |
 | Blue-green deployment | `env()` + conditional proxy |
 | Traffic mirroring | `fire` keyword (fire-and-forget HTTP) |
 | Circuit breaker | `upstream { breaker: ... }` |
 | Retry with backoff | `upstream { retry: ... }` |
-| Response caching | `cache(key:, ttl:) { }` |
-| Stale-while-revalidate | `cache(staleWhileRevalidate:)` |
-| Cache purge | `cache.purge(pattern:)` |
-| Streaming proxy | `proxy(upstream, streaming: true)` |
+| Response caching | runtime auto (RFC 7234) + `LRU` state type for custom logic |
+| Stale-while-revalidate | runtime auto (Cache-Control headers) |
+| Cache purge | `LRU.delete(key)` or runtime API |
+| Streaming proxy | `forward(upstream, streaming: true)` |
 | WebSocket proxy | `websocket(upstream)` |
-| Access logging | `accessLog { }` built-in |
+| Access logging | automatic — runtime always logs every request |
 | Prometheus metrics | `metrics()` built-in |
 | Distributed tracing | auto-instrumentation + `X-Debug` |
 | Health checks | `upstream { health: ... }` |
@@ -1077,7 +2776,110 @@ Using `SO_REUSEPORT`: each shard binds and listens on the same port. The kernel 
 
 No cross-shard connection migration. A connection accepted on shard N stays on shard N for its entire lifetime.
 
-### 4.3 I/O Backend Abstraction
+### 4.3 Handler Crash Isolation
+
+Handler code is JIT-compiled from user-written .rut — it is untrusted code running
+inside the shard's event loop. A handler crash (division by zero, array out of bounds,
+null dereference) **must never take down the shard**.
+
+**Compile-time prevention:**
+
+The compiler eliminates most crash sources:
+- Division by zero → compiler inserts check before every `/`, returns 500 if divisor is 0
+- Array out of bounds → compiler inserts bounds check on every `[]` access
+- Null/nil access → `Result` and `Optional` force `guard let` before access
+- Infinite loops → no `while`, no recursion, `for` only on finite collections
+- Stack overflow → all functions inline, no call stack depth
+
+**Runtime safety net:**
+
+For any crash the compiler cannot prevent (bug in codegen, hardware fault):
+- JIT handler runs inside a signal handler boundary (`SIGSEGV`, `SIGFPE`)
+- On signal: runtime catches it, returns 500 to client, logs the crash
+- Per-request Arena is reset — no memory leak
+- Connection is closed and removed from timer wheel
+- Shard event loop continues processing other connections
+- No shard restart, no process restart
+
+**State mutation on crash:**
+
+State operations (Hash.set, Counter.incr, Set.add) executed before the crash are
+**not rolled back**. This is by design:
+- Rate limit counter slightly off → self-corrects in next window
+- Cache entry from partial result → TTL expires it
+- Blacklist entry added → intended effect, no harm
+- Session written → client retries on 500, no corruption
+
+Transactional rollback would require write-ahead logging on every state operation —
+unacceptable overhead on the hot path. State operations are best-effort, idempotent
+by convention.
+
+### 4.4 Client Disconnect Cancellation
+
+When the runtime detects the client has disconnected (socket closed, reset, timeout):
+
+1. Cancel all pending I/O for that connection (`IORING_OP_ASYNC_CANCEL` / `epoll_ctl DEL`)
+2. Cancel pending upstream requests (close upstream connection or return to pool)
+3. Execute `defer` statements (cleanup counters, logging)
+4. Reset per-request Arena
+5. Remove connection from timer wheel
+
+The handler does not run to completion — all in-flight I/O is cancelled immediately.
+This prevents wasting upstream resources on responses nobody will read.
+
+The compiler generates cancellation points at every `yield` (forward, submit, wait).
+When the runtime detects disconnect, it resumes the handler's state machine with a
+cancellation error, triggering the `defer` chain and cleanup.
+
+### 4.5 Runtime Event Primitives
+
+Two Linux fd-based event mechanisms are used internally by the runtime. Both
+available since Linux 2.6.22 — well below Rutlang's minimum kernel requirement
+(epoll: 3.9+, io_uring: 6.0+). Not exposed to Rutlang user code.
+
+**signalfd — OS signal handling**
+
+Converts Unix signals into readable fd events. The runtime creates one signalfd
+per process, monitored by shard 0's event loop.
+
+```
+SIGTERM → signalfd readable → shard 0 initiates graceful shutdown
+          → notify all shards to drain connections
+          → wait for in-flight requests to complete
+          → exit
+
+SIGHUP  → signalfd readable → shard 0 triggers hot reload
+          → recompile .rut (or load new .so in sidecar mode)
+          → RCU swap compiled config on all shards
+```
+
+No signal handler functions (`sigaction`), no async-signal-safety concerns —
+signals are processed synchronously in the event loop like any other I/O event.
+
+**eventfd — cross-shard wakeup**
+
+Each shard pair has a SPSC ring buffer for `notify` messages. The eventfd wakes
+the receiving shard's event loop when a message is enqueued.
+
+```
+Shard 0                              Shard 1
+  │                                    │
+  ├─ enqueue msg to SPSC[0→1]         │
+  ├─ write(eventfd_01, 1)             │  ← eventfd wakes shard 1
+  │                                    ├─ io_uring/epoll sees eventfd readable
+  │                                    ├─ drain SPSC[0→1]
+  │                                    ├─ execute: blacklist.add(ip)
+  │                                    ├─ read(eventfd_01) to reset
+```
+
+Without eventfd, the receiving shard would only see the message on its next
+event loop tick (up to ~1ms latency). With eventfd, wakeup is immediate
+(~1μs — kernel schedules the target thread).
+
+One eventfd per shard pair: N shards = N×(N-1) eventfds. For 8 shards = 56 fds.
+Negligible resource cost.
+
+### 4.6 I/O Backend Abstraction
 
 The runtime supports two I/O backends behind a compile-time interface (no virtual dispatch):
 
@@ -2007,7 +3809,7 @@ SNI implementation:
   - OpenSSL SNI callback (SSL_CTX_set_tlsext_servername_callback)
   - Lookup hostname from ClientHello → select SSL_CTX with matching certificate
   - Per-shard certificate cache (share-nothing)
-  - Certificate reload on hot reload (new .rue → new cert paths → reload certs)
+  - Certificate reload on hot reload (new .rut → new cert paths → reload certs)
 ```
 
 TLS Session Resumption — avoid full handshake on reconnect:
@@ -2114,7 +3916,7 @@ Phase 2: Inbound TLS + Outbound TLS
   - OpenSSL + BIO_s_mem + io_uring
   - SNI for multi-domain
   - Session ID cache + Session Tickets
-  - TLS config in .rue files
+  - TLS config in .rut files
   - Outbound HTTPS for HTTP calls
 
 Phase 3: Optimization + Advanced
@@ -2213,7 +4015,7 @@ void handle(Connection* c) {
 
 8 shards x 1 check/5s = upstream receives 8 health checks per interval. Negligible overhead.
 
-**Option B: single shard checks, broadcast via atomic bitmap**
+**Option B: single shard checks, notify all via atomic bitmap**
 
 ```cpp
 alignas(64) std::atomic<u64> healthy_mask;  // up to 64 upstreams
@@ -2228,18 +4030,26 @@ if (!(mask & (1 << upstream_id))) skip_upstream();
 
 ### 8.6 Language-Level Exposure
 
-```
-// Users don't need to know about atomics, cache lines, or RCU
-// The type system guarantees safety
+All state types (Hash, LRU, Set, Counter, Bloom, Bitmap) are per-shard. No shared
+mutable state. Cross-shard communication uses `notify` — the only primitive:
 
-local counter: u32 = 0           // compiles to plain variable
-shared total: u64 = 0            // compiles to per-shard counter + aggregated read
-shared rate: u32 = 0             // compiles to atomic
+```swift
+// All state is per-shard, single-threaded, zero locking
+let blacklist = Set<IP>(capacity: 100000)
+let limits = Counter<IP>(capacity: 100000, window: 1m)
 
-// Compiler rejects unsafe shared patterns:
-shared map: Map<string, u32> = {}  // ❌ compile error: shared does not support Map
-shared counter += 1                // ✅ compiles to fetch_add
+// Per-shard mutation — immediate, no cross-core cost
+blacklist.add(ip)
+limits.incr(req.remoteAddr)
+
+// Cross-shard propagation — via SPSC queues, eventual consistency
+notify all blacklist.add(ip)    // N-1 relaxed writes, microsecond propagation
 ```
+
+The compiler generates:
+- State mutation → plain memory write (per-shard, single thread)
+- `notify all expr` → serialize operation, enqueue to N-1 SPSC ring buffers
+  (relaxed store + release on tail pointer, no seq_cst, no full barrier)
 
 ---
 
@@ -2534,7 +4344,7 @@ Hot path overhead per request:
 
 ```swift
 // 1. File watch (automatic)
-//    Runtime uses inotify to watch .rue files
+//    Runtime uses inotify to watch .rut files
 //    Change detected → debounce → compile → swap
 
 // 2. API endpoint (manual)
@@ -2575,7 +4385,7 @@ During shutdown:
 ### 11.1 Pipeline
 
 ```
-.rue source
+.rut source
     │
     ▼
   Lexer / Parser (hand-written recursive descent)
@@ -2598,7 +4408,7 @@ During shutdown:
   Inline Expansion (all func calls expanded)
     │
     ▼
-  Rue IR (RIR)  ◄── custom IR, backend-agnostic
+  Rutlang IR (RIR)  ◄── custom IR, backend-agnostic
     │
     ├── Optimization passes (on DIR)
     │   - dead code elimination
@@ -2623,7 +4433,7 @@ During shutdown:
   CompiledConfig { version, routes, handlers }
 ```
 
-### 11.2 Rue IR (RIR)
+### 11.2 Rutlang IR (RIR)
 
 A lightweight, flat, typed IR between the AST and LLVM IR. Each route handler compiles to one DIR function — a linear sequence of blocks with explicit control flow.
 
@@ -2719,7 +4529,7 @@ DIR instruction set:
   jmp block_next                           // unconditional jump
   ret.status 401                           // return HTTP status
   ret.status 429, { Retry-After: %w }      // return with headers
-  ret.proxy %upstream, { timeout: 10s }    // proxy to upstream
+  ret.forward %upstream, { timeout: 10s }    // proxy to upstream
 
   // --- I/O (suspend points → state machine boundaries) ---
   %29 = yield.http_get "http://auth/verify", { Authorization: %token }
@@ -2741,11 +4551,11 @@ DIR instruction set:
 
 Source:
 ```swift
-get /users/:id { req in
+get /users/:id {
     let user = auth(req, role: "user")
     rateLimit(req, limit: 100, window: 1m)
     req.X-User-ID = req.id
-    proxy(users, timeout: 10s)
+    forward(userService)
 }
 ```
 
@@ -2791,7 +4601,7 @@ func handle_get_users_id(req: Request) {
     // -- remaining handler --
     %id = req.param "id"
     req.set_header "X-User-ID", %id
-    ret.proxy upstream("users"), { timeout: 10s }
+    ret.forward upstream("users"), { timeout: 10s }
 
   block_reject_401:
     ret.status 401
@@ -2854,7 +4664,7 @@ Pass 5: Guard Coalescing
 #### 11.2.5 DIR Dump (--emit-dir)
 
 ```
-$ rue --emit-rir gateway.rue
+$ rue --emit-rir gateway.rut
 
 === handle_get_users_id ===
   params: [:id]
@@ -2898,7 +4708,7 @@ Recommended: start with LLVM ORC JIT (dynamic link), consider Cranelift if LLVM 
 ```cpp
 class RueEngine {
 public:
-    // Compile .rue source, returns compile result (errors or config)
+    // Compile .rut source, returns compile result (errors or config)
     CompileResult compile(std::string_view source);
 
     // Atomically load new config to all shards (RCU swap)
@@ -2907,7 +4717,7 @@ public:
     // Current config version
     uint64_t current_version() const;
 
-    // Register C++ functions callable from .rue
+    // Register C++ functions callable from .rut
     template<typename Func>
     void register_native(std::string_view name, Func&& fn);
 };
@@ -2940,16 +4750,19 @@ A Language Server Protocol implementation for editor support and LLM integration
 | musl libc | Static link | ~600KB | C standard library (needed by LLVM) |
 | Custom HTTP parser | Built-in | ~500-800 lines C++ | HTTP/1.1 request parsing (SIMD-accelerated, zero-copy, strict mode) |
 | LLVM ORC JIT | Dynamic link | ~50MB .so | JIT compilation |
+| Vectorscan | Static link | ~2MB | Regex engine (multi-pattern, SIMD-accelerated, O(n) guaranteed) |
+| libdeflate | Static link | ~100KB | gzip response compression (3-5x faster than zlib) |
+| google/brotli | Static link | ~300KB | Brotli response compression |
+| zstd | Static link | already in tree | zstd response compression + access log compression |
 | Custom DNS client | Built-in | ~200 lines C++ | Async DNS resolution (UDP over io_uring, A/AAAA queries) |
 | OpenSSL / BoringSSL (Phase 2) | Dynamic link | ~3MB .so | TLS for inbound + outbound |
 
-Total external dependencies: **4-6**
+Total external dependencies: **7-9**
 
 ### 12.2 What We Don't Depend On
 
 ```
 ❌ C++ standard library (std::)
-❌ Boost
 ❌ libevent / libev / libuv
 ❌ liburing (own wrapper)
 ❌ protobuf / grpc
@@ -3103,7 +4916,7 @@ let users = upstream {
 }
 
 // Override at proxy call:
-proxy(users, timeout: 30s)   // overrides total timeout
+forward(userService)   // overrides total timeout
 ```
 
 ```
@@ -3174,13 +4987,12 @@ let users = upstream {
 }
 // SRV records provide port + weight + priority
 
-// Phase 3: External discovery via extern FFI
-extern func consulDiscover(service: string) -> [string]
-
-// Periodic refresh using background timer (runtime feature):
-let users = upstream {
-    discover: .extern(consulDiscover, service: "user-service", every: 10s)
-    balance: .leastConn
+// Phase 3: External discovery via HTTP call to Consul/etcd API
+// Periodic refresh using timer:
+timer refreshUsers, every: 10s, shard: 0 {
+    let res = get http://consul:8500/v1/health/service/user-service
+    guard let res else { return }
+    // update upstream targets from Consul response
 }
 ```
 
@@ -3273,7 +5085,7 @@ func processOrder(_ req: Request) {
         guard res.status == 200 else { return 503 }
     }
 
-    proxy(orders)
+    forward(orders)
 }
 ```
 
@@ -3377,16 +5189,9 @@ Format: one JSON line per request
   }
 ```
 
-User-configurable in .rue:
-
-```swift
-accessLog {
-    format: .json                  // .json | .text | .clf
-    output: .stdout                // .stdout | .file("/var/log/access.log")
-    fields: [.method, .path, .status, .duration, .addr, .requestId]
-    filter: { $0.duration > 100ms || $0.status >= 400 }  // only slow/error
-}
-```
+Access logging is automatic — the runtime logs every request. Format and output
+are controlled by runtime flags (`--access-log-format`, `--access-log-output`),
+not in .rut source files.
 
 ### 13.7 Internal Endpoints
 
@@ -3394,19 +5199,19 @@ Built-in HTTP endpoints for runtime inspection. Can be on a separate port or pro
 
 ```swift
 // Option A: separate internal port (recommended)
-listen :9090, internal: true
+listen :9090
 
 // Option B: on main port with access control
 route {
-    group /internal { req in
+    /internal {
         ipAllow(req, cidrs: [10.0.0.0/8])
 
-        get /internal/metrics => metrics()    // Prometheus format
-        get /internal/health  => health()     // JSON health status
-        get /internal/shards  => shards()     // per-shard state
-        get /internal/upstreams => upstreams() // upstream status
-        get /internal/routes  => routes()     // route table + hit counts
-        post /internal/log-level { req in     // dynamic log level
+        get /metrics  { metrics() }     // Prometheus format
+        get /health   { health() }      // JSON health status
+        get /shards   { shards() }      // per-shard state
+        get /upstreams { upstreams() }   // upstream status
+        get /routes   { routes() }      // route table + hit counts
+        post /log-level {               // dynamic log level
             setLogLevel(req.body(LogLevelConfig))
             return 200
         }
@@ -3488,7 +5293,7 @@ POST /internal/log-level — dynamic log level change
 Compile-time validation without starting the server:
 
 ```
-$ rue --dry-run gateway.rue
+$ rue --dry-run gateway.rut
 
 ✓ Parsed 3 files
 ✓ Type check passed
@@ -3559,7 +5364,7 @@ Deliverable: can accept HTTP requests, proxy to upstream, return responses.
 ### Phase 2: Language + JIT
 
 ```
-├── Lexer + Parser for .rue (~2000 lines)
+├── Lexer + Parser for .rut (~2000 lines)
 ├── Type checker (~1500 lines)
 ├── LLVM IR codegen (~2000 lines)
 ├── JIT loading + hot reload (~1000 lines)
@@ -3567,7 +5372,7 @@ Deliverable: can accept HTTP requests, proxy to upstream, return responses.
 ├── Radix trie route compiler (~500 lines)
 └── Total: ~8000 lines
 
-Deliverable: .rue files compiled and loaded, hot reload works.
+Deliverable: .rut files compiled and loaded, hot reload works.
 ```
 
 ### Phase 3: Production Hardening
@@ -3594,7 +5399,282 @@ Deliverable: .rue files compiled and loaded, hot reload works.
 
 ---
 
-## 16. Design Decisions Log
+## 16. Service Mesh Deployment (Sidecar Mode)
+
+Rut can operate as a lightweight mesh sidecar, replacing Envoy in Istio-style
+service meshes. The key insight: .rut source is compiled centrally, pre-compiled
+native code is distributed to sidecars. Sidecars contain no compiler.
+
+### 16.1 Architecture
+
+```
+┌──────────────────────────────────────────────────┐
+│                 Rut Control Plane                 │
+│                                                    │
+│  Watch K8s resources → Generate .rut → Compile    │
+│  LLVM JIT only here → Produce .so binaries        │
+│  Watch Endpoints → Push target lists              │
+│  Manage certs → Push cert updates                 │
+└────────┬──────────────┬───────────────┬───────────┘
+         │ push .so     │ push endpoints│ push certs
+   ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐
+   │Rut Sidecar│  │Rut Sidecar│  │Rut Sidecar│
+   │ no compiler│  │ no compiler│  │ no compiler│
+   │ pure runtime│ │ pure runtime│ │ pure runtime│
+   │ dlopen .so │  │ dlopen .so │  │ dlopen .so │
+   │ atomic swap│  │ atomic swap│  │ atomic swap│
+   └───────────┘  └───────────┘  └───────────┘
+```
+
+### 16.2 Sidecar Binary Composition
+
+| Component | Control Plane | Sidecar |
+|-----------|:---:|:---:|
+| Lexer / Parser | ✅ | ❌ |
+| Type Checker | ✅ | ❌ |
+| RIR | ✅ | ❌ |
+| LLVM JIT | ✅ | ❌ |
+| io_uring / epoll runtime | ✅ | ✅ |
+| HTTP Parser (SIMD) | ✅ | ✅ |
+| Memory allocators (Arena/Slab/Slice) | ✅ | ✅ |
+| State types (Hash/LRU/Counter...) | ✅ | ✅ |
+| TLS (BoringSSL) | ✅ | ✅ |
+| Compression (zstd/brotli/libdeflate) | ✅ | ✅ |
+| Vectorscan (regex) | ✅ | ✅ |
+
+Estimated sidecar binary: **~5MB** (vs Envoy ~50MB).
+
+### 16.3 Dynamic Update Protocol
+
+Three update channels, all HTTP (Rut only speaks HTTP). Sidecar listens on
+an internal port (e.g., :15000) for control plane messages.
+
+```
+1. Code push — route/middleware/policy changes (infrequent)
+   POST /rut-sidecar/code
+   Body: compiled .so binary
+   Sidecar: dlopen → extract handler function pointers → RCU swap
+
+2. Endpoint push — pod IP changes (frequent, seconds)
+   POST /rut-sidecar/endpoints
+   Body: { upstream: "userService", targets: ["10.0.0.1:8080", ...] }
+   Sidecar: atomic update upstream target array, zero compilation
+
+3. Certificate push — cert rotation (periodic, hours)
+   POST /rut-sidecar/certs
+   Body: { domain: "api.example.com", cert: "...", key: "..." }
+   Sidecar: TLS context hot swap
+```
+
+### 16.4 Performance Comparison with Envoy
+
+**Per-request processing:**
+
+```
+Envoy:  route table lookup → traverse filter chain → dynamic dispatch per filter
+        → virtual function calls → runtime config interpretation
+        ↑ every request pays interpretation cost
+
+Rut:    compiled handler function pointer → direct jump → all middleware inlined
+        → zero dynamic dispatch → zero config interpretation
+        ↑ every request runs pre-compiled native code
+```
+
+**System call efficiency:**
+
+```
+Envoy:  libevent (epoll), 2 syscalls per I/O operation
+Rut:    io_uring, batched submission, 1 syscall for N operations
+```
+
+**Memory model:**
+
+```
+Envoy:  malloc/free per request (headers, buffers, filter state)
+Rut:    Arena bump-allocate, one pointer reset per request, zero free
+```
+
+**Estimated single-core performance:**
+
+| Metric | Envoy | Rut (estimated) | Source of difference |
+|--------|-------|-----------------|---------------------|
+| Small request QPS | ~50K/core | ~150-200K/core | Inlined handlers + zero malloc + io_uring batch |
+| P99 latency | ~200μs | ~50μs | No filter chain traversal, no allocation jitter |
+| Throughput (streaming) | ~5Gbps/core | ~10-15Gbps/core | kTLS + splice zero-copy |
+| Idle connection memory | ~50KB/conn | ~0B/conn | io_uring provided buffer ring |
+
+**Cluster-wide sidecar overhead (1000 pods):**
+
+| Resource | Envoy sidecars | Rut sidecars |
+|----------|---------------|-------------|
+| Total binary storage | 50GB | 5GB |
+| Total idle memory | 50-150GB | 5-10GB |
+| Startup time per sidecar | seconds (xDS sync) | milliseconds (dlopen) |
+| Config error detection | runtime (may crash) | compile-time (pre-deployment) |
+
+**10× lighter, 3-5× faster** — the architectural advantage of compiled DSL
+over runtime config interpretation.
+
+### 16.5 Kernel-Level Firewall (`firewall` block)
+
+Rutlang provides a `firewall` block for network-level packet filtering. The
+compiler generates eBPF bytecode from this block, loaded into the kernel's
+XDP (eXpress Data Path) hook — the earliest packet processing point, before
+TCP stack. Users don't need to know eBPF exists.
+
+```swift
+// firewall — network-level rules, compiled to eBPF, runs in kernel
+firewall {
+    // IP blacklist — line-rate filtering
+    guard not blacklist.contains(src.ip) else { drop }
+
+    // CIDR filtering
+    guard not badNetworks.contains(src.ip) else { drop }
+
+    // Port whitelist — only allow declared listen ports
+    guard dst.port == 443 or dst.port == 80 else { drop }
+
+    // SYN flood protection — rate limit new connections per IP
+    if src.isSYN {
+        guard synRate.incr(src.ip) <= 100 else { drop }
+    }
+
+    // TLS fingerprinting — block known malware/scanner clients
+    if src.tls? {
+        guard allowedDomains.contains(src.tls.sni) else { drop }
+        guard not badFingerprints.contains(src.tls.ja3) else { drop }
+    }
+
+    // TCP fingerprint — drop non-standard OS signatures (scanners)
+    guard src.ttl > 0 else { drop }
+
+    pass
+}
+```
+
+**`src` / `dst` members (packet-level, not HTTP-level):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `src.ip` | IP | Source IP address |
+| `src.port` | Port | Source port |
+| `dst.ip` | IP | Destination IP address |
+| `dst.port` | Port | Destination port |
+| `src.isSYN` | bool | TCP SYN flag |
+| `src.tls?` | bool | Is TLS ClientHello |
+| `src.tls.sni` | string? | TLS SNI domain name |
+| `src.tls.ja3` | string? | JA3 TLS client fingerprint |
+| `src.ttl` | i32 | IP TTL value |
+| `src.tcpWindow` | i32 | TCP window size |
+| `packet.len` | i32 | Total packet length |
+
+**Compiler constraints — `firewall` block can only:**
+- Access `src` / `dst` / `packet` fields
+- Use `Set<IP>`, `Set<CIDR>`, `Counter<IP>`, `Set<string>` state types
+- `guard ... else { drop }` or `pass`
+- No HTTP operations (`req`, `forward`, `auth`, regex)
+- Violation → compile error: "firewall block cannot access HTTP-level data"
+
+**Actions:** `drop` (silently discard packet) or `pass` (continue to TCP stack).
+
+**Two compilation targets from one .rut file:**
+
+```
+.rut source → compiler
+    ├→ firewall { } block → eBPF bytecode (.bpf) → kernel XDP hook
+    └→ route { } block   → native code (.so)     → userspace L7 handler
+```
+
+**Impact — blocked traffic never reaches userspace:**
+
+```
+With firewall:  NIC → XDP eBPF → DROP (kernel, zero TCP, zero buffer)
+                                → PASS → TCP stack → Rut L7 handler
+                ↑ line-rate filtering: 10M+ packets/sec
+
+Without:        NIC → TCP → accept → HTTP parse → guard → 403
+                ↑ each blocked request consumes connection + CPU
+```
+
+**eBPF WAF capabilities:**
+
+| Technique | How | Blocks |
+|-----------|-----|--------|
+| IP blacklist | `Set<IP>` → hash map | Known bad actors |
+| CIDR filtering | `Set<CIDR>` → LPM trie | Network ranges, GeoIP |
+| SYN flood | `Counter<IP>` on SYN packets | Connection exhaustion |
+| Port filtering | `dst.port` check | Port scanning |
+| SNI filtering | Parse ClientHello, check domain | Unknown domains (saves TLS CPU) |
+| JA3 fingerprint | Hash ClientHello fields | Malware, scanners, bots |
+| TCP fingerprint | TTL + window + options | OS-level scanner detection |
+| Protocol filter | No UDP listener → drop all UDP | Amplification attacks |
+
+**Fallback:** if kernel lacks XDP support or process lacks `CAP_BPF`, the
+`firewall` block is silently skipped — all filtering happens in L7 handler
+(same guards, just at HTTP level instead of packet level). The `.rut` code
+is correct either way.
+
+### 16.6 Mesh Three-Component Architecture
+
+```
+┌───────────────────────────────────────────────────┐
+│                 Rut Control Plane                  │
+│  K8s watch → generate .rut → compile .so + .bpf   │
+│  Push endpoints, certs, eBPF maps                  │
+└────┬─────────────────┬────────────────┬───────────┘
+     │ push .bpf       │ push .so       │ push endpoints
+     │ + map data      │               │ + certs
+     ▼                 ▼                ▼
+┌──────────┐    ┌───────────┐    ┌───────────┐
+│Node Agent │    │  Sidecar  │    │  Sidecar  │
+│(DaemonSet)│    │ (per pod) │    │ (per pod) │
+│ ~2MB      │    │ ~5MB      │    │ ~5MB      │
+│ CAP_BPF   │    │ no privs  │    │ no privs  │
+│ XDP+eBPF  │    │ L7 handler│    │ L7 handler│
+└─────┬─────┘    └───────────┘    └───────────┘
+      │ XDP in kernel
+      ▼
+┌──────────────────────────────┐
+│ NIC → XDP → DROP/PASS       │  ← blocked IPs dropped at line rate
+│        ↓                     │
+│    TCP stack → Sidecar       │  ← clean traffic to L7
+└──────────────────────────────┘
+```
+
+**Three components:**
+
+| Component | Size | Privileges | Role |
+|-----------|------|-----------|------|
+| Control Plane | ~50MB (has LLVM) | cluster admin | Compile .rut → .so + .bpf, push to nodes |
+| Node Agent | ~2MB (has libbpf) | CAP_BPF + CAP_NET_ADMIN | Load XDP programs, manage eBPF maps |
+| Sidecar | ~5MB (pure runtime) | none | Execute L7 handlers, zero-copy forward |
+
+**Dynamic eBPF map updates:**
+
+When a handler adds an IP to a blacklist, both userspace Set and kernel eBPF map
+are updated:
+
+```swift
+post /admin/ban {
+    let ip = req.body(IP)
+    guard let ip else { return 400 }
+    blacklist.add(ip)               // userspace Set (immediate)
+    notify all blacklist.add(ip)    // all shard userspace Sets
+    // compiler auto-generates: update eBPF map via Node Agent
+    return 200
+}
+```
+
+Sidecar → Node Agent (HTTP on localhost) → `bpf_map_update_elem`. The IP is
+blocked at kernel level within microseconds.
+
+**Fallback:** if Node Agent is absent or kernel lacks XDP support, the system
+works without eBPF — pure L7 filtering in sidecar. Same model as io_uring/epoll
+fallback.
+
+---
+
+## 17. Design Decisions Log
 
 | # | Decision | Alternatives Considered | Rationale |
 |---|----------|------------------------|-----------|
@@ -3621,4 +5701,4 @@ Deliverable: .rue files compiled and loaded, hot reload works.
 | 21 | Custom IR (DIR) between AST and LLVM IR | Direct AST → LLVM IR | Enables domain-specific optimizations, backend independence (swap LLVM for Cranelift), debuggability (--emit-dir), and clean instrumentation insertion point |
 | 22 | Security as language-level code, not runtime features | Built-in WAF/DDoS modules | WAF rules, bot detection, flood protection are all expressible in the DSL; no hardcoded security logic in runtime; users can customize everything |
 | 23 | Response middleware via parameter signature | Separate `onResponse` keyword | `func f(req, resp)` = response middleware; compiler auto-detects; no new syntax needed |
-| 24 | Connection-level protection in `listen` config | Runtime-only config | headerTimeout, maxConnsPerIP, minRecvRate, strictParsing are declared in .rue files; compile-time validated; visible alongside routing logic |
+| 24 | Connection-level protection in `listen` config | Runtime-only config | headerTimeout, maxConnsPerIP, minRecvRate, strictParsing are declared in .rut files; compile-time validated; visible alongside routing logic |

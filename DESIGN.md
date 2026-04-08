@@ -1486,9 +1486,10 @@ precedence rules so the compiler, simulator, and runtime agree on which route wi
 **Method matching**
 
 - The **language contract** is exact HTTP method matching
-- `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, `CONNECT`, and `TRACE` are distinct
-- `ANY` matches any method
-- Implementations that collapse multiple methods into one internal code are temporary and should not be treated as language semantics
+- `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS` are supported keywords
+- Multiple methods via `|`: `get|post /path { ... }`
+- `_` is the catch-all (matches any method and path)
+- No `ANY` keyword — omitting the method in a path group matches all methods for that group
 
 **Path matching**
 

@@ -233,7 +233,7 @@ static const char* action_str(jit::HandlerAction action) {
         case jit::HandlerAction::ReturnStatus:
             return "status";
         case jit::HandlerAction::Forward:
-            return "proxy";
+            return "forward";
         case jit::HandlerAction::Yield:
             return "yield";
     }

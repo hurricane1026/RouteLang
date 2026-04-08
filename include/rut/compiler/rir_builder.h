@@ -651,7 +651,6 @@ struct Builder {
         cur_func->yield_count++;
         return vid;
     }
-
 };
 
 }  // namespace rir

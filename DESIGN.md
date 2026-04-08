@@ -1322,18 +1322,22 @@ route {
 
 **Pre vs post middleware — inferred from function signature:**
 
-The compiler determines when a middleware runs by its first parameter type:
-- First parameter is `Request` → **pre-middleware** (before handler)
-- First parameter is `Response` → **post-middleware** (after handler)
+One rule: **if the signature contains a `Response` parameter (any position),
+it is post-middleware. Otherwise, it is pre-middleware.**
 
 ```swift
-// Pre — first param is Request
+// Pre — no Response in signature
 func requestId(_ req: Request) { ... }
 
-// Post — first param is Response
+// Post — signature contains Response
 func addSecurityHeaders(_ resp: Response) {
     resp.Server = nil
     resp.X-Content-Type-Options = "nosniff"
+}
+
+// Post — also contains Response (req available too)
+func logResponse(_ req: Request, _ resp: Response) {
+    log.info("responded", status: resp.status, path: req.path)
 }
 
 // Same @ syntax for both — compiler infers from signature

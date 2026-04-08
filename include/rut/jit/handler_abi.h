@@ -10,7 +10,7 @@ namespace jit {
 
 enum class HandlerAction : u8 {
     ReturnStatus = 0,  // Send HTTP response with status_code
-    Proxy = 1,         // Forward request to upstream_id
+    Forward = 1,       // Forward request to upstream_id
     Yield = 2,         // Suspend: initiate I/O, resume at next_state
 };
 
@@ -20,8 +20,7 @@ enum class HandlerAction : u8 {
 enum class YieldKind : u8 {
     HttpGet = 0,
     HttpPost = 1,
-    Proxy = 2,
-    Extern = 3,
+    Forward = 2,
 };
 
 // ── Handler Result ─────────────────────────────────────────────────
@@ -72,8 +71,8 @@ struct HandlerResult {
         return {HandlerAction::ReturnStatus, code, 0, 0, YieldKind::HttpGet};
     }
 
-    static HandlerResult make_proxy(u16 upstream) {
-        return {HandlerAction::Proxy, 0, upstream, 0, YieldKind::HttpGet};
+    static HandlerResult make_forward(u16 upstream) {
+        return {HandlerAction::Forward, 0, upstream, 0, YieldKind::HttpGet};
     }
 
     static HandlerResult make_yield(u16 state, YieldKind kind) {

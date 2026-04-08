@@ -1215,7 +1215,7 @@ func maxBody(_ req: Request, limit: ByteSize) {
     guard req.contentLength <= limit else { return 413 }
 }
 
-func concurrencyLimit(_ req: Request, active: Counter<string>, limit: i32) {
+func concurrencyLimit(_ req: Request, active: Counter<IP>, limit: i32) {
     guard active.get(req.remoteAddr) < limit else { return 503, "overloaded" }
 }
 
@@ -1910,7 +1910,6 @@ get /index.html {
     resp.Content-Type = "text/html"
     resp.body = html
     return resp
-    }
 }
 ```
 

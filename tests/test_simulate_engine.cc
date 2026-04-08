@@ -365,7 +365,7 @@ TEST(simulate_engine, proxy_upstream_match) {
     const auto result = simulate_one(
         engine, make_entry("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 502, "api-v1"));
     CHECK_EQ(result.verdict, Verdict::Match);
-    CHECK_EQ(result.action, jit::HandlerAction::Proxy);
+    CHECK_EQ(result.action, jit::HandlerAction::Forward);
 
     engine.shutdown();
     ctx.destroy();

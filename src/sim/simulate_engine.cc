@@ -232,7 +232,7 @@ static const char* action_str(jit::HandlerAction action) {
     switch (action) {
         case jit::HandlerAction::ReturnStatus:
             return "status";
-        case jit::HandlerAction::Proxy:
+        case jit::HandlerAction::Forward:
             return "proxy";
         case jit::HandlerAction::Yield:
             return "yield";
@@ -618,7 +618,7 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
         return result;
     }
 
-    if (kUnpacked.action == jit::HandlerAction::Proxy) {
+    if (kUnpacked.action == jit::HandlerAction::Forward) {
         const auto* upstream = find_upstream(engine, kUnpacked.upstream_id);
         if (!upstream) {
             result.verdict = Verdict::Failed;
@@ -688,7 +688,7 @@ u32 format_result(const SimulateResult& result, char* buf, u32 buf_size) {
     put_str(buf, buf_size, &pos, action_str(result.action));
     put_str(buf, buf_size, &pos, " ");
 
-    if (result.action == jit::HandlerAction::Proxy) {
+    if (result.action == jit::HandlerAction::Forward) {
         put_name(buf, buf_size, &pos, result.expected_upstream[0] ? result.expected_upstream : "-");
         put_str(buf, buf_size, &pos, " -> ");
         put_name(buf, buf_size, &pos, result.actual_upstream[0] ? result.actual_upstream : "-");

@@ -457,22 +457,22 @@ TEST(result, pack_unpack_status) {
     CHECK(r2.next_state == 0);
 }
 
-TEST(result, pack_unpack_proxy) {
-    auto r = HandlerResult::make_proxy(7);
+TEST(result, pack_unpack_forward) {
+    auto r = HandlerResult::make_forward(7);
     u64 packed = r.pack();
     auto r2 = HandlerResult::unpack(packed);
-    CHECK(r2.action == HandlerAction::Proxy);
+    CHECK(r2.action == HandlerAction::Forward);
     CHECK(r2.upstream_id == 7);
     CHECK(r2.status_code == 0);
 }
 
 TEST(result, pack_unpack_yield) {
-    auto r = HandlerResult::make_yield(3, YieldKind::Proxy);
+    auto r = HandlerResult::make_yield(3, YieldKind::Forward);
     u64 packed = r.pack();
     auto r2 = HandlerResult::unpack(packed);
     CHECK(r2.action == HandlerAction::Yield);
     CHECK(r2.next_state == 3);
-    CHECK(r2.yield_kind == YieldKind::Proxy);
+    CHECK(r2.yield_kind == YieldKind::Forward);
 }
 
 TEST(result, pack_matches_codegen_layout) {
@@ -1125,7 +1125,7 @@ TEST(jit, ret_forward) {
                                            reinterpret_cast<const u8*>(kGetApiRequest),
                                            sizeof(kGetApiRequest) - 1,
                                            nullptr));
-    CHECK(r.action == HandlerAction::Proxy);
+    CHECK(r.action == HandlerAction::Forward);
     CHECK(r.upstream_id == 3);
 
     engine.shutdown();

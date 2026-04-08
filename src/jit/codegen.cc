@@ -237,7 +237,7 @@ struct Ctx {
         return LLVMConstInt(i64_ty, packed, 0);
     }
 
-    LLVMValueRef make_result_proxy(u16 upstream) {
+    LLVMValueRef make_result_forward(u16 upstream) {
         u64 packed = 0;
         packed |= static_cast<u64>(1);               // action = Forward
         packed |= static_cast<u64>(upstream) << 24;  // upstream_id

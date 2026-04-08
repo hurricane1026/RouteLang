@@ -2029,23 +2029,29 @@ let stable  = upstream { "10.0.0.4:8080" }
 // By header
 get /api/users/:id {
     let target = match req.X-API-Version {
-        "v2" { usersV2 }
-        _    { usersV1 }
+        "v2" => usersV2
+        _    => usersV1
     }
-    forward(target)
+    return forward(target)
 }
 
 // Canary release: percentage-based
 get /api/** {
     let hash = fnv32(req.remoteAddr)
-    let target = hash % 100 < 10 ? canary : stable   // 10% canary
-    forward(target)
+    let target = match hash % 100 < 10 {
+        true => canary
+        _    => stable
+    }
+    return forward(target)
 }
 
 // Blue-green via environment variable
 get /api/** {
-    let target = env("DEPLOY_GROUP") == "blue" ? blueUpstream : greenUpstream
-    forward(target)
+    let target = match env("DEPLOY_GROUP") {
+        "blue" => blueUpstream
+        _      => greenUpstream
+    }
+    return forward(target)
 }
 ```
 
@@ -4678,7 +4684,7 @@ RIR instruction set:
   %19 = ip.in_cidr %8, 10.0.0.0/8        // → bool
   %20 = hash.hmac_sha256 %secret, %13    // → Bytes
   %21 = bytes.hex %20                     // → str
-  %22 = call.jwt_decode %12, %secret      // → Optional(Claims)
+  %22 = jwt.decode %12, %secret            // → Result(Claims) — built-in
   %23 = counter.incr %8, 1m              // → i32
 
   // --- Struct operations ---
@@ -4698,8 +4704,7 @@ RIR instruction set:
   // --- I/O (suspend points → state machine boundaries) ---
   %29 = yield.http_get "http://auth/verify", { Authorization: %token }
   %30 = yield.http_post "http://svc/create", { Body: %data }
-  %31 = yield.proxy %upstream
-  %32 = yield.extern "redisGet", %key
+  %31 = yield.forward %upstream
 
   // --- Debug/instrumentation (inserted by compiler) ---
   trace.func_enter "auth"
@@ -4739,7 +4744,7 @@ func handle_get_users_id(req: Request) {
   block_decode_jwt:
     %raw = str.trim_prefix %token, "Bearer "
     %secret = const.str env("JWT_SECRET")
-    %claims = call.jwt_decode %raw, %secret
+    %claims = jwt.decode %raw, %secret
     br %claims.is_nil, block_reject_401, block_check_exp
 
   block_check_exp:

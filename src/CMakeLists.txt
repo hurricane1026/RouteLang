@@ -174,7 +174,13 @@ target_include_directories(rut_jit PUBLIC
 
 # LLVM on this system is a single shared lib (-lLLVM-N).
 # llvm_map_components_to_libnames resolves to the shared lib automatically.
-llvm_map_components_to_libnames(LLVM_LIBS core orcjit orcshared orctargetprocess native support)
+# LLVM 17+ split ORC symbols into orcshared/orctargetprocess; older versions
+# include them in the main orcjit component.
+set(_RUT_ORC_COMPONENTS core orcjit native support)
+if(LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL "17")
+    list(APPEND _RUT_ORC_COMPONENTS orcshared orctargetprocess)
+endif()
+llvm_map_components_to_libnames(LLVM_LIBS ${_RUT_ORC_COMPONENTS})
 target_link_libraries(rut_jit ${LLVM_LIBS})
 
 # JIT .cc files may need LLVM definitions that conflict with -fno-rtti.

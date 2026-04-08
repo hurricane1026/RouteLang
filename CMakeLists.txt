@@ -36,11 +36,7 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
 
 # LLVM — required for JIT compilation (ORC JIT via C API).
 # Only the rut_jit library links LLVM; rut_runtime stays LLVM-free.
-# Minimum LLVM 17: orcshared/orctargetprocess components required.
 find_package(LLVM REQUIRED CONFIG)
-if(LLVM_PACKAGE_VERSION VERSION_LESS "17")
-    message(FATAL_ERROR "LLVM >= 17 required, found ${LLVM_PACKAGE_VERSION}")
-endif()
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 

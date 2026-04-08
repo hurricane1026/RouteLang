@@ -5078,8 +5078,10 @@ let users = upstream {
     sendTimeout: 5s
 }
 
-// Override at proxy call:
-forward(userService)   // overrides total timeout
+// Request-level timeout via any(wait()):
+let h = submit forward(userService, buffered: true)
+let resp = any(wait(h, 5s))   // 5s deadline, cancel if exceeded
+guard let resp else { return 504 }
 ```
 
 ```

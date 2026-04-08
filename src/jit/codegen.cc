@@ -239,7 +239,7 @@ struct Ctx {
 
     LLVMValueRef make_result_proxy(u16 upstream) {
         u64 packed = 0;
-        packed |= static_cast<u64>(1);               // action = Proxy
+        packed |= static_cast<u64>(1);               // action = Forward
         packed |= static_cast<u64>(upstream) << 24;  // upstream_id
         return LLVMConstInt(i64_ty, packed, 0);
     }
@@ -543,7 +543,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::RetForward: {
-            // Pack: action=1 (Proxy), upstream_id from operand or immediate.
+            // Pack: action=1 (Forward), upstream_id from operand or immediate.
             LLVMValueRef upstream;
             if (inst.operand_count > 0) {
                 upstream = c.get_value(inst.operands[0]);
@@ -553,7 +553,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             } else {
                 upstream = LLVMConstInt(c.i32_ty, 0, 0);
             }
-            LLVMValueRef action = LLVMConstInt(c.i64_ty, 1, 0);  // Proxy
+            LLVMValueRef action = LLVMConstInt(c.i64_ty, 1, 0);  // Forward
             LLVMValueRef up_ext = LLVMBuildZExt(c.builder, upstream, c.i64_ty, "up.e");
             LLVMValueRef shifted =
                 LLVMBuildShl(c.builder, up_ext, LLVMConstInt(c.i64_ty, 24, 0), "up.shl");

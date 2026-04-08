@@ -378,7 +378,7 @@ TEST(RirIntegration, AuthHandlerFromDesignDoc) {
     b.set_insert_point(fn, blk_proxy);
     auto id = V(b.emit_req_param(lit("id")));
     VOK(b.emit_req_set_header(lit("X-User-ID"), id));
-    auto upstream = V(b.emit_const_str(lit("users")));
+    auto upstream = V(b.emit_const_i32(0));  // upstream id 0
     VOK(b.emit_ret_forward(upstream));
 
     // Rejection blocks.

@@ -797,7 +797,7 @@ at compile time. This prevents a buggy handler from stalling a shard.
 - **`for ... in` only** — iterates finite collections (arrays, struct fields). No `while`, no `loop`.
 - **No `break` / `continue`** — every iteration runs to completion.
 - **No recursion** — all functions inline at compile time. A function calling itself is a compile error.
-- **No closures** — no first-class functions, no callbacks. No implicit variables.
+- **No closures** — no first-class functions, no callbacks. Keyword-specific trailing blocks (e.g., `websocket { }` with implicit `frame`) are compile-time constructs, not closures.
 
 ```swift
 // var — handler-local mutable variable

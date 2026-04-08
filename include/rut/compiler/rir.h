@@ -199,10 +199,10 @@ enum class Opcode : u8 {
     AccessLogWrite,
 
     // ── Terminators ── (must be last instruction in a block)
-    Br,         // br %cond, then_block, else_block
-    Jmp,        // jmp target_block
-    RetStatus,  // ret.status code [, headers/body]
-    RetForward, // ret.forward upstream [, options]
+    Br,          // br %cond, then_block, else_block
+    Jmp,         // jmp target_block
+    RetStatus,   // ret.status code [, headers/body]
+    RetForward,  // ret.forward upstream [, options]
 
     // ── Yield (I/O suspend → state machine boundary) ──
     YieldHttpGet,   // %r = yield.http_get url, headers

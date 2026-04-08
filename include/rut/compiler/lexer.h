@@ -63,7 +63,7 @@ enum class TokenType : u8 {
     KwOptions,
 
     // Regex literal
-    RegexLit,   // re"pattern"
+    RegexLit,  // re"pattern"
 
     // Symbols
     LParen,

@@ -625,7 +625,8 @@ Compiler emits a warning — user must acknowledge with `// rut:allow(consistent
 | notify(key) | `notify(key) expr` | 1 SPSC write | eventual, targeted |
 | consistent | `consistent: true` | 1 SPSC round-trip | strong |
 
-All three use SPSC message passing. No atomics, no STM, no locks.
+All three use SPSC message passing with minimal atomics (relaxed stores +
+release/acquire on queue tail pointer). No mutexes, no STM, no contended locks.
 
 **Cross-node state: `backend:` parameter**
 

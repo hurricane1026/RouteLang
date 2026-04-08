@@ -208,8 +208,6 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::BytesHex:
             buf.put_cstr("bytes.hex");
             break;
-            buf.put_cstr("call");
-            break;
         case Opcode::CounterIncr:
             buf.put_cstr("counter.incr");
             break;
@@ -275,8 +273,6 @@ void print_opcode(PrintBuf& buf, Opcode op) {
             break;
         case Opcode::YieldForward:
             buf.put_cstr("yield.forward");
-            break;
-            buf.put_cstr("yield.extern");
             break;
     }
 }
@@ -540,15 +536,6 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_i64(inst.imm.i64_val);
             buf.put('s');
             break;
-            buf.put('.');
-            if (inst.operand_count > 0) {
-                buf.put(' ');
-                for (u32 i = 0; i < inst.operand_count; i++) {
-                    if (i > 0) buf.put_cstr(", ");
-                    print_value_ref(buf, inst.operand(i));
-                }
-            }
-            break;
         case Opcode::HashHmacSha256:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
@@ -598,12 +585,6 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::YieldForward:
             buf.put(' ');
             if (inst.operand_count > 0) print_value_ref(buf, inst.operands[0]);
-            break;
-            buf.put(' ');
-            for (u32 i = 0; i < inst.operand_count; i++) {
-                buf.put_cstr(", ");
-                print_value_ref(buf, inst.operand(i));
-            }
             break;
 
         // Instrumentation

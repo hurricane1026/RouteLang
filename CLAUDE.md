@@ -59,7 +59,7 @@ Binary: `build/src/rut`. Compiler: clang++. Linter: clang-tidy (`.clang-tidy`). 
 - No RTTI (`-fno-rtti`)
 - No heap allocation on hot paths
 - Compile-time backend selection via templates, not virtual dispatch
-- Cross-shard communication via SPSC message passing (`broadcast`), per-shard state by default, RCU for config hot reload
+- Cross-shard communication via SPSC message passing (`notify`), per-shard state by default, RCU for config hot reload
 - Cache-line alignment (`alignas(64)`) for shared atomics to prevent false sharing
 
 ## Runtime Design Decisions

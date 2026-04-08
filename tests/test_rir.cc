@@ -351,7 +351,8 @@ TEST(RirIntegration, AuthHandlerFromDesignDoc) {
     // block_decode_jwt
     b.set_insert_point(fn, blk_decode_jwt);
     auto* t_str = V(b.make_type(TypeKind::Str));
-    // jwt_decode is a built-in. Model as returning Optional(Str) for this IR test.
+    // For this IR test, model decoded JWT claims via the X-Claims request header,
+    // treated as Optional(Str) rather than invoking a dedicated jwt_decode built-in.
     auto claims = V(b.emit_req_header(lit("X-Claims"), {45, 0}));
     auto claims_nil = V(b.emit_opt_is_nil(claims, {45, 0}));
     VOK(b.emit_br(claims_nil, blk_reject_401, blk_check_role, {45, 0}));

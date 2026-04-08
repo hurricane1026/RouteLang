@@ -38,7 +38,7 @@ This is intentionally coarse-grained. It exists to separate "designed" from
 | HTTP parsing and proxying runtime | **Implemented** | Production-oriented runtime paths and tests exist |
 | RIR data model + builder + printer | **Implemented** | RIR is real and exercised by tests |
 | LLVM ORC JIT integration | **Implemented** | Userspace handler JIT engine and codegen paths exist |
-| `packet {}` → eBPF / XDP compilation target | **Designed** | Packet-level kernel path is a first-class compilation target in this design |
+| `firewall {}` → eBPF / XDP compilation target | **Designed** | Packet-level kernel path is a first-class compilation target in this design |
 | Offline manifest → RIR → JIT simulate flow | **Implemented** | Current compile-like path is intentionally narrow |
 | Full Rutlang lexer / parser / type checker | **Partial / in progress** | Token surface is declared, but the front-end is not yet complete |
 | Route conflict analysis and full diagnostics | **Designed** | Mentioned throughout this doc, not fully enforced end-to-end today |
@@ -86,7 +86,7 @@ This file currently remains the umbrella design doc until that split happens.
                           └───────┬───────────┬─────────┘
                                   │           │
                                   │           └──────────────▶ eBPF bytecode
-                                  │                            (`packet {}` → XDP / kernel hook)
+                                  │                            (`firewall {}` → XDP / kernel hook)
                                   ▼
                          ┌──────────────────────┐
                          │  JIT (LLVM ORC JIT)   │
@@ -115,7 +115,7 @@ This file currently remains the umbrella design doc until that split happens.
 | Networking | io_uring (preferred) + epoll (fallback) | io_uring is optimal for Linux 6.0+; epoll fallback for older kernels (3.9+); both use kernel TCP stack |
 | Thread model | per-core shard, share-nothing | Proven by Seastar/Envoy/nginx; eliminates locks and race conditions |
 | Userspace codegen | LLVM ORC JIT | Same C++ toolchain, zero FFI overhead, lazy compilation support for L7 handlers |
-| Packet-path codegen | eBPF / XDP | Compile `packet {}` blocks to kernel-level packet filters for earliest-drop semantics |
+| Packet-path codegen | eBPF / XDP | Compile `firewall {}` blocks to kernel-level packet filters for earliest-drop semantics |
 | HTTP parser | Custom (~500 lines) | llhttp is callback-based (bad fit), picohttpparser lacks strict mode; custom parser integrates directly with our Slice buffer + Arena, supports SIMD, full control over strictness (anti-smuggling) |
 | C++ stdlib | `-nostdlib++`, musl libc only | Full memory control, faster compilation |
 | Compiler flags | `-fno-exceptions -fno-rtti` | No overhead from unused C++ features |
@@ -140,7 +140,7 @@ status matrix above.
 - **Middleware = ordinary functions**: return a status code to reject, return nothing to pass through
 - **Bounded execution**: no `while`, no recursion, `for` only iterates finite collections — every handler has a compile-time execution bound, cannot stall a shard
 - **Three-layer model**: `listen` (downstream/client) → .rut file (gateway logic) → `upstream` (backend). No `gateway` or `downstream` keyword — the .rut file IS the gateway, `listen` IS the downstream config
-- **Minimal keyword set**: `func`, `let`, `var`, `const`, `guard`, `struct`, `route`, `match`, `if`, `else`, `for`, `in`, `return`, `defer`, `upstream`, `listen`, `tls`, `defaults`, `forward`, `websocket`, `fire`, `submit`, `wait`, `timer`, `init`, `shutdown`, `packet`, `throttle`, `per`, `notify`, `import`, `using`, `as`, `and`, `or`, `not`, `nil`, `true`, `false`
+- **Minimal keyword set**: `func`, `let`, `var`, `const`, `guard`, `struct`, `route`, `match`, `if`, `else`, `for`, `in`, `return`, `defer`, `upstream`, `listen`, `tls`, `defaults`, `forward`, `websocket`, `fire`, `submit`, `wait`, `timer`, `init`, `shutdown`, `firewall`, `throttle`, `per`, `notify`, `import`, `using`, `as`, `and`, `or`, `not`, `nil`, `true`, `false`
 
 ### 3.2 File Extension
 
@@ -4870,7 +4870,7 @@ Recommended: start with LLVM ORC JIT (dynamic link), consider Cranelift if LLVM 
 ### 11.3 C++ Integration API
 
 ```cpp
-class RueEngine {
+class RutEngine {
 public:
     // Compile .rut source, returns compile result (errors or config)
     CompileResult compile(std::string_view source);
@@ -5679,16 +5679,16 @@ Rut:    Arena bump-allocate, one pointer reset per request, zero free
 **10× lighter, 3-5× faster** — the architectural advantage of compiled DSL
 over runtime config interpretation.
 
-### 16.5 Kernel-Level Packet Filter (`packet` block)
+### 16.5 Kernel-Level Packet Filter (`firewall` block)
 
-Rutlang provides a `packet` block for network-level packet filtering. The
+Rutlang provides a `firewall` block for network-level packet filtering. The
 compiler generates eBPF bytecode from this block, loaded into the kernel's
 XDP (eXpress Data Path) hook — the earliest packet processing point, before
 TCP stack. Users don't need to know eBPF exists.
 
 ```swift
-// packet — packet-level rules, compiled to eBPF, runs in kernel
-packet {
+// firewall — network-level rules, compiled to eBPF, runs in kernel
+firewall {
     // IP blacklist — line-rate filtering
     guard not blacklist.contains(src.ip) else { drop }
 
@@ -5732,7 +5732,7 @@ packet {
 | `src.tcpWindow` | i32 | TCP window size |
 | `packet.len` | i32 | Total packet length |
 
-**Compiler constraints — `packet` block can only:**
+**Compiler constraints — `firewall` block can only:**
 - Access `src` / `dst` / `packet` fields
 - Use `Set<IP>`, `Set<CIDR>`, `Counter<IP>`, `Set<string>` state types
 - `guard ... else { drop }` or `pass`
@@ -5745,14 +5745,14 @@ packet {
 
 ```
 .rut source → compiler
-    ├→ packet { } block   → eBPF bytecode (.bpf) → kernel XDP hook
+    ├→ firewall { } block   → eBPF bytecode (.bpf) → kernel XDP hook
     └→ route { } block   → native code (.so)     → userspace L7 handler
 ```
 
 **Impact — blocked traffic never reaches userspace:**
 
 ```
-With packet:    NIC → XDP eBPF → DROP (kernel, zero TCP, zero buffer)
+With firewall:    NIC → XDP eBPF → DROP (kernel, zero TCP, zero buffer)
                                 → PASS → TCP stack → Rut L7 handler
                 ↑ line-rate filtering: 10M+ packets/sec
 

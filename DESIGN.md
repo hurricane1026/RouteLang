@@ -1,6 +1,61 @@
 # Rutlang: Design Document
 
-> A strongly-typed DSL and high-performance L7 ingress runtime. API gateway, WAF, reverse proxy, mesh sidecar, CDN edge — one language, one binary.
+> A strongly-typed DSL and high-performance L7 ingress runtime. API gateway, WAF, reverse proxy, mesh sidecar, CDN edge — one language, multiple compilation targets.
+
+## Status and Scope
+
+This document currently serves three roles at once:
+
+- **Normative language/runtime spec** — the intended Rutlang contract
+- **Implementation design** — how the compiler, JIT, runtime, and reload path should work
+- **Roadmap** — features that are planned but not fully implemented yet
+
+That mix is useful for design exploration, but it is easy to misread aspirational
+features as already-shipping behavior. Unless a section explicitly says otherwise,
+read the language and runtime chapters below as the **target contract**, not a
+statement that the current repository already implements every feature.
+
+### Reading Guide
+
+- **Normative / contract-heavy sections**: language syntax, type system, route semantics, state semantics, compile-time checks
+- **Implementation design sections**: runtime architecture, memory layout, I/O backend design, hot reload internals
+- **Roadmap-heavy sections**: advanced TLS phases, sidecar integration, some cross-node/distributed features, observability expansion
+
+When the implementation and the design diverge, the repository source of truth is:
+
+1. tests covering current behavior
+2. runtime / compiler code paths that are actually reachable
+3. this document's intended target behavior
+
+### Implementation Status Matrix
+
+This is intentionally coarse-grained. It exists to separate "designed" from
+"implemented enough to rely on today".
+
+| Area | Status | Notes |
+|------|--------|-------|
+| Runtime event loop, sharding, socket handling | **Implemented** | Core epoll/io_uring runtime exists in-tree |
+| HTTP parsing and proxying runtime | **Implemented** | Production-oriented runtime paths and tests exist |
+| RIR data model + builder + printer | **Implemented** | RIR is real and exercised by tests |
+| LLVM ORC JIT integration | **Implemented** | Userspace handler JIT engine and codegen paths exist |
+| `packet {}` → eBPF / XDP compilation target | **Designed** | Packet-level kernel path is a first-class compilation target in this design |
+| Offline manifest → RIR → JIT simulate flow | **Implemented** | Current compile-like path is intentionally narrow |
+| Full Rutlang lexer / parser / type checker | **Partial / in progress** | Token surface is declared, but the front-end is not yet complete |
+| Route conflict analysis and full diagnostics | **Designed** | Mentioned throughout this doc, not fully enforced end-to-end today |
+| Full surface language in examples below | **Designed** | Many examples are target syntax, not necessarily accepted by current code |
+| Cross-shard language primitives (`notify`, `consistent`) | **Designed** | Runtime direction is defined here; treat semantics as target contract |
+| External state backends (`backend: .redis`) | **Designed** | Not a current repository guarantee |
+| Zero-downtime hot reload of full `.rut` programs | **Partially designed / partial runtime pieces** | Runtime has design direction; full language-level flow is not complete yet |
+
+### Document Restructure Plan
+
+Longer term, this document should be split into:
+
+- `LANG_SPEC.md` — grammar, typing, routing, state semantics, diagnostics
+- `RUNTIME.md` — shard model, I/O backends, memory, reload, networking internals
+- `ROADMAP.md` — future phases, optional features, deployment/sidecar expansion
+
+This file currently remains the umbrella design doc until that split happens.
 
 ## 1. Project Overview
 
@@ -25,19 +80,21 @@
 ## 2. Architecture Overview
 
 ```
-                        ┌─────────────────────────────┐
-  .rut source ───▶ │  Compiler (embedded in proc) │
-                        │  parse → type check → IR     │
-                        └──────────┬──────────────────┘
-                                   │
-                                   ▼
-                        ┌──────────────────────┐
-                        │  JIT (LLVM ORC JIT)   │
-                        └──────────┬───────────┘
-                                   │ native function pointers
-                                   ▼
+                          ┌─────────────────────────────┐
+    .rut source ───▶   │  Compiler (embedded in proc) │
+                          │  parse → type check → IR     │
+                          └───────┬───────────┬─────────┘
+                                  │           │
+                                  │           └──────────────▶ eBPF bytecode
+                                  │                            (`packet {}` → XDP / kernel hook)
+                                  ▼
+                         ┌──────────────────────┐
+                         │  JIT (LLVM ORC JIT)   │
+                         └──────────┬───────────┘
+                                    │ native function pointers
+                                    ▼
   ┌────────────────────────────────────────────────────────┐
-  │                    Rutlang Runtime                   │
+  │                    Rutlang Runtime                    │
   │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
   │  │  Shard 0  │ │  Shard 1  │ │  Shard 2  │ │  Shard N  │  │
   │  │ io_uring  │ │ io_uring  │ │ io_uring  │ │ io_uring  │  │
@@ -57,7 +114,8 @@
 | Runtime | Custom C++ (not Seastar) | Seastar too complex for this use case; only ~30% of Seastar code is relevant; custom runtime is ~5000 lines fully controlled |
 | Networking | io_uring (preferred) + epoll (fallback) | io_uring is optimal for Linux 6.0+; epoll fallback for older kernels (3.9+); both use kernel TCP stack |
 | Thread model | per-core shard, share-nothing | Proven by Seastar/Envoy/nginx; eliminates locks and race conditions |
-| JIT | LLVM ORC JIT | Same C++ toolchain, zero FFI overhead, lazy compilation support |
+| Userspace codegen | LLVM ORC JIT | Same C++ toolchain, zero FFI overhead, lazy compilation support for L7 handlers |
+| Packet-path codegen | eBPF / XDP | Compile `packet {}` blocks to kernel-level packet filters for earliest-drop semantics |
 | HTTP parser | Custom (~500 lines) | llhttp is callback-based (bad fit), picohttpparser lacks strict mode; custom parser integrates directly with our Slice buffer + Arena, supports SIMD, full control over strictness (anti-smuggling) |
 | C++ stdlib | `-nostdlib++`, musl libc only | Full memory control, faster compilation |
 | Compiler flags | `-fno-exceptions -fno-rtti` | No overhead from unused C++ features |
@@ -65,6 +123,12 @@
 ---
 
 ## 3. The Rutlang Language
+
+This chapter defines the **intended Rutlang surface language and semantics**.
+Some subsections describe features that are only partially implemented or not yet
+wired through the current front-end. When in doubt, treat examples here as the
+target language contract and verify current support against the implementation
+status matrix above.
 
 ### 3.1 Design Principles
 
@@ -76,7 +140,7 @@
 - **Middleware = ordinary functions**: return a status code to reject, return nothing to pass through
 - **Bounded execution**: no `while`, no recursion, `for` only iterates finite collections — every handler has a compile-time execution bound, cannot stall a shard
 - **Three-layer model**: `listen` (downstream/client) → .rut file (gateway logic) → `upstream` (backend). No `gateway` or `downstream` keyword — the .rut file IS the gateway, `listen` IS the downstream config
-- **Minimal keyword set**: `func`, `let`, `var`, `const`, `guard`, `struct`, `route`, `match`, `if`, `else`, `for`, `in`, `return`, `defer`, `upstream`, `listen`, `tls`, `defaults`, `forward`, `websocket`, `fire`, `submit`, `wait`, `timer`, `init`, `shutdown`, `firewall`, `throttle`, `per`, `notify`, `import`, `using`, `as`, `and`, `or`, `not`, `nil`, `true`, `false`
+- **Minimal keyword set**: `func`, `let`, `var`, `const`, `guard`, `struct`, `route`, `match`, `if`, `else`, `for`, `in`, `return`, `defer`, `upstream`, `listen`, `tls`, `defaults`, `forward`, `websocket`, `fire`, `submit`, `wait`, `timer`, `init`, `shutdown`, `packet`, `throttle`, `per`, `notify`, `import`, `using`, `as`, `and`, `or`, `not`, `nil`, `true`, `false`
 
 ### 3.2 File Extension
 
@@ -587,6 +651,45 @@ to Redis on miss. The runtime handles connection pooling and serialization.
 Cost: ~100μs per Redis round-trip vs ~10ns for local state. Use only when
 cluster-wide consistency is required.
 
+##### 3.3.6.1 State Failure and Ordering Semantics
+
+The state APIs above need explicit failure behavior. Without this, the syntax is
+clear but the contract is underspecified.
+
+**Ordering**
+
+- Operations issued by one shard to one destination shard are processed in send order
+- `notify(key)` preserves per-key send order only insofar as all operations for that key hash to the same owner shard
+- `notify all` does **not** provide a single global total order across all shards
+
+**Queue pressure**
+
+- `notify` is best-effort only if the program opts into lossy behavior explicitly
+- Default language contract: if the cross-shard queue is full, the operation is a runtime failure for that request path, not silent drop
+- Future syntax may allow `notify all?, lossy: true` or equivalent, but silent loss should not be the default
+
+**`consistent: true`**
+
+- A consistent operation either completes on the owner shard and returns its result, or fails the request-visible operation
+- Timeouts on cross-shard round trips must surface as runtime failures, not stale success
+- Reads and writes routed through the owner shard observe owner-shard program order
+
+**External backends**
+
+- `backend:` changes the consistency model from purely in-process semantics to backend-mediated semantics
+- Default contract for `backend: .redis(...)`: write-through intent with backend failure surfaced to the request unless the API explicitly documents degraded-local mode
+- Reads may be satisfied from local cache only when the cache entry is still valid under the declared TTL / freshness rules
+
+**Reload / shutdown**
+
+- Hot reload must not silently discard acknowledged consistent operations
+- In-flight best-effort `notify` operations may be dropped during shutdown unless the API used is documented as durable
+- Persistent state schema incompatibility remains a compile-time reload rejection, not a best-effort migration
+
+These rules are deliberately conservative. They keep the language contract tighter
+than the current implementation so runtime shortcuts do not accidentally become
+part of the public semantics.
+
 #### 3.3.7 Error Handling: Result and guard
 
 No exceptions. No try/catch. Every fallible operation returns `Result<T>`, which
@@ -1039,9 +1142,9 @@ let userService = upstream {
 
 All functions are inlined at compile time. No runtime function call overhead.
 
-Two types of middleware, distinguished by parameter signature:
-- **Request middleware**: `func f(_ req: Request)` — runs before handler. Return status code to reject, return nothing to pass through.
-- **Response middleware**: `func f(_ req: Request, _ resp: Response)` — runs after handler/proxy, before sending to client. Can modify response headers, body, status.
+Two types of middleware, distinguished by whether the signature contains `Response`:
+- **Request middleware**: signature has no `Response` parameter — runs before handler. Return status code to reject, return nothing to pass through. E.g., `func auth(_ req: Request, role: string)`.
+- **Response middleware**: signature contains a `Response` parameter — runs after handler, before sending to client. Can modify response headers, body, status. Valid signatures: `func f(_ resp: Response)` or `func f(_ req: Request, _ resp: Response)`.
 
 `guard` is the idiomatic way to express "check or reject".
 
@@ -1369,6 +1472,63 @@ route {
     _ => 404
 }
 ```
+
+##### 3.4.4.1 Route Dispatch Semantics
+
+The examples above describe syntax. The dispatch contract also needs explicit
+precedence rules so the compiler, simulator, and runtime agree on which route wins.
+
+**Method matching**
+
+- The **language contract** is exact HTTP method matching
+- `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, `CONNECT`, and `TRACE` are distinct
+- `ANY` matches any method
+- Implementations that collapse multiple methods into one internal code are temporary and should not be treated as language semantics
+
+**Path matching**
+
+- A literal segment outranks a parameter segment
+- A parameter segment outranks a catch-all segment
+- `*rest` matches the remainder of the path and must be the final segment
+- Query strings are not part of route matching unless a construct explicitly says otherwise
+
+**Precedence**
+
+For routes in the same host scope and method scope, the compiler must select the
+most specific match using this precedence order:
+
+1. More static path segments
+2. Fewer parameter segments
+3. No catch-all over catch-all
+4. Earlier declaration order only as the final tiebreaker when two patterns are otherwise equivalent
+
+Two routes that are semantically indistinguishable after applying these rules are
+a compile-time error, not "first match wins".
+
+**Examples**
+
+```swift
+get /users/me           // outranks:
+get /users/:id
+
+get /files/:id          // outranks:
+get /files/*rest
+
+get /users/:id
+get /users/:name        // compile error: conflicting route patterns
+```
+
+**Host precedence**
+
+- Exact host beats wildcard host
+- Wildcard host beats `_` catch-all
+- Missing TLS material for a host reachable on a TLS listener is a compile-time error
+
+**Current implementation note**
+
+Some current runtime/simulate paths still use reduced method encodings and simpler
+matching than the contract above. Those are implementation limitations, not the
+intended Rutlang semantics.
 
 #### 3.4.5 Response Modification
 
@@ -2390,7 +2550,7 @@ Bit operations: & | ^ << >> ~
 | Indirect call | `let f = auth; f(req)` | "functions cannot be assigned to variables" |
 | guard exhaustive | `guard let x = opt` (no else) | "guard must have else clause" |
 | Optional access | `req.authorization.hasPrefix("B")` | "value is optional, use guard let or ??" |
-| Response middleware | `func f(_ req: Request, _ resp: Response)` used as request-only `use` | "this is a response middleware, will run after handler" (info) |
+| Response middleware | `func f(_ resp: Response)` applied where only pre-middleware expected | "signature contains Response — this is a post-middleware, will run after handler" (info) |
 | TLS without host | `tls "x.com"` but no `x.com { }` in route | warning: "TLS cert declared but no routes for x.com" |
 | Host without TLS | `x.com { }` in route but no `tls "x.com"` and listen uses TLS | "no TLS certificate for host x.com" |
 | Duplicate TLS | two `tls "x.com"` declarations | "duplicate TLS declaration for x.com" |
@@ -4164,8 +4324,8 @@ struct CompilerThread {
 ```
 Each compilation produces an isolated JITDylib (LLVM dynamic library):
 
-  1. Parse → Typed AST → Inline expand → DIR → Optimize
-  2. Generate LLVM IR from DIR
+  1. Parse → Typed AST → Inline expand → RIR → Optimize
+  2. Generate LLVM IR from RIR
   3. Create new JITDylib: jit->createJITDylib("config_v3")
   4. Add IR module → ORC JIT compiles to native machine code
   5. Resolve function pointers: jit->lookup(dylib, "handle_get_users_id")
@@ -4410,17 +4570,17 @@ During shutdown:
     ▼
   Rutlang IR (RIR)  ◄── custom IR, backend-agnostic
     │
-    ├── Optimization passes (on DIR)
+    ├── Optimization passes (on RIR)
     │   - dead code elimination
     │   - constant folding / propagation
     │   - state machine construction (I/O points → states)
     │   - instrumentation insertion (metrics, debug, access log)
     │
-    ├── --dry-run: dump DIR and stop
-    ├── --emit-dir: output DIR for inspection
+    ├── --dry-run: dump RIR and stop
+    ├── --emit-rir: output RIR for inspection
     │
     ▼
-  LLVM IR Generation (from DIR)
+  LLVM IR Generation (from RIR)
     │
     ▼
   LLVM ORC JIT
@@ -4435,36 +4595,36 @@ During shutdown:
 
 ### 11.2 Rutlang IR (RIR)
 
-A lightweight, flat, typed IR between the AST and LLVM IR. Each route handler compiles to one DIR function — a linear sequence of blocks with explicit control flow.
+A lightweight, flat, typed IR between the AST and LLVM IR. Each route handler compiles to one RIR function — a linear sequence of blocks with explicit control flow.
 
-#### 11.2.1 Why DIR
+#### 11.2.1 Why RIR
 
 ```
 1. Optimization target
    AST is tree-shaped, hard to optimize
    LLVM IR is too low-level for domain-specific optimizations
-   DIR is flat + typed — easy to analyze and transform
+   RIR is flat + typed — easy to analyze and transform
 
 2. Backend independence
-   DIR → LLVM IR  (current)
-   DIR → Cranelift (future option)
-   DIR → custom bytecode VM (future option)
+   RIR → LLVM IR  (current)
+   RIR → Cranelift (future option)
+   RIR → custom bytecode VM (future option)
    Switch backend without touching parser/type checker/optimizer
 
 3. Debuggability
-   --dry-run / --emit-dir dumps human-readable IR
+   --dry-run / --emit-rir dumps human-readable IR
    Users and developers can see exactly what the compiler produced
    Each instruction maps back to source location
 
 4. Instrumentation insertion point
-   Compiler inserts metrics/tracing/debug code at DIR level
+   Compiler inserts metrics/tracing/debug code at RIR level
    Optimization passes can then simplify (e.g., remove debug code in release mode)
 ```
 
-#### 11.2.2 DIR Design
+#### 11.2.2 RIR Design
 
 ```
-DIR concepts:
+RIR concepts:
   Function   — one per route handler (after full inlining)
   Block      — a basic block: sequence of instructions, ends with a terminator
   Instruction — typed operation
@@ -4472,7 +4632,7 @@ DIR concepts:
 ```
 
 ```
-DIR types (mirrors language types):
+RIR types (mirrors language types):
   str, i32, i64, u32, u64, f64, bool
   ByteSize, Duration, Time, IP, CIDR, MediaType, StatusCode, Method
   Struct(name, fields)
@@ -4481,7 +4641,7 @@ DIR types (mirrors language types):
 ```
 
 ```
-DIR instruction set:
+RIR instruction set:
 
   // --- Values ---
   %0 = const.str "Bearer "
@@ -4559,7 +4719,7 @@ get /users/:id {
 }
 ```
 
-DIR output (after inlining + state machine construction):
+RIR output (after inlining + state machine construction):
 
 ```
 func handle_get_users_id(req: Request) {
@@ -4629,10 +4789,10 @@ State machine (derived from yield points):
     state 0: everything before yield → submit HTTP request → suspend
     state 1: everything after yield → process response → continue or proxy
 
-  The yield instruction is where the DIR optimizer inserts the state boundary.
+  The yield instruction is where the RIR optimizer inserts the state boundary.
 ```
 
-#### 11.2.4 DIR Optimization Passes
+#### 11.2.4 RIR Optimization Passes
 
 ```
 Pass 1: Dead Code Elimination
@@ -4661,10 +4821,10 @@ Pass 5: Guard Coalescing
   → merge into single block with combined condition
 ```
 
-#### 11.2.5 DIR Dump (--emit-dir)
+#### 11.2.5 RIR Dump (--emit-rir)
 
 ```
-$ rue --emit-rir gateway.rut
+$ rut --emit-rir gateway.rut
 
 === handle_get_users_id ===
   params: [:id]
@@ -5293,7 +5453,7 @@ POST /internal/log-level — dynamic log level change
 Compile-time validation without starting the server:
 
 ```
-$ rue --dry-run gateway.rut
+$ rut --dry-run gateway.rut
 
 ✓ Parsed 3 files
 ✓ Type check passed
@@ -5515,16 +5675,16 @@ Rut:    Arena bump-allocate, one pointer reset per request, zero free
 **10× lighter, 3-5× faster** — the architectural advantage of compiled DSL
 over runtime config interpretation.
 
-### 16.5 Kernel-Level Firewall (`firewall` block)
+### 16.5 Kernel-Level Packet Filter (`packet` block)
 
-Rutlang provides a `firewall` block for network-level packet filtering. The
+Rutlang provides a `packet` block for network-level packet filtering. The
 compiler generates eBPF bytecode from this block, loaded into the kernel's
 XDP (eXpress Data Path) hook — the earliest packet processing point, before
 TCP stack. Users don't need to know eBPF exists.
 
 ```swift
-// firewall — network-level rules, compiled to eBPF, runs in kernel
-firewall {
+// packet — packet-level rules, compiled to eBPF, runs in kernel
+packet {
     // IP blacklist — line-rate filtering
     guard not blacklist.contains(src.ip) else { drop }
 
@@ -5568,12 +5728,12 @@ firewall {
 | `src.tcpWindow` | i32 | TCP window size |
 | `packet.len` | i32 | Total packet length |
 
-**Compiler constraints — `firewall` block can only:**
+**Compiler constraints — `packet` block can only:**
 - Access `src` / `dst` / `packet` fields
 - Use `Set<IP>`, `Set<CIDR>`, `Counter<IP>`, `Set<string>` state types
 - `guard ... else { drop }` or `pass`
 - No HTTP operations (`req`, `forward`, `auth`, regex)
-- Violation → compile error: "firewall block cannot access HTTP-level data"
+- Violation → compile error: "packet block cannot access HTTP-level data"
 
 **Actions:** `drop` (silently discard packet) or `pass` (continue to TCP stack).
 
@@ -5581,14 +5741,14 @@ firewall {
 
 ```
 .rut source → compiler
-    ├→ firewall { } block → eBPF bytecode (.bpf) → kernel XDP hook
+    ├→ packet { } block   → eBPF bytecode (.bpf) → kernel XDP hook
     └→ route { } block   → native code (.so)     → userspace L7 handler
 ```
 
 **Impact — blocked traffic never reaches userspace:**
 
 ```
-With firewall:  NIC → XDP eBPF → DROP (kernel, zero TCP, zero buffer)
+With packet:    NIC → XDP eBPF → DROP (kernel, zero TCP, zero buffer)
                                 → PASS → TCP stack → Rut L7 handler
                 ↑ line-rate filtering: 10M+ packets/sec
 
@@ -5613,6 +5773,11 @@ Without:        NIC → TCP → accept → HTTP parse → guard → 403
 `firewall` block is silently skipped — all filtering happens in L7 handler
 (same guards, just at HTTP level instead of packet level). The `.rut` code
 is correct either way.
+
+**Degradation principle:** silent fallback is allowed ONLY when a higher layer
+provides equivalent protection (firewall → L7 guards, SO_MAX_PACING_RATE →
+token bucket). State operations (notify, consistent:true, Hash/Counter writes)
+must never silently fail — they return errors that the caller must handle.
 
 ### 16.6 Mesh Three-Component Architecture
 
@@ -5698,7 +5863,7 @@ fallback.
 | 18 | HTTP as native objects | Strings for everything | Status codes, methods, headers, CIDR, MediaType are typed; compiler catches typos, range errors, type mismatches |
 | 19 | No async/await | Explicit async | User writes sequential code; compiler auto-detects I/O points and generates state machines; simpler mental model |
 | 20 | Built-in security/encoding primitives | External dependencies | md5, sha256, hmac, jwt, base64, aes cover 95% of gateway needs; zero external deps |
-| 21 | Custom IR (DIR) between AST and LLVM IR | Direct AST → LLVM IR | Enables domain-specific optimizations, backend independence (swap LLVM for Cranelift), debuggability (--emit-dir), and clean instrumentation insertion point |
+| 21 | Custom IR (RIR) between AST and LLVM IR | Direct AST → LLVM IR | Enables domain-specific optimizations, backend independence (swap LLVM for Cranelift), debuggability (--emit-rir), and clean instrumentation insertion point |
 | 22 | Security as language-level code, not runtime features | Built-in WAF/DDoS modules | WAF rules, bot detection, flood protection are all expressible in the DSL; no hardcoded security logic in runtime; users can customize everything |
 | 23 | Response middleware via parameter signature | Separate `onResponse` keyword | `func f(req, resp)` = response middleware; compiler auto-detects; no new syntax needed |
 | 24 | Connection-level protection in `listen` config | Runtime-only config | headerTimeout, maxConnsPerIP, minRecvRate, strictParsing are declared in .rut files; compile-time validated; visible alongside routing logic |

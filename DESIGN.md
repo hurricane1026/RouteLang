@@ -4886,17 +4886,10 @@ public:
 
     // Current config version
     uint64_t current_version() const;
-
-    // Register C++ functions callable from .rut
-    template<typename Func>
-    void register_native(std::string_view name, Func&& fn);
 };
 
-// Example: register a Redis call
-engine.register_native("redis.get",
-    [&redis](Str key) -> AsyncResult<Str> {
-        return redis.get(key);
-    });
+// No register_native / FFI — Rutlang communicates with external systems
+// via HTTP (get/post), TCP (tcp()), or UDP (udp()). See §3.4.19 No FFI.
 ```
 
 ### 11.4 LSP Server

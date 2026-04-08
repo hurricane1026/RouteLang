@@ -347,7 +347,7 @@ TEST(simulate_engine, static_status_match) {
     ctx.destroy();
 }
 
-TEST(simulate_engine, proxy_upstream_match) {
+TEST(simulate_engine, forward_upstream_match) {
     Manifest manifest{};
     manifest.upstream_count = 1;
     manifest.upstreams[0].id = 7;

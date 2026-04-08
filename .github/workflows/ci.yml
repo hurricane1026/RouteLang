@@ -46,7 +46,7 @@ jobs:
           sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100
 
       - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
 
       - name: Lint
         run: |
@@ -83,10 +83,11 @@ jobs:
 
       - name: Configure
         run: |
+          LLVM_OPT="-DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm"
           if [ "${{ matrix.compiler }}" = "clang" ]; then
-            CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+            CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $LLVM_OPT
           else
-            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $LLVM_OPT
           fi
 
       - name: Build
@@ -115,7 +116,8 @@ jobs:
         run: |
           CC=clang CXX=clang++ cmake -B build -G Ninja \
             -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
-            -DCMAKE_BUILD_TYPE=Debug
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
           ninja -C build
 
       - name: Run tests

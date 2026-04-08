@@ -355,7 +355,7 @@ TEST(simulate_engine, proxy_upstream_match) {
     manifest.route_count = 1;
     manifest.routes[0].method = 0;
     strcpy(manifest.routes[0].pattern, "/api");
-    manifest.routes[0].action = ManifestAction::Proxy;
+    manifest.routes[0].action = ManifestAction::Forward;
     manifest.routes[0].upstream_id = 7;
 
     ModuleContext ctx;
@@ -817,7 +817,7 @@ TEST(simulate_engine, summary_counts_mismatch) {
     manifest.routes[0].status_code = 200;
     manifest.routes[1].method = 'G';
     strcpy(manifest.routes[1].pattern, "/api");
-    manifest.routes[1].action = ManifestAction::Proxy;
+    manifest.routes[1].action = ManifestAction::Forward;
     manifest.routes[1].upstream_id = 9;
 
     ModuleContext ctx;

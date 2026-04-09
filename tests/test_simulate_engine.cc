@@ -347,7 +347,7 @@ TEST(simulate_engine, static_status_match) {
     ctx.destroy();
 }
 
-TEST(simulate_engine, proxy_upstream_match) {
+TEST(simulate_engine, forward_upstream_match) {
     Manifest manifest{};
     manifest.upstream_count = 1;
     manifest.upstreams[0].id = 7;
@@ -355,7 +355,7 @@ TEST(simulate_engine, proxy_upstream_match) {
     manifest.route_count = 1;
     manifest.routes[0].method = 0;
     strcpy(manifest.routes[0].pattern, "/api");
-    manifest.routes[0].action = ManifestAction::Proxy;
+    manifest.routes[0].action = ManifestAction::Forward;
     manifest.routes[0].upstream_id = 7;
 
     ModuleContext ctx;
@@ -365,7 +365,7 @@ TEST(simulate_engine, proxy_upstream_match) {
     const auto result = simulate_one(
         engine, make_entry("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 502, "api-v1"));
     CHECK_EQ(result.verdict, Verdict::Match);
-    CHECK_EQ(result.action, jit::HandlerAction::Proxy);
+    CHECK_EQ(result.action, jit::HandlerAction::Forward);
 
     engine.shutdown();
     ctx.destroy();
@@ -817,7 +817,7 @@ TEST(simulate_engine, summary_counts_mismatch) {
     manifest.routes[0].status_code = 200;
     manifest.routes[1].method = 'G';
     strcpy(manifest.routes[1].pattern, "/api");
-    manifest.routes[1].action = ManifestAction::Proxy;
+    manifest.routes[1].action = ManifestAction::Forward;
     manifest.routes[1].upstream_id = 9;
 
     ModuleContext ctx;

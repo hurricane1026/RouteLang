@@ -156,7 +156,7 @@ static bool validate_manifest(const Manifest& manifest) {
     }
     for (u32 i = 0; i < manifest.route_count; i++) {
         const auto& route = manifest.routes[i];
-        if (route.action == ManifestAction::Proxy &&
+        if (route.action == ManifestAction::Forward &&
             !manifest_has_upstream_id(manifest, route.upstream_id))
             return false;
     }
@@ -232,8 +232,8 @@ static const char* action_str(jit::HandlerAction action) {
     switch (action) {
         case jit::HandlerAction::ReturnStatus:
             return "status";
-        case jit::HandlerAction::Proxy:
-            return "proxy";
+        case jit::HandlerAction::Forward:
+            return "forward";
         case jit::HandlerAction::Yield:
             return "yield";
     }
@@ -428,13 +428,14 @@ bool load_manifest(const char* path, Manifest& out) {
                 }
                 route.action = ManifestAction::ReturnStatus;
                 route.status_code = static_cast<u16>(code);
-            } else if (tokens[3].len == 5 && __builtin_memcmp(tokens[3].ptr, "proxy", 5) == 0) {
+            } else if ((tokens[3].len == 7 && __builtin_memcmp(tokens[3].ptr, "forward", 7) == 0) ||
+                       (tokens[3].len == 5 && __builtin_memcmp(tokens[3].ptr, "proxy", 5) == 0)) {
                 u32 id = 0;
                 if (!parse_u32_token(tokens[4].ptr, tokens[4].len, &id) || id > 65535) {
                     munmap(map, static_cast<u64>(st.st_size));
                     return false;
                 }
-                route.action = ManifestAction::Proxy;
+                route.action = ManifestAction::Forward;
                 route.upstream_id = static_cast<u16>(id);
             } else {
                 munmap(map, static_cast<u64>(st.st_size));
@@ -507,7 +508,7 @@ bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
         } else {
             auto upstream = b.emit_const_i32(manifest.routes[i].upstream_id);
             if (!upstream) return fail();
-            if (!b.emit_ret_proxy(upstream.value())) return fail();
+            if (!b.emit_ret_forward(upstream.value())) return fail();
         }
     }
 
@@ -618,7 +619,7 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
         return result;
     }
 
-    if (kUnpacked.action == jit::HandlerAction::Proxy) {
+    if (kUnpacked.action == jit::HandlerAction::Forward) {
         const auto* upstream = find_upstream(engine, kUnpacked.upstream_id);
         if (!upstream) {
             result.verdict = Verdict::Failed;
@@ -688,7 +689,7 @@ u32 format_result(const SimulateResult& result, char* buf, u32 buf_size) {
     put_str(buf, buf_size, &pos, action_str(result.action));
     put_str(buf, buf_size, &pos, " ");
 
-    if (result.action == jit::HandlerAction::Proxy) {
+    if (result.action == jit::HandlerAction::Forward) {
         put_name(buf, buf_size, &pos, result.expected_upstream[0] ? result.expected_upstream : "-");
         put_str(buf, buf_size, &pos, " -> ");
         put_name(buf, buf_size, &pos, result.actual_upstream[0] ? result.actual_upstream : "-");

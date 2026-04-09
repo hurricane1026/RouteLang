@@ -599,24 +599,6 @@ struct Builder {
         return vid;
     }
 
-    // ── External calls ──────────────────────────────────────────────
-
-    Result<ValueId> emit_call_extern(Str func_name,
-                                     const ValueId* args,
-                                     u32 arg_count,
-                                     const Type* return_type,
-                                     SourceLoc loc = {}) {
-        if (!return_type) return err(RirError::InvalidState);
-        auto r = TRY(emit(Opcode::CallExtern, return_type, loc));
-        r.inst->imm.extern_name = func_name;
-        auto ops = set_operands(r.inst, args, arg_count);
-        if (!ops) {
-            rollback_emit(r);
-            return err(ops.error());
-        }
-        return r.vid;
-    }
-
     // ── Terminators ─────────────────────────────────────────────────
 
     VoidResult emit_br(ValueId cond, BlockId then_blk, BlockId else_blk, SourceLoc loc = {}) {
@@ -646,9 +628,12 @@ struct Builder {
         return {};
     }
 
-    VoidResult emit_ret_proxy(ValueId upstream, SourceLoc loc = {}) {
+    VoidResult emit_ret_forward(ValueId upstream, SourceLoc loc = {}) {
         if (!valid_val(upstream)) return err(RirError::InvalidState);
-        auto r = TRY(emit(Opcode::RetProxy, nullptr, loc));
+        // Upstream operand must be an integer type (upstream id).
+        if (!val_has_type(upstream, TypeKind::I32) && !val_has_type(upstream, TypeKind::U32))
+            return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RetForward, nullptr, loc));
         r.inst->operands[0] = upstream;
         r.inst->operand_count = 1;
         return {};
@@ -668,20 +653,6 @@ struct Builder {
         }
         cur_func->yield_count++;
         return vid;
-    }
-
-    Result<ValueId> emit_yield_extern(
-        Str name, const ValueId* args, u32 arg_count, const Type* return_type, SourceLoc loc = {}) {
-        if (!return_type) return err(RirError::InvalidState);
-        auto r = TRY(emit(Opcode::YieldExtern, return_type, loc));
-        r.inst->imm.extern_name = name;
-        auto ops = set_operands(r.inst, args, arg_count);
-        if (!ops) {
-            rollback_emit(r);
-            return err(ops.error());
-        }
-        cur_func->yield_count++;
-        return r.vid;
     }
 };
 

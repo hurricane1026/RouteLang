@@ -20,7 +20,7 @@ struct ManifestUpstream {
 
 enum class ManifestAction : u8 {
     ReturnStatus = 0,
-    Proxy = 1,
+    Forward = 1,
 };
 
 struct ManifestRoute {

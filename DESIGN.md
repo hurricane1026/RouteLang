@@ -193,9 +193,41 @@ and   or   not                  // boolean (keywords)
 ??                              // null coalescing (x ?? default)
 !                               // logical not (alias for not)
 @                               // decorator prefix
-=>                              // single expression, implicit return
+=>                              // single-expression body / branch result
 ->                              // function return type
 ```
+
+### 3.2.2 Core Control-Flow Surface
+
+Rut keeps a small set of branching constructs with clear roles:
+
+- `if` — the lightweight boolean branch
+- `guard` — fail-fast branch for error handling
+- `match` — the general multi-branch construct
+
+`switch` is not a language keyword. Where a traditional switch would normally be
+used, Rut uses `match`.
+
+`=>` has one uniform meaning across the language: it introduces a single-expression
+body or branch result. It is not function-specific syntax.
+
+Examples:
+
+- `func id(x: i32) -> i32 => x`
+- `get /health => 200`
+- `case .ok(v) => v`
+
+Where a construct uses `=>`, the right-hand side is interpreted as a single
+expression body with implicit result/return semantics appropriate to that
+construct.
+
+`match` is the general form:
+
+- `if` is the boolean special case users will usually prefer for simple two-way conditions
+- `match` handles general value dispatch, structured variants, and richer multi-way branching
+- `match const` is the compile-time form for branching on compile-time-known values
+
+Likewise, `if const` is the lightweight compile-time boolean branch.
 
 ### 3.3 Type System
 
@@ -215,7 +247,7 @@ ip.isLoopback                        // bool — 127.0.0.0/8 or ::1
 ip.in(10.0.0.0/8)                    // bool — CIDR containment
 ip.octets                            // [u8] — 4 or 16 bytes
 ip as string                         // "10.0.0.1"
-"10.0.0.1" as IP                     // Result<IP>
+IP.parse("10.0.0.1")                // IP? / error-capable parse, depending on context
 ```
 
 **CIDR** — network range
@@ -378,8 +410,8 @@ req.query("page")       // string? — single query parameter
 req.query("tags")       // [string]? — multi-value parameter (?tags=a&tags=b)
 
 // Body
-req.body(User)          // parse body as User struct → Result<User>
-req.bodyRaw             // raw body as string → Result<string>
+req.body(User)          // parse body as User struct, error-capable
+req.bodyRaw             // raw body as string, error-capable
 req.bodyRaw = newBody   // replace body before forward (recomputes Content-Length)
 
 // Cookies
@@ -576,7 +608,7 @@ let blacklist = Set<IP>(capacity: 100000)
 
 post /admin/ban {
     let ip = req.body(IP)
-    guard let ip else { return 400 }
+    guard ip else { return 400 }
     blacklist.add(ip)              // local shard — immediate
     notify all blacklist.add(ip)   // all other shards — next event loop tick
     return 200
@@ -691,76 +723,104 @@ These rules are deliberately conservative. They keep the language contract tight
 than the current implementation so runtime shortcuts do not accidentally become
 part of the public semantics.
 
-#### 3.3.7 Error Handling: Result and guard
+#### 3.3.7 Error Handling: values, nil, error, and guard
 
-No exceptions. No try/catch. Every fallible operation returns `Result<T>`, which
-carries either a value or an error message. The caller **must** use `guard let` to
-unwrap a Result — the compiler rejects code that ignores a Result value.
+No exceptions. No try/catch. Rut is primarily a value-flow language: most ergonomic
+syntax works in terms of values and `nil`, not explicit `Result<T, E>` plumbing in
+ordinary user code.
 
-**Result vs Optional:**
-- `string?` (Optional) — value may be absent, not an error. E.g., optional header.
-- `Result<User>` — operation may fail with an error message. E.g., body parse.
+The language still has a standard built-in `Error` type. A function that can produce
+an `error(...)` value is error-capable, and the compiler may normalize such code in
+HIR to `Result<V, Error>` internally. That normalized form is mainly for compiler
+semantics, analysis, and lowering, not the default surface syntax that ordinary
+users are expected to write every day.
 
-**Nil handling — four operators:**
+**Nil vs Error**
 
-| Syntax | Name | Returns | Meaning |
-|--------|------|---------|---------|
-| `x?` | nil check | `bool` | `x != nil` |
-| `x?.method` | optional chaining | `T?` | if x is nil → nil, else → x.method |
-| `x ?? default` | null coalescing | `T` | if x is nil → default, else → x |
-| `guard let x else { return N }` | unwrap or reject | `T` | if x is nil → exit handler |
+- `nil` means "there is no usable value here"
+- `error(...)` carries failure information
+
+In surface value-flow syntax, errors are treated as producing no usable value. The
+short forms therefore work on the value channel and naturally see failure as `nil`.
+Users who care about the precise error reason enter an explicit error-handling path
+with `guard` (and later possibly `match`).
+
+**Value-flow operators**
+
+| Syntax | Meaning |
+|--------|---------|
+| `x?` | nil check on the usable value channel |
+| `x?.field` / `x?.method()` | continue only if a usable value exists |
+| `x ?? default` | provide a default when no usable value exists |
+| `a | f(_, ...)` | pipeline over the usable value channel |
+
+These operators intentionally optimize for the common case: keep the normal logic
+flowing without forcing local `if/else`, `match`, or `guard` at every step.
+
+That means a pipeline or optional-style expression may ignore detailed error causes
+and simply continue in terms of "value present" vs "value absent":
 
 ```swift
-// x? — check existence (bool)
-guard req.authorization? else { return 401 }
-if req.origin? {
-    resp.Vary = "Origin"
-}
-
-// x?.method — optional chaining (nil propagation)
-let len = req.authorization?.len               // i32? — nil if no header
-let ok = req.authorization?.hasPrefix("Bearer") // bool? — nil if no header
-
-// x ?? default — null coalescing (provide default)
 let name = req.query("name") ?? "anonymous"
-let page = parseInt(req.query("page") ?? "1")
+let parts = req.path | trimPrefix("/api", _) | split(_, "/")
+let userName = findUser(id)?.profile?.name ?? "guest"
+```
 
-// guard let — unwrap or reject (early return)
-guard let token = req.authorization else { return 401 }
-// token is now a string, usable below
+When a caller needs to care about the failure reason rather than just the absence
+of a usable value, they should switch to explicit handling:
 
-// Result — operation can fail with an error
-let user = req.body(User)                  // Result<User>
-guard let user else { return 400 }         // discard error message
-guard let user else { return 400, user.error }  // include error in response
-guard let user else {
-    log.warn("bad body", { error: user.error })
-    return 400, "invalid request body"
+```swift
+guard let user = req.body(User) else {
+    log.warn("bad body")
+    return .badRequest
 }
 ```
 
-**Result types by operation:**
+`guard let` is therefore the main bridge from the ergonomic value-flow world into
+the explicit failure-handling world.
 
-| Operation | Return type | Typical guard |
-|-----------|-------------|---------------|
-| `req.body(T)` | `Result<T>` | `guard let x else { return 400 }` |
-| `get/post http://...` | `Result<Response>` | `guard let res else { return 502 }` |
-| `jwtDecode(token, secret:)` | `Result<Claims>` | `guard let claims else { return 401 }` |
-| `forward(upstream)` | built-in, returns 502 on failure | no guard needed |
-| `req.authorization` | `string?` (Optional) | `guard let x else { return 401 }` |
-| `req.query("key")` | `string?` (Optional) | `guard let x else { return 400 }` |
+Tuple values remain ordinary values. Numbered placeholders such as `_1` and `_2`
+only project tuple slots; they do not introduce a separate error model.
 
-**Compile-time enforcement:** if a Result is assigned to `let` without a subsequent
-`guard let ... else`, the compiler emits an error:
+**`guard` scope and role**
+
+Rut `guard` is intentionally narrower than Swift-style optional unwrapping:
+
+- `guard` handles **error**, not `nil`
+- `nil` remains part of the normal value channel and is handled by `?`, `?.`, `??`, and `or(...)`
+- `guard ... else { ... }` must terminate control flow in the `else` block
+- `guard let x = expr else { ... }` binds the success value of `expr`, but does not implicitly unwrap optional payloads inside that success value
+
+This means:
+
+- use `guard` when the caller needs to stop and explicitly handle failure
+- use value-flow operators when the caller only cares whether a usable value exists
+
+When a caller needs to distinguish *which* error occurred, they should use `match`
+rather than trying to overload `guard` with pattern semantics.
+
+**`or(...)`**
+
+`or(...)` is the standard value fallback operation:
+
+- if a usable value exists, return it
+- if the expression yields `nil`, return the fallback
+- if the expression fails with `error(...)`, also return the fallback
+
+Examples:
 
 ```swift
-let user = req.body(User)
-forward(users)
-// ERROR: Result<User> must be unwrapped with 'guard let user else { return ... }'
+let page = req.query("page").or("1")
+let n = parseInt(raw).or(0)
+let name = findUser(id)?.profile?.name.or("guest")
 ```
 
-**Runtime errors** (division by zero, array out of bounds) are programming bugs —
-they return 500 immediately. No recovery mechanism.
+`or(...)` is deliberately value-oriented. It does not expose or classify the error.
+
+**Runtime bugs**
+
+Division by zero, out-of-bounds access, and similar programming bugs are not modeled
+as ordinary `error(...)` values. They remain runtime faults.
 
 #### 3.3.8 Compile-Time Constants
 
@@ -1151,11 +1211,11 @@ Two types of middleware, distinguished by whether the signature contains `Respon
 
 ```swift
 func auth(_ req: Request, role: string) -> User {
-    guard let token = req.authorization else { return 401 }
+    let token = req.authorization.or("")
     guard token.hasPrefix("Bearer ") else { return 401 }
 
     let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard let claims else { return 401 }
+    guard claims else { return 401 }
     guard claims.exp >= now() else { return 401, "token expired" }
     guard claims.role == role else { return 403 }
 
@@ -1196,7 +1256,8 @@ func cors(_ req: Request, origins: [string]) {
 }
 
 func verifySig(_ req: Request, secret: string) {
-    guard let ts = req.X-Timestamp else { return 401 }
+    let ts = req.X-Timestamp.or("")
+    guard ts.isEmpty == false else { return 401 }
     guard now() - time(ts) <= 5m else { return 401, "expired" }
 
     let payload = "\(req.method)\n\(req.path)\n\(ts)"
@@ -1458,7 +1519,7 @@ route {
 
         post /orders {
             let order = req.body(Order)
-            guard let order else { return 400 }
+            guard order else { return 400 }
             for item in order.items {
                 guard item.qty > 0 else { return 400, "invalid quantity" }
             }
@@ -1882,7 +1943,7 @@ zero-cost upgrade when the infrastructure supports it.
 determined by usage, same as `forward`:
 
 - `return read(...)` or `=> read(...)` → **zero-copy** (sendfile/splice)
-- `let content = read(...)` → **buffered**, returns `Result<string>`
+- `let content = read(...)` → **buffered**, error-capable value
 
 ```swift
 // Zero-copy — static file serving, data goes directly to client socket
@@ -1905,8 +1966,8 @@ get /stream => read(path: "/tmp/data_pipe")
 // Buffered — read into memory for modification
 get /index.html {
     let content = read(path: "/var/www/index.html")
-    guard let content else { return 404 }
-    let html = content.replace("{{VERSION}}", env("APP_VERSION"))
+    guard content else { return 404 }
+    let html = content.or("").replace("{{VERSION}}", env("APP_VERSION"))
     let resp = response(200)
     resp.Content-Type = "text/html"
     resp.body = html
@@ -1937,23 +1998,23 @@ Same async safety model — compiler generates yield points, io_uring/epoll back
 **TCP — connection-oriented, stream:**
 
 ```swift
-let conn = tcp("redis:6379")           // Result<TcpConn>, compiler yields
-guard let conn else { return 502 }
+let conn = tcp("redis:6379")           // error-capable TcpConn, compiler yields
+guard conn else { return 502 }
 defer conn.close()
 
 conn.send("PING\r\n")                  // send data
-let data = conn.recv(maxSize: 4kb)     // Result<string>, compiler yields
-guard let data else { return 502 }
+let data = conn.recv(maxSize: 4kb)     // error-capable string, compiler yields
+guard data else { return 502 }
 
 // With timeout
 let h = submit conn.recv(maxSize: 4kb)
 let data = any(wait(h, 1s))
-guard let data else { return 504 }
+guard data else { return 504 }
 ```
 
 `TcpConn` members:
-- `.send(data)` — send data, returns `Result<i32>` (bytes sent)
-- `.recv(maxSize:)` — receive data, returns `Result<string>`
+- `.send(data)` — send data, error-capable bytes-sent result
+- `.recv(maxSize:)` — receive data, error-capable string result
 - `.close()` — close connection
 - `.remoteAddr` — `IP`
 - `.localAddr` — `IP`
@@ -1962,15 +2023,15 @@ guard let data else { return 504 }
 
 ```swift
 let sock = udp()
-guard let sock else { return 500 }
+guard sock else { return 500 }
 defer sock.close()
 
 // Send (fire-and-forget, typical for metrics/logging)
 sock.sendTo("10.0.0.1:8125", "myapp.requests:1|c")
 
 // Receive
-let data = sock.recvFrom(maxSize: 4kb)   // Result<(string, IP)>
-guard let data else { return 502 }
+let data = sock.recvFrom(maxSize: 4kb)   // error-capable `(string, IP)`
+guard data else { return 502 }
 let (payload, sender) = data
 ```
 
@@ -1984,11 +2045,11 @@ via `defer`. No `while` loops prevent unbounded read loops.
 // stdlib/redis.rut
 func redisGet(_ req: Request, addr: string, key: string) -> string? {
     let conn = tcp(addr)
-    guard let conn else { return nil }
+    guard conn else { return nil }
     defer conn.close()
     conn.send("GET \(key)\r\n")
     let resp = conn.recv(maxSize: 16kb)
-    guard let resp else { return nil }
+    guard resp else { return nil }
     return parseRedisReply(resp)
 }
 ```
@@ -2095,9 +2156,9 @@ database for one-pass scanning.
 // Matching
 guard req.path.matches(re"^/api/v\d+/") else { return 404 }
 
-// Capture groups — returns Result<Match>
+// Capture groups — error-capable match extraction
 let m = req.path.match(re"^/api/v(\d+)/(.*)")
-guard let m else { return 404 }
+guard m else { return 404 }
 let version = m[1]    // "2"
 let rest = m[2]       // "users/123"
 
@@ -2142,6 +2203,8 @@ import "middleware/security.rut"        // security.cors, security.waf
 
 // Selective import — symbols brought into current scope, no prefix
 import { cors, securityHeaders } from "stdlib/security.rut"
+import { jwtAuth as authV1 } from "middleware/auth.rut"
+import { Hashable as Digestible, Box as AuthBox } from "proto.rut"
 
 // using — create alias for namespaced symbol
 import "middleware/v1.rut"
@@ -2152,37 +2215,218 @@ using authV2 = v2.jwtAuth
 
 Rules:
 - File name is the namespace: `"path/foo.rut"` → `foo.symbol`
-- Selective import (`import { x } from`) puts symbols in current scope without prefix
+- Selective import (`import { x } from`) puts only the selected top-level symbols in current scope without prefix
+- Selective import supports aliasing via `import { x as y } from "file"`; imported functions and top-level type declarations (`struct` / `variant` / `protocol`) can be renamed, and the original imported name is not brought into scope
+- Referencing a non-selected name is a compile error
+- Selecting a symbol that the imported file does not export is a compile error
+- Repeated selective imports of the same file merge selected-name sets; any plain `import "file"` upgrades visibility to the full file
 - `using name = module.symbol` creates an alias
+- `using` is only for alias/import syntax; it must not be reused for protocol conformance
 - Circular imports are a compile error
 - Importing a symbol that doesn't exist is a compile error
 - Duplicate imports of the same file are silently deduplicated
+- Relative `import` is resolved from the importing file path
+- The current first-stage multi-file implementation merges imported top-level functions and makes imported `struct` / `variant` / `protocol` declarations visible during analysis
+- Imported explicit `impl` blocks participate in the same visible conformance set as local `impl` blocks
+- Any visible overlap in explicit `impl` for the same `Type + Protocol` pair is a compile error, regardless of whether the overlap is local vs imported, imported vs imported, concrete vs generic, or import order
+- `namespace` is the language-level naming model; imports, qualified names, and aliases resolve through namespaces, not through package-specific lookup rules
 
-#### 3.4.18 Type Conversion
+#### 3.4.18 Package Metadata
 
-`as` converts between types. Returns `Result<T>` when conversion can fail
-(string → number), returns `T` directly when it cannot fail (number → string).
+Rut may eventually expose a lightweight `package` concept, but only as a
+distribution boundary, not as a second namespace system and not as a full
+dependency solver.
+
+Intended boundary:
+
+- `namespace` remains the language-level name-resolution concept
+- `package` is only a unit of publication / reuse
+- imports still resolve to namespaces and module paths
+- package metadata must stay lightweight enough for a DSL workflow
+
+The intended first-stage package model is:
+
+- by default, one file is one implicit package unit
+- a file may declare `package foo` at the top to join a named package
+- multiple files that declare the same `package foo` belong to the same package
+- package grouping is explicit in source, not inferred from a directory-only rule
+- `package foo` is a file-header declaration and must appear before other top-level declarations
+- a package declaration groups files for distribution/reuse, but each file still keeps its own file/module namespace
+- no registry protocol
+- no semantic-version solving
+- no lockfile-driven dependency graph resolution
+- no separate package-level namespace rules beyond normal module/namespace lookup
+
+If Rut later adds package-manager metadata for dependencies, the design must
+distinguish between:
+
+- a dependency requirement recorded in manifest metadata
+- a resolved dependency version recorded by package-management tooling
+- downloaded artifact integrity recorded for verification
+
+So a manifest version string by itself is not enough to verify dependency
+correctness. Correctness eventually depends on resolver output, lock data, and
+integrity checks.
+
+The current design direction is:
+
+- every declared dependency must carry an explicit version requirement
+- version requirements may later be exact versions or constrained ranges, but
+  manifest requirements are not themselves the final verified install result
+- missing dependency versions are invalid
+- a future lock step is responsible for recording resolved exact versions
+- a future integrity step is responsible for recording source/checksum data
+
+What package metadata is allowed to affect:
+
+- how a file or file-group is identified for publication / reuse
+- whether multiple files are grouped into one named package
+- future packaging / release tooling
+- package-level validation that a set of files intentionally belong together
+
+What package metadata must not affect in the first stage:
+
+- local lexical scope rules
+- namespace formation rules
+- qualified-name syntax
+- import semantics inside a package once the target file/module is resolved
+- heavy dependency resolution or transitive version selection
+
+First-stage package validity rules:
+
+- `package foo` must be the first non-comment, non-whitespace declaration in a file
+- a file has at most one package declaration
+- files that omit `package` remain standalone implicit package units
+- files that declare the same package still do not merge into one flat namespace; top-level lookup continues to go through file/module namespaces
+- if two files in the same package expose colliding top-level names through the same namespace path, that is still a normal namespace/import conflict, not a special package rule
+
+Current implementation status:
+
+- file-header `package foo` is parsed and recorded in `AstFile` and `HirModule`
+- imported files also carry package metadata into `HirImport`
+- `HirImport.same_package` is available as a compiler-internal signal when the
+  importing file and imported file both declare the same package name
+- this `same_package` signal is recorded consistently for plain import,
+  selective import, and namespace-alias import
+- this signal is currently observational only; it does not yet change import
+  resolution, namespace formation, or visibility
+- package-aware import resolution, package namespaces, and package-manager
+  behavior are intentionally still out of scope
+
+Example:
 
 ```swift
-// String → number (fallible → Result)
-let page = "42" as i32                        // Result<i32>
-guard let page else { return 400 }
+// implicit file package unit
+func jwtAuth() -> i32 => 200
+```
 
-let weight = "3.14" as f64                    // Result<f64>
-guard let weight else { return 400 }
+```swift
+package auth
 
-// With ?? for defaults
-let limit = (req.query("limit") ?? "20") as i32
-guard let limit else { return 400 }
+func jwtAuth() -> i32 => 200
+```
+
+```swift
+package auth
+
+func basicAuth() -> i32 => 200
+```
+
+In the example above, the first file stands alone as its own package unit. The
+last two files belong to the same explicit package `auth`, while still being
+separate file/module namespaces.
+
+Possible future package-manager metadata shape:
+
+```swift
+package auth
+
+manifest {
+    version: "1.2.3"
+    root: "src"
+    deps: [
+        dep("security", "0.4.1"),
+        dep("jwt", "1.2.0"),
+    ]
+}
+```
+
+The intent is that package metadata remains self-described in Rut rather than
+switching to TOML or YAML. At the same time, this manifest form should stay a
+restricted declaration surface, not an arbitrary executable Rut program.
+
+This example only illustrates manifest-level dependency requirements. A future
+package manager would still need resolver output and lock/integrity data before
+dependency versions are actually reproducible and verifiable.
+
+Package grouping does not replace file/module namespaces. Once a module is
+loaded, the compiler still reasons in terms of file/module namespaces such as
+`auth.jwtAuth` or `proto.Box`.
+
+So the design target is:
+
+- keep namespace semantics in the compiler
+- optionally add package metadata for distribution and reuse
+- do not turn Rut into a general-purpose package-managed ecosystem
+
+#### 3.4.19 Current Scope And Name Resolution
+
+Current implementation behavior should be read as:
+
+- a file provides a **top-level declaration namespace**, not a general-purpose local variable scope
+- top-level names include declarations such as `func`, `struct`, `variant`, `protocol`, `impl`, `import`, and `using` alias declarations
+- imported top-level declarations participate in the same visible lookup set as local top-level declarations, subject to the import rules above
+
+Local variable scope is block-oriented:
+
+- route-body `let` bindings are visible to later statements in the same route body
+- function parameters are visible throughout the function body
+- function-body `let` bindings are visible to later statements in the same block
+- bindings introduced inside `if` / `match` / branch blocks stay inside that branch block
+- `match` payload bindings are visible only inside their corresponding arm
+
+Current `guard` scoping rules:
+
+- `guard let x = expr else { ... }` extends `x` into the success path after the guard
+- `guard match ... else { ... }` is a control-flow check; it does not itself introduce a new post-guard binding name
+
+Name-resolution consequences:
+
+- a plain file import such as `import "auth.rut"` makes the file stem available as a namespace for value/type references such as `auth.jwtAuth()` and `auth.Box`
+- `import * as auth from "auth.rut"` creates an explicit namespace alias
+- selective import brings only the selected symbols into the current top-level namespace and does not create a namespace object
+- `using` only creates aliases for already-visible names; it is not a second conformance system and is not a local-value binding construct
+- package metadata does not replace namespace lookup; imported names still resolve through file/module namespaces and explicit aliases
+
+This is the current implementation contract. A future language-level scope chapter may formalize this more completely, but current tests and compiler behavior already rely on these rules.
+
+#### 3.4.20 Type Conversion
+
+`as` is for value-to-value conversion, not text parsing.
+
+- infallible conversions stay as `as`
+- checked conversions use `as?`
+- string/domain decoding belongs to parse APIs such as `parseInt(...)`, `IP.parse(...)`, and `Duration.parse(...)`
+
+```swift
+// Checked numeric conversion
+let page = parseInt("42")
+guard page else { return 400 }
+
+let weight = parseFloat("3.14")
+guard weight else { return 400 }
+
+// With value fallback
+let limit = parseInt(req.query("limit").or("20")).or(20)
 
 // Number → string (infallible)
 let s = 200 as string                         // "200"
 let s = 3.14 as string                        // "3.14"
 
-// Domain type parsing (fallible → Result)
-let ip = "10.0.0.1" as IP                     // Result<IP>
-let cidr = "10.0.0.0/8" as CIDR               // Result<CIDR>
-let dur = "30s" as Duration                    // Result<Duration>
+// Domain type parsing
+let ip = IP.parse("10.0.0.1")
+let cidr = CIDR.parse("10.0.0.0/8")
+let dur = Duration.parse("30s")
 ```
 
 **Standard library:**
@@ -2225,17 +2469,18 @@ let h1 = submit get http://user-service/users/1
 let h2 = submit get http://order-service/orders?user=1
 
 // Wait all — single yield point, one io_uring_enter syscall
-let (r1, r2) = wait(h1, h2)           // (Result<Response>, Result<Response>)
-guard let r1 else { return 502 }
-guard let r2 else { return 502 }
+let (r1, r2) = wait(h1, h2)           // pair of error-capable responses
+guard r1 else { return 502 }
+guard r2 else { return 502 }
 return 200, json({ user: r1.body, orders: r2.body })
 
 // Wait any — first response wins, cancel rest
-let first = any(wait(h1, h2))         // Result<Response>
+let first = any(wait(h1, h2))         // first-completing error-capable response
 
 // All — wait all, fail-fast on first error (cancel rest)
 let (r1, r2) = all(h1, h2)            // both succeed or first error
-guard let r1, r2 else { return 502 }
+guard r1 else { return 502 }
+guard r2 else { return 502 }
 ```
 
 `wait` also accepts a Duration — compiler generates `IORING_OP_TIMEOUT`:
@@ -2247,12 +2492,12 @@ wait(2s)
 // Timeout — race I/O against deadline, cancel loser
 let h = submit get http://slow-service/data
 let result = any(wait(h, 5s))     // first to complete wins
-guard let result else { return 504, "timeout" }
+guard result else { return 504, "timeout" }
 
 // Custom timeout on any I/O (alternative to per-call timeout: parameter)
 let h1 = submit forward(userService, buffered: true)
 let resp = any(wait(h1, 30s))
-guard let resp else { return 504 }
+guard resp else { return 504 }
 return resp
 ```
 
@@ -2314,7 +2559,7 @@ Both can use I/O.
 ```swift
 init {
     let resp = get http://config-service/warmup
-    guard let resp else {
+    guard resp else {
         log.error("warmup failed")
         return
     }
@@ -2441,23 +2686,22 @@ s.replace(old, new)               // string
 s.split(sep)                      // [string]
 s.slice(start, end)               // string
 s.matches(re"pattern")            // bool (Vectorscan)
-s.match(re"pattern")              // Result<Match> (capture groups)
+s.match(re"pattern")              // error-capable match object (capture groups)
 
-// --- Type Conversion (runtime C++ built-in, via `as` keyword) ---
-"42" as i32                       // Result<i32>
-"3.14" as f64                     // Result<f64>
-42 as string                      // string (infallible)
-"10.0.0.1" as IP                  // Result<IP>
+// --- Type Conversion / Parse ---
+42 as string                      // string (infallible conversion)
+IP.parse("10.0.0.1")              // typed parse
+parseInt("42")                    // typed parse
 
 // --- JSON ---
-req.body(Type)                    // parse body → Result<T>
+req.body(Type)                    // typed body parse, error-capable
 json(value)                       // serialize to JSON string
 resp.body                         // response body string
 
 // --- Regex (Vectorscan) ---
 re"pattern"                       // compile-time validated regex literal
 s.matches(re"pat")                // bool
-s.match(re"(group)")              // Result<Match>, m[1] for captures
+s.match(re"(group)")              // match object on success
 s.replace(re"pat", replacement)   // string
 
 // --- Hash ---
@@ -2474,14 +2718,14 @@ hmacSha384(key, data)         // string (hex)
 hmacSha512(key, data)         // string (hex)
 
 // --- JWT (multi-algorithm, backed by BoringSSL) ---
-jwtDecode(token, secret: key)               // Result<Claims> — HS256/384/512
-jwtDecode(token, publicKey: pem)            // Result<Claims> — RS256/384/512, ES256/384/512
+jwtDecode(token, secret: key)               // error-capable Claims decode — HS256/384/512
+jwtDecode(token, publicKey: pem)            // error-capable Claims decode — RS256/384/512, ES256/384/512
 jwtEncode(claims, secret: key, alg: .HS256) // string — sign with HMAC
 jwtEncode(claims, privateKey: pem, alg: .RS256)  // string — sign with RSA/ECDSA
 
 // --- Encryption ---
 aesGcmEncrypt(key, plaintext, nonce)        // [u8] — AES-256-GCM authenticated encryption
-aesGcmDecrypt(key, ciphertext)              // Result<[u8]> — decrypt + verify tag
+aesGcmDecrypt(key, ciphertext)              // error-capable decrypt + verify tag
 
 // --- Random ---
 randomBytes(n)                // [u8] — cryptographically secure random
@@ -2492,23 +2736,23 @@ base64(data)                  // string
 base64url(data)               // string
 hex(data)                     // string
 urlEncode(data)               // string
-urlDecode(data)               // Result<string>
+urlDecode(data)               // error-capable decode
 htmlDecode(data)              // string — &#x3C; → <, &amp; → &, etc.
 unicodeNormalize(data)        // string — \u003C → <, NFC normalization
 
 // --- Request Body ---
-req.body(Type)                // typed parse → Result<T>
-req.bodyRaw                   // raw body → Result<string> (auto-decompresses)
-req.bodyJson()                // dynamic JSON → Result<Json>
-req.multipart()               // multipart/form-data → Result<[Part]>
+req.body(Type)                // typed parse, error-capable
+req.bodyRaw                   // raw body, error-capable (auto-decompresses)
+req.bodyJson()                // dynamic JSON, error-capable
+req.multipart()               // multipart/form-data, error-capable
 
 // Json — dynamic JSON access (no struct required)
 let j = req.bodyJson()
-guard let j else { return 400 }
+guard j else { return 400 }
 j.field("name")              // Json? — nested access
-j.string()                   // Result<string> — extract as string
-j.int()                      // Result<i32> — extract as number
-j.array()                    // Result<[Json]> — extract as array
+j.string()                   // error-capable extract as string
+j.int()                      // error-capable extract as number
+j.array()                    // error-capable extract as array
 j.allValues()                // [string] — all leaf values (for WAF scanning)
 j.allKeys()                  // [string] — all keys
 
@@ -2559,15 +2803,15 @@ Bit operations: & | ^ << >> ~
 | CIDR format | `req.remoteAddr.in(999.0.0.0/8)` | "invalid IP in CIDR" |
 | Header spell | `req.athorization` | "warning: did you mean authorization?" |
 | Indirect call | `let f = auth; f(req)` | "functions cannot be assigned to variables" |
-| guard exhaustive | `guard let x = opt` (no else) | "guard must have else clause" |
-| Optional access | `req.authorization.hasPrefix("B")` | "value is optional, use guard let or ??" |
+| guard exhaustive | `guard expr else { ... }` with non-terminating or missing `else` | "guard must have else clause" |
+| Optional access | `req.authorization.hasPrefix("B")` | "value may be nil, use ?, ?., ??, or or(...)" |
 | Response middleware | `func f(_ resp: Response)` applied where only pre-middleware expected | "signature contains Response — this is a post-middleware, will run after handler" (info) |
 | TLS without host | `tls "x.com"` but no `x.com { }` in route | warning: "TLS cert declared but no routes for x.com" |
 | Host without TLS | `x.com { }` in route but no `tls "x.com"` and listen uses TLS | "no TLS certificate for host x.com" |
 | Duplicate TLS | two `tls "x.com"` declarations | "duplicate TLS declaration for x.com" |
 | Host pattern | `x.y.z { }` in route with invalid domain chars | "invalid host pattern" |
-| Result unused | `let x = req.body(User)` without `guard let` | "Result\<User\> must be unwrapped with guard let" |
-| Result as Optional | `if x != nil` on a Result value | "use guard let to unwrap Result, not nil check" |
+| Error-capable value ignored | `let x = req.body(User)` and later code assumes a usable value without fallback/guard | "expression may fail; use guard, match, or a value fallback such as or(...)" |
+| Error/nil confusion | treating an error-capable value as plain Optional without an explicit value-flow operation | "failure and nil are distinct; use guard/match for error handling or value-flow operators to treat failure as no value" |
 | Regex syntax | `re"[unclosed"` | "invalid regex: unclosed bracket" |
 | Regex capture | `m[3]` but pattern has 2 groups | "regex has 2 capture groups, index 3 out of range" |
 | Recursion | `func foo() { foo() }` | "recursive call detected: foo → foo" |
@@ -2589,14 +2833,15 @@ The language has no `async`, `await`, `future`, or `promise` keywords. User writ
 ```swift
 // User writes:
 func auth(_ req: Request, role: string) -> User {
-    guard let token = req.authorization else { return 401 }
+    let token = req.authorization.or("")
+    guard token.isEmpty == false else { return 401 }
     let res = get http://auth/verify {     // compiler knows: I/O point
         Authorization: token
     }
-    guard let res else { return 502 }      // Result<Response> — must guard
+    guard res else { return 502 }          // error-capable response
     guard res.status == 200 else { return 401 }
     let user = res.body(User)
-    guard let user else { return 401 }     // Result<User> — must guard
+    guard user else { return 401 }         // error-capable body parse
     guard user.role == role else { return 403 }
     req.X-User-ID = user.id
     return user
@@ -2622,7 +2867,7 @@ func auth(_ req: Request, role: string) -> User {
 
 | Feature | Example | Why |
 |---------|---------|-----|
-| `guard ... else` | `guard let token = req.authorization else { return 401 }` | Perfect for middleware "reject or continue" pattern |
+| `guard ... else` | `guard jwtDecode(token, secret: key) else { return 401 }` | Perfect for middleware "reject or continue" pattern |
 | Named parameters | `auth(req, role: "user")` | Self-documenting calls, LLMs generate correct argument order |
 | `_` unlabeled param | `func auth(_ req: Request, role: string)` | First param (always req) doesn't need label |
 | Optional chaining | `req.authorization?.hasPrefix("Bearer ")` | Safe navigation on nullable headers |
@@ -2706,11 +2951,12 @@ let userCache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
 // ---------- Middleware ----------
 
 func auth(_ req: Request, role: string) {
-    guard let token = req.authorization else { return 401 }
+    let token = req.authorization.or("")
+    guard token.isEmpty == false else { return 401 }
     guard token.hasPrefix("Bearer ") else { return 401 }
 
     let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard let claims else { return 401 }
+    guard claims else { return 401 }
     guard claims.exp >= now() else { return 401, "token expired" }
     guard claims.role == role else { return 403 }
 
@@ -2774,7 +3020,7 @@ route {
 
         post /orders {
             let order = req.body(Order)
-            guard let order else { return 400 }
+            guard order else { return 400 }
             for item in order.items {
                 guard item.qty > 0 else { return 400, "invalid quantity" }
             }
@@ -2803,7 +3049,7 @@ route {
         }
         post /ban {
             let ip = req.body(IP)
-            guard let ip else { return 400 }
+            guard ip else { return 400 }
             blacklist.add(ip)
             notify all blacklist.add(ip)
             return 200
@@ -2958,7 +3204,7 @@ null dereference) **must never take down the shard**.
 The compiler eliminates most crash sources:
 - Division by zero → compiler inserts check before every `/`, returns 500 if divisor is 0
 - Array out of bounds → compiler inserts bounds check on every `[]` access
-- Null/nil access → `Result` and `Optional` force `guard let` before access
+- Null/nil access → use `?`, `?.`, `??`, or `or(...)`; use `guard` only for explicit error handling
 - Infinite loops → no `while`, no recursion, `for` only on finite collections
 - Stack overflow → all functions inline, no call stack depth
 
@@ -4562,25 +4808,31 @@ During shutdown:
   Lexer / Parser (hand-written recursive descent)
     │
     ▼
-  Untyped AST
+  AST
     │
     ▼
-  Type Checker / Semantic Analysis
-    │  - type inference
+  HIR (resolved + typed language semantics)
+    │  - name resolution
+    │  - type inference / checking
     │  - route conflict detection
     │  - domain value range checks
-    │  - unreachable code detection
     │  - header spell check
     │  - optional access safety
     ▼
-  Typed AST
+  MIR (normalized execution model / CFG)
+    │
+    │  - explicit control flow
+    │  - evaluation order
+    │  - early return / guard lowering
+    │  - yield boundary placement
+    │  - unreachable code detection
+    ▼
+  Inline Expansion + Lowering
     │
     ▼
-  Inline Expansion (all func calls expanded)
+  RIR (backend-facing typed IR)
     │
     ▼
-  Rutlang IR (RIR)  ◄── custom IR, backend-agnostic
-    │
     ├── Optimization passes (on RIR)
     │   - dead code elimination
     │   - constant folding / propagation
@@ -4604,9 +4856,687 @@ During shutdown:
   CompiledConfig { version, routes, handlers }
 ```
 
+#### 11.1.1 Layer Responsibilities
+
+The compiler is intentionally split into four semantic layers:
+
+- **AST** — source-structure model. Preserves the user's surface syntax and source spans.
+- **HIR** — language-semantics model. Names are resolved, types are known, and Rut-specific objects such as `route`, `upstream`, and `forward` are explicit.
+- **MIR** — execution-semantics model. Control flow, evaluation order, short-circuiting, early returns, and yield boundaries become explicit.
+- **RIR** — backend contract. A compact, typed, SSA-friendly IR consumed by optimization passes and code generation.
+
+The intended boundary between these layers is:
+
+- **AST answers:** "What did the user write?"
+- **HIR answers:** "What does that code mean in Rut?"
+- **MIR answers:** "How does that meaning execute?"
+- **RIR answers:** "What primitive operations must the backend emit?"
+
+Concrete ownership rules:
+
+- **AST** carries source structure and `span` information, but not resolved symbols, inferred types, or backend opcodes.
+- **HIR** carries resolved references, type information, and normalized language semantics, but not SSA numbering or backend instruction selection.
+- **MIR** carries blocks, branches, terminators, evaluation order, and temporary values, but not target-specific code generation details.
+- **RIR** carries explicit backend-facing operations and source locations, but does not try to model high-level parser recovery state or unresolved language constructs.
+
+`HIR -> MIR` is the key semantic boundary in the compiler:
+
+- `HIR` is where the compiler understands the language.
+- `MIR` is where the compiler understands execution.
+
+That split exists so Rut-specific language features can evolve without forcing the backend IR to absorb high-level control-flow lowering, optional semantics, or route-level sugar directly.
+
+#### 11.1.2 Optimization Ownership by Layer
+
+Optimization responsibility is intentionally layered as well:
+
+- **HIR** may perform language-semantic simplifications that depend on type knowledge or constant domain values, but it is not responsible for storage reuse or backend-style value scheduling.
+- **MIR** is the first good place for temporary-value cleanup, such as trivial copy propagation, dead temporary elimination, expression flattening, and simplifications that depend on explicit control flow or evaluation order.
+- **RIR** is the main optimization IR for backend-independent passes such as dead code elimination, constant folding, guard coalescing, and state-machine construction.
+- **Backend / LLVM** owns physical storage reuse: register allocation, stack-slot reuse, frame layout, and related lifetime-based memory optimizations.
+
+In practice this means:
+
+- "Can this temporary value be optimized away?" is usually a **MIR or RIR** question.
+- "Can two dead/non-overlapping variables reuse the same storage?" is a **backend allocation** question, typically handled after RIR lowering by LLVM or an equivalent code generator.
+
+#### 11.1.3 Type System Boundaries
+
+Rut's type system is intentionally designed to avoid runtime type uncertainty.
+
+The target model is:
+
+- No inheritance
+- No subtype polymorphism
+- No runtime RTTI-style type discovery
+- No trait objects / erased interface dispatch
+- No implicit fallback to dynamic `Any`
+
+This means every expression must have a single, fully known static type by the end of HIR construction.
+
+Failure may still occur in the language, but not because the runtime is discovering the type of a value. The remaining failure categories are:
+
+- value-range checks (for example, narrowing numeric conversions)
+- optional absence / `nil`
+- parsing failures
+- explicitly modeled sum/variant matching, if such types are introduced later
+
+As a result:
+
+- `is` is not a runtime type-test operator in Rut's design
+- `as` is not a dynamic cast
+- MIR and RIR are not expected to carry runtime type tests as ordinary program operations
+
+Instead, Rut should treat these features as follows:
+
+- **`is`** — a compile-time type/shape predicate only. It answers questions about statically known type relationships and should fold during semantic analysis whenever possible.
+- **`as`** — an explicit conversion that is guaranteed to succeed if accepted by the type checker.
+- **`as?`** — an explicit checked conversion for cases where the conversion is semantically valid but may fail.
+- **`parse`** — text-to-value interpretation. String-to-domain conversions belong here rather than in `as` / `as?`.
+
+That distinction is important:
+
+- `i32 as i64` is a conversion
+- `i64 as? i32` is a checked conversion
+- `string -> IP` is parsing, not casting
+
+The language should avoid treating text as a universal source type. In particular, most `string -> T` operations for domain types (`IP`, `CIDR`, `Duration`, `StatusCode`, etc.) should be modeled as parse operations rather than casts.
+
+Optionality must also remain explicit in the semantic layers, even if the surface
+language sometimes hides it ergonomically. In particular, the compiler must
+distinguish:
+
+- `T`
+- `T?`
+- `Result<T, Error>`
+- `Result<T?, Error>`
+
+These are not interchangeable. They imply different control-flow shapes, different
+dataflow facts, and different optimization opportunities.
+
+Semantically, the two key questions are independent:
+
+- **optionality** — can this expression yield no usable value (`nil`)?
+- **error capability** — can this expression carry failure information?
+
+That means the compiler should treat "may be nil" and "may have error" as separate
+dimensions of the internal model rather than collapsing them into one flag.
+
+The same rule applies to function return-type inference.
+
+At the surface level, users may omit the return type or spell it explicitly. But by
+the end of HIR construction, the compiler must normalize each function's return
+shape using two independent dimensions:
+
+- `may_nil`
+- `may_error`
+
+That yields exactly four normalized semantic forms:
+
+- `T` — not optional, not error-capable
+- `T?` — optional, not error-capable
+- `Result<T, Error>` — error-capable, success value required
+- `Result<T?, Error>` — error-capable, success value may still be absent
+
+This means surface syntax may look lightweight, but the normalized semantic return
+shape must remain precise for control-flow lowering, diagnostics, and optimization.
+
+However, the *representation* of `T?` is a backend choice, not a language promise.
+When the compiler can prove it is safe, it may represent optional values using:
+
+- spare / niche bit patterns
+- out-of-range sentinel values
+- tagged pointers or equivalent compact layouts
+
+For example, a reference-like type may use `null` as `nil`, while certain bounded
+domain values may be able to reserve an impossible value as the `nil` sentinel.
+
+This is purely an implementation optimization. It must not change source-level
+semantics. If the compiler cannot prove a niche/sentinel encoding is safe, it must
+fall back to an explicit tag or equivalent representation.
+
+#### 11.1.4 Generics and Constraints
+
+Rut still needs abstraction power, even though it avoids runtime type uncertainty.
+
+The intended answer is **compile-time generics with monomorphization**, not subtype polymorphism:
+
+- Generic functions are instantiated at compile time
+- Generic structs / enums / sum types are instantiated at compile time
+- Generated MIR/RIR always see concrete types after instantiation
+- No runtime generic erasure is required
+
+This is important for ergonomics. Without generics, routine language building blocks such as `Option<T>`, `Result<T, E>`, typed collections, and reusable helper functions would force large amounts of duplicated code.
+
+Traits / constraints are still needed, but mainly for people defining abstractions rather than ordinary users writing application logic.
+
+The intended usage split is:
+
+- **Ordinary users** mostly consume generic APIs and usually do not write explicit constraints
+- **Library authors / framework authors / large-system authors** define generic abstractions and therefore write constraints
+
+For that reason, constraints should optimize for semantic clarity, extensibility, and diagnostics more than for being the shortest syntax in everyday code.
+
+Rut should therefore distinguish clearly between three different surface concerns:
+
+- `protocol` declares a behavioral contract
+- `impl` declares that a type conforms to one or more protocols and optionally provides method bodies
+- `using` is reserved for import / alias syntax only; it must not be used to declare protocol conformance
+
+Conformance should therefore use `impl`, not `using`.
+If a type only wants to adopt protocol default implementations, it should do so with an empty `impl` block:
+
+```rut
+Box impl Hashable {}
+```
+
+Rut should therefore use a single semantic core for constraints:
+
+- predicate-based constraint solving inside the compiler
+- trait-like surface syntax only as sugar, if desired
+
+In other words, the compiler should not maintain two separate type-system mechanisms for "traits" and "constraints". There should be one internal constraint model, with optional lighter surface syntax layered on top.
+
+Examples of the intended layering:
+
+- User-facing sugar: `func contains<T: Eq>(xs: [T], needle: T) -> bool`
+- Canonical semantic form: `func contains<T>(xs: [T], needle: T) -> bool where Eq(T)`
+
+The second form is the semantic core. The first is optional sugar.
+
+**Protocol Conformance and Default Implementations**
+
+Rut should support explicit protocol conformance blocks in type-first form:
+
+```rut
+Box impl Hashable {
+    func hash(self: Box) -> i32 => self.value
+}
+```
+
+A single block may list multiple protocols:
+
+```rut
+Box impl Hashable, Adder {
+    func hash(self: Box) -> i32 => self.value
+    func add(self: Box, x: i32) -> i32 => x
+}
+```
+
+First-stage conformance rules:
+
+- `impl` itself declares conformance; no separate conformance declaration syntax is needed
+- an empty `impl` block is valid when all required protocol methods have default implementations
+- if a required protocol method has no default implementation, the `impl` block must provide it
+- one type may conform to multiple protocols, but if two protocols in the same `impl` block define the same method name, the block must be rejected as ambiguous
+- `using Type as Protocol` is not protocol syntax and must remain invalid for conformance
+
+Dispatch rules for the first stage:
+
+- dispatch is static
+- concrete receiver calls may resolve to either an explicit `impl` method or a protocol default method
+- explicit `impl` methods take precedence over protocol default methods
+- generic receiver calls may dispatch through protocol constraints when the generic type is known to conform
+- imported explicit `impl` blocks are visible to the importing file for both concrete receiver dispatch and generic constraint satisfaction
+- empty imported `impl` blocks may adopt protocol default methods just like local empty `impl` blocks
+- explicit `impl` uniqueness is global within the current visible import graph: if two visible explicit `impl` blocks overlap on the same `Type + Protocol`, the program must be rejected rather than selecting one by priority
+- dynamic dispatch, witness tables, and trait objects are out of scope for the first stage
+
+#### 11.1.5 Type-Level Computation for Constraints
+
+If Rut supports generic constraints seriously, the compiler needs internal type predicates and type computation utilities.
+
+At minimum, the type checker needs internal operations such as:
+
+- type equality
+- "is this type comparable / hashable / optional / numeric?"
+- "what is the inner type of `Optional<T>`?"
+- "can `T` be compared to `U`?"
+- "is this cast total, checked, or forbidden?"
+
+These capabilities are primarily compiler infrastructure. They do not imply that the language must immediately expose a full user-programmable type-level function language.
+
+The intended order of exposure is:
+
+- internal type predicates and type computations first
+- user-visible generic constraints second
+- only later, if truly needed, richer user-facing type-level expressions
+
+This keeps the implementation coherent while avoiding premature complexity in the surface language.
+
+#### 11.1.6 Pipeline Placeholder Rules
+
+Rut may support a pipeline operator for staged dataflow, but if it does, the placeholder rules should be explicit and compile-time checked.
+
+The intended placeholder model is:
+
+- `_` is syntax sugar for `_1`
+- `_N` refers to pipeline input slot `N`
+- placeholders are positional, not named
+
+The key rule is:
+
+- a pipeline stage may only reference input slots that are statically provided by the value on the left-hand side
+
+For the first-stage design this means:
+
+- a non-tuple value provides only slot `_1`
+- a tuple value with arity `K` provides slots `_1 ... _K`
+- the maximum placeholder index referenced by the right-hand stage must be `<=` the left-hand input arity
+
+Examples:
+
+- `x | f(_)` is valid because `_` means `_1`
+- `x | f(_1)` is valid
+- `x | f(_2)` is invalid because a single value only provides one slot
+- `(a, b) | f(_1, _2)` is valid
+- `(a, b) | f(_3)` is invalid
+
+The compiler should reject placeholder misuse during semantic analysis, before MIR/RIR lowering.
+
+This placeholder system is intentionally future-friendly:
+
+- single-input pipelines stay simple
+- multi-input pipelines can later reuse the same numbered-slot model
+- the syntax does not need to be redesigned when tuple-fed stages are introduced
+
+The pipeline operator should only trigger its special pipeline semantics when the right-hand side is a stage application using placeholders. That keeps bitwise operators and pipeline syntax distinguishable at compile time while preserving a clear path for stream-style lowering and fusion optimizations.
+
+#### 11.1.6A Recursive Tuple Type Shapes
+
+Rut's current tuple handling may begin with a flat internal representation such as:
+
+- `tuple_len`
+- `tuple_types[]`
+- `tuple_variant_indices[]`
+- `tuple_struct_indices[]`
+
+That flat form is acceptable as an implementation starting point, but it is not
+the right long-term semantic model.
+
+The target model is a recursive type-shape graph:
+
+- `Bool`
+- `I32`
+- `Str`
+- `Generic`
+- `Variant`
+- `Struct`
+- `Tuple([TypeShape, ...])`
+
+In particular, tuple element shapes must be allowed to contain:
+
+- nested tuples
+- concrete generic instances
+- qualified imported types
+- structs and variants with their own concrete payload/field shapes
+
+Examples that should be representable directly in the type model:
+
+- `(i32, i32)`
+- `(Box, i32)`
+- `((Box, i32), i32)`
+- `Result<Box<i32>>`
+- `Result<(Box<i32>, i32)>`
+
+This matters because a flat tuple metadata scheme creates avoidable special cases:
+
+- nested tuple elements become artificially forbidden or awkward
+- tuple equality / ordering lowering needs ad hoc parallel arrays
+- imported qualified generic type arguments become harder to preserve
+- tuple fields, tuple payloads, tuple params, and tuple returns drift apart semantically
+
+So the intended invariant is:
+
+- **HIR semantic type identity must be expressible using recursive type shapes**
+- backend-facing flattened tuple metadata may still exist temporarily as lowering cache or compatibility data
+- but flattened metadata must not be treated as the semantic source of truth forever
+
+The recommended migration order is:
+
+1. Introduce a recursive `TypeShape` pool in HIR.
+2. Record function parameter and return shapes there first.
+3. Extend the same shape model to struct fields, variant payloads, locals, and expressions.
+4. Keep flat tuple arrays only as compatibility fields until MIR/RIR lowering fully consumes recursive shapes.
+5. Remove duplicated flat semantic metadata once lowering no longer depends on it.
+
+During the migration period, both representations may coexist, but the rule should be:
+
+- new type-system features must attach to the recursive shape model first
+- flat tuple arrays exist only to preserve existing lowering paths until they are retired
+
+Current implementation status for this migration is intentionally split into two
+separate signals:
+
+- `is_concrete`
+  - means the recursive shape is fully concrete as a type
+  - examples: `i32`, `Box<i32>`, `Result<Box<i32>>`
+  - this does **not** imply lowering can already materialize every required runtime carrier
+
+- `carrier_ready`
+  - means lowering may safely consume that shape without violating the current
+    build order for struct/variant runtime carriers
+  - this is stricter than `is_concrete`
+  - it is currently computed in MIR, not inferred ad hoc in lowering
+
+That distinction exists because a shape may be fully concrete while still depending
+on a struct definition or variant carrier that has not yet been materialized in the
+current lowering pass.
+
+The current intended lowering rule is:
+
+- prefer recursive shape metadata when `carrier_ready` is true
+- otherwise fall back to the legacy flat metadata / existing build-order checks
+
+At the moment, that `carrier_ready` gate is already used in conservative lowering
+entry points such as:
+
+- shape-sensitive comparison / field-access helpers
+- struct field type selection during user-struct build
+- variant payload carrier selection for tuple / struct / variant payload paths
+
+More concretely, the current `lower_rir` implementation already prefers
+shape-derived views at these call sites:
+
+- top-level binary `Eq` / `Lt` / `Gt` dispatch after MIR values are materialized
+- tuple-valued `materialize_value(...)` paths before tuple lowering lookup
+- struct field `Eq` / `Ord` recursion
+- variant payload `Eq` / `Ord` recursion
+- struct-build field type selection
+- variant payload carrier selection
+
+And it still intentionally keeps legacy flat tuple metadata as the primary source
+in a few narrower places:
+
+- tuple comparison / ordering recursion at individual tuple-slot level
+- tuple lowering cache keys and tuple-shape equality checks
+- variant pre-scan logic that merges multiple tuple payload cases into one
+  lowering record
+
+Those remaining flat-metadata paths are not accidental. They still operate on
+slot-level tuple metadata without an existing standalone `FlatMirShape` value, so
+they have been left in place until that representation is promoted cleanly rather
+than patched ad hoc.
+
+Current analyzer-side shape refresh rules are also important here:
+
+- generic struct instantiation and generic struct refresh recompute `field.shape_index`
+  from the instantiated field type, rather than inheriting a template-era shape index
+- generic variant instantiation and generic variant refresh recompute
+  `payload_shape_index` from the instantiated payload type for the same reason
+- generic function instantiation recomputes expression `shape_index` after named
+  struct/variant instances are concretized, so inlined generic call results do not
+  retain template-era shape indices
+- concrete generic struct / variant instances now also record per-type-argument
+  `instance_shape_indices[]`, instead of only base kind + flat tuple metadata
+- helper paths that reconstruct generic bindings from existing concrete instances
+  are expected to preserve those `instance_shape_indices[]`, not silently drop
+  back to shape-less bindings
+- declaration-side `TypeArgRef.shape_index` is no longer just transitional storage:
+  deferred named-type instantiation and generic-binding reconstruction helpers are
+  expected to reuse an existing `shape_index` first, and only recompute shape when
+  a legacy path still leaves it absent
+- analyzer-side generic binding reconstruction is now partially centralized through
+  `fill_bound_binding_from_type_metadata(...)`; current high-traffic users include:
+  explicit generic `StructInit`, explicit generic `VariantCase`, function
+  parameter/return named-generic paths, and declaration-side struct-field / variant
+  payload named-generic paths
+- that helper coverage now also extends into lower-frequency reconstruction paths:
+  explicit call-site `generic_bindings`, imported target instance bindings,
+  concrete instance refresh, concrete generic type-ref instantiation,
+  impl generic binding reconstruction, named-instance concretization, and the
+  `Self` fallback binding used during method-body instantiation
+- transitional tuple metadata remains semantically relevant during this migration:
+  `tuple_types[]`, `tuple_variant_indices[]`, and `tuple_struct_indices[]` must
+  stay in sync across generic binding, named type concretization, and instance reuse
+
+This matters because `carrier_ready` is only meaningful if the shape attached to
+an instantiated field / payload / expression is itself the instantiated shape.
+If template-era shape indices leak through, MIR may stay artificially conservative
+even when the concrete type graph is already safe to consume.
+
+The same is true for the flat tuple compatibility layer:
+
+- tuple elements with `Variant` kind must use `tuple_variant_indices[i]`
+- tuple elements with `Struct` kind must use `tuple_struct_indices[i]`
+- generic struct / variant instance equality and reuse must compare both arrays,
+  not only the variant-side indices
+
+Until recursive `TypeShape` fully replaces the old tuple metadata, these flat
+arrays remain part of the implementation contract and cannot be treated as
+optional compatibility trivia.
+
+The current observed consequence is:
+
+- simple concrete type-decl paths such as `(Box, i32)` can now become `carrier_ready`
+- imported nested generic payload paths such as `Result<Box<Result<i32>>>` can also
+  become `carrier_ready` once their instantiated payload shapes are recomputed
+- the generic-instance readiness path now has an explicit shape-based chain:
+  HIR `instance_shape_indices[]` -> MIR `instance_shape_indices[]` ->
+  MIR fixed-point `carrier_ready` -> lowering-side generic-instance gates
+- analyzer helper code is in a mixed state:
+  high-frequency generic-binding paths now prefer existing `shape_index` values,
+  and several formerly low-frequency paths now share the same reconstruction helper;
+  remaining outliers are expected to be genuinely specialized sites rather than the
+  old repeated "copy flat metadata then recompute shape" pattern
+- readiness is still allowed to remain conservative where the recursive shape is not
+  yet fully propagated or where lowering still depends on legacy compatibility data
+
+But the migration is not complete yet:
+
+- recursive shape metadata is the semantic source of truth
+- legacy flat tuple metadata still remains a compatibility layer for older lowering paths
+- lowering must continue to prefer explicit safety gates over guessing readiness from
+  `Unknown`, missing indices, or similar indirect signals
+
+#### 11.1.7 Error Model and Pipeline Short-Circuiting
+
+Rut's surface language should not force ordinary users to spell `Result<T, E>`
+everywhere, but the compiler still needs one clear semantic failure model.
+
+The intended split is:
+
+- **Surface language** may use ordinary values, `nil`, and explicit `error(...)`
+- **HIR** may normalize error-capable expressions and functions to `Result<V, Error>`
+
+This means `Result<V, Error>` remains the compiler's internal semantic model even
+when the user-facing syntax is lighter and more DSL-like.
+
+The built-in `Error` type is standard language infrastructure:
+
+- it is not the same as `nil`
+- it may carry structured information
+- it is the common failure payload used by the compiler's normalized `Result<V, Error>` form
+
+The semantic distinction still matters:
+
+- `nil` is the absence of a usable value on the value channel
+- `error(...)` is structured failure information
+- HIR is allowed to preserve and analyze that failure information explicitly
+
+But the ergonomic operators of the language intentionally work in terms of the
+value channel:
+
+- `|`, `?`, `?.`, and `??` are value-oriented syntax
+- they optimize for "keep going if a usable value exists"
+- in those forms, failure behaves like "no usable value", so the expression flows as `nil`
+
+This is a deliberate usability tradeoff for gateway-style code, where many failures
+are tolerated locally and only need logging, counting, or fallback behavior.
+
+Explicit failure handling remains available:
+
+- `guard let` is the primary entry into explicit error handling
+- future `match` may expose error details more directly where needed
+
+So Rut keeps one semantic failure model for the compiler, while allowing the common
+surface syntax to treat failure as absence when that is the more ergonomic thing to do.
+
+#### 11.1.8 Standard Error Model
+
+Ordinary users should not need to define a custom error type just to return a
+failure. Rut therefore needs a standard concrete `Error` struct in the language.
+
+The standard `Error` should contain at least:
+
+- `code`
+- `msg`
+- `file`
+- `func`
+- `line`
+
+`code` and `msg` are the semantic identity of the error. `file`, `func`, and
+`line` are source-origin diagnostics and should normally be injected automatically
+by the compiler at the error-construction site.
+
+The preferred ordinary-user construction path is a lightweight built-in
+constructor:
+
+- `error(.badRegex)`
+- `error(.badRegex, "invalid regex")`
+
+That constructor builds the standard `Error` value and fills source-location fields
+automatically.
+
+Rut should also have an `Error` protocol so advanced users can define custom error
+types. Those custom types are not the default path; they are for library authors
+and specialized modules that need more payload or domain-specific structure.
+
+The standard `Error` struct should satisfy the `Error` protocol, and custom error
+types may satisfy it as well, typically by composition rather than inheritance.
+
+Finally, error-side type aggregation is allowed:
+
+- if a function may produce multiple distinct error kinds, the compiler may
+  aggregate the error side into a generated variant
+- this auto-aggregation applies to **errors**, not to ordinary success return values
+- ordinary success return values still require an explicit `variant` declaration if
+  multiple normal shapes are intended
+
+This gives Rut a simple default error path for most users while still allowing
+precise typed error handling where it is actually useful.
+
+#### 11.1.9 Variants and Match
+
+Rut needs a first-class way to represent "one of several named cases", but it does
+not need the full complexity of a Rust-sized enum system on day one.
+
+The language should therefore have a `variant` keyword as part of the core syntax.
+
+The intended use is:
+
+- model mutually exclusive named cases
+- optionally attach payload values to each case
+- use `match` as the general branching construct over those cases
+
+Important constraints:
+
+- ordinary success return values do **not** automatically become a variant
+- if a function needs multiple normal return shapes, the user must declare an explicit `variant`
+- error returns may still be aggregated by the compiler as part of the error model
+
+`match` is not variant-only magic. It is the language's general multi-way branching
+construct:
+
+- `if` is the lightweight boolean special case
+- value dispatch that might look like a traditional `switch` is handled by `match`
+- variant dispatch is also handled by `match`
+
+So Rut does not need a separate `switch` keyword.
+
+The first-stage `variant` / `match` surface should stay deliberately small.
+
+**Variant case spelling**
+
+- short form: `.timeout`
+- fully qualified form: `NetError.timeout`
+- bare names like `timeout` are not accepted as variant cases
+
+This keeps variant-case references explicit without forcing full qualification in
+every local context.
+
+**First-stage `match` forms**
+
+Rut should support:
+
+- `match expr { ... }`
+- `case <literal>:`
+- `case .variant:`
+- `case .variant(x):`
+- `case Type.variant:`
+- `case _:` as fallback
+
+Payload binding is intentionally shallow in the first stage:
+
+- single-layer payload binding is supported
+- deep nested destructuring is not
+- OR-patterns, range patterns, and `case ... if cond` are not part of the first stage
+
+`match` is initially a statement form. It does not need to be an expression in the
+first implementation.
+
+**Exhaustiveness**
+
+For `variant`-based matches, the compiler should require either:
+
+- all cases are covered, or
+- a `case _:` fallback is present
+
+That exhaustiveness check is one of the main reasons to have `match` at all, and it
+should be part of the first-stage design.
+
+#### 11.1.10 Compile-Time Branching
+
+Rut should support compile-time branching in a small, explicit form.
+
+The preferred surface direction is:
+
+- `if const` for compile-time boolean branching
+- `match const` for compile-time multi-way branching
+
+In both forms, the condition / matched value must be known at compile time. If it
+is not, compilation fails.
+
+These are true compile-time branches, not ordinary runtime branches that are merely
+optimized later.
+
+That means:
+
+- they are valid for type-based specialization
+- they are valid for compile-time configuration values
+- they are valid for results produced by compile-time-evaluable pure functions
+- they are not valid for request data or other runtime-only values
+
+To preserve their usefulness for specialization, only the selected branch is
+required to pass full semantic and type checking for the current instantiation. An
+unselected branch does not need to type-check under that same compile-time choice.
+
+This provides enough power for specialization and compile-time configuration
+without turning the language into a large meta-programming system.
+
+#### 11.1.11 Response Shorthand
+
+HTTP responses are common enough in Rut that they should have a high-level surface
+form instead of always being assembled from raw status/header/body pieces.
+
+Rut should support response shorthand such as:
+
+- `return .ok`
+- `return .unauthorized`
+- `return .notFound`
+- `return .ok(json: user)`
+- `return .tooManyRequests(retryAfter: 1m)`
+
+These forms are not just printer sugar. The compiler should preserve them as
+high-level response intent in HIR, then lower them later to concrete status codes,
+headers, and body construction.
+
+That keeps routine gateway code compact while still giving the compiler explicit
+HTTP semantics instead of losing intent too early.
+
 ### 11.2 Rutlang IR (RIR)
 
-A lightweight, flat, typed IR between the AST and LLVM IR. Each route handler compiles to one RIR function — a linear sequence of blocks with explicit control flow.
+A lightweight, flat, typed IR between MIR and LLVM IR. Each route handler compiles to one RIR function — a linear sequence of blocks with explicit control flow.
 
 #### 11.2.1 Why RIR
 
@@ -4931,7 +5861,7 @@ Total external dependencies: **7-9**
 ❌ protobuf / grpc
 ❌ OpenSSL (Phase 1)
 ❌ tcmalloc / jemalloc (own allocators)
-❌ any package manager
+❌ heavy package manager / dependency solver
 ```
 
 ---
@@ -5081,7 +6011,7 @@ let users = upstream {
 // Request-level timeout via any(wait()):
 let h = submit forward(userService, buffered: true)
 let resp = any(wait(h, 5s))   // 5s deadline, cancel if exceeded
-guard let resp else { return 504 }
+guard resp else { return 504 }
 ```
 
 ```
@@ -5109,7 +6039,8 @@ let authService = service("http://auth-service") {
 
 // Use like a typed HTTP client — same syntax, but with retry + breaker:
 func auth(_ req: Request, role: string) -> User {
-    guard let token = req.authorization else { return 401 }
+    let token = req.authorization.or("")
+    guard token.isEmpty == false else { return 401 }
 
     let res = authService.get("/verify") {
         Authorization: token
@@ -5156,7 +6087,7 @@ let users = upstream {
 // Periodic refresh using timer:
 timer refreshUsers, every: 10s, shard: 0 {
     let res = get http://consul:8500/v1/health/service/user-service
-    guard let res else { return }
+    guard res else { return }
     // update upstream targets from Consul response
 }
 ```
@@ -5200,7 +6131,8 @@ fire (async calls)      ✅              -               -
 ```swift
 // Structured logging — built into the language
 func auth(_ req: Request, role: string) -> User {
-    guard let token = req.authorization else {
+    let token = req.authorization.or("")
+    guard token.isEmpty == false else {
         log.warn("missing auth token", {
             path: req.path
             addr: req.remoteAddr
@@ -5240,6 +6172,7 @@ func auth(_ req: Request, role: string) -> User {
 func processOrder(_ req: Request) {
     trace.span("validate_order") {
         let order = req.body(Order)
+        guard order else { return 400 }
         guard !order.items.isEmpty else { return 400 }
     }
 
@@ -5827,7 +6760,7 @@ are updated:
 ```swift
 post /admin/ban {
     let ip = req.body(IP)
-    guard let ip else { return 400 }
+    guard ip else { return 400 }
     blacklist.add(ip)               // userspace Set (immediate)
     notify all blacklist.add(ip)    // all shard userspace Sets
     // compiler auto-generates: update eBPF map via Node Agent

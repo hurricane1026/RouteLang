@@ -220,6 +220,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::BodyParse:
             buf.put_cstr("body.parse");
             break;
+        case Opcode::OptNil:
+            buf.put_cstr("opt.nil");
+            break;
+        case Opcode::OptWrap:
+            buf.put_cstr("opt.wrap");
+            break;
         case Opcode::ArrayLen:
             buf.put_cstr("array.len");
             break;
@@ -231,6 +237,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
             break;
         case Opcode::OptUnwrap:
             buf.put_cstr("opt.unwrap");
+            break;
+        case Opcode::Select:
+            buf.put_cstr("select");
             break;
         case Opcode::TraceFuncEnter:
             buf.put_cstr("trace.func_enter");
@@ -499,11 +508,20 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_cstr(", ");
             print_quoted_str(buf, inst.imm.str_val);
             break;
+        case Opcode::OptWrap:
         case Opcode::OptIsNil:
         case Opcode::OptUnwrap:
         case Opcode::BytesHex:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::Select:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[1]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[2]);
             break;
         case Opcode::StructCreate:
             buf.put(' ');

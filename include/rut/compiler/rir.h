@@ -186,8 +186,13 @@ enum class Opcode : u8 {
     ArrayGet,      // %r = array.get %arr, %idx      → T
 
     // ── Optional operations ──
+    OptNil,     // %r = opt.nil                    → Optional(T)
+    OptWrap,    // %r = opt.wrap %v               → Optional(T)
     OptIsNil,   // %r = opt.is_nil %v              → bool
     OptUnwrap,  // %r = opt.unwrap %v              → inner type
+
+    // ── Value selection ──
+    Select,  // %r = select %cond, %then, %else  → T
 
     // ── Instrumentation (compiler-inserted) ──
     TraceFuncEnter,

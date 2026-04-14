@@ -3,6 +3,7 @@
 #include "rut/jit/runtime_helpers.h"
 
 #include <llvm-c/Core.h>
+#include <llvm-c/Analysis.h>
 #include <llvm-c/Error.h>
 #include <llvm-c/LLJIT.h>
 #include <llvm-c/Orc.h>
@@ -41,6 +42,8 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_req_header", reinterpret_cast<void*>(&rut_helper_req_header)},
     {"rut_helper_req_remote_addr", reinterpret_cast<void*>(&rut_helper_req_remote_addr)},
     {"rut_helper_str_has_prefix", reinterpret_cast<void*>(&rut_helper_str_has_prefix)},
+    {"rut_helper_str_eq", reinterpret_cast<void*>(&rut_helper_str_eq)},
+    {"rut_helper_str_cmp", reinterpret_cast<void*>(&rut_helper_str_cmp)},
     {"rut_helper_str_trim_prefix", reinterpret_cast<void*>(&rut_helper_str_trim_prefix)},
     {nullptr, nullptr},
 };
@@ -104,6 +107,24 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
     if (dl) LLVMSetDataLayout(mod, dl);
     const char* triple = LLVMOrcLLJITGetTripleString(lljit);
     if (triple) LLVMSetTarget(mod, triple);
+
+    char* verify_msg = nullptr;
+    if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &verify_msg)) {
+        if (verify_msg) {
+            auto write_str = [](const char* s) {
+                int len = 0;
+                while (s[len]) len++;
+                (void)::write(2, s, len);
+            };
+            write_str("jit: module verification failed: ");
+            write_str(verify_msg);
+            write_str("\n");
+            LLVMDisposeMessage(verify_msg);
+        }
+        LLVMDisposeModule(mod);
+        LLVMContextDispose(ctx);
+        return false;
+    }
 
     // Wrap module into a ThreadSafeModule for submission to LLJIT.
     // We create a fresh ThreadSafeContext as the lock wrapper. Its internal

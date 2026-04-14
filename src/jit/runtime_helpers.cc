@@ -104,6 +104,27 @@ u8 rut_helper_str_has_prefix(const char* s, u32 s_len, const char* pfx, u32 pfx_
     return 1;
 }
 
+u8 rut_helper_str_eq(const char* a, u32 a_len, const char* b, u32 b_len) {
+    if (a_len != b_len) return 0;
+    for (u32 i = 0; i < a_len; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+i32 rut_helper_str_cmp(const char* a, u32 a_len, const char* b, u32 b_len) {
+    u32 n = a_len < b_len ? a_len : b_len;
+    for (u32 i = 0; i < n; i++) {
+        unsigned char ac = static_cast<unsigned char>(a[i]);
+        unsigned char bc = static_cast<unsigned char>(b[i]);
+        if (ac < bc) return -1;
+        if (ac > bc) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}
+
 void rut_helper_str_trim_prefix(
     const char* s, u32 s_len, const char* pfx, u32 pfx_len, const char** out_ptr, u32* out_len) {
     if (pfx_len <= s_len) {

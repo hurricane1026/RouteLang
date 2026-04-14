@@ -56,6 +56,9 @@ struct Ctx {
     // Optional(Str): {i8, ptr, i32} — has_value byte + ptr + len
     LLVMTypeRef opt_str_ty;
 
+    // Optional(I32): {i8, i32}
+    LLVMTypeRef opt_i32_ty;
+
     // HandlerResult: i64 (packed 8-byte struct, passed as integer)
     LLVMTypeRef result_ty;
 
@@ -78,6 +81,8 @@ struct Ctx {
     LLVMValueRef fn_req_header;
     LLVMValueRef fn_req_remote_addr;
     LLVMValueRef fn_str_has_prefix;
+    LLVMValueRef fn_str_eq;
+    LLVMValueRef fn_str_cmp;
     LLVMValueRef fn_str_trim_prefix;
 
     void init_types() {
@@ -96,6 +101,10 @@ struct Ctx {
         // Optional(Str): {i8, ptr, i32}
         LLVMTypeRef opt_str_fields[] = {i8_ty, ptr_ty, i32_ty};
         opt_str_ty = LLVMStructTypeInContext(llvm_ctx, opt_str_fields, 3, 0);
+
+        // Optional(I32): {i8, i32}
+        LLVMTypeRef opt_i32_fields[] = {i8_ty, i32_ty};
+        opt_i32_ty = LLVMStructTypeInContext(llvm_ctx, opt_i32_fields, 2, 0);
 
         // HandlerResult is returned as i64 (8-byte packed struct)
         result_ty = i64_ty;
@@ -155,6 +164,26 @@ struct Ctx {
             fn_str_has_prefix = LLVMAddFunction(llvm_mod, "rut_helper_str_has_prefix", ft);
         }
         return fn_str_has_prefix;
+    }
+
+    // u8 rut_helper_str_eq(ptr, i32, ptr, i32)
+    LLVMValueRef get_str_eq() {
+        if (!fn_str_eq) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 4, 0);
+            fn_str_eq = LLVMAddFunction(llvm_mod, "rut_helper_str_eq", ft);
+        }
+        return fn_str_eq;
+    }
+
+    // i32 rut_helper_str_cmp(ptr, i32, ptr, i32)
+    LLVMValueRef get_str_cmp() {
+        if (!fn_str_cmp) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i32_ty, params, 4, 0);
+            fn_str_cmp = LLVMAddFunction(llvm_mod, "rut_helper_str_cmp", ft);
+        }
+        return fn_str_cmp;
     }
 
     // void rut_helper_str_trim_prefix(ptr, i32, ptr, i32, ptr, ptr)
@@ -275,7 +304,23 @@ struct Ctx {
             case rir::TypeKind::Method:
                 return i8_ty;
             case rir::TypeKind::Optional:
-                return opt_str_ty;  // TODO: generic optional
+                if (ty->inner && ty->inner->kind == rir::TypeKind::I32) return opt_i32_ty;
+                if (ty->inner && ty->inner->kind == rir::TypeKind::Str) return opt_str_ty;
+                {
+                    LLVMTypeRef payload = map_type(ty->inner);
+                    LLVMTypeRef fields[] = {i8_ty, payload};
+                    return LLVMStructTypeInContext(llvm_ctx, fields, 2, 0);
+                }
+            case rir::TypeKind::Struct:
+                if (ty->struct_def) {
+                    auto* sd = ty->struct_def;
+                    LLVMTypeRef fields[16]{};
+                    for (u32 i = 0; i < sd->field_count; i++) {
+                        fields[i] = map_type(sd->fields()[i].type);
+                    }
+                    return LLVMStructTypeInContext(llvm_ctx, fields, sd->field_count, 0);
+                }
+                return ptr_ty;
             default:
                 return ptr_ty;
         }
@@ -450,6 +495,52 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::CmpGe: {
             LLVMValueRef a = c.get_value(inst.operands[0]);
             LLVMValueRef b = c.get_value(inst.operands[1]);
+            const rir::Type* lhs_ty =
+                c.cur_fn && inst.operands[0].id < c.cur_fn->value_cap ? c.cur_fn->values[inst.operands[0].id].type
+                                                                      : nullptr;
+            if (lhs_ty && lhs_ty->kind == rir::TypeKind::Str) {
+                LLVMValueRef a_ptr = LLVMBuildExtractValue(c.builder, a, 0, "cmp.s.a.ptr");
+                LLVMValueRef a_len = LLVMBuildExtractValue(c.builder, a, 1, "cmp.s.a.len");
+                LLVMValueRef b_ptr = LLVMBuildExtractValue(c.builder, b, 0, "cmp.s.b.ptr");
+                LLVMValueRef b_len = LLVMBuildExtractValue(c.builder, b, 1, "cmp.s.b.len");
+                LLVMValueRef args[] = {a_ptr, a_len, b_ptr, b_len};
+                if (inst.op == rir::Opcode::CmpEq || inst.op == rir::Opcode::CmpNe) {
+                    LLVMValueRef eq = LLVMBuildCall2(c.builder,
+                                                     LLVMGlobalGetValueType(c.get_str_eq()),
+                                                     c.get_str_eq(),
+                                                     args,
+                                                     4,
+                                                     "str.eq");
+                    LLVMValueRef as_bool = LLVMBuildICmp(c.builder,
+                                                         LLVMIntNE,
+                                                         eq,
+                                                         LLVMConstInt(c.i8_ty, 0, 0),
+                                                         "str.eq.bool");
+                    if (inst.op == rir::Opcode::CmpNe) {
+                        as_bool = LLVMBuildNot(c.builder, as_bool, "str.ne.bool");
+                    }
+                    c.set_value(inst.result, as_bool);
+                    break;
+                }
+                LLVMValueRef cmp = LLVMBuildCall2(c.builder,
+                                                  LLVMGlobalGetValueType(c.get_str_cmp()),
+                                                  c.get_str_cmp(),
+                                                  args,
+                                                  4,
+                                                  "str.cmp");
+                LLVMIntPredicate pred;
+                switch (inst.op) {
+                    case rir::Opcode::CmpLt: pred = LLVMIntSLT; break;
+                    case rir::Opcode::CmpGt: pred = LLVMIntSGT; break;
+                    case rir::Opcode::CmpLe: pred = LLVMIntSLE; break;
+                    case rir::Opcode::CmpGe: pred = LLVMIntSGE; break;
+                    default: pred = LLVMIntEQ; break;
+                }
+                LLVMValueRef as_bool =
+                    LLVMBuildICmp(c.builder, pred, cmp, LLVMConstInt(c.i32_ty, 0, 0), "str.ord.bool");
+                c.set_value(inst.result, as_bool);
+                break;
+            }
             // Eq/Ne are sign-agnostic. For ordered comparisons, pick
             // signed vs unsigned predicates based on the RIR operand type.
             bool uns = c.is_unsigned_operand(inst.operands[0]);
@@ -483,6 +574,40 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
 
         // ── Optional operations ──
+        case rir::Opcode::OptNil: {
+            LLVMTypeRef out_ty = c.map_type(c.cur_fn->values[inst.result.id].type);
+            LLVMValueRef opt = LLVMGetUndef(out_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, LLVMConstInt(c.i8_ty, 0, 0), 0, "opt.nil.has");
+            if (out_ty == c.opt_i32_ty) {
+                opt = LLVMBuildInsertValue(c.builder, opt, LLVMConstInt(c.i32_ty, 0, 0), 1, "opt.nil.i32");
+            } else if (out_ty == c.opt_str_ty) {
+                opt = LLVMBuildInsertValue(c.builder, opt, LLVMConstNull(c.ptr_ty), 1, "opt.nil.ptr");
+                opt = LLVMBuildInsertValue(c.builder, opt, LLVMConstInt(c.i32_ty, 0, 0), 2, "opt.nil.len");
+            } else {
+                LLVMTypeRef payload_ty = LLVMStructGetTypeAtIndex(out_ty, 1);
+                opt = LLVMBuildInsertValue(c.builder, opt, LLVMGetUndef(payload_ty), 1, "opt.nil.payload");
+            }
+            c.set_value(inst.result, opt);
+            break;
+        }
+        case rir::Opcode::OptWrap: {
+            LLVMValueRef val = c.get_value(inst.operands[0]);
+            LLVMTypeRef out_ty = c.map_type(c.cur_fn->values[inst.result.id].type);
+            LLVMValueRef opt = LLVMGetUndef(out_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, LLVMConstInt(c.i8_ty, 1, 0), 0, "opt.wrap.has");
+            if (out_ty == c.opt_i32_ty) {
+                opt = LLVMBuildInsertValue(c.builder, opt, val, 1, "opt.wrap.i32");
+            } else if (out_ty == c.opt_str_ty) {
+                LLVMValueRef p = LLVMBuildExtractValue(c.builder, val, 0, "opt.wrap.ptr");
+                LLVMValueRef l = LLVMBuildExtractValue(c.builder, val, 1, "opt.wrap.len");
+                opt = LLVMBuildInsertValue(c.builder, opt, p, 1, "opt.wrap.ptr.set");
+                opt = LLVMBuildInsertValue(c.builder, opt, l, 2, "opt.wrap.len.set");
+            } else {
+                opt = LLVMBuildInsertValue(c.builder, opt, val, 1, "opt.wrap.payload");
+            }
+            c.set_value(inst.result, opt);
+            break;
+        }
         case rir::Opcode::OptIsNil: {
             LLVMValueRef opt = c.get_value(inst.operands[0]);
             LLVMValueRef has = LLVMBuildExtractValue(c.builder, opt, 0, "opt.has");
@@ -492,14 +617,55 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::OptUnwrap: {
-            // Extract the value fields (ptr, len) from Optional(Str).
             LLVMValueRef opt = c.get_value(inst.operands[0]);
-            LLVMValueRef p = LLVMBuildExtractValue(c.builder, opt, 1, "uw.ptr");
-            LLVMValueRef l = LLVMBuildExtractValue(c.builder, opt, 2, "uw.len");
-            LLVMValueRef strval = LLVMGetUndef(c.str_ty);
-            strval = LLVMBuildInsertValue(c.builder, strval, p, 0, "uw.s.ptr");
-            strval = LLVMBuildInsertValue(c.builder, strval, l, 1, "uw.s.len");
-            c.set_value(inst.result, strval);
+            LLVMTypeRef out_ty = c.map_type(c.cur_fn->values[inst.result.id].type);
+            if (out_ty == c.i32_ty) {
+                LLVMValueRef v = LLVMBuildExtractValue(c.builder, opt, 1, "uw.i32");
+                c.set_value(inst.result, v);
+            } else if (out_ty == c.str_ty) {
+                LLVMValueRef p = LLVMBuildExtractValue(c.builder, opt, 1, "uw.ptr");
+                LLVMValueRef l = LLVMBuildExtractValue(c.builder, opt, 2, "uw.len");
+                LLVMValueRef strval = LLVMGetUndef(c.str_ty);
+                strval = LLVMBuildInsertValue(c.builder, strval, p, 0, "uw.s.ptr");
+                strval = LLVMBuildInsertValue(c.builder, strval, l, 1, "uw.s.len");
+                c.set_value(inst.result, strval);
+            } else {
+                LLVMValueRef v = LLVMBuildExtractValue(c.builder, opt, 1, "uw.payload");
+                c.set_value(inst.result, v);
+            }
+            break;
+        }
+        case rir::Opcode::Select: {
+            LLVMValueRef cond = c.get_value(inst.operands[0]);
+            LLVMValueRef then_v = c.get_value(inst.operands[1]);
+            LLVMValueRef else_v = c.get_value(inst.operands[2]);
+            LLVMValueRef v = LLVMBuildSelect(c.builder, cond, then_v, else_v, "sel");
+            c.set_value(inst.result, v);
+            break;
+        }
+        case rir::Opcode::StructCreate: {
+            LLVMTypeRef out_ty = c.map_type(c.cur_fn->values[inst.result.id].type);
+            LLVMValueRef s = LLVMGetUndef(out_ty);
+            for (u32 i = 0; i < inst.operand_count; i++) {
+                s = LLVMBuildInsertValue(c.builder, s, c.get_value(inst.operand(i)), i, "st.ins");
+            }
+            c.set_value(inst.result, s);
+            break;
+        }
+        case rir::Opcode::StructField: {
+            LLVMValueRef s = c.get_value(inst.operands[0]);
+            auto* struct_ty = c.cur_fn->values[inst.operands[0].id].type;
+            u32 field_index = struct_ty && struct_ty->struct_def ? struct_ty->struct_def->field_count : 0;
+            if (struct_ty && struct_ty->struct_def) {
+                for (u32 i = 0; i < struct_ty->struct_def->field_count; i++) {
+                    if (struct_ty->struct_def->fields()[i].name.eq(inst.imm.struct_ref.name)) {
+                        field_index = i;
+                        break;
+                    }
+                }
+            }
+            LLVMValueRef v = LLVMBuildExtractValue(c.builder, s, field_index, "st.field");
+            c.set_value(inst.result, v);
             break;
         }
 
@@ -652,6 +818,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_header = nullptr;
     c.fn_req_remote_addr = nullptr;
     c.fn_str_has_prefix = nullptr;
+    c.fn_str_eq = nullptr;
     c.fn_str_trim_prefix = nullptr;
     c.cur_fn = nullptr;
 

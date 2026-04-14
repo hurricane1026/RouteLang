@@ -487,7 +487,7 @@ struct Builder {
             bool orderable = k == TypeKind::I32 || k == TypeKind::I64 || k == TypeKind::U32 ||
                              k == TypeKind::U64 || k == TypeKind::F64 || k == TypeKind::ByteSize ||
                              k == TypeKind::Duration || k == TypeKind::Time ||
-                             k == TypeKind::StatusCode;
+                             k == TypeKind::StatusCode || k == TypeKind::Str;
             if (!orderable) return err(RirError::InvalidState);
         }
         auto* ty = TRY(make_type(TypeKind::Bool));
@@ -528,12 +528,43 @@ struct Builder {
 
     // ── Optional operations ─────────────────────────────────────────
 
+    Result<ValueId> emit_opt_nil(const Type* inner_type, SourceLoc loc = {}) {
+        if (!inner_type) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Optional, inner_type));
+        return TRY(emit(Opcode::OptNil, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_opt_wrap(ValueId val, SourceLoc loc = {}) {
+        if (!valid_val(val)) return err(RirError::InvalidState);
+        auto* inner = cur_func->values[val.id].type;
+        if (!inner) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto [inst, vid] = TRY(emit(Opcode::OptWrap, ty, loc));
+        inst->operands[0] = val;
+        inst->operand_count = 1;
+        return vid;
+    }
+
     Result<ValueId> emit_opt_is_nil(ValueId opt, SourceLoc loc = {}) {
         if (!val_has_type(opt, TypeKind::Optional)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));
         auto [inst, vid] = TRY(emit(Opcode::OptIsNil, ty, loc));
         inst->operands[0] = opt;
         inst->operand_count = 1;
+        return vid;
+    }
+
+    Result<ValueId> emit_select(ValueId cond, ValueId then_val, ValueId else_val, SourceLoc loc = {}) {
+        if (!val_has_type(cond, TypeKind::Bool)) return err(RirError::InvalidState);
+        if (!valid_val(then_val) || !valid_val(else_val)) return err(RirError::InvalidState);
+        auto* then_ty = cur_func->values[then_val.id].type;
+        auto* else_ty = cur_func->values[else_val.id].type;
+        if (!types_equal(then_ty, else_ty)) return err(RirError::InvalidState);
+        auto [inst, vid] = TRY(emit(Opcode::Select, then_ty, loc));
+        inst->operands[0] = cond;
+        inst->operands[1] = then_val;
+        inst->operands[2] = else_val;
+        inst->operand_count = 3;
         return vid;
     }
 
@@ -577,6 +608,36 @@ struct Builder {
         inst->operand_count = 1;
         inst->imm.struct_ref.name = field_name;
         inst->imm.struct_ref.type = field_type;
+        return vid;
+    }
+
+    Result<ValueId> emit_struct_create(StructDef* sd,
+                                       const ValueId* values,
+                                       u32 count,
+                                       SourceLoc loc = {}) {
+        if (!sd || (!values && count != 0)) return err(RirError::InvalidState);
+        if (count != sd->field_count) return err(RirError::InvalidState);
+        for (u32 i = 0; i < count; i++) {
+            if (!valid_val(values[i])) return err(RirError::InvalidState);
+            auto* got = cur_func->values[values[i].id].type;
+            if (!types_equal(got, sd->fields()[i].type)) return err(RirError::InvalidState);
+        }
+        auto* ty = TRY(make_type(TypeKind::Struct, nullptr, sd));
+        auto [inst, vid] = TRY(emit(Opcode::StructCreate, ty, loc));
+        inst->operand_count = count;
+        if (count <= kMaxInlineOperands) {
+            for (u32 i = 0; i < count; i++) inst->operands[i] = values[i];
+        } else {
+            inst->extra_operands = static_cast<ValueId*>(
+                mod->arena->alloc(sizeof(ValueId) * (count - kMaxInlineOperands)));
+            if (!inst->extra_operands) return err(RirError::OutOfMemory);
+            for (u32 i = 0; i < count; i++) {
+                if (i < kMaxInlineOperands) inst->operands[i] = values[i];
+                else inst->extra_operands[i - kMaxInlineOperands] = values[i];
+            }
+        }
+        inst->imm.struct_ref.name = sd->name;
+        inst->imm.struct_ref.type = ty;
         return vid;
     }
 

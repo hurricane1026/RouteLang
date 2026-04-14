@@ -2,4 +2,6 @@ build/
 build-cov/
 .cache/
 build-release/
+build-review/
 node_modules/
+.codex

@@ -1,6 +1,8 @@
 #pragma once
 
+#include "core/expected.h"
 #include "rut/common/types.h"
+#include "rut/compiler/diagnostic.h"
 
 namespace rut {
 
@@ -18,6 +20,11 @@ enum class TokenType : u8 {
     KwVar,
     KwConst,
     KwGuard,
+    KwCase,
+    KwError,
+    KwProtocol,
+    KwImpl,
+    KwVariant,
     KwStruct,
     KwRoute,
     KwMatch,
@@ -33,6 +40,7 @@ enum class TokenType : u8 {
     KwForward,
     KwWebsocket,
     KwImport,
+    KwPackage,
     KwUsing,
     KwAs,
     KwFire,
@@ -108,8 +116,19 @@ enum class TokenType : u8 {
 struct Token {
     TokenType type;
     Str text;
+    u32 start;
+    u32 end;
     u32 line;
     u32 col;
 };
+
+struct LexedTokens {
+    static constexpr u32 kMaxTokens = 512;
+    FixedVec<Token, kMaxTokens> tokens;
+};
+
+using LexResult = core::Expected<LexedTokens, Diagnostic>;
+
+LexResult lex(Str source);
 
 }  // namespace rut

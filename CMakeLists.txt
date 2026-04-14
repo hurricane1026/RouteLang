@@ -22,13 +22,18 @@ endif()
 # Core compiler flags per DESIGN.md: no exceptions, no RTTI, no C++ stdlib
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffunction-sections -fdata-sections -Wall -Wextra -Wpedantic")
-# Use CMake's native LTO support — handles llvm-ar/gcc-ar automatically.
-# Applied to both C and C++ so mixed-language targets (bench/llhttp) link correctly.
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
-check_ipo_supported(RESULT RUE_IPO_SUPPORTED OUTPUT RUE_IPO_OUTPUT LANGUAGES C CXX)
-if(RUE_IPO_SUPPORTED)
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+option(RUT_ENABLE_IPO "Enable interprocedural optimization/LTO for Release builds" OFF)
+if(RUT_ENABLE_IPO)
+    # Use CMake's native IPO support only when explicitly requested.
+    # In the default developer/test build, keep archives and test linking simple and stable.
+    check_ipo_supported(RESULT RUE_IPO_SUPPORTED OUTPUT RUE_IPO_OUTPUT LANGUAGES C CXX)
+    if(RUE_IPO_SUPPORTED)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    else()
+        message(WARNING "IPO requested but not supported: ${RUE_IPO_OUTPUT}")
+    endif()
 endif()
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
 

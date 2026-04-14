@@ -151,6 +151,10 @@ endif()
 # Compiler library
 add_library(rut_compiler STATIC
     compiler/lexer.cc
+    compiler/parser.cc
+    compiler/analyze.cc
+    compiler/mir_build.cc
+    compiler/lower_rir.cc
     compiler/rir_printer.cc
 )
 

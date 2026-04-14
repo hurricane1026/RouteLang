@@ -1,0 +1,413 @@
+#pragma once
+
+#include "rut/common/types.h"
+#include "rut/compiler/diagnostic.h"
+
+namespace rut {
+
+enum class AstItemKind : u8 {
+    Upstream,
+    Import,
+    Func,
+    Struct,
+    Variant,
+    Protocol,
+    Using,
+    Impl,
+    Route,
+};
+
+enum class AstStmtKind : u8 {
+    Expr,
+    Let,
+    Guard,
+    ReturnStatus,
+    ForwardUpstream,
+    If,
+    Match,
+    Block,
+};
+
+enum class AstExprKind : u8 {
+    BoolLit,
+    IntLit,
+    StrLit,
+    Tuple,
+    StructInit,
+    Placeholder,
+    VariantCase,
+    Call,
+    MethodCall,
+    Field,
+    ReqHeader,
+    Nil,
+    Error,
+    Ident,
+    Eq,
+    Lt,
+    Gt,
+    Or,
+    Pipe,
+};
+
+struct AstTypeRef {
+    static constexpr u32 kMaxTypeArgs = 4;
+    Str namespace_name{};
+    Str name{};
+    bool is_tuple = false;
+    static constexpr u32 kMaxTupleElems = 10;
+    FixedVec<Str, kMaxTupleElems> tuple_elem_names;
+    FixedVec<AstTypeRef*, kMaxTupleElems> tuple_elem_types;
+    FixedVec<Str, kMaxTypeArgs> type_arg_names;
+    FixedVec<Str, kMaxTypeArgs> type_arg_namespaces;
+    FixedVec<AstTypeRef*, kMaxTypeArgs> type_args;
+};
+
+struct AstExpr {
+    static constexpr u32 kMaxTypeArgs = 4;
+    struct FieldInit {
+        Str name{};
+        AstExpr* value = nullptr;
+    };
+
+    AstExprKind kind = AstExprKind::BoolLit;
+    Span span{};
+    bool bool_value = false;
+    i32 int_value = 0;
+    Str str_value{};
+    Str msg{};
+    Str name{};
+    AstExpr* lhs = nullptr;
+    AstExpr* rhs = nullptr;
+    static constexpr u32 kMaxFieldInits = 8;
+    static constexpr u32 kMaxArgs = 8;
+    FixedVec<FieldInit, kMaxFieldInits> field_inits;
+    FixedVec<AstTypeRef, kMaxTypeArgs> type_args;
+    FixedVec<AstExpr*, kMaxArgs> args;
+};
+
+struct AstStatement {
+    AstStmtKind kind = AstStmtKind::ReturnStatus;
+    Span span{};
+    Str name{};
+    bool bind_value = false;
+    bool is_const = false;
+    bool has_type = false;
+    AstTypeRef type{};
+    AstExpr expr{};
+    i32 status_code = 0;
+    AstStatement* then_stmt = nullptr;
+    AstStatement* else_stmt = nullptr;
+    static constexpr u32 kMaxBlockStatements = 8;
+    FixedVec<AstStatement*, kMaxBlockStatements> block_stmts;
+    static constexpr u32 kMaxMatchArms = 8;
+    struct MatchArm {
+        Span span{};
+        bool is_wildcard = false;
+        AstExpr pattern{};
+        AstStatement* stmt = nullptr;
+    };
+    FixedVec<MatchArm, kMaxMatchArms> match_arms;
+};
+
+struct AstUpstreamDecl {
+    Span span{};
+    Str name{};
+};
+
+struct AstFunctionDecl {
+    static constexpr u32 kMaxTypeParams = 4;
+    struct TypeParamDecl {
+        static constexpr u32 kMaxConstraints = 4;
+        Str name{};
+        bool has_constraint = false;
+        Str constraint_namespace{};
+        Str constraint{};
+        FixedVec<Str, kMaxConstraints> constraint_namespaces;
+        FixedVec<Str, kMaxConstraints> constraints;
+    };
+    struct ParamDecl {
+        Str name{};
+        AstTypeRef type{};
+    };
+
+    Span span{};
+    Str name{};
+    bool has_return_type = false;
+    AstTypeRef return_type{};
+    AstStatement* body = nullptr;
+    static constexpr u32 kMaxParams = 8;
+    FixedVec<TypeParamDecl, kMaxTypeParams> type_params;
+    FixedVec<ParamDecl, kMaxParams> params;
+};
+
+struct AstStructDecl {
+    static constexpr u32 kMaxTypeParams = 4;
+    struct FieldDecl {
+        Str name{};
+        AstTypeRef type{};
+    };
+
+    Span span{};
+    Str name{};
+    FixedVec<Str, kMaxTypeParams> type_params;
+    static constexpr u32 kMaxFields = 8;
+    FixedVec<FieldDecl, kMaxFields> fields;
+};
+
+struct AstVariantDecl {
+    static constexpr u32 kMaxTypeParams = 4;
+    struct CaseDecl {
+        Str name{};
+        bool has_payload = false;
+        AstTypeRef payload_type{};
+    };
+
+    Span span{};
+    Str name{};
+    FixedVec<Str, kMaxTypeParams> type_params;
+    static constexpr u32 kMaxCases = 16;
+    FixedVec<CaseDecl, kMaxCases> cases;
+};
+
+struct AstProtocolDecl {
+    static constexpr u32 kMaxMethods = 8;
+    static constexpr u32 kMaxParams = 8;
+    struct MethodDecl {
+        struct ParamDecl {
+            Str name{};
+            AstTypeRef type{};
+        };
+        Str name{};
+        bool has_return_type = false;
+        AstTypeRef return_type{};
+        AstStatement* default_body = nullptr;
+        FixedVec<ParamDecl, kMaxParams> params;
+    };
+    Span span{};
+    Str name{};
+    FixedVec<MethodDecl, kMaxMethods> methods;
+};
+
+struct AstImportDecl {
+    static constexpr u32 kMaxSelectedNames = 16;
+    struct SelectedName {
+        Str name{};
+        bool has_alias = false;
+        Str alias{};
+    };
+    Span span{};
+    Str path{};
+    bool selective = false;
+    bool has_namespace_alias = false;
+    Str namespace_alias{};
+    FixedVec<SelectedName, kMaxSelectedNames> selected_names;
+};
+
+struct AstUsingDecl {
+    static constexpr u32 kMaxTargetParts = 8;
+    Span span{};
+    Str name{};
+    FixedVec<Str, kMaxTargetParts> target_parts;
+};
+
+struct AstImplDecl {
+    static constexpr u32 kMaxProtocols = 4;
+    static constexpr u32 kMaxMethods = 8;
+    Span span{};
+    AstTypeRef target{};
+    FixedVec<Str, kMaxProtocols> protocol_namespaces;
+    FixedVec<Str, kMaxProtocols> protocols;
+    FixedVec<AstFunctionDecl, kMaxMethods> methods;
+};
+
+struct AstRouteDecl {
+    Span span{};
+    Span body_span{};
+    u8 method = 0;
+    Str path{};
+    static constexpr u32 kMaxStatements = 16;
+    FixedVec<AstStatement, kMaxStatements> statements;
+};
+
+struct AstItem {
+    AstItemKind kind = AstItemKind::Upstream;
+    Span span{};
+    AstUpstreamDecl upstream{};
+    AstImportDecl import_decl{};
+    AstFunctionDecl func{};
+    AstStructDecl struct_decl{};
+    AstVariantDecl variant{};
+    AstProtocolDecl protocol{};
+    AstUsingDecl using_decl{};
+    AstImplDecl impl_decl{};
+    AstRouteDecl route{};
+};
+
+struct AstFile {
+    static constexpr u32 kMaxItems = 128;
+    static constexpr u32 kMaxExprPool = 128;
+    static constexpr u32 kMaxStmtPool = 64;
+    static constexpr u32 kMaxTypePool = 256;
+    FixedVec<AstItem, kMaxItems> items;
+    FixedVec<AstExpr, kMaxExprPool> expr_pool;
+    FixedVec<AstStatement, kMaxStmtPool> stmt_pool;
+    FixedVec<AstTypeRef, kMaxTypePool> type_pool;
+    bool has_package_decl = false;
+    Span package_span{};
+    Str package_name{};
+
+    AstFile() = default;
+    AstFile(const AstFile& other)
+        : items(other.items), expr_pool(other.expr_pool), stmt_pool(other.stmt_pool), type_pool(other.type_pool) {
+        rebase_from(other);
+    }
+    AstFile& operator=(const AstFile& other) {
+        if (this == &other) return *this;
+        items = other.items;
+        expr_pool = other.expr_pool;
+        stmt_pool = other.stmt_pool;
+        type_pool = other.type_pool;
+        rebase_from(other);
+        return *this;
+    }
+    AstFile(AstFile&& other) noexcept
+        : items(other.items), expr_pool(other.expr_pool), stmt_pool(other.stmt_pool), type_pool(other.type_pool) {
+        rebase_from(other);
+    }
+    AstFile& operator=(AstFile&& other) noexcept {
+        if (this == &other) return *this;
+        items = other.items;
+        expr_pool = other.expr_pool;
+        stmt_pool = other.stmt_pool;
+        type_pool = other.type_pool;
+        rebase_from(other);
+        return *this;
+    }
+
+private:
+    void rebase_type_ptr(const AstFile& other, AstTypeRef*& ptr) {
+        if (ptr == nullptr) return;
+        const auto begin = &other.type_pool.data[0];
+        const auto end = begin + other.type_pool.len;
+        if (ptr < begin || ptr >= end) return;
+        const u32 index = static_cast<u32>(ptr - begin);
+        ptr = &type_pool.data[index];
+    }
+
+    void rebase_expr_ptr(const AstFile& other, AstExpr*& ptr) {
+        if (ptr == nullptr) return;
+        const auto begin = &other.expr_pool.data[0];
+        const auto end = begin + other.expr_pool.len;
+        if (ptr < begin || ptr >= end) return;
+        const u32 index = static_cast<u32>(ptr - begin);
+        ptr = &expr_pool.data[index];
+    }
+
+    void rebase_stmt_ptr(const AstFile& other, AstStatement*& ptr) {
+        if (ptr == nullptr) return;
+        const auto begin = &other.stmt_pool.data[0];
+        const auto end = begin + other.stmt_pool.len;
+        if (ptr < begin || ptr >= end) return;
+        const u32 index = static_cast<u32>(ptr - begin);
+        ptr = &stmt_pool.data[index];
+    }
+
+    void rebase_type_ref(const AstFile& other, AstTypeRef& type) {
+        for (u32 i = 0; i < type.tuple_elem_types.len; i++) {
+            rebase_type_ptr(other, type.tuple_elem_types[i]);
+        }
+        for (u32 i = 0; i < type.type_args.len; i++) {
+            rebase_type_ptr(other, type.type_args[i]);
+        }
+    }
+
+    void rebase_expr(const AstFile& other, AstExpr& expr) {
+        rebase_expr_ptr(other, expr.lhs);
+        rebase_expr_ptr(other, expr.rhs);
+        for (u32 i = 0; i < expr.type_args.len; i++) {
+            rebase_type_ref(other, expr.type_args[i]);
+        }
+        for (u32 i = 0; i < expr.field_inits.len; i++) {
+            rebase_expr_ptr(other, expr.field_inits[i].value);
+        }
+        for (u32 i = 0; i < expr.args.len; i++) {
+            rebase_expr_ptr(other, expr.args[i]);
+        }
+    }
+
+    void rebase_stmt(const AstFile& other, AstStatement& stmt) {
+        if (stmt.has_type) rebase_type_ref(other, stmt.type);
+        rebase_expr(other, stmt.expr);
+        rebase_stmt_ptr(other, stmt.then_stmt);
+        rebase_stmt_ptr(other, stmt.else_stmt);
+        for (u32 i = 0; i < stmt.block_stmts.len; i++) {
+            rebase_stmt_ptr(other, stmt.block_stmts[i]);
+        }
+        for (u32 i = 0; i < stmt.match_arms.len; i++) {
+            rebase_expr(other, stmt.match_arms[i].pattern);
+            rebase_stmt_ptr(other, stmt.match_arms[i].stmt);
+        }
+    }
+
+    void rebase_func(const AstFile& other, AstFunctionDecl& func) {
+        if (func.has_return_type) rebase_type_ref(other, func.return_type);
+        for (u32 i = 0; i < func.params.len; i++) {
+            rebase_type_ref(other, func.params[i].type);
+        }
+        rebase_stmt_ptr(other, func.body);
+    }
+
+    void rebase_struct(const AstFile& other, AstStructDecl& decl) {
+        for (u32 i = 0; i < decl.fields.len; i++) {
+            rebase_type_ref(other, decl.fields[i].type);
+        }
+    }
+
+    void rebase_variant(const AstFile& other, AstVariantDecl& decl) {
+        for (u32 i = 0; i < decl.cases.len; i++) {
+            if (decl.cases[i].has_payload) rebase_type_ref(other, decl.cases[i].payload_type);
+        }
+    }
+
+    void rebase_protocol(const AstFile& other, AstProtocolDecl& decl) {
+        for (u32 i = 0; i < decl.methods.len; i++) {
+            auto& method = decl.methods[i];
+            if (method.has_return_type) rebase_type_ref(other, method.return_type);
+            for (u32 pi = 0; pi < method.params.len; pi++) {
+                rebase_type_ref(other, method.params[pi].type);
+            }
+            rebase_stmt_ptr(other, method.default_body);
+        }
+    }
+
+    void rebase_impl(const AstFile& other, AstImplDecl& decl) {
+        rebase_type_ref(other, decl.target);
+        for (u32 i = 0; i < decl.methods.len; i++) {
+            rebase_func(other, decl.methods[i]);
+        }
+    }
+
+    void rebase_from(const AstFile& other) {
+        for (u32 i = 0; i < type_pool.len; i++) rebase_type_ref(other, type_pool[i]);
+        for (u32 i = 0; i < expr_pool.len; i++) rebase_expr(other, expr_pool[i]);
+        for (u32 i = 0; i < stmt_pool.len; i++) rebase_stmt(other, stmt_pool[i]);
+        for (u32 i = 0; i < items.len; i++) {
+            switch (items[i].kind) {
+                case AstItemKind::Func: rebase_func(other, items[i].func); break;
+                case AstItemKind::Struct: rebase_struct(other, items[i].struct_decl); break;
+                case AstItemKind::Variant: rebase_variant(other, items[i].variant); break;
+                case AstItemKind::Protocol: rebase_protocol(other, items[i].protocol); break;
+                case AstItemKind::Impl: rebase_impl(other, items[i].impl_decl); break;
+                case AstItemKind::Route:
+                    for (u32 j = 0; j < items[i].route.statements.len; j++) {
+                        rebase_stmt(other, items[i].route.statements[j]);
+                    }
+                    break;
+                default: break;
+            }
+        }
+    }
+};
+
+}  // namespace rut

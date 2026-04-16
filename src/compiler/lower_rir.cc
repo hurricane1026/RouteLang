@@ -2552,15 +2552,15 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     field_ty = i32_ty.value();
                 } else if (field_shape.type == MirTypeKind::Str) {
                     field_ty = str_ty.value();
-                } else if (field_shape.type == MirTypeKind::Variant &&
-                           field_shape.variant_index < mir.variants.len &&
-                           variant_infos[field_shape.variant_index].struct_type != nullptr) {
-                    field_ty = variant_infos[field_shape.variant_index].struct_type;
                 } else if (field_shape.type == MirTypeKind::Variant) {
-                    return false;
-                } else if (field_shape.type == MirTypeKind::Struct &&
-                           field_shape.struct_index < mir.structs.len &&
-                           user_struct_defs[field_shape.struct_index] != nullptr) {
+                    if (field_shape.variant_index >= mir.variants.len ||
+                        variant_infos[field_shape.variant_index].struct_type == nullptr)
+                        return false;
+                    field_ty = variant_infos[field_shape.variant_index].struct_type;
+                } else if (field_shape.type == MirTypeKind::Struct) {
+                    if (field_shape.struct_index >= mir.structs.len ||
+                        user_struct_defs[field_shape.struct_index] == nullptr)
+                        return false;
                     auto ty = b.make_type(
                         rir::TypeKind::Struct,
                         nullptr,
@@ -2568,8 +2568,6 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     if (!ty)
                         return frontend_error(FrontendError::OutOfMemory, mir.structs[si].span);
                     field_ty = ty.value();
-                } else if (field_shape.type == MirTypeKind::Struct) {
-                    return false;
                 } else if (field_shape.type == MirTypeKind::Tuple) {
                     auto tuple_info =
                         get_or_create_tuple_lowering(field_shape.tuple_len,

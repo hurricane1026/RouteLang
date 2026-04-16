@@ -1299,10 +1299,7 @@ struct Parser {
         }
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());
-        item.span = Span{target.value().name.ptr != nullptr ? kw.value()->start : kw.value()->start,
-                         rbrace.value()->end,
-                         kw.value()->line,
-                         kw.value()->col};
+        item.span = Span{kw.value()->start, rbrace.value()->end, kw.value()->line, kw.value()->col};
         item.impl_decl.span = item.span;
         return item;
     }

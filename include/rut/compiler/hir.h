@@ -117,6 +117,10 @@ struct HirProtocol {
         u32 return_tuple_variant_indices[kMaxTupleSlots]{};
         u32 return_tuple_struct_indices[kMaxTupleSlots]{};
         u32 return_shape_index = 0xffffffffu;
+        bool return_may_nil = false;
+        bool return_may_error = false;
+        u32 return_error_struct_index = 0xffffffffu;
+        u32 return_error_variant_index = 0xffffffffu;
         u32 function_index = 0xffffffffu;
     };
     Span span{};
@@ -140,6 +144,7 @@ struct HirConformance {
 
 struct HirVariant {
     static constexpr u32 kMaxTypeParams = 4;
+    static constexpr u32 kMaxGenericProtocols = 4;
     struct TypeArgRef {
         HirTypeKind type = HirTypeKind::Unknown;
         u32 generic_index = 0xffffffffu;
@@ -156,6 +161,12 @@ struct HirVariant {
         HirTypeKind payload_type = HirTypeKind::Unknown;
         bool has_payload = false;
         u32 payload_generic_index = 0xffffffffu;
+        bool payload_generic_has_error_constraint = false;
+        bool payload_generic_has_eq_constraint = false;
+        bool payload_generic_has_ord_constraint = false;
+        u32 payload_generic_protocol_index = 0xffffffffu;
+        u32 payload_generic_protocol_count = 0;
+        u32 payload_generic_protocol_indices[kMaxGenericProtocols]{};
         u32 payload_variant_index = 0xffffffffu;
         u32 payload_struct_index = 0xffffffffu;
         u32 payload_tuple_len = 0;
@@ -189,6 +200,7 @@ struct HirVariant {
 
 struct HirStruct {
     static constexpr u32 kMaxTypeParams = 4;
+    static constexpr u32 kMaxGenericProtocols = 4;
     using TypeArgRef = HirVariant::TypeArgRef;
     struct FieldDecl {
         Str name{};
@@ -196,6 +208,12 @@ struct HirStruct {
         HirTypeKind type = HirTypeKind::Unknown;
         bool is_error_type = false;
         u32 generic_index = 0xffffffffu;
+        bool generic_has_error_constraint = false;
+        bool generic_has_eq_constraint = false;
+        bool generic_has_ord_constraint = false;
+        u32 generic_protocol_index = 0xffffffffu;
+        u32 generic_protocol_count = 0;
+        u32 generic_protocol_indices[kMaxGenericProtocols]{};
         u32 variant_index = 0xffffffffu;
         u32 struct_index = 0xffffffffu;
         u32 tuple_len = 0;
@@ -591,15 +609,23 @@ struct HirControl {
 };
 
 struct HirRoute {
+    struct DecoratorRef {
+        Span span{};
+        Str name{};
+        u32 function_index = 0xffffffffu;  // resolved in analyze; 0xffffffffu = unresolved
+    };
+
     Span span{};
     u8 method = 0;
     Str path{};
     static constexpr u32 kMaxLocals = 16;
     static constexpr u32 kMaxGuards = 8;
     static constexpr u32 kMaxExprs = 64;
+    static constexpr u32 kMaxDecorators = 8;
     FixedVec<HirExpr, kMaxExprs> exprs;
     FixedVec<HirLocal, kMaxLocals> locals;
     FixedVec<HirGuard, kMaxGuards> guards;
+    FixedVec<DecoratorRef, kMaxDecorators> decorators;
     HirControl control{};
     u32 error_variant_index = 0xffffffffu;
 
@@ -611,6 +637,7 @@ struct HirRoute {
           exprs(other.exprs),
           locals(other.locals),
           guards(other.guards),
+          decorators(other.decorators),
           control(other.control),
           error_variant_index(other.error_variant_index) {
         rebase_from(other);
@@ -623,6 +650,7 @@ struct HirRoute {
         exprs = other.exprs;
         locals = other.locals;
         guards = other.guards;
+        decorators = other.decorators;
         control = other.control;
         error_variant_index = other.error_variant_index;
         rebase_from(other);
@@ -635,6 +663,7 @@ struct HirRoute {
           exprs(other.exprs),
           locals(other.locals),
           guards(other.guards),
+          decorators(other.decorators),
           control(other.control),
           error_variant_index(other.error_variant_index) {
         rebase_from(other);
@@ -647,6 +676,7 @@ struct HirRoute {
         exprs = other.exprs;
         locals = other.locals;
         guards = other.guards;
+        decorators = other.decorators;
         control = other.control;
         error_variant_index = other.error_variant_index;
         rebase_from(other);

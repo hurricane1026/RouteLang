@@ -176,9 +176,14 @@ target_include_directories(rut_jit PUBLIC
     ${LLVM_INCLUDE_DIRS}
 )
 
-# LLVM on this system is a single shared lib (-lLLVM-N).
-# llvm_map_components_to_libnames resolves to the shared lib automatically.
-llvm_map_components_to_libnames(LLVM_LIBS core orcjit orcshared orctargetprocess native support)
+# Prefer the monolithic shared LLVM dylib when the packaged config exposes it.
+# This avoids depending on broken per-component static archives in environments
+# where LLVM is installed in shared mode.
+if(LLVM_LINK_LLVM_DYLIB AND TARGET LLVM)
+    set(LLVM_LIBS LLVM)
+else()
+    llvm_map_components_to_libnames(LLVM_LIBS core orcjit orcshared orctargetprocess native support)
+endif()
 target_link_libraries(rut_jit ${LLVM_LIBS})
 
 # JIT .cc files may need LLVM definitions that conflict with -fno-rtti.

@@ -227,6 +227,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
         v.type = MirTypeKind::Struct;
         v.struct_index = expr.struct_index;
         v.str_value = expr.str_value;
+        apply_expr_shape_if_available(module, expr, &v);
         for (u32 i = 0; i < expr.field_inits.len; i++) {
             auto field_value = mir_value(*expr.field_inits[i].value, module, fn);
             if (!field_value) return core::make_unexpected(field_value.error());
@@ -269,6 +270,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
         v.error_variant_index = expr.error_variant_index;
         v.error_case_index = expr.error_case_index;
         v.int_value = expr.int_value;
+        apply_expr_shape_if_available(module, expr, &v);
         if (expr.lhs != nullptr) {
             auto payload = mir_value(*expr.lhs, module, fn);
             if (!payload) return core::make_unexpected(payload.error());

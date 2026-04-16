@@ -147,6 +147,15 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    if (!hir) {
+        std::fprintf(stderr,
+                     "hir error code=%d detail=%.*s span=(%u,%u)\n",
+                     static_cast<int>(hir.error().code),
+                     static_cast<int>(hir.error().detail.len),
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    }
     REQUIRE(hir);
     CHECK(hir->functions.len >= 1u);
 }
@@ -302,6 +311,15 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    if (!hir) {
+        rut::test::out("import_namespace_default_method_struct_return err=");
+        rut::test::out_int(static_cast<int>(hir.error().code));
+        rut::test::out(" line=");
+        rut::test::out_int(static_cast<int>(hir.error().span.line));
+        rut::test::out(" col=");
+        rut::test::out_int(static_cast<int>(hir.error().span.col));
+        rut::test::out("\n");
+    }
     REQUIRE(hir);
 }
 
@@ -355,6 +373,15 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    if (!hir) {
+        rut::test::out("import_namespace_default_method_struct_return err=");
+        rut::test::out_int(static_cast<int>(hir.error().code));
+        rut::test::out(" line=");
+        rut::test::out_int(static_cast<int>(hir.error().span.line));
+        rut::test::out(" col=");
+        rut::test::out_int(static_cast<int>(hir.error().span.col));
+        rut::test::out("\n");
+    }
     REQUIRE(hir);
 }
 TEST(frontend, import_relative_file_merges_imported_struct_symbol) {
@@ -376,8 +403,74 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    if (!hir) std::fprintf(stderr,
+                           "import_namespace_default_method_struct_return err=%d line=%u col=%u\n",
+                           static_cast<int>(hir.error().code),
+                           hir.error().span.line,
+                           hir.error().span.col);
     REQUIRE(hir);
 }
+
+TEST(frontend, import_relative_file_merges_imported_struct_tuple_of_struct_field_symbol) {
+    const std::string dir = "/tmp/rut_import_struct_tuple_of_struct_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/types.rut", std::ios::binary);
+        out << "struct Item { value: i32 }\n";
+        out << "struct Wrap { pair: (Item, i32) }\n";
+    }
+    const auto src = R"rut(
+import "types.rut"
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE(hir->structs.len >= 2u);
+    const auto& wrap = hir->structs[1];
+    REQUIRE_EQ(wrap.fields.len, 1u);
+    const auto& pair = wrap.fields[0];
+    CHECK(pair.type == HirTypeKind::Tuple);
+    REQUIRE_EQ(pair.tuple_len, 2u);
+    CHECK(pair.tuple_types[0] == HirTypeKind::Struct);
+    CHECK(pair.tuple_struct_indices[0] == 0u);
+}
+
+TEST(frontend, import_relative_file_merges_imported_struct_tuple_of_variant_field_symbol) {
+    const std::string dir = "/tmp/rut_import_struct_tuple_of_variant_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/types.rut", std::ios::binary);
+        out << "variant State { ok, err }\n";
+        out << "struct Wrap { pair: (State, i32) }\n";
+    }
+    const auto src = R"rut(
+import "types.rut"
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE(hir->structs.len >= 1u);
+    const auto& wrap = hir->structs[0];
+    REQUIRE_EQ(wrap.fields.len, 1u);
+    const auto& pair = wrap.fields[0];
+    CHECK(pair.type == HirTypeKind::Tuple);
+    REQUIRE_EQ(pair.tuple_len, 2u);
+    CHECK(pair.tuple_types[0] == HirTypeKind::Variant);
+    CHECK(pair.tuple_variant_indices[0] == 0u);
+}
+
 TEST(frontend, import_relative_file_merges_imported_variant_symbol) {
     const std::string dir = "/tmp/rut_import_variant_frontend";
     std::filesystem::create_directories(dir);
@@ -397,6 +490,15 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    if (!hir) {
+        std::fprintf(stderr,
+                     "hir error code=%d detail=%.*s span=(%u,%u)\n",
+                     static_cast<int>(hir.error().code),
+                     static_cast<int>(hir.error().detail.len),
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    }
     REQUIRE(hir);
 }
 TEST(frontend, import_relative_file_merges_imported_variant_tuple_of_struct_payload_symbol) {
@@ -448,6 +550,15 @@ route GET "/users" { if run(Box(value: 1)) == 1 { return 200 } else { return 500
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    if (!hir) {
+        std::fprintf(stderr,
+                     "hir error code=%d detail=%.*s span=(%u,%u)\n",
+                     static_cast<int>(hir.error().code),
+                     static_cast<int>(hir.error().detail.len),
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    }
     REQUIRE(hir);
 }
 TEST(frontend, import_relative_file_merges_imported_impl_symbol) {
@@ -472,6 +583,81 @@ route GET "/users" { if run(Box(value: 1)) == 1 { return 200 } else { return 500
     REQUIRE(ast);
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_impl_symbol) {
+    const std::string dir = "/tmp/rut_import_generic_impl_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 200\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" { if run(Box(value: 123)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_remaps_imported_concrete_generic_impl_target) {
+    const std::string dir = "/tmp/rut_import_concrete_generic_impl_target_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<i32> impl Hashable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 7)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+
+    const u32 protocol_index = [&]() {
+        for (u32 i = 0; i < hir->protocols.len; i++) {
+            if (hir->protocols[i].name.eq(lit("Hashable"))) return i;
+        }
+        return hir->protocols.len;
+    }();
+    REQUIRE(protocol_index < hir->protocols.len);
+    const HirImpl* imported_impl = nullptr;
+    for (u32 i = 0; i < hir->impls.len; i++) {
+        const auto& impl = hir->impls[i];
+        if (impl.protocol_index != protocol_index || impl.is_generic_template || impl.type != HirTypeKind::Struct)
+            continue;
+        if (impl.struct_index >= hir->structs.len) continue;
+        const auto& st = hir->structs[impl.struct_index];
+        if (!st.name.eq(lit("Box")) || st.template_struct_index == 0xffffffffu) continue;
+        imported_impl = &impl;
+        break;
+    }
+    REQUIRE(imported_impl != nullptr);
+    REQUIRE(imported_impl->struct_index < hir->structs.len);
+    const auto& concrete = hir->structs[imported_impl->struct_index];
+    REQUIRE(concrete.template_struct_index < hir->structs.len);
+    REQUIRE(concrete.instance_type_arg_count == 1);
+    CHECK(concrete.instance_type_args[0] == HirTypeKind::I32);
+    CHECK(concrete.instance_shape_indices[0] != 0xffffffffu);
+    CHECK(hir->type_shapes[concrete.instance_shape_indices[0]].type == HirTypeKind::I32);
 }
 TEST(frontend, analyze_rejects_local_impl_overlapping_imported_impl_for_same_protocol_and_type) {
     const std::string dir = "/tmp/rut_import_impl_conflict_frontend";
@@ -498,6 +684,120 @@ route GET "/users" { return 200 }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     CHECK(!hir);
 }
+TEST(frontend, analyze_rejects_local_impl_overlapping_imported_concrete_generic_impl) {
+    const std::string dir = "/tmp/rut_import_concrete_generic_impl_conflict_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<i32> impl Hashable {\n";
+        out << "    func hash(self: Box<i32>) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+Box<i32> impl Hashable {
+    func hash(self: Box<i32>) -> i32 => 0
+}
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    CHECK(!hir);
+}
+
+TEST(frontend, import_relative_file_allows_distinct_local_concrete_generic_impl) {
+    const std::string dir = "/tmp/rut_import_concrete_generic_impl_distinct_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<i32> impl Hashable {\n";
+        out << "    func hash(self: Box<i32>) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+Box<str> impl Hashable {
+    func hash(self: Box<str>) -> i32 => 200
+}
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: "ok")) == 200 { return 200 } else { return 500 }
+}
+    )rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_dispatches_distinct_concrete_generic_impls) {
+    const std::string dir = "/tmp/rut_import_concrete_generic_impl_dual_dispatch_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<i32> impl Hashable {\n";
+        out << "    func hash(self: Box<i32>) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+Box<str> impl Hashable {
+    func hash(self: Box<str>) -> i32 => 200
+}
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 7)) == 7 {
+        if run(Box(value: "ok")) == 200 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, analyze_rejects_imported_concrete_generic_impl_for_distinct_local_instance) {
+    const std::string dir = "/tmp/rut_import_concrete_generic_impl_distinct_instance_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<i32> impl Hashable {\n";
+        out << "    func hash(self: Box<i32>) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: "ok")) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    CHECK(!hir);
+}
+
 TEST(frontend, analyze_rejects_local_concrete_impl_overlapping_imported_generic_impl) {
     const std::string dir = "/tmp/rut_import_impl_overlap_frontend";
     std::filesystem::create_directories(dir);
@@ -523,6 +823,57 @@ route GET "/users" { return 200 }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     CHECK(!hir);
 }
+
+TEST(frontend, analyze_rejects_local_generic_impl_overlapping_imported_generic_impl) {
+    const std::string dir = "/tmp/rut_import_generic_impl_overlap_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 1\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+Box<U> impl Hashable {
+    func hash(self: Box<U>) -> i32 => 200
+}
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_rejects_local_concrete_impl_overlapping_imported_generic_empty_impl) {
+    const std::string dir = "/tmp/rut_import_generic_empty_impl_overlap_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+Box<i32> impl Hashable {
+    func hash(self: Box<i32>) -> i32 => self.value
+}
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    CHECK(!hir);
+}
+
 TEST(frontend, analyze_rejects_imported_impl_conflict_across_files_for_same_protocol_and_type) {
     const std::string dir = "/tmp/rut_import_impl_imported_conflict_frontend";
     std::filesystem::create_directories(dir);
@@ -575,6 +926,366 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch_with_parameter) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_param_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder { func add(x: i32) -> i32 => x }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_optional_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_optional_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => nil }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_error_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_error_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => error(.timeout) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_tuple_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_tuple_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func second(a: i32, b: i32) -> i32 => b
+func run<T: Pairable>(x: T) -> i32 => x.pair() | second(_2, _1)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func second(a: i32, b: i32) -> i32 => b
+func run<T: Pairable>(x: T) -> i32 => x.pair() | second(_2, _1)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_equality) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_eq_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Pairable>(x: T) -> (i32, i32) => x.pair()
+route GET "/users" { if run(Box(value: 1)) == (200, 500) { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_ordering) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_ord_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Pairable>(x: T) -> (i32, i32) => x.pair()
+route GET "/users" { if run(Box(value: 1)) < (200, 600) { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code()
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code()
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch_with_parameter) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_block_param_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch_with_parameter) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_block_param_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_if_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_if_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code(ok: bool) -> i32 { if ok { 200 } else { 500 } } }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code(true)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_if_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_if_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code(ok: bool) -> i32 { if ok { 200 } else { 500 } } }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code(true)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, lower_to_rir_supports_imported_generic_empty_impl_for_error_default_method_guard_match) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_error_guard_match_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code(ok: bool) -> i32 { if ok { 200 } else { error(.timeout) } } }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 {
+    let failed = x.code(false)
+    guard match failed else { case .timeout => 401 case _ => 500 }
+    200
+}
+route GET "/users" { if run(Box(value: 1)) == 401 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, selective_import_relative_file_merges_selected_function_symbol) {
     const std::string dir = "/tmp/rut_selective_import_frontend";
     std::filesystem::create_directories(dir);
@@ -1949,6 +2660,15 @@ TEST(frontend, variant_match_all_cases_without_wildcard_is_exhaustive) {
     REQUIRE(mir);
     FrontendRirModule rir{};
     auto lowered = lower_to_rir(mir.value(), rir);
+    if (!lowered) {
+        std::fprintf(stderr,
+                     "imported_optional_default lowered err=%d detail=%.*s span=(%u,%u)\n",
+                     static_cast<int>(lowered.error().code),
+                     static_cast<int>(lowered.error().detail.len),
+                     lowered.error().detail.ptr,
+                     lowered.error().span.line,
+                     lowered.error().span.col);
+    }
     REQUIRE(lowered);
     rir.destroy();
 }
@@ -2019,6 +2739,15 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_if) {
     REQUIRE(mir);
     FrontendRirModule rir{};
     auto lowered = lower_to_rir(mir.value(), rir);
+    if (!lowered) {
+        std::fprintf(stderr,
+                     "imported_error_default lowered err=%d detail=%.*s span=(%u,%u)\n",
+                     static_cast<int>(lowered.error().code),
+                     static_cast<int>(lowered.error().detail.len),
+                     lowered.error().detail.ptr,
+                     lowered.error().span.line,
+                     lowered.error().span.col);
+    }
     REQUIRE(lowered);
     rir.destroy();
 }
@@ -2193,6 +2922,662 @@ TEST(frontend, route_match_struct_payload_binding_preserves_shape) {
              static_cast<u8>(HirMatchArm::BodyKind::If));
 }
 
+TEST(frontend, route_match_nested_struct_payload_projection) {
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "struct Outer { inner: Box }\n"
+        "variant Result { ok(Outer), err }\n"
+        "route GET \"/users\" { let state = Result.ok(Outer(inner: Box(value: 200))) match state { case .ok(v): { let code = v.inner.value if code == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::I32);
+}
+
+TEST(frontend, import_namespace_route_match_nested_struct_payload_projection) {
+    const std::string dir = "/tmp/rut_import_namespace_match_nested_struct_payload_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+        out << "struct Outer { inner: Box }\n";
+        out << "variant Result { ok(Outer), err }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let state = proto.Result.ok(proto.Outer(inner: proto.Box(value: 200)))
+    match state {
+    case .ok(v): {
+        let code = v.inner.value
+        if code == 200 { return 200 } else { return 500 }
+    }
+    case .err: return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::I32);
+}
+
+TEST(frontend, import_namespace_match_payload_is_struct_and_carrier_ready_in_mir) {
+    const std::string dir = "/tmp/rut_import_namespace_match_payload_mir_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+        out << "struct Outer { inner: Box }\n";
+        out << "variant Result { ok(Outer), err }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let state = proto.Result.ok(proto.Outer(inner: proto.Box(value: 200)))
+    match state {
+    case .ok(v): {
+        let code = v.inner.value
+        if code == 200 { return 200 } else { return 500 }
+    }
+    case .err: return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    bool found = false;
+    for (u32 fi = 0; fi < mir->functions.len; fi++) {
+        const auto& fn = mir->functions[fi];
+        for (u32 vi = 0; vi < fn.values.len; vi++) {
+            const auto& value = fn.values[vi];
+            if (value.kind != MirValueKind::MatchPayload) continue;
+            CHECK_EQ(value.type, MirTypeKind::Struct);
+            CHECK(value.struct_index < mir->structs.len);
+            CHECK(value.shape_index != 0xffffffffu);
+            REQUIRE(value.shape_index < mir->type_shapes.len);
+            const auto& shape = mir->type_shapes[value.shape_index];
+            CHECK_EQ(shape.type, MirTypeKind::Struct);
+            CHECK(shape.struct_index < mir->structs.len);
+            CHECK(shape.is_concrete);
+            CHECK(shape.carrier_ready);
+            found = true;
+        }
+    }
+    CHECK(found);
+}
+
+TEST(frontend, import_relative_file_preserves_imported_function_signature_shape_indices) {
+    const std::string dir = "/tmp/rut_import_function_signature_shape_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result<T> { ok(T), err }\n";
+        out << "struct Holder<T> { state: Result<T> }\n";
+        out << "func unwrap(x: Holder<i32>) -> Result<i32> => x.state\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+
+    const HirFunction* imported_fn = nullptr;
+    for (u32 i = 0; i < hir->functions.len; i++) {
+        if (hir->functions[i].name.eq(lit("unwrap"))) {
+            imported_fn = &hir->functions[i];
+            break;
+        }
+    }
+    REQUIRE(imported_fn != nullptr);
+    REQUIRE_EQ(imported_fn->params.len, 1u);
+    CHECK_EQ(imported_fn->params[0].type, HirTypeKind::Struct);
+    CHECK(imported_fn->params[0].shape_index != 0xffffffffu);
+    CHECK(imported_fn->params[0].type_args[0].shape_index != 0xffffffffu);
+    CHECK_EQ(imported_fn->return_type, HirTypeKind::Variant);
+    CHECK(imported_fn->return_shape_index != 0xffffffffu);
+    CHECK(imported_fn->return_type_args[0].shape_index != 0xffffffffu);
+}
+
+TEST(frontend, import_relative_file_preserves_imported_function_body_shape_indices_in_hir) {
+    const std::string dir = "/tmp/rut_import_function_body_shape_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+        out << "variant Result { ok, err }\n";
+        out << "func makeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { Box(value: 500) } }\n";
+        out << "func maybe(ok: bool) { if ok { 200 } else { nil } }\n";
+        out << "func pickOr(ok: bool) -> i32 => or(maybe(ok), 500)\n";
+        out << "func pickMatch(x: Result) -> i32 {\n";
+        out << "    match x {\n";
+        out << "        case .ok => 200\n";
+        out << "        case .err => 500\n";
+        out << "    }\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+
+    const HirFunction* make_box = nullptr;
+    const HirFunction* pick_or = nullptr;
+    const HirFunction* pick_match = nullptr;
+    for (u32 i = 0; i < hir->functions.len; i++) {
+        if (hir->functions[i].name.eq(lit("makeBox"))) make_box = &hir->functions[i];
+        if (hir->functions[i].name.eq(lit("pickOr"))) pick_or = &hir->functions[i];
+        if (hir->functions[i].name.eq(lit("pickMatch"))) pick_match = &hir->functions[i];
+    }
+    REQUIRE(make_box != nullptr);
+    REQUIRE(pick_or != nullptr);
+    REQUIRE(pick_match != nullptr);
+
+    CHECK_EQ(static_cast<u8>(make_box->body.kind), static_cast<u8>(HirExprKind::IfElse));
+    CHECK(make_box->body.shape_index != 0xffffffffu);
+    REQUIRE(make_box->body.shape_index < hir->type_shapes.len);
+    CHECK_EQ(hir->type_shapes[make_box->body.shape_index].type, HirTypeKind::Struct);
+    CHECK(hir->type_shapes[make_box->body.shape_index].struct_index < hir->structs.len);
+
+    CHECK_EQ(static_cast<u8>(pick_or->body.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK(pick_or->body.shape_index != 0xffffffffu);
+    REQUIRE(pick_or->body.shape_index < hir->type_shapes.len);
+    CHECK_EQ(hir->type_shapes[pick_or->body.shape_index].type, HirTypeKind::I32);
+    CHECK(hir->type_shapes[pick_or->body.shape_index].is_concrete);
+
+    CHECK_EQ(static_cast<u8>(pick_match->body.kind), static_cast<u8>(HirExprKind::IfElse));
+    CHECK(pick_match->body.shape_index != 0xffffffffu);
+    REQUIRE(pick_match->body.shape_index < hir->type_shapes.len);
+    CHECK_EQ(hir->type_shapes[pick_match->body.shape_index].type, HirTypeKind::I32);
+    CHECK(hir->type_shapes[pick_match->body.shape_index].is_concrete);
+}
+
+TEST(frontend, import_relative_file_preserves_imported_protocol_default_method_wrapper_metadata_in_hir) {
+    const std::string dir = "/tmp/rut_import_protocol_default_wrapper_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => nil }\n";
+        out << "protocol MaybeFail { func code() -> i32 => error(.timeout) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+        out << "Box<T> impl MaybeFail {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+
+    const auto* maybe_code = [&]() -> const HirProtocol* {
+        for (u32 i = 0; i < hir->protocols.len; i++) {
+            if (hir->protocols[i].name.eq(lit("MaybeCode"))) return &hir->protocols[i];
+        }
+        return nullptr;
+    }();
+    REQUIRE(maybe_code != nullptr);
+    const auto* maybe_code_req = [&]() -> const HirProtocol::MethodDecl* {
+        for (u32 i = 0; i < maybe_code->methods.len; i++) {
+            if (maybe_code->methods[i].name.eq(lit("code"))) return &maybe_code->methods[i];
+        }
+        return nullptr;
+    }();
+    REQUIRE(maybe_code_req != nullptr);
+    CHECK(maybe_code_req->function_index != 0xffffffffu);
+    CHECK(maybe_code_req->return_may_nil);
+    CHECK_FALSE(maybe_code_req->return_may_error);
+
+    const auto* maybe_fail = [&]() -> const HirProtocol* {
+        for (u32 i = 0; i < hir->protocols.len; i++) {
+            if (hir->protocols[i].name.eq(lit("MaybeFail"))) return &hir->protocols[i];
+        }
+        return nullptr;
+    }();
+    REQUIRE(maybe_fail != nullptr);
+    const auto* maybe_fail_req = [&]() -> const HirProtocol::MethodDecl* {
+        for (u32 i = 0; i < maybe_fail->methods.len; i++) {
+            if (maybe_fail->methods[i].name.eq(lit("code"))) return &maybe_fail->methods[i];
+        }
+        return nullptr;
+    }();
+    REQUIRE(maybe_fail_req != nullptr);
+    CHECK(maybe_fail_req->function_index != 0xffffffffu);
+    CHECK_FALSE(maybe_fail_req->return_may_nil);
+    CHECK(maybe_fail_req->return_may_error);
+    CHECK(maybe_fail_req->return_error_variant_index != 0xffffffffu);
+}
+
+TEST(frontend, imported_generic_receiver_protocol_call_preserves_default_method_wrapper_metadata_in_hir) {
+    const std::string dir = "/tmp/rut_import_protocol_call_wrapper_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => nil }\n";
+        out << "protocol MaybeFail { func code() -> i32 => error(.timeout) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+        out << "Box<T> impl MaybeFail {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func runOpt<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+func runErr<T: MaybeFail>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" {
+    if runOpt(Box(value: 1)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+
+    const auto* run_opt = [&]() -> const HirFunction* {
+        for (u32 i = 0; i < hir->functions.len; i++) {
+            if (hir->functions[i].name.eq(lit("runOpt"))) return &hir->functions[i];
+        }
+        return nullptr;
+    }();
+    REQUIRE(run_opt != nullptr);
+    REQUIRE(run_opt->body.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(run_opt->body.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(run_opt->body.lhs->kind), static_cast<u8>(HirExprKind::ProtocolCall));
+    CHECK(run_opt->body.lhs->may_nil);
+    CHECK_FALSE(run_opt->body.lhs->may_error);
+
+    const auto* run_err = [&]() -> const HirFunction* {
+        for (u32 i = 0; i < hir->functions.len; i++) {
+            if (hir->functions[i].name.eq(lit("runErr"))) return &hir->functions[i];
+        }
+        return nullptr;
+    }();
+    REQUIRE(run_err != nullptr);
+    REQUIRE(run_err->body.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(run_err->body.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(run_err->body.lhs->kind), static_cast<u8>(HirExprKind::ProtocolCall));
+    CHECK_FALSE(run_err->body.lhs->may_nil);
+    CHECK(run_err->body.lhs->may_error);
+    CHECK(run_err->body.lhs->error_variant_index != 0xffffffffu);
+}
+
+TEST(frontend, import_relative_file_inlines_imported_generic_empty_impl_default_method_wrappers_in_route_hir) {
+    const std::string dir = "/tmp/rut_import_protocol_call_wrapper_route_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => nil }\n";
+        out << "protocol MaybeFail { func code() -> i32 => error(.timeout) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+        out << "Box<T> impl MaybeFail {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func runOpt<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+func runErr<T: MaybeFail>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" {
+    let a = runOpt(Box(value: 1))
+    let b = runErr(Box(value: 1))
+    if a == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+
+    const auto& opt = hir->routes[0].locals[0].init;
+    CHECK_EQ(static_cast<u8>(opt.kind), static_cast<u8>(HirExprKind::Or));
+    REQUIRE(opt.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(opt.lhs->kind), static_cast<u8>(HirExprKind::Nil));
+    CHECK(opt.lhs->may_nil);
+    CHECK_FALSE(opt.lhs->may_error);
+
+    const auto& err = hir->routes[0].locals[1].init;
+    CHECK_EQ(static_cast<u8>(err.kind), static_cast<u8>(HirExprKind::Or));
+    REQUIRE(err.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(err.lhs->kind), static_cast<u8>(HirExprKind::Error));
+    CHECK_FALSE(err.lhs->may_nil);
+    CHECK(err.lhs->may_error);
+    CHECK(err.lhs->error_variant_index != 0xffffffffu);
+}
+
+TEST(frontend, import_relative_file_preserves_imported_decl_type_arg_shape_indices_in_hir) {
+    const std::string dir = "/tmp/rut_import_decl_type_arg_shapes_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Item { value: i32 }\n";
+        out << "struct Wrap<T> { value: T }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "struct Holder { value: Box<Wrap<Item>> }\n";
+        out << "variant Result { ok(Box<Wrap<Item>>), err }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+
+    const auto* holder = [&]() -> const HirStruct* {
+        for (u32 i = 0; i < hir->structs.len; i++) {
+            if (hir->structs[i].name.eq(lit("Holder"))) return &hir->structs[i];
+        }
+        return nullptr;
+    }();
+    REQUIRE(holder != nullptr);
+    const auto& field = holder->fields[0];
+    REQUIRE(field.type_arg_count == 1);
+    CHECK(field.type_args[0].shape_index != 0xffffffffu);
+    CHECK(hir->type_shapes[field.type_args[0].shape_index].type == HirTypeKind::Struct);
+
+    const auto* result = [&]() -> const HirVariant* {
+        for (u32 i = 0; i < hir->variants.len; i++) {
+            if (hir->variants[i].name.eq(lit("Result"))) return &hir->variants[i];
+        }
+        return nullptr;
+    }();
+    REQUIRE(result != nullptr);
+    const auto& payload = result->cases[0];
+    REQUIRE(payload.payload_type_arg_count == 1);
+    CHECK(payload.payload_type_args[0].shape_index != 0xffffffffu);
+    CHECK(hir->type_shapes[payload.payload_type_args[0].shape_index].type == HirTypeKind::Struct);
+}
+
+TEST(frontend, lower_to_rir_supports_imported_function_body_struct_init_projection) {
+    const std::string dir = "/tmp/rut_import_function_body_struct_init_lower_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+        out << "func make() -> Box => Box(value: 200)\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let box = make()
+    if box.value == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_supports_imported_function_body_variant_case_projection) {
+    const std::string dir = "/tmp/rut_import_function_body_variant_case_lower_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result { ok(i32), err }\n";
+        out << "struct Holder { state: Result }\n";
+        out << "func make() -> Result => Result.ok(200)\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let holder = proto.Holder(state: make())
+    if holder.state == proto.Result.ok(200) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_supports_imported_function_body_ifelse_struct_projection) {
+    const std::string dir = "/tmp/rut_import_function_body_ifelse_struct_lower_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+        out << "func make(ok: bool) -> Box {\n";
+        out << "    if ok { Box(value: 200) } else { Box(value: 500) }\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let box = make(true)
+    if box.value == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_supports_imported_function_body_or) {
+    const std::string dir = "/tmp/rut_import_function_body_or_lower_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "func maybe(ok: bool) { if ok { 200 } else { nil } }\n";
+        out << "func pick(ok: bool) -> i32 => or(maybe(ok), 500)\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let code = pick(true)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_supports_imported_generic_empty_impl_for_optional_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_optional_lower_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => nil }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_supports_imported_generic_empty_impl_for_error_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_error_lower_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => error(.timeout) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_supports_imported_function_body_match) {
+    const std::string dir = "/tmp/rut_import_function_body_match_lower_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result { ok, err }\n";
+        out << "func pick(x: Result) -> i32 {\n";
+        out << "    match x {\n";
+        out << "        case .ok => 200\n";
+        out << "        case .err => 500\n";
+        out << "    }\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let code = pick(proto.Result.ok)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_supports_import_namespace_route_match_nested_struct_payload_projection) {
+    const std::string dir = "/tmp/rut_import_namespace_match_nested_struct_payload_lower_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+        out << "struct Outer { inner: Box }\n";
+        out << "variant Result { ok(Outer), err }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let state = proto.Result.ok(proto.Outer(inner: proto.Box(value: 200)))
+    match state {
+    case .ok(v): {
+        let code = v.inner.value
+        if code == 200 { return 200 } else { return 500 }
+    }
+    case .err: return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, route_guard_bound_struct_preserves_shape_index) {
     const char* src =
         "struct Box { value: i32 }\n"
@@ -2297,6 +3682,9 @@ route GET "/users" {
     CHECK_EQ(inst.instance_type_arg_count, 1u);
     CHECK_EQ(inst.instance_type_args[0], HirTypeKind::Struct);
     CHECK_NE(inst.instance_shape_indices[0], 0xffffffffu);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_NE(hir->routes[0].locals[0].shape_index, 0xffffffffu);
+    CHECK_NE(hir->routes[0].locals[0].init.shape_index, 0xffffffffu);
 }
 TEST(frontend, generic_variant_constructor_infers_type_argument_from_single_payload_case) {
     const auto src = R"rut(
@@ -3089,6 +4477,126 @@ route GET "/users" {
     CHECK_EQ(hir->structs[0].fields[0].type, HirTypeKind::Variant);
     CHECK_EQ(hir->structs[0].fields[0].variant_index, 1u);
 }
+
+TEST(frontend, variant_struct_field_projection_supports_equality) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+struct Holder { state: Result<i32> }
+route GET "/users" {
+    let holder = Holder(state: Result.ok(200))
+    if holder.state == Result.ok(200) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, variant_struct_field_projection_supports_ordering) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+struct Holder { state: Result<i32> }
+route GET "/users" {
+    let holder = Holder(state: Result.ok(200))
+    if holder.state < Result.ok(500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_namespace_variant_struct_field_projection_supports_equality) {
+    const std::string dir = "/tmp/rut_import_namespace_variant_field_eq_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result { ok(i32), err }\n";
+        out << "struct Holder { state: Result }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let holder = proto.Holder(state: proto.Result.ok(200))
+    if holder.state == proto.Result.ok(200) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_namespace_variant_struct_field_projection_supports_ordering) {
+    const std::string dir = "/tmp/rut_import_namespace_variant_field_ord_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result { ok(i32), err }\n";
+        out << "struct Holder { state: Result }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let holder = proto.Holder(state: proto.Result.ok(200))
+    if holder.state < proto.Result.ok(500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, tuple_of_struct_field_projection_supports_ordering) {
+    const auto src = R"rut(
+struct Item { value: i32 }
+struct Holder { pair: (Item, i32) }
+route GET "/users" {
+    let holder = Holder(pair: (Item(value: 200), 500))
+    if holder.pair < (Item(value: 200), 600) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, import_namespace_tuple_of_struct_field_projection_supports_ordering) {
+    const std::string dir = "/tmp/rut_import_namespace_tuple_struct_field_ord_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Item { value: i32 }\n";
+        out << "struct Holder { pair: (Item, i32) }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let holder = proto.Holder(pair: (proto.Item(value: 200), 500))
+    if holder.pair < (proto.Item(value: 200), 600) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
 TEST(frontend, concrete_generic_type_refs_are_supported_in_variant_payloads) {
     const auto src = R"rut(
 variant Result<T> { ok(T), err }
@@ -3285,6 +4793,9 @@ route GET "/users" {
     CHECK_EQ(inst.instance_type_arg_count, 1u);
     CHECK_EQ(inst.instance_type_args[0], HirTypeKind::Variant);
     CHECK_NE(inst.instance_shape_indices[0], 0xffffffffu);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_NE(hir->routes[0].locals[0].shape_index, 0xffffffffu);
+    CHECK_NE(hir->routes[0].locals[0].init.shape_index, 0xffffffffu);
 }
 TEST(frontend, concrete_nested_generic_variant_type_ref_records_instance_shape_index) {
     const auto src = R"rut(
@@ -3445,6 +4956,37 @@ TEST(frontend, plain_struct_tuple_field_can_flow_into_pipe_slots) {
     REQUIRE(lowered);
     CHECK(block_has_op(rir.module.functions[0].blocks[0], rir::Opcode::StructField));
     rir.destroy();
+}
+
+TEST(frontend, custom_error_nested_struct_field_projection) {
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "struct AuthError { err: Error, inner: Box }\n"
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", inner: Box(value: 200)) let code = failed.inner.value if code == 200 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir.value().routes[0].locals.len, 2u);
+    CHECK_EQ(hir.value().routes[0].locals[1].type, HirTypeKind::I32);
+}
+
+TEST(frontend, nested_struct_field_projection_preserves_projected_struct_type) {
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "struct Outer { inner: Box }\n"
+        "route GET \"/users\" { let outer = Outer(inner: Box(value: 200)) let code = outer.inner.value if code == 200 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Struct);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::I32);
 }
 TEST(frontend, plain_struct_tuple_of_struct_field_projection_preserves_struct_slots) {
     const char* src =
@@ -5141,6 +6683,73 @@ route GET "/users" { return 200 }
     CHECK_EQ(body.generic_protocol_count, 1u);
     CHECK_NE(body.generic_protocol_indices[0], 0xffffffffu);
 }
+TEST(frontend, generic_protocol_constraint_survives_match_payload_binding_in_hir) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+variant Wrap<T> { some(T) }
+func unwrap<T: Hashable>(state: Wrap<T>) -> T {
+    match state {
+    case .some(v) => v
+    }
+}
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    const auto& body = hir->functions[0].body;
+    CHECK_EQ(body.type, HirTypeKind::Generic);
+    CHECK_EQ(body.generic_protocol_count, 1u);
+    CHECK_NE(body.generic_protocol_indices[0], 0xffffffffu);
+}
+TEST(frontend, generic_protocol_constraint_survives_struct_field_projection_in_hir) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+struct Holder<T> { state: T }
+func unwrap<T: Hashable>(x: Holder<T>) -> i32 => x.state.hash()
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    const auto& body = hir->functions[0].body;
+    REQUIRE(body.lhs != nullptr);
+    CHECK_EQ(body.lhs->type, HirTypeKind::Generic);
+    CHECK_EQ(body.lhs->generic_protocol_count, 1u);
+    CHECK_NE(body.lhs->generic_protocol_indices[0], 0xffffffffu);
+}
+
+TEST(frontend, source_struct_field_projection_supports_method_dispatch) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+struct Box { value: i32 }
+Box impl Hashable { func hash(self: Box) -> i32 => self.value }
+struct Holder { state: Box }
+route GET "/users" {
+    let holder = Holder(state: Box(value: 200))
+    let code = holder.state.hash()
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
 TEST(frontend, concretized_generic_call_result_clears_protocol_constraint_metadata) {
     const auto src = R"rut(
 protocol Hashable {
@@ -5952,6 +7561,58 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
+TEST(frontend, source_generic_receiver_custom_protocol_default_method_supports_tuple_return) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+func second(a: i32, b: i32) -> i32 => b
+func run<T: Pairable>(x: T) -> i32 => x.pair() | second(_2, _1)
+route GET "/users" {
+    if run(Box(value: 7)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_receiver_custom_protocol_default_method_tuple_return_supports_ordering) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+func run<T: Pairable>(x: T) -> (i32, i32) => x.pair()
+route GET "/users" {
+    if run(Box(value: 7)) < (200, 600) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_receiver_custom_protocol_default_method_tuple_return_supports_equality) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+func run<T: Pairable>(x: T) -> (i32, i32) => x.pair()
+route GET "/users" {
+    if run(Box(value: 7)) == (200, 500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
 TEST(frontend, analyze_rejects_empty_impl_when_protocol_method_has_no_default_body) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 }
@@ -6020,6 +7681,38 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
+TEST(frontend, source_custom_protocol_default_method_tuple_return_supports_ordering) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+route GET "/users" {
+    if Box(value: 7).pair() < (200, 600) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_custom_protocol_default_method_tuple_return_supports_equality) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+route GET "/users" {
+    if Box(value: 7).pair() == (200, 500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
 TEST(frontend, source_custom_protocol_default_method_supports_optional_return) {
     const auto src = R"rut(
 protocol MaybeCode { func code() -> i32 => nil }
@@ -6066,6 +7759,113 @@ struct Box { value: i32 }
 Box impl MaybeCode {}
 route GET "/users" {
     if Box(value: 7).code() == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, source_generic_receiver_custom_protocol_default_method_supports_block_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code() -> i32 {
+        let x = 200
+        x
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode {}
+func run<T: MaybeCode>(x: T) -> i32 => x.code()
+route GET "/users" {
+    if run(Box(value: 7)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_custom_protocol_default_method_supports_block_body_with_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Adder {}
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_receiver_custom_protocol_default_method_supports_block_body_with_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Adder {}
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" {
+    if run(Box(value: 7)) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_custom_protocol_default_method_supports_if_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode {}
+route GET "/users" {
+    if Box(value: 7).code(true) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_receiver_custom_protocol_default_method_supports_if_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode {}
+func run<T: MaybeCode>(x: T) -> i32 => x.code(true)
+route GET "/users" {
+    if run(Box(value: 7)) == 200 { return 200 } else { return 500 }
 }
 )rut";
     auto lexed = lex(lit(src));
@@ -6185,6 +7985,279 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
+TEST(frontend, source_impl_overrides_protocol_default_method_with_error_return) {
+    const auto src = R"rut(
+protocol MaybeCode { func code() -> i32 => error(.timeout) }
+struct Box { value: i32 }
+Box impl MaybeCode { func code(self: Box) -> i32 => self.value }
+route GET "/users" {
+    let code = or(Box(value: 7).code(), 200)
+    if code == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_impl_overrides_protocol_default_method_with_block_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code() -> i32 {
+        let x = 200
+        x
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode { func code(self: Box) -> i32 => self.value }
+route GET "/users" {
+    if Box(value: 7).code() == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_impl_overrides_protocol_default_method_with_if_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode { func code(self: Box, ok: bool) -> i32 => self.value }
+route GET "/users" {
+    if Box(value: 7).code(true) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_impl_overrides_protocol_default_method_with_block_body_and_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Adder { func add(self: Box, x: i32) -> i32 => self.value }
+route GET "/users" {
+    if Box(value: 7).add(201) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_impl_overrides_protocol_default_method_with_if_body_and_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box { value: i32 }
+Box impl Adder { func add(self: Box, ok: bool) -> i32 => self.value }
+route GET "/users" {
+    if Box(value: 7).add(true) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_optional_return) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_optional_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => nil }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl MaybeCode { func code(self: Box) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let code = or(Box(value: 7).code(), 200)
+    if code == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_error_return) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_error_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => error(.timeout) }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl MaybeCode { func code(self: Box) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let code = or(Box(value: 7).code(), 200)
+    if code == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_block_body) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_block_body_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl MaybeCode { func code(self: Box) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).code() == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_if_body) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_if_body_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code(ok: bool) -> i32 {\n";
+        out << "        if ok { 200 } else { 500 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl MaybeCode { func code(self: Box, ok: bool) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).code(true) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_block_body_and_parameter) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_block_body_parameter_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Adder { func add(self: Box, x: i32) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(201) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_if_body_and_parameter) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_if_body_parameter_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Adder { func add(self: Box, ok: bool) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(true) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_impl_takes_precedence_over_protocol_default_method) {
+    const std::string dir = "/tmp/rut_import_impl_precedence_over_default_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable { func hash(self: Box) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).hash() == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
 TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 => 200 }
@@ -6200,6 +8273,305 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
+    const auto src = R"rut(
+protocol MaybeCode { func code() -> i32 => nil }
+struct Box<T> { value: T }
+Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
+    const auto src = R"rut(
+protocol MaybeCode { func code() -> i32 => error(.timeout) }
+struct Box<T> { value: T }
+Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code() -> i32 {
+        let x = 200
+        x
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }
+func run<T: MaybeCode>(x: T) -> i32 => x.code()
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl MaybeCode { func code(self: Box<T>, ok: bool) -> i32 => 7 }
+func run<T: MaybeCode>(x: T) -> i32 => x.code(true)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl Adder { func add(self: Box<T>, x: i32) -> i32 => 7 }
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl Adder { func add(self: Box<T>, ok: bool) -> i32 => 7 }
+func run<T: Adder>(x: T) -> i32 => x.add(true)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
+    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_optional_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => nil }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
+    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_error_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => error(.timeout) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
+    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_block_body_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code()
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body) {
+    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_if_body_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code(ok: bool) -> i32 {\n";
+        out << "        if ok { 200 } else { 500 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode { func code(self: Box<T>, ok: bool) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code(true)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
+    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_block_body_parameter_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Adder { func add(self: Box<T>, x: i32) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
+    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_if_body_parameter_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Adder { func add(self: Box<T>, ok: bool) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Adder>(x: T) -> i32 => x.add(true)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method) {
+    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_default_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable { func hash(self: Box<T>) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
 TEST(frontend, source_generic_receiver_multi_protocol_default_method_dispatch_is_supported) {
@@ -6223,6 +8595,784 @@ route GET "/users" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+}
+TEST(frontend, source_generic_receiver_multi_protocol_empty_impl_block_default_method_dispatch_is_supported) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Adder { func add(x: i32) -> i32 => x }
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_multi_protocol_empty_impl_block_default_method_dispatch_is_supported) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Adder { func add(x: i32) -> i32 => x }
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).add(3) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_multi_protocol_empty_impl_block_default_method_supports_block_body) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32 {
+        let x = 200
+        x
+    }
+}
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).add(3) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_multi_protocol_empty_impl_block_default_method_supports_if_body) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+route GET "/users" {
+    let h = Box(value: 7).hash(true)
+    if h == 200 {
+        if Box(value: 7).add(true) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_multi_protocol_empty_impl_block_default_method_supports_tuple_return) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Hashable, Pairable {}
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).pair() == (200, 500) { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_multi_protocol_empty_impl_block_default_method_tuple_return_supports_ordering) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Hashable, Pairable {}
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).pair() < (200, 600) { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_block_body) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32 {
+        let x = 200
+        x
+    }
+}
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_tuple_return) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Hashable, Pairable {}
+func run<T: Hashable, Pairable>(x: T) -> (i32, i32) {
+    let h = x.hash()
+    if h == 200 { x.pair() } else { (0, 0) }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == (200, 500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_receiver_multi_protocol_empty_impl_block_default_method_tuple_return_supports_ordering) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Hashable, Pairable {}
+func run<T: Hashable, Pairable>(x: T) -> (i32, i32) {
+    let h = x.hash()
+    if h == 200 { x.pair() } else { (0, 0) }
+}
+route GET "/users" {
+    if run(Box(value: 7)) < (200, 600) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_if_body) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash(true)
+    if h == 200 { x.add(true) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_multi_protocol_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_multi_protocol_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Adder { func add(x: i32) -> i32 => x }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable {}\n";
+        out << "Box<T> impl Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_tuple_default_impl_generic_multi_protocol_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Pairable>(x: T) -> (i32, i32) {
+    let h = x.hash()
+    if h == 200 { x.pair() } else { (0, 0) }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == (200, 500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
+    const std::string dir = "/tmp/rut_import_tuple_ordering_default_impl_generic_multi_protocol_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Pairable>(x: T) -> (i32, i32) {
+    let h = x.hash()
+    if h == 200 { x.pair() } else { (0, 0) }
+}
+route GET "/users" {
+    if run(Box(value: 7)) < (200, 600) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_if_body_default_impl_generic_multi_protocol_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash(ok: bool) -> i32 {\n";
+        out << "        if ok { 200 } else { 500 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash(true)
+    if h == 200 { x.add(true) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_tuple_default_impl_multi_protocol_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).pair() == (200, 500) { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
+    const std::string dir = "/tmp/rut_import_tuple_ordering_default_impl_multi_protocol_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).pair() < (200, 600) { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_block_body_default_impl_generic_multi_protocol_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_if_body_default_impl_multi_protocol_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash(ok: bool) -> i32 {\n";
+        out << "        if ok { 200 } else { 500 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let h = Box(value: 7).hash(true)
+    if h == 200 {
+        if Box(value: 7).add(true) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_block_body_default_impl_multi_protocol_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).add(3) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_default_impl_multi_protocol_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Adder { func add(x: i32) -> i32 => x }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).add(3) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_multi_protocol_empty_impl_block_for_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_multi_protocol_block_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Adder { func add(x: i32) -> i32 => x }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, analyze_rejects_generic_receiver_multi_protocol_empty_impl_block_when_required_method_is_missing) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+protocol Adder { func add(x: i32) -> i32 => x }
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_imported_generic_multi_protocol_empty_impl_block_when_required_method_is_missing) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_multi_protocol_block_missing_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "protocol Adder { func add(x: i32) -> i32 => x }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_imported_generic_multi_protocol_empty_impl_block_with_conflicting_default_method_names) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_multi_protocol_conflict_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol P1 { func hash() -> i32 => 1 }\n";
+        out << "protocol P2 { func hash() -> i32 => 2 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl P1, P2 {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_imported_generic_multi_protocol_impl_block_with_ambiguous_method_name) {
+    const std::string dir = "/tmp/rut_import_generic_impl_multi_protocol_ambiguous_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol P1 { func hash() -> i32 }\n";
+        out << "protocol P2 { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl P1, P2 {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_imported_generic_multi_protocol_impl_block_with_duplicate_protocol_name) {
+    const std::string dir = "/tmp/rut_import_generic_impl_multi_protocol_duplicate_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Hashable {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_imported_generic_multi_protocol_impl_block_with_unknown_protocol_name) {
+    const std::string dir = "/tmp/rut_import_generic_impl_multi_protocol_unknown_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Missing {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_imported_duplicate_impl_for_same_protocol_and_type_via_empty_impl) {
+    const std::string dir = "/tmp/rut_import_empty_impl_duplicate_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable {}\n";
+        out << "Box<T> impl Hashable {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_imported_overlapping_empty_impl_and_multi_protocol_impl) {
+    const std::string dir = "/tmp/rut_import_empty_impl_overlap_multi_protocol_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "protocol Adder { func add(x: i32) -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable {}\n";
+        out << "Box<T> impl Hashable, Adder {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "    func add(self: Box<T>, x: i32) -> i32 => x\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
 TEST(frontend, analyze_rejects_generic_receiver_method_dispatch_when_multiple_protocol_constraints_define_same_name) {
     const auto src = R"rut(
@@ -6325,6 +9475,33 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
+TEST(frontend, import_relative_file_impl_may_omit_protocol_method_with_default_body) {
+    const std::string dir = "/tmp/rut_import_impl_omit_default_body_method_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "    func add(x: i32) -> i32 => x\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
 TEST(frontend, analyze_rejects_impl_missing_required_protocol_method_without_default_body) {
     const auto src = R"rut(
 protocol Hashable {
@@ -6369,6 +9546,150 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
+TEST(frontend, source_multi_protocol_impl_may_omit_methods_with_block_body_default) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {
+    func hash(self: Box) -> i32 => self.value
+}
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_multi_protocol_impl_may_omit_methods_with_if_body_default) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {
+    func hash(self: Box) -> i32 => self.value
+}
+route GET "/users" {
+    if Box(value: 7).add(true) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_multi_protocol_impl_with_default_bodies) {
+    const std::string dir = "/tmp/rut_import_multi_protocol_impl_default_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "    func add(x: i32) -> i32 => x\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func mul(x: i32) -> i32 => x\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_multi_protocol_impl_with_block_body_default) {
+    const std::string dir = "/tmp/rut_import_multi_protocol_impl_block_body_default_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_multi_protocol_impl_with_if_body_default) {
+    const std::string dir = "/tmp/rut_import_multi_protocol_impl_if_body_default_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(true) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
 TEST(frontend, source_generic_multi_protocol_impl_may_omit_methods_with_default_bodies) {
     const auto src = R"rut(
 protocol Hashable {
@@ -6395,6 +9716,226 @@ route GET "/users" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+}
+TEST(frontend, source_generic_multi_protocol_impl_may_omit_methods_with_block_body_default) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl Hashable, Adder {
+    func hash(self: Box<T>) -> i32 => 7
+}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, source_generic_multi_protocol_impl_may_omit_methods_with_if_body_default) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl Hashable, Adder {
+    func hash(self: Box<T>) -> i32 => 7
+}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(true) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_multi_protocol_impl_with_default_bodies) {
+    const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_default_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 => x\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_multi_protocol_impl_with_block_body_default) {
+    const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_block_body_default_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, import_relative_file_merges_imported_generic_multi_protocol_impl_with_if_body_default) {
+    const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_if_body_default_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(true) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+TEST(frontend, analyze_rejects_imported_multi_protocol_impl_missing_required_method_without_default_body) {
+    const std::string dir = "/tmp/rut_import_multi_protocol_impl_missing_required_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "    func add(x: i32) -> i32 => x\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func mul(x: i32) -> i32\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_imported_generic_multi_protocol_impl_missing_required_method_without_default_body) {
+    const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_missing_required_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
 TEST(frontend, analyze_rejects_multi_protocol_impl_missing_required_method_without_default_body) {
     const auto src = R"rut(
@@ -7831,6 +11372,8 @@ route GET "/users" {
     CHECK(hir->routes[0].locals[0].may_nil);
     CHECK_FALSE(hir->routes[0].locals[0].may_error);
     CHECK(hir->routes[0].locals[1].type == HirTypeKind::Str);
+    CHECK(hir->routes[0].locals[1].init.kind == HirExprKind::Or);
+    CHECK_NE(hir->routes[0].locals[1].init.shape_index, 0xffffffffu);
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }

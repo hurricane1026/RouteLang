@@ -1068,6 +1068,7 @@ struct Parser {
 
         if (!take(TokenType::RParen)) {
             while (true) {
+                const bool has_underscore = take(TokenType::Underscore) != nullptr;
                 auto param_name = expect(TokenType::Ident);
                 if (!param_name) return core::make_unexpected(param_name.error());
                 auto colon = expect(TokenType::Colon);
@@ -1077,6 +1078,7 @@ struct Parser {
                 AstFunctionDecl::ParamDecl param{};
                 param.name = param_name.value()->text;
                 param.type = type_ref.value();
+                param.has_underscore_label = has_underscore;
                 if (!item.func.params.push(param))
                     return frontend_error(FrontendError::TooManyItems, span_from(*param_name.value()));
                 if (take(TokenType::RParen)) break;
@@ -1185,6 +1187,7 @@ struct Parser {
             if (!lparen) return core::make_unexpected(lparen.error());
             if (!take(TokenType::RParen)) {
                 while (true) {
+                    const bool has_underscore = take(TokenType::Underscore) != nullptr;
                     auto param_name = expect(TokenType::Ident);
                     if (!param_name) return core::make_unexpected(param_name.error());
                     auto colon = expect(TokenType::Colon);
@@ -1194,6 +1197,7 @@ struct Parser {
                     AstProtocolDecl::MethodDecl::ParamDecl param{};
                     param.name = param_name.value()->text;
                     param.type = type_ref.value();
+                    param.has_underscore_label = has_underscore;
                     if (!method.params.push(param))
                         return frontend_error(FrontendError::TooManyItems, span_from(*param_name.value()));
                     if (take(TokenType::RParen)) break;
@@ -1397,27 +1401,39 @@ struct Parser {
         return item;
     }
 
-    FrontendResult<AstItem> parse_route() {
-        auto kw = expect(TokenType::KwRoute);
-        if (!kw) return core::make_unexpected(kw.error());
+    static bool is_method_keyword(TokenType t) {
+        return t == TokenType::KwGet || t == TokenType::KwPost || t == TokenType::KwPut ||
+               t == TokenType::KwDelete || t == TokenType::KwPatch || t == TokenType::KwHead ||
+               t == TokenType::KwOptions;
+    }
+
+    FrontendResult<AstDecorator> parse_decorator_atom() {
+        auto at = expect(TokenType::At);
+        if (!at) return core::make_unexpected(at.error());
+        auto name_tok = expect(TokenType::Ident);
+        if (!name_tok) return core::make_unexpected(name_tok.error());
+        AstDecorator d{};
+        d.name = name_tok.value()->text;
+        d.span = Span{at.value()->start, name_tok.value()->end, at.value()->line, at.value()->col};
+        return d;
+    }
+
+    static bool binding_matches(Str pattern, bool is_wildcard, Str path) {
+        if (is_wildcard) return true;
+        if (path.len < pattern.len) return false;
+        for (u32 i = 0; i < pattern.len; i++) {
+            if (path.ptr[i] != pattern.ptr[i]) return false;
+        }
+        return true;
+    }
+
+    FrontendResult<AstItem> parse_route_entry(const Token& kw_route) {
         AstItem item{};
         item.kind = AstItemKind::Route;
-
         const Token* method = nullptr;
-        switch (cur().type) {
-            case TokenType::KwGet:
-            case TokenType::KwPost:
-            case TokenType::KwPut:
-            case TokenType::KwDelete:
-            case TokenType::KwPatch:
-            case TokenType::KwHead:
-            case TokenType::KwOptions:
-                method = &toks->tokens[pos++];
-                break;
-            default:
-                return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
-        }
-
+        if (!is_method_keyword(cur().type))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+        method = &toks->tokens[pos++];
         auto path = expect(TokenType::StringLit);
         if (!path) return core::make_unexpected(path.error());
         auto lbrace = expect(TokenType::LBrace);
@@ -1433,13 +1449,84 @@ struct Parser {
         if (!rbrace) return core::make_unexpected(rbrace.error());
         if (item.route.statements.len == 0)
             return frontend_error(FrontendError::UnexpectedToken, span_from(*rbrace.value()));
-
-        item.span = Span{kw.value()->start, rbrace.value()->end, kw.value()->line, kw.value()->col};
+        item.span = Span{kw_route.start, rbrace.value()->end, kw_route.line, kw_route.col};
         item.route.span = item.span;
         item.route.body_span = Span{lbrace.value()->start, rbrace.value()->end, lbrace.value()->line, lbrace.value()->col};
         item.route.method = static_cast<u8>(method->type);
         item.route.path = path.value()->text;
         return item;
+    }
+
+    FrontendResult<AstItem> parse_route() {
+        auto kw = expect(TokenType::KwRoute);
+        if (!kw) return core::make_unexpected(kw.error());
+        return parse_route_entry(*kw.value());
+    }
+
+    // Block form: route { @binding "pattern"...  @entry-decorator method "path" { stmts } ... }
+    // Pushes one AstItem::Route per entry into file->items; bindings are matched against entry
+    // paths and merged into each entry's `decorators` list at parse time.
+    FrontendResult<u32> parse_route_block() {
+        auto kw = expect(TokenType::KwRoute);
+        if (!kw) return core::make_unexpected(kw.error());
+        auto lbrace = expect(TokenType::LBrace);
+        if (!lbrace) return core::make_unexpected(lbrace.error());
+
+        struct PendingBinding {
+            AstDecorator decorator{};
+            Str pattern{};
+            bool is_wildcard = false;
+        };
+        static constexpr u32 kMaxBindings = AstRouteDecl::kMaxDecorators;
+        FixedVec<PendingBinding, kMaxBindings> bindings;
+
+        // Phase 1: bindings — `@ident "pattern"` while next-after-@ident is StringLit.
+        while (cur().type == TokenType::At &&
+               peek().type == TokenType::Ident &&
+               peek(2).type == TokenType::StringLit) {
+            auto deco = parse_decorator_atom();
+            if (!deco) return core::make_unexpected(deco.error());
+            auto pat = expect(TokenType::StringLit);
+            if (!pat) return core::make_unexpected(pat.error());
+            PendingBinding pb{};
+            pb.decorator = deco.value();
+            pb.pattern = pat.value()->text;
+            pb.is_wildcard = pb.pattern.len == 1 && pb.pattern.ptr[0] == '*';
+            if (!bindings.push(pb))
+                return frontend_error(FrontendError::TooManyItems, deco->span);
+        }
+
+        // Phase 2: entries (with optional entry-prefix decorators).
+        u32 emitted = 0;
+        while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+            FixedVec<AstDecorator, AstRouteDecl::kMaxDecorators> entry_decorators;
+            while (cur().type == TokenType::At) {
+                auto deco = parse_decorator_atom();
+                if (!deco) return core::make_unexpected(deco.error());
+                if (!entry_decorators.push(deco.value()))
+                    return frontend_error(FrontendError::TooManyItems, deco->span);
+            }
+            auto entry = parse_route_entry(*kw.value());
+            if (!entry) return core::make_unexpected(entry.error());
+            for (u32 i = 0; i < bindings.len; i++) {
+                if (binding_matches(bindings[i].pattern, bindings[i].is_wildcard, entry->route.path)) {
+                    if (!entry->route.decorators.push(bindings[i].decorator))
+                        return frontend_error(FrontendError::TooManyItems, bindings[i].decorator.span);
+                }
+            }
+            for (u32 i = 0; i < entry_decorators.len; i++) {
+                if (!entry->route.decorators.push(entry_decorators[i]))
+                    return frontend_error(FrontendError::TooManyItems, entry_decorators[i].span);
+            }
+            if (!file->items.push(entry.value()))
+                return frontend_error(FrontendError::TooManyItems, entry->span);
+            emitted++;
+        }
+        auto rbrace = expect(TokenType::RBrace);
+        if (!rbrace) return core::make_unexpected(rbrace.error());
+        if (emitted == 0)
+            return frontend_error(FrontendError::UnexpectedToken, span_from(*rbrace.value()));
+        return emitted;
     }
 };
 
@@ -1484,6 +1571,11 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 item = p.parse_variant();
                 break;
             case TokenType::KwRoute:
+                if (p.peek().type == TokenType::LBrace) {
+                    auto block = p.parse_route_block();
+                    if (!block) return core::make_unexpected(block.error());
+                    continue;
+                }
                 item = p.parse_route();
                 break;
             default:

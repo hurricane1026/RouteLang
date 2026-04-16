@@ -74,6 +74,147 @@ TEST(frontend, lex_parse_return_route) {
     CHECK_EQ(ast->items[1].route.statements[0].status_code, 200);
 }
 
+TEST(frontend, lex_emits_at_token_for_decorator_prefix) {
+    const char* src = "@auth";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 3u);  // @, auth, EOF
+    CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::At));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::Ident));
+    CHECK(lexed->tokens[1].text.eq(lit("auth")));
+}
+
+TEST(frontend, lex_recognizes_lowercase_http_methods) {
+    const char* src = "get post put delete patch head options";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 8u);  // 7 methods + EOF
+    CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwGet));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::KwPost));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[2].type), static_cast<u8>(TokenType::KwPut));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[3].type), static_cast<u8>(TokenType::KwDelete));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[4].type), static_cast<u8>(TokenType::KwPatch));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[5].type), static_cast<u8>(TokenType::KwHead));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[6].type), static_cast<u8>(TokenType::KwOptions));
+}
+
+TEST(frontend, parse_route_block_single_entry_no_decorators) {
+    const char* src = "route { GET \"/users\" { return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    CHECK_EQ(static_cast<u8>(ast->items[0].kind), static_cast<u8>(AstItemKind::Route));
+    CHECK(ast->items[0].route.path.eq(lit("/users")));
+    CHECK_EQ(ast->items[0].route.decorators.len, 0u);
+}
+
+TEST(frontend, parse_route_block_multiple_entries) {
+    const char* src = "route {\n  GET \"/users\" { return 200 }\n  POST \"/orders\" { return 201 }\n}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    CHECK(ast->items[0].route.path.eq(lit("/users")));
+    CHECK(ast->items[1].route.path.eq(lit("/orders")));
+}
+
+TEST(frontend, parse_route_block_wildcard_binding_applies_to_all_entries) {
+    const char* src = "route {\n  @auth \"*\"\n  GET \"/users\" { return 200 }\n  POST \"/orders\" { return 201 }\n}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    REQUIRE_EQ(ast->items[0].route.decorators.len, 1u);
+    CHECK(ast->items[0].route.decorators[0].name.eq(lit("auth")));
+    REQUIRE_EQ(ast->items[1].route.decorators.len, 1u);
+    CHECK(ast->items[1].route.decorators[0].name.eq(lit("auth")));
+}
+
+TEST(frontend, parse_route_block_prefix_binding_applies_only_to_matching_entries) {
+    const char* src = "route {\n  @auth \"/admin\"\n  GET \"/admin/users\" { return 200 }\n  GET \"/public/health\" { return 200 }\n}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    REQUIRE_EQ(ast->items[0].route.decorators.len, 1u);
+    CHECK(ast->items[0].route.decorators[0].name.eq(lit("auth")));
+    CHECK_EQ(ast->items[1].route.decorators.len, 0u);
+}
+
+TEST(frontend, parse_route_block_entry_decorator_only_attached_to_its_entry) {
+    const char* src = "route {\n  @logResp\n  GET \"/users\" { return 200 }\n  GET \"/health\" { return 200 }\n}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    REQUIRE_EQ(ast->items[0].route.decorators.len, 1u);
+    CHECK(ast->items[0].route.decorators[0].name.eq(lit("logResp")));
+    CHECK_EQ(ast->items[1].route.decorators.len, 0u);
+}
+
+TEST(frontend, parse_route_block_binding_and_entry_decorators_are_merged) {
+    const char* src = "route {\n  @requestId \"*\"\n  @auth \"/admin\"\n  @maxBody\n  POST \"/admin/upload\" { return 200 }\n}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.decorators.len, 3u);
+    // Order: matching bindings first (in declaration order), then entry-prefix decorators
+    CHECK(ast->items[0].route.decorators[0].name.eq(lit("requestId")));
+    CHECK(ast->items[0].route.decorators[1].name.eq(lit("auth")));
+    CHECK(ast->items[0].route.decorators[2].name.eq(lit("maxBody")));
+}
+
+TEST(frontend, parse_route_block_lowercase_methods_are_accepted) {
+    const char* src = "route {\n  get \"/users\" { return 200 }\n  post \"/orders\" { return 201 }\n}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+}
+
+TEST(frontend, parse_route_block_legacy_form_still_works) {
+    const char* src = "route GET \"/users\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    CHECK(ast->items[0].route.path.eq(lit("/users")));
+    CHECK_EQ(ast->items[0].route.decorators.len, 0u);
+}
+
+TEST(frontend, parse_func_param_accepts_underscore_label) {
+    const char* src = "func auth(_ req: i32) -> i32 => 0\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].func.params.len, 1u);
+    CHECK(ast->items[0].func.params[0].has_underscore_label);
+    CHECK(ast->items[0].func.params[0].name.eq(lit("req")));
+}
+
+TEST(frontend, parse_func_param_without_underscore_label) {
+    const char* src = "func plain(req: i32) -> i32 => 0\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].func.params.len, 1u);
+    CHECK(!ast->items[0].func.params[0].has_underscore_label);
+}
+
 TEST(frontend, parse_file_header_package_decl_is_recorded) {
     const char* src = "package auth\nfunc jwtAuth() -> i32 => 200\n";
     auto lexed = lex(lit(src));

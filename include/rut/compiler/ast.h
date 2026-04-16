@@ -129,6 +129,7 @@ struct AstFunctionDecl {
     struct ParamDecl {
         Str name{};
         AstTypeRef type{};
+        bool has_underscore_label = false;  // `_ name: Type` (Swift-style omitted-label)
     };
 
     Span span{};
@@ -177,6 +178,7 @@ struct AstProtocolDecl {
         struct ParamDecl {
             Str name{};
             AstTypeRef type{};
+            bool has_underscore_label = false;
         };
         Str name{};
         bool has_return_type = false;
@@ -221,6 +223,12 @@ struct AstImplDecl {
     FixedVec<AstFunctionDecl, kMaxMethods> methods;
 };
 
+struct AstDecorator {
+    Span span{};
+    Str namespace_name{};  // empty unless @ns.name form
+    Str name{};
+};
+
 struct AstRouteDecl {
     Span span{};
     Span body_span{};
@@ -228,6 +236,8 @@ struct AstRouteDecl {
     Str path{};
     static constexpr u32 kMaxStatements = 16;
     FixedVec<AstStatement, kMaxStatements> statements;
+    static constexpr u32 kMaxDecorators = 8;
+    FixedVec<AstDecorator, kMaxDecorators> decorators;
 };
 
 struct AstItem {

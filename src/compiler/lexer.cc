@@ -47,13 +47,13 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"forward", 7})) return TokenType::KwForward;
     if (text.eq({"true", 4})) return TokenType::KwTrue;
     if (text.eq({"false", 5})) return TokenType::KwFalse;
-    if (text.eq({"GET", 3})) return TokenType::KwGet;
-    if (text.eq({"POST", 4})) return TokenType::KwPost;
-    if (text.eq({"PUT", 3})) return TokenType::KwPut;
-    if (text.eq({"DELETE", 6})) return TokenType::KwDelete;
-    if (text.eq({"PATCH", 5})) return TokenType::KwPatch;
-    if (text.eq({"HEAD", 4})) return TokenType::KwHead;
-    if (text.eq({"OPTIONS", 7})) return TokenType::KwOptions;
+    if (text.eq({"GET", 3}) || text.eq({"get", 3})) return TokenType::KwGet;
+    if (text.eq({"POST", 4}) || text.eq({"post", 4})) return TokenType::KwPost;
+    if (text.eq({"PUT", 3}) || text.eq({"put", 3})) return TokenType::KwPut;
+    if (text.eq({"DELETE", 6}) || text.eq({"delete", 6})) return TokenType::KwDelete;
+    if (text.eq({"PATCH", 5}) || text.eq({"patch", 5})) return TokenType::KwPatch;
+    if (text.eq({"HEAD", 4}) || text.eq({"head", 4})) return TokenType::KwHead;
+    if (text.eq({"OPTIONS", 7}) || text.eq({"options", 7})) return TokenType::KwOptions;
     return TokenType::Ident;
 }
 
@@ -231,6 +231,9 @@ LexResult lex(Str source) {
                 break;
             case '=':
                 tok.type = TokenType::Eq;
+                break;
+            case '@':
+                tok.type = TokenType::At;
                 break;
             default:
                 return frontend_error(FrontendError::UnexpectedChar, token_span(tok), tok.text);

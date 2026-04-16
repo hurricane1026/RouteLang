@@ -140,19 +140,26 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
     LLVMOrcThreadSafeModuleRef tsm = LLVMOrcCreateNewThreadSafeModule(mod, tsctx);
     LLVMOrcDisposeThreadSafeContext(tsctx);
 
-    // Track the orphaned context for cleanup.
-    if (ctx_count < kMaxContexts) {
-        contexts[ctx_count++] = ctx;
-    }
-
     // Submit to the main JITDylib. On success, LLJIT owns tsm.
+    // We defer tracking `ctx` until *after* the module is accepted: on failure
+    // we dispose ctx here rather than letting a failed compile consume a slot
+    // in `contexts[]` (and eventually exhaust kMaxContexts).
     LLVMOrcJITDylibRef main_jd = LLVMOrcLLJITGetMainJITDylib(lljit);
     LLVMErrorRef err = LLVMOrcLLJITAddLLVMIRModule(lljit, main_jd, tsm);
     if (err) {
         log_error("jit: module compilation failed", err);
-        // On failure, ownership of tsm stays with us.
+        // On failure, ownership of tsm stays with us; disposing tsm also
+        // disposes the inner module. We still own `ctx` (module's original
+        // context) — dispose it here to match the verification-failure path.
         LLVMOrcDisposeThreadSafeModule(tsm);
+        LLVMContextDispose(ctx);
         return false;
+    }
+
+    // Track the orphaned context for cleanup in shutdown(), after LLJIT
+    // has accepted the module.
+    if (ctx_count < kMaxContexts) {
+        contexts[ctx_count++] = ctx;
     }
 
     return true;

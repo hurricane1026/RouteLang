@@ -158,6 +158,7 @@ LexResult lex(Str source) {
             }
             tok.type = TokenType::StringLit;
             tok.start = quote_start + 1;
+            tok.col++;  // keep col in sync with start, which now points past the opening quote
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
             pos++;

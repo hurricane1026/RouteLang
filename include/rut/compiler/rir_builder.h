@@ -554,7 +554,10 @@ struct Builder {
         return vid;
     }
 
-    Result<ValueId> emit_select(ValueId cond, ValueId then_val, ValueId else_val, SourceLoc loc = {}) {
+    Result<ValueId> emit_select(ValueId cond,
+                                ValueId then_val,
+                                ValueId else_val,
+                                SourceLoc loc = {}) {
         if (!val_has_type(cond, TypeKind::Bool)) return err(RirError::InvalidState);
         if (!valid_val(then_val) || !valid_val(else_val)) return err(RirError::InvalidState);
         auto* then_ty = cur_func->values[then_val.id].type;
@@ -632,8 +635,10 @@ struct Builder {
                 mod->arena->alloc(sizeof(ValueId) * (count - kMaxInlineOperands)));
             if (!inst->extra_operands) return err(RirError::OutOfMemory);
             for (u32 i = 0; i < count; i++) {
-                if (i < kMaxInlineOperands) inst->operands[i] = values[i];
-                else inst->extra_operands[i - kMaxInlineOperands] = values[i];
+                if (i < kMaxInlineOperands)
+                    inst->operands[i] = values[i];
+                else
+                    inst->extra_operands[i - kMaxInlineOperands] = values[i];
             }
         }
         inst->imm.struct_ref.name = sd->name;

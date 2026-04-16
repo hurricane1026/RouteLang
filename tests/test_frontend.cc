@@ -48,7 +48,8 @@ static HeapFrontendResult<HirModule> analyze_file_heap(const AstFile& file) {
     if (!hir) return {core::make_unexpected(hir.error())};
     return {hir.value()};
 }
-static HeapFrontendResult<HirModule> analyze_file_heap_with_path(const AstFile& file, const std::string& source_path) {
+static HeapFrontendResult<HirModule> analyze_file_heap_with_path(const AstFile& file,
+                                                                 const std::string& source_path) {
     Str path{source_path.c_str(), static_cast<u32>(source_path.size())};
     auto hir = analyze_file(file, path);
     if (!hir) return {core::make_unexpected(hir.error())};
@@ -111,7 +112,8 @@ TEST(frontend, parse_route_block_single_entry_no_decorators) {
 }
 
 TEST(frontend, parse_route_block_multiple_entries) {
-    const char* src = "route {\n  GET \"/users\" { return 200 }\n  POST \"/orders\" { return 201 }\n}\n";
+    const char* src =
+        "route {\n  GET \"/users\" { return 200 }\n  POST \"/orders\" { return 201 }\n}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -122,7 +124,9 @@ TEST(frontend, parse_route_block_multiple_entries) {
 }
 
 TEST(frontend, parse_route_block_wildcard_binding_applies_to_all_entries) {
-    const char* src = "route {\n  @auth \"*\"\n  GET \"/users\" { return 200 }\n  POST \"/orders\" { return 201 }\n}\n";
+    const char* src =
+        "route {\n  @auth \"*\"\n  GET \"/users\" { return 200 }\n  POST \"/orders\" { return 201 "
+        "}\n}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -135,7 +139,9 @@ TEST(frontend, parse_route_block_wildcard_binding_applies_to_all_entries) {
 }
 
 TEST(frontend, parse_route_block_prefix_binding_applies_only_to_matching_entries) {
-    const char* src = "route {\n  @auth \"/admin\"\n  GET \"/admin/users\" { return 200 }\n  GET \"/public/health\" { return 200 }\n}\n";
+    const char* src =
+        "route {\n  @auth \"/admin\"\n  GET \"/admin/users\" { return 200 }\n  GET "
+        "\"/public/health\" { return 200 }\n}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -147,7 +153,9 @@ TEST(frontend, parse_route_block_prefix_binding_applies_only_to_matching_entries
 }
 
 TEST(frontend, parse_route_block_entry_decorator_only_attached_to_its_entry) {
-    const char* src = "route {\n  @logResp\n  GET \"/users\" { return 200 }\n  GET \"/health\" { return 200 }\n}\n";
+    const char* src =
+        "route {\n  @logResp\n  GET \"/users\" { return 200 }\n  GET \"/health\" { return 200 "
+        "}\n}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -159,7 +167,9 @@ TEST(frontend, parse_route_block_entry_decorator_only_attached_to_its_entry) {
 }
 
 TEST(frontend, parse_route_block_binding_and_entry_decorators_are_merged) {
-    const char* src = "route {\n  @requestId \"*\"\n  @auth \"/admin\"\n  @maxBody\n  POST \"/admin/upload\" { return 200 }\n}\n";
+    const char* src =
+        "route {\n  @requestId \"*\"\n  @auth \"/admin\"\n  @maxBody\n  POST \"/admin/upload\" { "
+        "return 200 }\n}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -173,7 +183,8 @@ TEST(frontend, parse_route_block_binding_and_entry_decorators_are_merged) {
 }
 
 TEST(frontend, parse_route_block_lowercase_methods_are_accepted) {
-    const char* src = "route {\n  get \"/users\" { return 200 }\n  post \"/orders\" { return 201 }\n}\n";
+    const char* src =
+        "route {\n  get \"/users\" { return 200 }\n  post \"/orders\" { return 201 }\n}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -631,11 +642,12 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
-    if (!hir) std::fprintf(stderr,
-                           "import_namespace_default_method_struct_return err=%d line=%u col=%u\n",
-                           static_cast<int>(hir.error().code),
-                           hir.error().span.line,
-                           hir.error().span.col);
+    if (!hir)
+        std::fprintf(stderr,
+                     "import_namespace_default_method_struct_return err=%d line=%u col=%u\n",
+                     static_cast<int>(hir.error().code),
+                     hir.error().span.line,
+                     hir.error().span.col);
     REQUIRE(hir);
 }
 
@@ -870,7 +882,8 @@ route GET "/users" {
     const HirImpl* imported_impl = nullptr;
     for (u32 i = 0; i < hir->impls.len; i++) {
         const auto& impl = hir->impls[i];
-        if (impl.protocol_index != protocol_index || impl.is_generic_template || impl.type != HirTypeKind::Struct)
+        if (impl.protocol_index != protocol_index || impl.is_generic_template ||
+            impl.type != HirTypeKind::Struct)
             continue;
         if (impl.struct_index >= hir->structs.len) continue;
         const auto& st = hir->structs[impl.struct_index];
@@ -1155,7 +1168,8 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch) {
+TEST(frontend,
+     import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1177,7 +1191,9 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch_with_parameter) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch_with_parameter) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_param_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1199,7 +1215,8 @@ route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_optional_default_method_dispatch) {
+TEST(frontend,
+     import_relative_file_merges_imported_generic_empty_impl_for_optional_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_optional_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1221,7 +1238,8 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_error_default_method_dispatch) {
+TEST(frontend,
+     import_relative_file_merges_imported_generic_empty_impl_for_error_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_error_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1242,7 +1260,8 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_tuple_default_method_dispatch) {
+TEST(frontend,
+     import_relative_file_merges_imported_generic_empty_impl_for_tuple_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_tuple_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1265,7 +1284,9 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_dispatch) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1287,7 +1308,9 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_equality) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_equality) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_eq_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1308,7 +1331,9 @@ route GET "/users" { if run(Box(value: 1)) == (200, 500) { return 200 } else { r
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_ordering) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_ordering) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_ord_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1330,7 +1355,9 @@ route GET "/users" { if run(Box(value: 1)) < (200, 600) { return 200 } else { re
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_block_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1357,7 +1384,9 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_block_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1384,7 +1413,9 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch_with_parameter) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch_with_parameter) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_block_param_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1411,7 +1442,9 @@ route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch_with_parameter) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch_with_parameter) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_block_param_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1438,7 +1471,8 @@ route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_if_body_default_method_dispatch) {
+TEST(frontend,
+     import_relative_file_merges_imported_generic_empty_impl_for_if_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_if_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1460,7 +1494,9 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_if_body_default_method_dispatch) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_if_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_if_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1482,12 +1518,14 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
-TEST(frontend, lower_to_rir_supports_imported_generic_empty_impl_for_error_default_method_guard_match) {
+TEST(frontend,
+     lower_to_rir_supports_imported_generic_empty_impl_for_error_default_method_guard_match) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_error_guard_match_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
-        out << "protocol MaybeCode { func code(ok: bool) -> i32 { if ok { 200 } else { error(.timeout) } } }\n";
+        out << "protocol MaybeCode { func code(ok: bool) -> i32 { if ok { 200 } else { "
+               "error(.timeout) } } }\n";
         out << "struct Box<T> { value: T }\n";
         out << "Box<T> impl MaybeCode {}\n";
     }
@@ -1657,7 +1695,8 @@ route GET "/users" { if run(proto.Box(value: 1)) == 1 { return 200 } else { retu
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, analyze_rejects_import_namespace_protocol_constraint_for_local_same_name_type_without_impl) {
+TEST(frontend,
+     analyze_rejects_import_namespace_protocol_constraint_for_local_same_name_type_without_impl) {
     const std::string dir = "/tmp/rut_import_namespace_protocol_constraint_same_name_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1682,7 +1721,8 @@ route GET "/users" {
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_import_namespace_generic_receiver_dispatch_with_local_same_name_protocol) {
+TEST(frontend,
+     analyze_rejects_import_namespace_generic_receiver_dispatch_with_local_same_name_protocol) {
     const std::string dir = "/tmp/rut_import_namespace_protocol_dispatch_same_name_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -1708,8 +1748,11 @@ route GET "/users" {
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_import_namespace_concrete_generic_receiver_dispatch_with_local_same_name_type) {
-    const std::string dir = "/tmp/rut_import_namespace_concrete_generic_receiver_dispatch_same_name_type_frontend";
+TEST(
+    frontend,
+    analyze_rejects_import_namespace_concrete_generic_receiver_dispatch_with_local_same_name_type) {
+    const std::string dir =
+        "/tmp/rut_import_namespace_concrete_generic_receiver_dispatch_same_name_type_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -1809,7 +1852,8 @@ route GET "/users" { let state = wrap(proto.Result<proto.Box<proto.Result<i32>>>
         if (variant.template_variant_index == 0xffffffffu) continue;
         bool variant_fully_instantiated = variant.instance_type_arg_count != 0;
         for (u32 ai = 0; variant_fully_instantiated && ai < variant.instance_type_arg_count; ai++) {
-            if (variant.instance_shape_indices[ai] == 0xffffffffu) variant_fully_instantiated = false;
+            if (variant.instance_shape_indices[ai] == 0xffffffffu)
+                variant_fully_instantiated = false;
         }
         if (!variant_fully_instantiated) continue;
         if (variant.cases.len == 0) continue;
@@ -1820,8 +1864,10 @@ route GET "/users" { let state = wrap(proto.Result<proto.Box<proto.Result<i32>>>
         const auto& payload_struct = mir->structs[c.payload_struct_index];
         if (payload_struct.template_struct_index == 0xffffffffu) continue;
         bool payload_fully_instantiated = payload_struct.instance_type_arg_count != 0;
-        for (u32 ai = 0; payload_fully_instantiated && ai < payload_struct.instance_type_arg_count; ai++) {
-            if (payload_struct.instance_shape_indices[ai] == 0xffffffffu) payload_fully_instantiated = false;
+        for (u32 ai = 0; payload_fully_instantiated && ai < payload_struct.instance_type_arg_count;
+             ai++) {
+            if (payload_struct.instance_shape_indices[ai] == 0xffffffffu)
+                payload_fully_instantiated = false;
         }
         if (!payload_fully_instantiated) continue;
         if (c.payload_shape_index == 0xffffffffu) continue;
@@ -2321,7 +2367,8 @@ route GET "/users" { if run(AuthBox(value: "x")) == 200 { return 200 } else { re
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_selective_import_struct_alias_impl_target_with_local_same_name_receiver_type) {
+TEST(frontend,
+     analyze_rejects_selective_import_struct_alias_impl_target_with_local_same_name_receiver_type) {
     const std::string dir = "/tmp/rut_selective_import_alias_struct_same_name_impl_target_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -2345,7 +2392,9 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_selective_import_protocol_alias_constraint_for_local_same_name_type_without_impl) {
+TEST(
+    frontend,
+    analyze_rejects_selective_import_protocol_alias_constraint_for_local_same_name_type_without_impl) {
     const std::string dir = "/tmp/rut_selective_import_alias_protocol_same_name_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -2371,8 +2420,12 @@ route GET "/users" {
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_selective_import_concrete_generic_receiver_dispatch_with_local_same_name_type) {
-    const std::string dir = "/tmp/rut_selective_import_alias_concrete_generic_receiver_dispatch_same_name_type_frontend";
+TEST(
+    frontend,
+    analyze_rejects_selective_import_concrete_generic_receiver_dispatch_with_local_same_name_type) {
+    const std::string dir =
+        "/tmp/"
+        "rut_selective_import_alias_concrete_generic_receiver_dispatch_same_name_type_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -2398,7 +2451,8 @@ route GET "/users" {
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_selective_import_protocol_alias_impl_binding_to_local_same_name_protocol) {
+TEST(frontend,
+     analyze_rejects_selective_import_protocol_alias_impl_binding_to_local_same_name_protocol) {
     const std::string dir = "/tmp/rut_selective_import_alias_protocol_impl_same_name_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -2420,8 +2474,11 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_selective_import_protocol_alias_empty_impl_binding_to_local_same_name_protocol) {
-    const std::string dir = "/tmp/rut_selective_import_alias_protocol_empty_impl_same_name_frontend";
+TEST(
+    frontend,
+    analyze_rejects_selective_import_protocol_alias_empty_impl_binding_to_local_same_name_protocol) {
+    const std::string dir =
+        "/tmp/rut_selective_import_alias_protocol_empty_impl_same_name_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -2443,8 +2500,10 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_selective_import_impl_method_with_mismatched_concrete_generic_return_type) {
-    const std::string dir = "/tmp/rut_selective_import_alias_protocol_concrete_generic_return_mismatch_frontend";
+TEST(frontend,
+     analyze_rejects_selective_import_impl_method_with_mismatched_concrete_generic_return_type) {
+    const std::string dir =
+        "/tmp/rut_selective_import_alias_protocol_concrete_generic_return_mismatch_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -2468,8 +2527,10 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_selective_import_impl_method_with_mismatched_concrete_generic_parameter_type) {
-    const std::string dir = "/tmp/rut_selective_import_alias_protocol_concrete_generic_parameter_mismatch_frontend";
+TEST(frontend,
+     analyze_rejects_selective_import_impl_method_with_mismatched_concrete_generic_parameter_type) {
+    const std::string dir =
+        "/tmp/rut_selective_import_alias_protocol_concrete_generic_parameter_mismatch_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -2813,12 +2874,14 @@ route GET "/users" { return 200 }
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast);
-    CHECK(ast.error().code == FrontendError::UnexpectedToken || ast.error().code == FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().code == FrontendError::UnexpectedToken ||
+          ast.error().code == FrontendError::UnsupportedSyntax);
 }
 TEST(frontend, variant_match_lowers_to_tag_compare) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return 200 case _: return 403 } }\n";
+        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
+        "200 case _: return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2852,7 +2915,8 @@ TEST(frontend, variant_match_lowers_to_tag_compare) {
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     REQUIRE_EQ(mir->functions[0].locals.len, 1u);
-    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].type), static_cast<u8>(MirTypeKind::Variant));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].type),
+             static_cast<u8>(MirTypeKind::Variant));
     CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
              static_cast<u8>(MirValueKind::VariantCase));
     FrontendRirModule rir{};
@@ -2867,7 +2931,8 @@ TEST(frontend, variant_match_lowers_to_tag_compare) {
 TEST(frontend, variant_match_all_cases_without_wildcard_is_exhaustive) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return 200 case .forbidden: return 403 } }\n";
+        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
+        "200 case .forbidden: return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2903,7 +2968,8 @@ TEST(frontend, variant_match_all_cases_without_wildcard_is_exhaustive) {
 TEST(frontend, variant_single_payload_case_parses_and_lowers) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): return 200 case .err: return 500 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): return 200 "
+        "case .err: return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2919,7 +2985,8 @@ TEST(frontend, variant_single_payload_case_parses_and_lowers) {
     REQUIRE_EQ(hir->variants.len, 1u);
     REQUIRE_EQ(hir->variants[0].cases.len, 2u);
     CHECK(hir->variants[0].cases[0].has_payload);
-    CHECK_EQ(static_cast<u8>(hir->variants[0].cases[0].payload_type), static_cast<u8>(HirTypeKind::I32));
+    CHECK_EQ(static_cast<u8>(hir->variants[0].cases[0].payload_type),
+             static_cast<u8>(HirTypeKind::I32));
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
              static_cast<u8>(HirExprKind::VariantCase));
@@ -2941,7 +3008,8 @@ TEST(frontend, variant_single_payload_case_parses_and_lowers) {
 TEST(frontend, variant_payload_binding_flows_into_match_arm_if) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): if x == 200 { return 200 } else { return 500 } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): if x == 200 "
+        "{ return 200 } else { return 500 } case .err: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2982,7 +3050,8 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_if) {
 TEST(frontend, variant_payload_binding_flows_into_match_arm_block) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let y = x if y == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let y = x "
+        "if y == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -3013,7 +3082,9 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_block) {
 TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed = error(7) guard failed else { return 401 } if x == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed "
+        "= error(7) guard failed else { return 401 } if x == 200 { return 200 } else { return 500 "
+        "} } case .err: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -3043,7 +3114,9 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard) {
 TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed = error(.timeout) guard match failed else { case .timeout: return 401 case _: return 402 } if x == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed "
+        "= error(.timeout) guard match failed else { case .timeout: return 401 case _: return 402 "
+        "} if x == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -3073,7 +3146,9 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard_mat
 TEST(frontend, variant_mixed_payload_cases_lower) {
     const char* src =
         "variant Mixed { count(i32), ready(bool), label(str), none }\n"
-        "route GET \"/users\" { let state = Mixed.ready(true) match state { case .count(x): return 200 case .ready(flag): if flag == true { return 201 } else { return 202 } case .label(name): return 203 case .none: return 204 } }\n";
+        "route GET \"/users\" { let state = Mixed.ready(true) match state { case .count(x): return "
+        "200 case .ready(flag): if flag == true { return 201 } else { return 202 } case "
+        ".label(name): return 203 case .none: return 204 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -3091,9 +3166,12 @@ TEST(frontend, variant_mixed_payload_cases_lower) {
     REQUIRE(hir);
     REQUIRE_EQ(hir->variants.len, 1u);
     REQUIRE_EQ(hir->variants[0].cases.len, 4u);
-    CHECK_EQ(static_cast<u8>(hir->variants[0].cases[0].payload_type), static_cast<u8>(HirTypeKind::I32));
-    CHECK_EQ(static_cast<u8>(hir->variants[0].cases[1].payload_type), static_cast<u8>(HirTypeKind::Bool));
-    CHECK_EQ(static_cast<u8>(hir->variants[0].cases[2].payload_type), static_cast<u8>(HirTypeKind::Str));
+    CHECK_EQ(static_cast<u8>(hir->variants[0].cases[0].payload_type),
+             static_cast<u8>(HirTypeKind::I32));
+    CHECK_EQ(static_cast<u8>(hir->variants[0].cases[1].payload_type),
+             static_cast<u8>(HirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(hir->variants[0].cases[2].payload_type),
+             static_cast<u8>(HirTypeKind::Str));
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
@@ -3105,7 +3183,9 @@ TEST(frontend, variant_tuple_payload_binding_flows_into_pipe_multi_slot) {
     const char* src =
         "variant Result { ok((i32, i32)), err }\n"
         "func second(a: i32, b: i32) -> i32 => b\n"
-        "route GET \"/users\" { let state = Result.ok((200, 500)) match state { case .ok(pair): { let code = pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok((200, 500)) match state { case .ok(pair): { "
+        "let code = pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } } case "
+        ".err: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -3135,7 +3215,9 @@ TEST(frontend, route_match_struct_payload_binding_preserves_shape) {
         "struct Box { value: i32 }\n"
         "variant Result { ok(Box), err }\n"
         "func boxCode(x: Box) -> i32 => x.value\n"
-        "route GET \"/users\" { let state = Result.ok(Box(value: 200)) match state { case .ok(box): { let code = box | boxCode(_) if code == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(Box(value: 200)) match state { case "
+        ".ok(box): { let code = box | boxCode(_) if code == 200 { return 200 } else { return 500 } "
+        "} case .err: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -3155,7 +3237,9 @@ TEST(frontend, route_match_nested_struct_payload_projection) {
         "struct Box { value: i32 }\n"
         "struct Outer { inner: Box }\n"
         "variant Result { ok(Outer), err }\n"
-        "route GET \"/users\" { let state = Result.ok(Outer(inner: Box(value: 200))) match state { case .ok(v): { let code = v.inner.value if code == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(Outer(inner: Box(value: 200))) match state { "
+        "case .ok(v): { let code = v.inner.value if code == 200 { return 200 } else { return 500 } "
+        "} case .err: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -3296,7 +3380,8 @@ TEST(frontend, import_relative_file_preserves_imported_function_body_shape_indic
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
         out << "struct Box { value: i32 }\n";
         out << "variant Result { ok, err }\n";
-        out << "func makeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { Box(value: 500) } }\n";
+        out << "func makeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { Box(value: 500) } "
+               "}\n";
         out << "func maybe(ok: bool) { if ok { 200 } else { nil } }\n";
         out << "func pickOr(ok: bool) -> i32 => or(maybe(ok), 500)\n";
         out << "func pickMatch(x: Result) -> i32 {\n";
@@ -3350,7 +3435,8 @@ route GET "/users" {
     CHECK(hir->type_shapes[pick_match->body.shape_index].is_concrete);
 }
 
-TEST(frontend, import_relative_file_preserves_imported_protocol_default_method_wrapper_metadata_in_hir) {
+TEST(frontend,
+     import_relative_file_preserves_imported_protocol_default_method_wrapper_metadata_in_hir) {
     const std::string dir = "/tmp/rut_import_protocol_default_wrapper_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -3412,7 +3498,8 @@ route GET "/users" {
     CHECK(maybe_fail_req->return_error_variant_index != 0xffffffffu);
 }
 
-TEST(frontend, imported_generic_receiver_protocol_call_preserves_default_method_wrapper_metadata_in_hir) {
+TEST(frontend,
+     imported_generic_receiver_protocol_call_preserves_default_method_wrapper_metadata_in_hir) {
     const std::string dir = "/tmp/rut_import_protocol_call_wrapper_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -3466,7 +3553,9 @@ route GET "/users" {
     CHECK(run_err->body.lhs->error_variant_index != 0xffffffffu);
 }
 
-TEST(frontend, import_relative_file_inlines_imported_generic_empty_impl_default_method_wrappers_in_route_hir) {
+TEST(
+    frontend,
+    import_relative_file_inlines_imported_generic_empty_impl_default_method_wrappers_in_route_hir) {
     const std::string dir = "/tmp/rut_import_protocol_call_wrapper_route_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -3680,7 +3769,8 @@ route GET "/users" {
     rir.destroy();
 }
 
-TEST(frontend, lower_to_rir_supports_imported_generic_empty_impl_for_optional_default_method_dispatch) {
+TEST(frontend,
+     lower_to_rir_supports_imported_generic_empty_impl_for_optional_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_optional_lower_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -3708,7 +3798,8 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     rir.destroy();
 }
 
-TEST(frontend, lower_to_rir_supports_imported_generic_empty_impl_for_error_default_method_dispatch) {
+TEST(frontend,
+     lower_to_rir_supports_imported_generic_empty_impl_for_error_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_error_lower_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -3770,7 +3861,8 @@ route GET "/users" {
     rir.destroy();
 }
 
-TEST(frontend, lower_to_rir_supports_import_namespace_route_match_nested_struct_payload_projection) {
+TEST(frontend,
+     lower_to_rir_supports_import_namespace_route_match_nested_struct_payload_projection) {
     const std::string dir = "/tmp/rut_import_namespace_match_nested_struct_payload_lower_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -3810,7 +3902,8 @@ TEST(frontend, route_guard_bound_struct_preserves_shape_index) {
     const char* src =
         "struct Box { value: i32 }\n"
         "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
-        "route GET \"/users\" { guard let picked = maybeBox(true) else { return 401 } if picked.value == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { guard let picked = maybeBox(true) else { return 401 } if "
+        "picked.value == 200 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -3827,7 +3920,8 @@ TEST(frontend, route_guard_bound_runtime_error_struct_preserves_init_shape) {
     const char* src =
         "struct Box { value: i32 }\n"
         "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { error(.timeout) } }\n"
-        "route GET \"/users\" { guard let picked = maybeBox(true) else { return 401 } if picked.value == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { guard let picked = maybeBox(true) else { return 401 } if "
+        "picked.value == 200 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -3850,7 +3944,9 @@ TEST(frontend, match_arm_guard_bound_struct_preserves_shape_index) {
         "struct Box { value: i32 }\n"
         "variant Result { ok, err }\n"
         "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
-        "route GET \"/users\" { let state = Result.ok match state { case .ok: { guard let picked = maybeBox(true) else { return 401 } if picked.value == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok match state { case .ok: { guard let picked = "
+        "maybeBox(true) else { return 401 } if picked.value == 200 { return 200 } else { return "
+        "500 } } case .err: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4027,7 +4123,8 @@ route GET "/users" {
 }
 TEST(frontend, named_errors_aggregate_into_hidden_error_variant) {
     const char* src =
-        "route GET \"/users\" { let timeout = error(.timeout) let denied = error(.forbidden) return 200 }\n";
+        "route GET \"/users\" { let timeout = error(.timeout) let denied = error(.forbidden) "
+        "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4050,7 +4147,8 @@ TEST(frontend, named_errors_aggregate_into_hidden_error_variant) {
 }
 TEST(frontend, error_message_is_preserved_for_named_error) {
     const char* src =
-        "route GET \"/users\" { let timeout = error(.timeout, \"request timed out\") return 200 }\n";
+        "route GET \"/users\" { let timeout = error(.timeout, \"request timed out\") return 200 "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4069,7 +4167,8 @@ TEST(frontend, error_message_is_preserved_for_named_error) {
 TEST(frontend, custom_error_struct_can_be_used_in_error_constructor) {
     const char* src =
         "struct AuthError { err: Error }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\") return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\") return 200 "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4086,7 +4185,8 @@ TEST(frontend, custom_error_struct_can_be_used_in_error_constructor) {
     CHECK(hir->structs[0].name.eq(lit("AuthError")));
     CHECK(hir->structs[0].conforms_error);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Error));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::Error));
     CHECK_EQ(hir->routes[0].locals[0].init.error_struct_index, 0u);
     CHECK(hir->routes[0].locals[0].init.msg.eq(lit("timed out")));
     auto mir = build_mir_heap(hir.value());
@@ -4097,7 +4197,8 @@ TEST(frontend, custom_error_struct_can_be_used_in_error_constructor) {
 TEST(frontend, custom_error_struct_with_extra_fields_lowers_to_rir_struct) {
     const char* src =
         "struct AuthError { err: Error, token: str, retry: i32 }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: \"abc\", retry: 3) return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
+        "\"abc\", retry: 3) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4139,7 +4240,8 @@ TEST(frontend, custom_error_struct_with_extra_fields_lowers_to_rir_struct) {
 TEST(frontend, custom_error_struct_constructor_preserves_extra_field_inits) {
     const char* src =
         "struct AuthError { err: Error, token: str, retry: i32 }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: \"abc\", retry: 3) return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
+        "\"abc\", retry: 3) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4165,7 +4267,8 @@ TEST(frontend, custom_error_struct_constructor_preserves_extra_field_inits) {
 TEST(frontend, custom_error_struct_with_tuple_field_lowers_to_rir_struct) {
     const char* src =
         "struct AuthError { err: Error, pair: (i32, i32) }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, 500)) return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, "
+        "500)) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4213,7 +4316,8 @@ TEST(frontend, analyze_rejects_non_error_struct_in_error_constructor) {
 TEST(frontend, analyze_rejects_custom_error_constructor_missing_extra_fields) {
     const char* src =
         "struct AuthError { err: Error, token: str, retry: i32 }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: \"abc\") return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
+        "\"abc\") return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4225,7 +4329,8 @@ TEST(frontend, analyze_rejects_custom_error_constructor_missing_extra_fields) {
 TEST(frontend, analyze_rejects_custom_error_constructor_unknown_extra_field) {
     const char* src =
         "struct AuthError { err: Error, token: str }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", retry: 3) return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", retry: 3) "
+        "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4237,7 +4342,8 @@ TEST(frontend, analyze_rejects_custom_error_constructor_unknown_extra_field) {
 TEST(frontend, analyze_rejects_custom_error_constructor_wrong_extra_field_type) {
     const char* src =
         "struct AuthError { err: Error, retry: i32 }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", retry: \"soon\") return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", retry: "
+        "\"soon\") return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4290,7 +4396,8 @@ TEST(frontend, explicit_error_variant_is_not_wrapped_again) {
 TEST(frontend, error_message_is_preserved_for_explicit_error_variant) {
     const char* src =
         "variant AuthError { timeout, forbidden }\n"
-        "route GET \"/users\" { let failed = error(AuthError.timeout, \"timed out\") return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError.timeout, \"timed out\") return 200 "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4306,7 +4413,8 @@ TEST(frontend, error_message_is_preserved_for_explicit_error_variant) {
 }
 TEST(frontend, lower_to_rir_emits_standard_error_struct) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = or(failed, 200) return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = or(failed, "
+        "200) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4336,7 +4444,8 @@ TEST(frontend, lower_to_rir_emits_standard_error_struct) {
 }
 TEST(frontend, lower_to_rir_uses_module_name_for_error_file_field) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = or(failed, 200) return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = or(failed, "
+        "200) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4368,7 +4477,8 @@ TEST(frontend, lower_to_rir_uses_module_name_for_error_file_field) {
 TEST(frontend, custom_error_struct_lowers_with_standard_error_metadata) {
     const char* src =
         "struct AuthError { err: Error }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\") let code = or(failed, 200) return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\") let code = "
+        "or(failed, 200) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4410,7 +4520,8 @@ TEST(frontend, custom_error_struct_lowers_with_standard_error_metadata) {
 TEST(frontend, custom_error_struct_extra_fields_enter_runtime_lowering) {
     const char* src =
         "struct AuthError { err: Error, token: str, retry: i32 }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: \"abc\", retry: 3) let code = or(failed, 200) return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
+        "\"abc\", retry: 3) let code = or(failed, 200) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4429,10 +4540,10 @@ TEST(frontend, custom_error_struct_extra_fields_enter_runtime_lowering) {
         const auto& block = rir.module.functions[0].blocks[bi];
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const auto& inst = block.insts[ii];
-            if (inst.op == rir::Opcode::StructCreate && inst.imm.struct_ref.name.eq(lit("AuthError")))
+            if (inst.op == rir::Opcode::StructCreate &&
+                inst.imm.struct_ref.name.eq(lit("AuthError")))
                 saw_auth_error_create = true;
-            if (inst.op == rir::Opcode::ConstI32 && inst.imm.i32_val == 3)
-                saw_retry = true;
+            if (inst.op == rir::Opcode::ConstI32 && inst.imm.i32_val == 3) saw_retry = true;
             if (inst.op == rir::Opcode::ConstStr && inst.imm.str_val.eq(lit("abc")))
                 saw_token = true;
         }
@@ -4445,7 +4556,9 @@ TEST(frontend, custom_error_struct_extra_fields_enter_runtime_lowering) {
 TEST(frontend, custom_error_struct_fields_can_be_projected_from_known_error_local) {
     const char* src =
         "struct AuthError { err: Error, token: str, retry: i32 }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: \"abc\", retry: 3) let token = failed.token let retry = failed.retry if retry == 3 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
+        "\"abc\", retry: 3) let token = failed.token let retry = failed.retry if retry == 3 { "
+        "return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4454,17 +4567,21 @@ TEST(frontend, custom_error_struct_fields_can_be_projected_from_known_error_loca
     REQUIRE(hir);
     REQUIRE_EQ(hir.value().routes[0].locals.len, 3u);
     CHECK_EQ(hir.value().routes[0].locals[1].type, HirTypeKind::Str);
-    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::StrLit));
+    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::StrLit));
     CHECK(hir.value().routes[0].locals[1].init.str_value.eq(lit("abc")));
     CHECK_EQ(hir.value().routes[0].locals[2].type, HirTypeKind::I32);
-    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[2].init.kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[2].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
     CHECK_EQ(hir.value().routes[0].locals[2].init.int_value, 3);
 }
 TEST(frontend, custom_error_struct_tuple_field_can_flow_into_pipe_slots) {
     const char* src =
         "struct AuthError { err: Error, pair: (i32, i32) }\n"
         "func second(a: i32, b: i32) -> i32 => b\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, 500)) let code = failed.pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, "
+        "500)) let code = failed.pair | second(_2, _1) if code == 200 { return 200 } else { return "
+        "500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4483,7 +4600,8 @@ TEST(frontend, custom_error_struct_tuple_field_can_flow_into_pipe_slots) {
 TEST(frontend, plain_struct_constructor_and_field_projection_are_supported) {
     constexpr auto src =
         "struct Foo { code: i32, msg: str }\n"
-        "route GET \"/users\" { let foo = Foo(code: 200, msg: \"ok\") let code = foo.code let msg = foo.msg if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let foo = Foo(code: 200, msg: \"ok\") let code = foo.code let msg "
+        "= foo.msg if code == 200 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4506,7 +4624,8 @@ TEST(frontend, plain_struct_constructor_and_field_projection_are_supported) {
 TEST(frontend, generic_struct_constructor_and_field_projection_are_supported) {
     const char* src =
         "struct Box<T> { value: T }\n"
-        "route GET \"/users\" { let box = Box<i32>(value: 200) if box.value == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let box = Box<i32>(value: 200) if box.value == 200 { return 200 } "
+        "else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4935,7 +5054,8 @@ route GET "/users" {
     CHECK_EQ(hir->variants[1].template_variant_index, 0u);
     CHECK_EQ(hir->variants[1].cases[0].payload_type, HirTypeKind::Struct);
     REQUIRE(hir->variants[1].cases[0].payload_struct_index < hir->structs.len);
-    CHECK_EQ(hir->structs[hir->variants[1].cases[0].payload_struct_index].template_struct_index, 0u);
+    CHECK_EQ(hir->structs[hir->variants[1].cases[0].payload_struct_index].template_struct_index,
+             0u);
 }
 TEST(frontend, concrete_nested_generic_struct_type_refs_are_supported_in_function_signatures) {
     const auto src = R"rut(
@@ -5167,7 +5287,8 @@ TEST(frontend, plain_struct_tuple_field_can_flow_into_pipe_slots) {
     const char* src =
         "struct Foo { pair: (i32, i32) }\n"
         "func second(a: i32, b: i32) -> i32 => b\n"
-        "route GET \"/users\" { let foo = Foo(pair: (200, 500)) let code = foo.pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let foo = Foo(pair: (200, 500)) let code = foo.pair | second(_2, "
+        "_1) if code == 200 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5190,7 +5311,9 @@ TEST(frontend, custom_error_nested_struct_field_projection) {
     const char* src =
         "struct Box { value: i32 }\n"
         "struct AuthError { err: Error, inner: Box }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", inner: Box(value: 200)) let code = failed.inner.value if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", inner: "
+        "Box(value: 200)) let code = failed.inner.value if code == 200 { return 200 } else { "
+        "return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5205,7 +5328,8 @@ TEST(frontend, nested_struct_field_projection_preserves_projected_struct_type) {
     const char* src =
         "struct Box { value: i32 }\n"
         "struct Outer { inner: Box }\n"
-        "route GET \"/users\" { let outer = Outer(inner: Box(value: 200)) let code = outer.inner.value if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let outer = Outer(inner: Box(value: 200)) let code = "
+        "outer.inner.value if code == 200 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5220,7 +5344,8 @@ TEST(frontend, plain_struct_tuple_of_struct_field_projection_preserves_struct_sl
     const char* src =
         "struct Box { value: i32 }\n"
         "struct Foo { pair: (Box, i32) }\n"
-        "route GET \"/users\" { let foo = Foo(pair: (Box(value: 200), 500)) let pair = foo.pair return 200 }\n";
+        "route GET \"/users\" { let foo = Foo(pair: (Box(value: 200), 500)) let pair = foo.pair "
+        "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5237,7 +5362,8 @@ TEST(frontend, plain_struct_variant_field_can_flow_into_match) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
         "struct Foo { state: AuthState }\n"
-        "route GET \"/users\" { let foo = Foo(state: AuthState.timeout) match foo.state { case .timeout: return 200 case _: return 403 } }\n";
+        "route GET \"/users\" { let foo = Foo(state: AuthState.timeout) match foo.state { case "
+        ".timeout: return 200 case _: return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5257,7 +5383,8 @@ TEST(frontend, plain_struct_variant_field_can_flow_into_match) {
 }
 TEST(frontend, source_error_standard_fields_are_accessible) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = failed.code let msg = failed.msg if code == 0 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = failed.code "
+        "let msg = failed.msg if code == 0 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5266,14 +5393,17 @@ TEST(frontend, source_error_standard_fields_are_accessible) {
     REQUIRE(hir);
     REQUIRE_EQ(hir.value().routes[0].locals.len, 3u);
     CHECK_EQ(hir.value().routes[0].locals[1].type, HirTypeKind::I32);
-    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
     CHECK_EQ(hir.value().routes[0].locals[2].type, HirTypeKind::Str);
-    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[2].init.kind), static_cast<u8>(HirExprKind::StrLit));
+    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[2].init.kind),
+             static_cast<u8>(HirExprKind::StrLit));
     CHECK(hir.value().routes[0].locals[2].init.str_value.eq(lit("timed out")));
 }
 TEST(frontend, source_error_line_field_is_accessible) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let line = failed.line if line == 1 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let line = failed.line "
+        "if line == 1 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5282,12 +5412,14 @@ TEST(frontend, source_error_line_field_is_accessible) {
     REQUIRE(hir);
     REQUIRE_EQ(hir.value().routes[0].locals.len, 2u);
     CHECK_EQ(hir.value().routes[0].locals[1].type, HirTypeKind::I32);
-    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
     CHECK_EQ(hir.value().routes[0].locals[1].init.int_value, 1);
 }
 TEST(frontend, source_error_file_and_func_fields_are_accessible) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let file_name = failed.file let fn_name = failed.func return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let file_name = "
+        "failed.file let fn_name = failed.func return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5296,10 +5428,12 @@ TEST(frontend, source_error_file_and_func_fields_are_accessible) {
     REQUIRE(hir);
     REQUIRE_EQ(hir.value().routes[0].locals.len, 3u);
     CHECK_EQ(hir.value().routes[0].locals[1].type, HirTypeKind::Str);
-    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Field));
+    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::Field));
     CHECK(hir.value().routes[0].locals[1].init.str_value.eq(lit("file")));
     CHECK_EQ(hir.value().routes[0].locals[2].type, HirTypeKind::Str);
-    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[2].init.kind), static_cast<u8>(HirExprKind::Field));
+    CHECK_EQ(static_cast<u8>(hir.value().routes[0].locals[2].init.kind),
+             static_cast<u8>(HirExprKind::Field));
     CHECK(hir.value().routes[0].locals[2].init.str_value.eq(lit("func")));
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -5311,7 +5445,8 @@ TEST(frontend, source_error_file_and_func_fields_are_accessible) {
 }
 TEST(frontend, known_named_error_match_selects_error_case) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout: return 503 case _: return 200 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout: return "
+        "503 case _: return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5345,7 +5480,8 @@ TEST(frontend, if_const_selects_then_without_checking_else) {
 }
 TEST(frontend, if_const_rejects_runtime_condition) {
     const char* src =
-        "route GET \"/users\" { if const req.header(\"Host\") { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { if const req.header(\"Host\") { return 200 } else { return 500 } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5357,7 +5493,8 @@ TEST(frontend, if_const_rejects_runtime_condition) {
 TEST(frontend, match_const_selects_variant_case_without_checking_other_arms) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match const state { case .ok(x): if x == 200 { return 200 } else { return 500 } case .err: forward missing } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match const state { case .ok(x): if x "
+        "== 200 { return 200 } else { return 500 } case .err: forward missing } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5386,7 +5523,8 @@ TEST(frontend, function_match_const_preserves_outer_payload_binding) {
         "    case .err => 404\n"
         "  }\n"
         "}\n"
-        "route GET \"/users\" { let code = pick(Result.ok(200)) if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let code = pick(Result.ok(200)) if code == 200 { return 200 } else "
+        "{ return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5399,7 +5537,8 @@ TEST(frontend, function_match_const_preserves_outer_payload_binding) {
 TEST(frontend, match_const_rejects_runtime_subject) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { match const req.header(\"Host\") { case .timeout: return 200 case _: return 500 } }\n";
+        "route GET \"/users\" { match const req.header(\"Host\") { case .timeout: return 200 case "
+        "_: return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5420,7 +5559,8 @@ TEST(frontend, analyze_rejects_variant_payload_type_mismatch) {
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
-TEST(frontend, analyze_rejects_generic_variant_constructor_when_not_all_type_arguments_can_be_inferred) {
+TEST(frontend,
+     analyze_rejects_generic_variant_constructor_when_not_all_type_arguments_can_be_inferred) {
     const auto src = R"rut(
 variant Pair<T, U> { one(T), two(U) }
 route GET "/users" {
@@ -5438,7 +5578,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     CHECK(!hir);
 }
-TEST(frontend, analyze_rejects_generic_struct_constructor_when_not_all_type_arguments_can_be_inferred) {
+TEST(frontend,
+     analyze_rejects_generic_struct_constructor_when_not_all_type_arguments_can_be_inferred) {
     const auto src = R"rut(
 struct Holder<T, U> { value: T, tag: i32 }
 route GET "/users" {
@@ -5480,7 +5621,8 @@ TEST(frontend, analyze_rejects_payload_on_payloadless_variant_case) {
 TEST(frontend, analyze_rejects_variant_match_missing_case_without_wildcard) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return 200 } }\n";
+        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
+        "200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5492,7 +5634,8 @@ TEST(frontend, analyze_rejects_variant_match_missing_case_without_wildcard) {
 TEST(frontend, analyze_rejects_duplicate_variant_match_case) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return 200 case .timeout: return 403 } }\n";
+        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
+        "200 case .timeout: return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5529,8 +5672,7 @@ TEST(frontend, lower_forward_route_to_rir) {
     REQUIRE_EQ(fn.blocks[0].inst_count, 2u);
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ConstI32));
     CHECK_EQ(fn.blocks[0].insts[0].imm.i32_val, 1);
-    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[1].op),
-             static_cast<u8>(rir::Opcode::RetForward));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[1].op), static_cast<u8>(rir::Opcode::RetForward));
     rir.destroy();
 }
 TEST(frontend, let_if_lowers_to_branching_rir) {
@@ -5571,7 +5713,8 @@ TEST(frontend, let_if_lowers_to_branching_rir) {
 }
 TEST(frontend, route_if_branch_block_with_let_lowers_via_match_shape) {
     const char* src =
-        "route GET \"/users\" { let ok = true if ok { let code = 200 if code == 200 { return 200 } else { return 500 } } else { return 404 } }\n";
+        "route GET \"/users\" { let ok = true if ok { let code = 200 if code == 200 { return 200 } "
+        "else { return 500 } } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5589,7 +5732,8 @@ TEST(frontend, route_if_branch_block_with_let_lowers_via_match_shape) {
 }
 TEST(frontend, route_if_branch_block_with_guard_is_supported) {
     const char* src =
-        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard failed else { return 401 } return 200 } else { return 404 } }\n";
+        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard failed else { "
+        "return 401 } return 200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5603,7 +5747,8 @@ TEST(frontend, route_if_branch_block_with_guard_is_supported) {
 TEST(frontend, guard_lowers_to_fail_and_continue_blocks) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let failed = error(7) guard failed else { return 401 } forward api }\n";
+        "route GET \"/users\" { let failed = error(7) guard failed else { return 401 } forward api "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5639,7 +5784,8 @@ TEST(frontend, guard_lowers_to_fail_and_continue_blocks) {
 }
 TEST(frontend, guard_else_block_with_let_is_supported) {
     const char* src =
-        "route GET \"/users\" { let failed = error(7) guard failed else { let code = 401 if code == 401 { return 401 } else { return 500 } } return 200 }\n";
+        "route GET \"/users\" { let failed = error(7) guard failed else { let code = 401 if code "
+        "== 401 { return 401 } else { return 500 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5647,13 +5793,15 @@ TEST(frontend, guard_else_block_with_let_is_supported) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].guards.len, 1u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].fail_kind), static_cast<u8>(HirGuard::FailKind::Body));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].fail_kind),
+             static_cast<u8>(HirGuard::FailKind::Body));
     CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].fail_body.body_kind),
              static_cast<u8>(HirGuardBody::BodyKind::If));
 }
 TEST(frontend, guard_let_binds_success_value) {
     const char* src =
-        "route GET \"/users\" { guard let code = 200 else { return 401 } if code == 200 { return 200 } else { return 404 } }\n";
+        "route GET \"/users\" { guard let code = 200 else { return 401 } if code == 200 { return "
+        "200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5692,13 +5840,15 @@ TEST(frontend, guard_let_does_not_unwrap_nil) {
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Unknown));
     CHECK(hir->routes[0].locals[0].may_nil);
     CHECK_FALSE(hir->routes[0].locals[0].may_error);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind), static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
+             static_cast<u8>(HirExprKind::BoolLit));
     CHECK(hir->routes[0].guards[0].cond.bool_value);
 }
 TEST(frontend, equality_expression_lowers_to_cmp_eq) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let code = 200 if code == 200 { forward api } else { return 404 } }\n";
+        "route GET \"/users\" { let code = 200 if code == 200 { forward api } else { return 404 } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5723,7 +5873,8 @@ TEST(frontend, equality_expression_lowers_to_cmp_eq) {
 }
 TEST(frontend, or_builtin_falls_back_from_nil) {
     const char* src =
-        "route GET \"/users\" { let code = or(nil, 200) if code == 200 { return 200 } else { return 404 } }\n";
+        "route GET \"/users\" { let code = or(nil, 200) if code == 200 { return 200 } else { "
+        "return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5739,12 +5890,14 @@ TEST(frontend, or_builtin_falls_back_from_nil) {
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::I32));
     CHECK_FALSE(hir->routes[0].locals[0].may_nil);
     CHECK_FALSE(hir->routes[0].locals[0].may_error);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
     CHECK_EQ(hir->routes[0].locals[0].init.int_value, 200);
 }
 TEST(frontend, req_header_flows_as_optional_str) {
     const char* src =
-        "route GET \"/users\" { let host = req.header(\"Host\") let value = or(host, \"fallback\") return 200 }\n";
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = or(host, \"fallback\") "
+        "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5787,7 +5940,8 @@ TEST(frontend, req_header_flows_as_optional_str) {
 }
 TEST(frontend, req_header_alias_flows_as_optional_str) {
     const char* src =
-        "route GET \"/users\" { let host = req.header(\"Host\") let alias = host let value = or(alias, \"fallback\") return 200 }\n";
+        "route GET \"/users\" { let host = req.header(\"Host\") let alias = host let value = "
+        "or(alias, \"fallback\") return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5820,7 +5974,8 @@ TEST(frontend, req_header_alias_flows_as_optional_str) {
 }
 TEST(frontend, or_builtin_falls_back_from_nil_local) {
     const char* src =
-        "route GET \"/users\" { let maybe = nil let code = or(maybe, 200) if code == 200 { return 200 } else { return 404 } }\n";
+        "route GET \"/users\" { let maybe = nil let code = or(maybe, 200) if code == 200 { return "
+        "200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5831,10 +5986,12 @@ TEST(frontend, or_builtin_falls_back_from_nil_local) {
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Unknown));
     CHECK(hir->routes[0].locals[0].may_nil);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Nil));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::Nil));
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].type), static_cast<u8>(HirTypeKind::I32));
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
     CHECK_EQ(hir->routes[0].locals[1].init.int_value, 200);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -5842,7 +5999,8 @@ TEST(frontend, or_builtin_falls_back_from_nil_local) {
 }
 TEST(frontend, or_builtin_falls_back_from_error_local) {
     const char* src =
-        "route GET \"/users\" { let failed = error(7) let code = or(failed, 200) if code == 200 { return 200 } else { return 404 } }\n";
+        "route GET \"/users\" { let failed = error(7) let code = or(failed, 200) if code == 200 { "
+        "return 200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5851,18 +6009,21 @@ TEST(frontend, or_builtin_falls_back_from_error_local) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Error));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::Error));
     CHECK_FALSE(hir->routes[0].locals[0].may_nil);
     CHECK(hir->routes[0].locals[0].may_error);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].type), static_cast<u8>(HirTypeKind::I32));
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
     CHECK_EQ(hir->routes[0].locals[1].init.int_value, 200);
 }
 TEST(frontend, or_builtin_falls_back_from_error_alias) {
     const char* src =
-        "route GET \"/users\" { let failed = error(7) let alias = failed let code = or(alias, 200) if code == 200 { return 200 } else { return 404 } }\n";
+        "route GET \"/users\" { let failed = error(7) let alias = failed let code = or(alias, 200) "
+        "if code == 200 { return 200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5873,7 +6034,8 @@ TEST(frontend, or_builtin_falls_back_from_error_alias) {
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[2].type), static_cast<u8>(HirTypeKind::I32));
     CHECK_FALSE(hir->routes[0].locals[2].may_nil);
     CHECK_FALSE(hir->routes[0].locals[2].may_error);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[2].init.kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[2].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
     CHECK_EQ(hir->routes[0].locals[2].init.int_value, 200);
 }
 TEST(frontend, analyze_rejects_unknown_upstream) {
@@ -5889,7 +6051,8 @@ TEST(frontend, analyze_rejects_unknown_upstream) {
 TEST(frontend, match_lowers_to_cmp_eq_chain) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let code = 200 match code { case 200: forward api case _: return 404 } }\n";
+        "route GET \"/users\" { let code = 200 match code { case 200: forward api case _: return "
+        "404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5921,7 +6084,8 @@ TEST(frontend, match_lowers_to_cmp_eq_chain) {
 TEST(frontend, guard_then_match_lowers_to_guard_and_match_blocks) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let failed = error(7) let code = 200 guard code else { return 401 } match code { case 200: forward api case _: return 404 } }\n";
+        "route GET \"/users\" { let failed = error(7) let code = 200 guard code else { return 401 "
+        "} match code { case 200: forward api case _: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5945,7 +6109,8 @@ TEST(frontend, guard_then_match_lowers_to_guard_and_match_blocks) {
 }
 TEST(frontend, multiple_top_level_guards_are_allowed) {
     const char* src =
-        "route GET \"/users\" { let ok = 200 guard ok else { return 401 } let failed = error(7) guard failed else { return 402 } return 200 }\n";
+        "route GET \"/users\" { let ok = 200 guard ok else { return 401 } let failed = error(7) "
+        "guard failed else { return 402 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5964,7 +6129,8 @@ TEST(frontend, multiple_top_level_guards_are_allowed) {
 }
 TEST(frontend, guard_match_lowers_to_fail_side_match_arms) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case .timeout: return 503 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
+        ".timeout: return 503 case _: return 500 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5987,7 +6153,8 @@ TEST(frontend, guard_match_lowers_to_fail_side_match_arms) {
 }
 TEST(frontend, analyze_rejects_guard_match_without_wildcard) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case .timeout: return 503 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
+        ".timeout: return 503 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5998,7 +6165,8 @@ TEST(frontend, analyze_rejects_guard_match_without_wildcard) {
 }
 TEST(frontend, analyze_rejects_guard_match_wildcard_before_last) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case _: return 500 case .timeout: return 503 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case _: "
+        "return 500 case .timeout: return 503 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6009,7 +6177,8 @@ TEST(frontend, analyze_rejects_guard_match_wildcard_before_last) {
 }
 TEST(frontend, analyze_rejects_guard_match_duplicate_case) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case .timeout: return 503 case .timeout: return 504 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
+        ".timeout: return 503 case .timeout: return 504 case _: return 500 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6021,7 +6190,8 @@ TEST(frontend, analyze_rejects_guard_match_duplicate_case) {
 TEST(frontend, analyze_rejects_guard_match_pattern_type_mismatch) {
     const char* src =
         "variant AuthError { timeout, forbidden }\n"
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case AuthError.timeout: return 503 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
+        "AuthError.timeout: return 503 case _: return 500 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6033,7 +6203,9 @@ TEST(frontend, analyze_rejects_guard_match_pattern_type_mismatch) {
 TEST(frontend, analyze_rejects_match_arm_block_guard_match_on_non_error_value) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { guard match x else { case .timeout: return 401 case _: return 402 } if x == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { guard "
+        "match x else { case .timeout: return 401 case _: return 402 } if x == 200 { return 200 } "
+        "else { return 500 } } case .err: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6056,7 +6228,8 @@ TEST(frontend, analyze_rejects_match_without_wildcard) {
 TEST(frontend, guard_lowers_from_error_alias) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let failed = error(7) let alias = failed guard alias else { return 401 } forward api }\n";
+        "route GET \"/users\" { let failed = error(7) let alias = failed guard alias else { return "
+        "401 } forward api }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6071,7 +6244,8 @@ TEST(frontend, guard_lowers_from_error_alias) {
 }
 TEST(frontend, analyze_rejects_match_wildcard_before_last) {
     const char* src =
-        "route GET \"/users\" { let code = 200 match code { case _: return 404 case 200: return 200 } }\n";
+        "route GET \"/users\" { let code = 200 match code { case _: return 404 case 200: return "
+        "200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6082,7 +6256,8 @@ TEST(frontend, analyze_rejects_match_wildcard_before_last) {
 }
 TEST(frontend, analyze_rejects_match_pattern_type_mismatch) {
     const char* src =
-        "route GET \"/users\" { let ok = true match ok { case 200: return 200 case _: return 404 } }\n";
+        "route GET \"/users\" { let ok = true match ok { case 200: return 200 case _: return 404 } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6103,8 +6278,7 @@ TEST(frontend, analyze_rejects_or_with_mismatched_types) {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, analyze_rejects_or_with_fallible_fallback) {
-    const char* src =
-        "route GET \"/users\" { let code = or(nil, error(7)) return 200 }\n";
+    const char* src = "route GET \"/users\" { let code = or(nil, error(7)) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6126,7 +6300,8 @@ TEST(frontend, analyze_rejects_guard_let_binding_error_value) {
 }
 TEST(frontend, analyze_rejects_guard_let_binding_error_alias) {
     const char* src =
-        "route GET \"/users\" { let failed = error(7) let alias = failed guard let code = alias else { return 401 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(7) let alias = failed guard let code = alias "
+        "else { return 401 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6474,9 +6649,11 @@ TEST(frontend, lower_to_rir_supports_runtime_optional_str_or_value) {
     CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[1].op), static_cast<u8>(rir::Opcode::OptWrap));
     CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[2].op), static_cast<u8>(rir::Opcode::ConstStr));
     CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[3].op), static_cast<u8>(rir::Opcode::OptIsNil));
-    CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[4].op), static_cast<u8>(rir::Opcode::OptUnwrap));
+    CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[4].op),
+             static_cast<u8>(rir::Opcode::OptUnwrap));
     CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[5].op), static_cast<u8>(rir::Opcode::Select));
-    CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[6].op), static_cast<u8>(rir::Opcode::RetStatus));
+    CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[6].op),
+             static_cast<u8>(rir::Opcode::RetStatus));
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_no_error_guard) {
@@ -7180,7 +7357,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, analyze_rejects_generic_function_call_with_custom_protocol_constraint_without_impls) {
+TEST(frontend,
+     analyze_rejects_generic_function_call_with_custom_protocol_constraint_without_impls) {
     const auto src = R"rut(
 protocol Hashable {}
 func hash<T: Hashable>(x: T) -> i32 => 200
@@ -7363,7 +7541,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_custom_protocol_method_dispatch_with_generic_impl_target_is_supported) {
+TEST(
+    frontend,
+    source_generic_receiver_custom_protocol_method_dispatch_with_generic_impl_target_is_supported) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 }
 struct Box<T> { value: T }
@@ -7382,7 +7562,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_custom_protocol_method_dispatch_with_generic_impl_target_tuple_of_struct_arg_is_supported) {
+TEST(
+    frontend,
+    source_generic_receiver_custom_protocol_method_dispatch_with_generic_impl_target_tuple_of_struct_arg_is_supported) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 }
 struct Item { value: i32 }
@@ -7562,7 +7744,8 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_impl_method_with_mismatched_imported_namespace_same_name_parameter_type) {
+TEST(frontend,
+     analyze_rejects_impl_method_with_mismatched_imported_namespace_same_name_parameter_type) {
     const std::string dir = "/tmp/rut_import_namespace_protocol_requirement_mismatch_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -7587,8 +7770,10 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_impl_method_with_mismatched_imported_namespace_same_name_return_type) {
-    const std::string dir = "/tmp/rut_import_namespace_protocol_requirement_return_mismatch_frontend";
+TEST(frontend,
+     analyze_rejects_impl_method_with_mismatched_imported_namespace_same_name_return_type) {
+    const std::string dir =
+        "/tmp/rut_import_namespace_protocol_requirement_return_mismatch_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -7612,7 +7797,8 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_impl_method_with_mismatched_concrete_generic_requirement_parameter_type) {
+TEST(frontend,
+     analyze_rejects_impl_method_with_mismatched_concrete_generic_requirement_parameter_type) {
     const auto src = R"rut(
 protocol Consumer { func take(x: Box<i32>) -> i32 }
 struct Box<T> { value: T }
@@ -7630,8 +7816,10 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_impl_method_with_mismatched_imported_namespace_concrete_generic_return_type) {
-    const std::string dir = "/tmp/rut_import_namespace_protocol_requirement_generic_return_mismatch_frontend";
+TEST(frontend,
+     analyze_rejects_impl_method_with_mismatched_imported_namespace_concrete_generic_return_type) {
+    const std::string dir =
+        "/tmp/rut_import_namespace_protocol_requirement_generic_return_mismatch_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -7654,8 +7842,11 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_impl_method_with_mismatched_imported_namespace_concrete_generic_parameter_type) {
-    const std::string dir = "/tmp/rut_import_namespace_protocol_requirement_generic_param_mismatch_frontend";
+TEST(
+    frontend,
+    analyze_rejects_impl_method_with_mismatched_imported_namespace_concrete_generic_parameter_type) {
+    const std::string dir =
+        "/tmp/rut_import_namespace_protocol_requirement_generic_param_mismatch_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -7756,7 +7947,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_concrete_custom_protocol_default_method_dispatch_with_parameter_is_supported) {
+TEST(frontend,
+     source_concrete_custom_protocol_default_method_dispatch_with_parameter_is_supported) {
     const auto src = R"rut(
 protocol Adder { func add(x: i32) -> i32 => x }
 struct Box { value: i32 }
@@ -7772,7 +7964,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_custom_protocol_default_method_dispatch_with_parameter_is_supported) {
+TEST(frontend,
+     source_generic_receiver_custom_protocol_default_method_dispatch_with_parameter_is_supported) {
     const auto src = R"rut(
 protocol Adder { func add(x: i32) -> i32 => x }
 struct Box { value: i32 }
@@ -7807,7 +8000,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_custom_protocol_default_method_tuple_return_supports_ordering) {
+TEST(frontend,
+     source_generic_receiver_custom_protocol_default_method_tuple_return_supports_ordering) {
     const auto src = R"rut(
 protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
 struct Box { value: i32 }
@@ -7824,7 +8018,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_custom_protocol_default_method_tuple_return_supports_equality) {
+TEST(frontend,
+     source_generic_receiver_custom_protocol_default_method_tuple_return_supports_equality) {
     const auto src = R"rut(
 protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
 struct Box { value: i32 }
@@ -7858,7 +8053,8 @@ route GET "/users" {
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_generic_receiver_custom_protocol_default_method_dispatch_without_conformance) {
+TEST(frontend,
+     analyze_rejects_generic_receiver_custom_protocol_default_method_dispatch_without_conformance) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 => 200 }
 struct Box { value: i32 }
@@ -7875,7 +8071,8 @@ route GET "/users" {
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_concrete_custom_protocol_default_method_dispatch_without_conformance) {
+TEST(frontend,
+     analyze_rejects_concrete_custom_protocol_default_method_dispatch_without_conformance) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 => 200 }
 struct Box { value: i32 }
@@ -8040,7 +8237,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_custom_protocol_default_method_supports_block_body_with_parameter) {
+TEST(frontend,
+     source_generic_receiver_custom_protocol_default_method_supports_block_body_with_parameter) {
     const auto src = R"rut(
 protocol Adder {
     func add(x: i32) -> i32 {
@@ -8411,8 +8609,10 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_block_body_and_parameter) {
-    const std::string dir = "/tmp/rut_import_impl_overrides_block_body_parameter_default_method_frontend";
+TEST(frontend,
+     import_relative_file_impl_overrides_protocol_default_method_with_block_body_and_parameter) {
+    const std::string dir =
+        "/tmp/rut_import_impl_overrides_block_body_parameter_default_method_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8438,8 +8638,10 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_if_body_and_parameter) {
-    const std::string dir = "/tmp/rut_import_impl_overrides_if_body_parameter_default_method_frontend";
+TEST(frontend,
+     import_relative_file_impl_overrides_protocol_default_method_with_if_body_and_parameter) {
+    const std::string dir =
+        "/tmp/rut_import_impl_overrides_if_body_parameter_default_method_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8503,7 +8705,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
+TEST(frontend,
+     source_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
     const auto src = R"rut(
 protocol MaybeCode { func code() -> i32 => nil }
 struct Box<T> { value: T }
@@ -8520,7 +8723,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
+TEST(frontend,
+     source_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
     const auto src = R"rut(
 protocol MaybeCode { func code() -> i32 => error(.timeout) }
 struct Box<T> { value: T }
@@ -8537,7 +8741,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
+TEST(frontend,
+     source_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
     const auto src = R"rut(
 protocol MaybeCode {
     func code() -> i32 {
@@ -8559,7 +8764,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body) {
+TEST(frontend,
+     source_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body) {
     const auto src = R"rut(
 protocol MaybeCode {
     func code(ok: bool) -> i32 {
@@ -8580,7 +8786,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
+TEST(
+    frontend,
+    source_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
     const auto src = R"rut(
 protocol Adder {
     func add(x: i32) -> i32 {
@@ -8602,7 +8810,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
+TEST(
+    frontend,
+    source_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
     const auto src = R"rut(
 protocol Adder {
     func add(ok: bool) -> i32 {
@@ -8623,8 +8833,11 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_optional_default_method_frontend";
+TEST(
+    frontend,
+    import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_optional_default_method_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8646,8 +8859,11 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_error_default_method_frontend";
+TEST(
+    frontend,
+    import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_error_default_method_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8669,8 +8885,12 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_block_body_default_method_frontend";
+TEST(
+    frontend,
+    import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
+    const std::string dir =
+        "/tmp/"
+        "rut_import_generic_impl_overrides_generic_receiver_block_body_default_method_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8697,8 +8917,11 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_if_body_default_method_frontend";
+TEST(
+    frontend,
+    import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_if_body_default_method_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8724,8 +8947,13 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_block_body_parameter_default_method_frontend";
+TEST(
+    frontend,
+    import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
+    const std::string dir =
+        "/tmp/"
+        "rut_import_generic_impl_overrides_generic_receiver_block_body_parameter_default_method_"
+        "frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8752,8 +8980,13 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_if_body_parameter_default_method_frontend";
+TEST(
+    frontend,
+    import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
+    const std::string dir =
+        "/tmp/"
+        "rut_import_generic_impl_overrides_generic_receiver_if_body_parameter_default_method_"
+        "frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8779,8 +9012,10 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_default_method_frontend";
+TEST(frontend,
+     import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_default_method_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8824,7 +9059,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_multi_protocol_empty_impl_block_default_method_dispatch_is_supported) {
+TEST(frontend,
+     source_generic_receiver_multi_protocol_empty_impl_block_default_method_dispatch_is_supported) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 => 200 }
 protocol Adder { func add(x: i32) -> i32 => x }
@@ -8951,7 +9187,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_multi_protocol_empty_impl_block_default_method_tuple_return_supports_ordering) {
+TEST(frontend,
+     source_multi_protocol_empty_impl_block_default_method_tuple_return_supports_ordering) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 => 200 }
 protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
@@ -8973,7 +9210,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_block_body) {
+TEST(frontend,
+     source_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_block_body) {
     const auto src = R"rut(
 protocol Hashable {
     func hash() -> i32 {
@@ -9004,7 +9242,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_tuple_return) {
+TEST(frontend,
+     source_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_tuple_return) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 => 200 }
 protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
@@ -9025,7 +9264,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_multi_protocol_empty_impl_block_default_method_tuple_return_supports_ordering) {
+TEST(
+    frontend,
+    source_generic_receiver_multi_protocol_empty_impl_block_default_method_tuple_return_supports_ordering) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 => 200 }
 protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
@@ -9046,7 +9287,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, source_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_if_body) {
+TEST(frontend,
+     source_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_if_body) {
     const auto src = R"rut(
 protocol Hashable {
     func hash(ok: bool) -> i32 {
@@ -9075,7 +9317,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_multi_protocol_default_method_dispatch) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_multi_protocol_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_multi_protocol_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9103,8 +9347,11 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
-    const std::string dir = "/tmp/rut_import_tuple_default_impl_generic_multi_protocol_block_frontend";
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
+    const std::string dir =
+        "/tmp/rut_import_tuple_default_impl_generic_multi_protocol_block_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9130,8 +9377,11 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
-    const std::string dir = "/tmp/rut_import_tuple_ordering_default_impl_generic_multi_protocol_block_frontend";
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
+    const std::string dir =
+        "/tmp/rut_import_tuple_ordering_default_impl_generic_multi_protocol_block_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9157,8 +9407,11 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
-    const std::string dir = "/tmp/rut_import_if_body_default_impl_generic_multi_protocol_block_frontend";
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
+    const std::string dir =
+        "/tmp/rut_import_if_body_default_impl_generic_multi_protocol_block_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9192,7 +9445,9 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_tuple_default_impl_multi_protocol_block_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9220,8 +9475,11 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
-    const std::string dir = "/tmp/rut_import_tuple_ordering_default_impl_multi_protocol_block_frontend";
+TEST(
+    frontend,
+    import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
+    const std::string dir =
+        "/tmp/rut_import_tuple_ordering_default_impl_multi_protocol_block_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9248,8 +9506,11 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
-    const std::string dir = "/tmp/rut_import_block_body_default_impl_generic_multi_protocol_block_frontend";
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
+    const std::string dir =
+        "/tmp/rut_import_block_body_default_impl_generic_multi_protocol_block_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9285,7 +9546,9 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_if_body_default_impl_multi_protocol_block_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9321,7 +9584,9 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_block_body_default_impl_multi_protocol_block_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9359,7 +9624,9 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_default_method_dispatch) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_default_impl_multi_protocol_block_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9387,7 +9654,9 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_multi_protocol_empty_impl_block_for_default_method_dispatch) {
+TEST(
+    frontend,
+    import_relative_file_merges_imported_generic_multi_protocol_empty_impl_block_for_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_multi_protocol_block_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9414,7 +9683,9 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, analyze_rejects_generic_receiver_multi_protocol_empty_impl_block_when_required_method_is_missing) {
+TEST(
+    frontend,
+    analyze_rejects_generic_receiver_multi_protocol_empty_impl_block_when_required_method_is_missing) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 }
 protocol Adder { func add(x: i32) -> i32 => x }
@@ -9434,8 +9705,11 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_imported_generic_multi_protocol_empty_impl_block_when_required_method_is_missing) {
-    const std::string dir = "/tmp/rut_import_generic_default_impl_multi_protocol_block_missing_frontend";
+TEST(
+    frontend,
+    analyze_rejects_imported_generic_multi_protocol_empty_impl_block_when_required_method_is_missing) {
+    const std::string dir =
+        "/tmp/rut_import_generic_default_impl_multi_protocol_block_missing_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9460,7 +9734,9 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_imported_generic_multi_protocol_empty_impl_block_with_conflicting_default_method_names) {
+TEST(
+    frontend,
+    analyze_rejects_imported_generic_multi_protocol_empty_impl_block_with_conflicting_default_method_names) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_multi_protocol_conflict_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9482,7 +9758,8 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_imported_generic_multi_protocol_impl_block_with_ambiguous_method_name) {
+TEST(frontend,
+     analyze_rejects_imported_generic_multi_protocol_impl_block_with_ambiguous_method_name) {
     const std::string dir = "/tmp/rut_import_generic_impl_multi_protocol_ambiguous_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9506,7 +9783,8 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_imported_generic_multi_protocol_impl_block_with_duplicate_protocol_name) {
+TEST(frontend,
+     analyze_rejects_imported_generic_multi_protocol_impl_block_with_duplicate_protocol_name) {
     const std::string dir = "/tmp/rut_import_generic_impl_multi_protocol_duplicate_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9529,7 +9807,8 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_imported_generic_multi_protocol_impl_block_with_unknown_protocol_name) {
+TEST(frontend,
+     analyze_rejects_imported_generic_multi_protocol_impl_block_with_unknown_protocol_name) {
     const std::string dir = "/tmp/rut_import_generic_impl_multi_protocol_unknown_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9602,7 +9881,9 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_generic_receiver_method_dispatch_when_multiple_protocol_constraints_define_same_name) {
+TEST(
+    frontend,
+    analyze_rejects_generic_receiver_method_dispatch_when_multiple_protocol_constraints_define_same_name) {
     const auto src = R"rut(
 protocol A { func hash() -> i32 => 1 }
 protocol B { func hash() -> i32 => 2 }
@@ -9622,7 +9903,9 @@ route GET "/users" {
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_selective_import_protocol_alias_generic_receiver_dispatch_with_local_same_name_protocol) {
+TEST(
+    frontend,
+    analyze_rejects_selective_import_protocol_alias_generic_receiver_dispatch_with_local_same_name_protocol) {
     const std::string dir = "/tmp/rut_selective_import_alias_protocol_dispatch_same_name_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -9647,7 +9930,9 @@ route GET "/users" {
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_concrete_receiver_method_dispatch_when_multiple_protocol_impls_define_same_name) {
+TEST(
+    frontend,
+    analyze_rejects_concrete_receiver_method_dispatch_when_multiple_protocol_impls_define_same_name) {
     const auto src = R"rut(
 protocol A { func hash() -> i32 => 1 }
 protocol B { func hash() -> i32 => 2 }
@@ -10004,7 +10289,8 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_multi_protocol_impl_with_default_bodies) {
+TEST(frontend,
+     import_relative_file_merges_imported_generic_multi_protocol_impl_with_default_bodies) {
     const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_default_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -10037,8 +10323,10 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_multi_protocol_impl_with_block_body_default) {
-    const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_block_body_default_frontend";
+TEST(frontend,
+     import_relative_file_merges_imported_generic_multi_protocol_impl_with_block_body_default) {
+    const std::string dir =
+        "/tmp/rut_import_generic_multi_protocol_impl_block_body_default_frontend";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -10073,7 +10361,8 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, import_relative_file_merges_imported_generic_multi_protocol_impl_with_if_body_default) {
+TEST(frontend,
+     import_relative_file_merges_imported_generic_multi_protocol_impl_with_if_body_default) {
     const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_if_body_default_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -10108,7 +10397,8 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-TEST(frontend, analyze_rejects_imported_multi_protocol_impl_missing_required_method_without_default_body) {
+TEST(frontend,
+     analyze_rejects_imported_multi_protocol_impl_missing_required_method_without_default_body) {
     const std::string dir = "/tmp/rut_import_multi_protocol_impl_missing_required_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -10137,7 +10427,9 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_imported_generic_multi_protocol_impl_missing_required_method_without_default_body) {
+TEST(
+    frontend,
+    analyze_rejects_imported_generic_multi_protocol_impl_missing_required_method_without_default_body) {
     const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_missing_required_frontend";
     std::filesystem::create_directories(dir);
     {
@@ -10188,7 +10480,8 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
-TEST(frontend, analyze_rejects_generic_multi_protocol_impl_missing_required_method_without_default_body) {
+TEST(frontend,
+     analyze_rejects_generic_multi_protocol_impl_missing_required_method_without_default_body) {
     const auto src = R"rut(
 protocol Hashable {
     func hash() -> i32

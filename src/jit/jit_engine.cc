@@ -2,8 +2,8 @@
 
 #include "rut/jit/runtime_helpers.h"
 
-#include <llvm-c/Core.h>
 #include <llvm-c/Analysis.h>
+#include <llvm-c/Core.h>
 #include <llvm-c/Error.h>
 #include <llvm-c/LLJIT.h>
 #include <llvm-c/Orc.h>

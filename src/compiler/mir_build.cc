@@ -1,6 +1,5 @@
 #include "rut/compiler/mir_build.h"
 
-
 namespace rut {
 
 namespace {
@@ -38,13 +37,13 @@ static Str match_default_label() {
 }
 
 static MirTypeKind mir_type_kind(HirTypeKind kind) {
-    return kind == HirTypeKind::Bool    ? MirTypeKind::Bool
-           : kind == HirTypeKind::I32   ? MirTypeKind::I32
-           : kind == HirTypeKind::Str   ? MirTypeKind::Str
+    return kind == HirTypeKind::Bool      ? MirTypeKind::Bool
+           : kind == HirTypeKind::I32     ? MirTypeKind::I32
+           : kind == HirTypeKind::Str     ? MirTypeKind::Str
            : kind == HirTypeKind::Variant ? MirTypeKind::Variant
-           : kind == HirTypeKind::Tuple ? MirTypeKind::Tuple
-           : kind == HirTypeKind::Struct ? MirTypeKind::Struct
-                                         : MirTypeKind::Unknown;
+           : kind == HirTypeKind::Tuple   ? MirTypeKind::Tuple
+           : kind == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                          : MirTypeKind::Unknown;
 }
 
 static bool expand_hir_flat_shape(const HirModule& module,
@@ -75,7 +74,9 @@ static bool expand_hir_flat_shape(const HirModule& module,
     return true;
 }
 
-static void apply_expr_shape_if_available(const HirModule& module, const HirExpr& expr, MirValue* out) {
+static void apply_expr_shape_if_available(const HirModule& module,
+                                          const HirExpr& expr,
+                                          MirValue* out) {
     expand_hir_flat_shape(module,
                           expr.shape_index,
                           &out->type,
@@ -94,7 +95,8 @@ static bool shape_carrier_ready(const MirModule& mir,
     if (shape_index >= mir.type_shapes.len) return false;
     const auto& shape = mir.type_shapes[shape_index];
     if (!shape.is_concrete) return false;
-    if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 || shape.type == MirTypeKind::Str)
+    if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 ||
+        shape.type == MirTypeKind::Str)
         return true;
     if (shape.type == MirTypeKind::Struct)
         return shape.struct_index < mir.structs.len && struct_ready[shape.struct_index];
@@ -102,7 +104,8 @@ static bool shape_carrier_ready(const MirModule& mir,
         return shape.variant_index < mir.variants.len && variant_ready[shape.variant_index];
     if (shape.type != MirTypeKind::Tuple) return false;
     for (u32 i = 0; i < shape.tuple_len; i++) {
-        if (!shape_carrier_ready(mir, shape.tuple_elem_shape_indices[i], struct_ready, variant_ready))
+        if (!shape_carrier_ready(
+                mir, shape.tuple_elem_shape_indices[i], struct_ready, variant_ready))
             return false;
     }
     return true;
@@ -141,7 +144,8 @@ static bool field_carrier_ready(const MirModule& mir,
     if (field.is_error_type) return true;
     if (field.shape_index != 0xffffffffu)
         return shape_carrier_ready(mir, field.shape_index, struct_ready, variant_ready);
-    if (field.type == MirTypeKind::Bool || field.type == MirTypeKind::I32 || field.type == MirTypeKind::Str)
+    if (field.type == MirTypeKind::Bool || field.type == MirTypeKind::I32 ||
+        field.type == MirTypeKind::Str)
         return true;
     if (field.type == MirTypeKind::Struct)
         return field.struct_index < mir.structs.len && struct_ready[field.struct_index];
@@ -157,7 +161,8 @@ static bool variant_payload_carrier_ready(const MirModule& mir,
     if (!c.has_payload) return true;
     if (c.payload_shape_index != 0xffffffffu)
         return shape_carrier_ready(mir, c.payload_shape_index, struct_ready, variant_ready);
-    if (c.payload_type == MirTypeKind::Bool || c.payload_type == MirTypeKind::I32 || c.payload_type == MirTypeKind::Str)
+    if (c.payload_type == MirTypeKind::Bool || c.payload_type == MirTypeKind::I32 ||
+        c.payload_type == MirTypeKind::Str)
         return true;
     if (c.payload_type == MirTypeKind::Struct)
         return c.payload_struct_index < mir.structs.len && struct_ready[c.payload_struct_index];
@@ -166,7 +171,9 @@ static bool variant_payload_carrier_ready(const MirModule& mir,
     return false;
 }
 
-static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& module, MirFunction* fn) {
+static FrontendResult<MirValue> mir_value(const HirExpr& expr,
+                                          const HirModule& module,
+                                          MirFunction* fn) {
     MirValue v{};
     v.shape_index = expr.shape_index;
     v.may_nil = expr.may_nil;
@@ -194,12 +201,12 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
         v.type = MirTypeKind::Tuple;
         v.tuple_len = expr.tuple_len;
         for (u32 i = 0; i < expr.tuple_len; i++) {
-            v.tuple_types[i] = expr.tuple_types[i] == HirTypeKind::Bool    ? MirTypeKind::Bool
-                             : expr.tuple_types[i] == HirTypeKind::I32     ? MirTypeKind::I32
-                             : expr.tuple_types[i] == HirTypeKind::Str     ? MirTypeKind::Str
-                             : expr.tuple_types[i] == HirTypeKind::Variant ? MirTypeKind::Variant
-                             : expr.tuple_types[i] == HirTypeKind::Struct  ? MirTypeKind::Struct
-                                                                            : MirTypeKind::Unknown;
+            v.tuple_types[i] = expr.tuple_types[i] == HirTypeKind::Bool      ? MirTypeKind::Bool
+                               : expr.tuple_types[i] == HirTypeKind::I32     ? MirTypeKind::I32
+                               : expr.tuple_types[i] == HirTypeKind::Str     ? MirTypeKind::Str
+                               : expr.tuple_types[i] == HirTypeKind::Variant ? MirTypeKind::Variant
+                               : expr.tuple_types[i] == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                                                             : MirTypeKind::Unknown;
             v.tuple_variant_indices[i] = expr.tuple_variant_indices[i];
             v.tuple_struct_indices[i] = expr.tuple_struct_indices[i];
         }
@@ -247,12 +254,12 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         v.kind = MirValueKind::TupleSlot;
-        v.type = expr.type == HirTypeKind::Bool  ? MirTypeKind::Bool
-                 : expr.type == HirTypeKind::I32 ? MirTypeKind::I32
-                 : expr.type == HirTypeKind::Str ? MirTypeKind::Str
+        v.type = expr.type == HirTypeKind::Bool      ? MirTypeKind::Bool
+                 : expr.type == HirTypeKind::I32     ? MirTypeKind::I32
+                 : expr.type == HirTypeKind::Str     ? MirTypeKind::Str
                  : expr.type == HirTypeKind::Variant ? MirTypeKind::Variant
-                 : expr.type == HirTypeKind::Struct ? MirTypeKind::Struct
-                                                    : MirTypeKind::Unknown;
+                 : expr.type == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                                     : MirTypeKind::Unknown;
         v.variant_index = expr.variant_index;
         v.struct_index = expr.struct_index;
         v.int_value = expr.int_value;
@@ -283,27 +290,28 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
     if (expr.kind == HirExprKind::Field) {
         auto lhs = mir_value(*expr.lhs, module, fn);
         if (!lhs) return core::make_unexpected(lhs.error());
-        if (!fn->values.push(lhs.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         v.kind = MirValueKind::Field;
-        v.type = expr.type == HirTypeKind::Bool    ? MirTypeKind::Bool
-                 : expr.type == HirTypeKind::I32   ? MirTypeKind::I32
-                 : expr.type == HirTypeKind::Str   ? MirTypeKind::Str
+        v.type = expr.type == HirTypeKind::Bool      ? MirTypeKind::Bool
+                 : expr.type == HirTypeKind::I32     ? MirTypeKind::I32
+                 : expr.type == HirTypeKind::Str     ? MirTypeKind::Str
                  : expr.type == HirTypeKind::Variant ? MirTypeKind::Variant
-                 : expr.type == HirTypeKind::Tuple ? MirTypeKind::Tuple
-                 : expr.type == HirTypeKind::Struct ? MirTypeKind::Struct
-                                                    : MirTypeKind::Unknown;
+                 : expr.type == HirTypeKind::Tuple   ? MirTypeKind::Tuple
+                 : expr.type == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                                     : MirTypeKind::Unknown;
         v.str_value = expr.str_value;
         v.lhs = &fn->values[fn->values.len - 1];
         v.variant_index = expr.variant_index;
         v.struct_index = expr.struct_index;
         v.tuple_len = expr.tuple_len;
         for (u32 i = 0; i < expr.tuple_len; i++) {
-            v.tuple_types[i] = expr.tuple_types[i] == HirTypeKind::Bool    ? MirTypeKind::Bool
-                             : expr.tuple_types[i] == HirTypeKind::I32     ? MirTypeKind::I32
-                             : expr.tuple_types[i] == HirTypeKind::Str     ? MirTypeKind::Str
-                             : expr.tuple_types[i] == HirTypeKind::Variant ? MirTypeKind::Variant
-                             : expr.tuple_types[i] == HirTypeKind::Struct  ? MirTypeKind::Struct
-                                                                            : MirTypeKind::Unknown;
+            v.tuple_types[i] = expr.tuple_types[i] == HirTypeKind::Bool      ? MirTypeKind::Bool
+                               : expr.tuple_types[i] == HirTypeKind::I32     ? MirTypeKind::I32
+                               : expr.tuple_types[i] == HirTypeKind::Str     ? MirTypeKind::Str
+                               : expr.tuple_types[i] == HirTypeKind::Variant ? MirTypeKind::Variant
+                               : expr.tuple_types[i] == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                                                             : MirTypeKind::Unknown;
             v.tuple_variant_indices[i] = expr.tuple_variant_indices[i];
             v.tuple_struct_indices[i] = expr.tuple_struct_indices[i];
         }
@@ -345,16 +353,21 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
         }
         return v;
     }
-    if (expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt || expr.kind == HirExprKind::Gt) {
+    if (expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
+        expr.kind == HirExprKind::Gt) {
         auto lhs = mir_value(*expr.lhs, module, fn);
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = mir_value(*expr.rhs, module, fn);
         if (!rhs) return core::make_unexpected(rhs.error());
-        if (!fn->values.push(lhs.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         MirValue* lhs_ptr = &fn->values[fn->values.len - 1];
-        if (!fn->values.push(rhs.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(rhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         MirValue* rhs_ptr = &fn->values[fn->values.len - 1];
-        v.kind = expr.kind == HirExprKind::Eq ? MirValueKind::Eq : (expr.kind == HirExprKind::Lt ? MirValueKind::Lt : MirValueKind::Gt);
+        v.kind = expr.kind == HirExprKind::Eq
+                     ? MirValueKind::Eq
+                     : (expr.kind == HirExprKind::Lt ? MirValueKind::Lt : MirValueKind::Gt);
         v.type = MirTypeKind::Bool;
         v.lhs = lhs_ptr;
         v.rhs = rhs_ptr;
@@ -368,20 +381,23 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
         if (!then_v) return core::make_unexpected(then_v.error());
         auto else_v = mir_value(*expr.args[0], module, fn);
         if (!else_v) return core::make_unexpected(else_v.error());
-        if (!fn->values.push(cond.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(cond.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         MirValue* cond_ptr = &fn->values[fn->values.len - 1];
-        if (!fn->values.push(then_v.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(then_v.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         MirValue* then_ptr = &fn->values[fn->values.len - 1];
-        if (!fn->values.push(else_v.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(else_v.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         MirValue* else_ptr = &fn->values[fn->values.len - 1];
         v.kind = MirValueKind::IfElse;
-        v.type = expr.type == HirTypeKind::Bool    ? MirTypeKind::Bool
-                 : expr.type == HirTypeKind::I32   ? MirTypeKind::I32
-                 : expr.type == HirTypeKind::Str   ? MirTypeKind::Str
+        v.type = expr.type == HirTypeKind::Bool      ? MirTypeKind::Bool
+                 : expr.type == HirTypeKind::I32     ? MirTypeKind::I32
+                 : expr.type == HirTypeKind::Str     ? MirTypeKind::Str
                  : expr.type == HirTypeKind::Variant ? MirTypeKind::Variant
-                 : expr.type == HirTypeKind::Tuple ? MirTypeKind::Tuple
-                 : expr.type == HirTypeKind::Struct ? MirTypeKind::Struct
-                                                    : MirTypeKind::Unknown;
+                 : expr.type == HirTypeKind::Tuple   ? MirTypeKind::Tuple
+                 : expr.type == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                                     : MirTypeKind::Unknown;
         v.lhs = cond_ptr;
         v.rhs = then_ptr;
         if (!v.args.push(else_ptr)) return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -397,18 +413,20 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = mir_value(*expr.rhs, module, fn);
         if (!rhs) return core::make_unexpected(rhs.error());
-        if (!fn->values.push(lhs.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         MirValue* lhs_ptr = &fn->values[fn->values.len - 1];
-        if (!fn->values.push(rhs.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(rhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         MirValue* rhs_ptr = &fn->values[fn->values.len - 1];
         v.kind = MirValueKind::Or;
-        v.type = expr.type == HirTypeKind::Bool    ? MirTypeKind::Bool
-                 : expr.type == HirTypeKind::I32   ? MirTypeKind::I32
-                 : expr.type == HirTypeKind::Str   ? MirTypeKind::Str
+        v.type = expr.type == HirTypeKind::Bool      ? MirTypeKind::Bool
+                 : expr.type == HirTypeKind::I32     ? MirTypeKind::I32
+                 : expr.type == HirTypeKind::Str     ? MirTypeKind::Str
                  : expr.type == HirTypeKind::Variant ? MirTypeKind::Variant
-                 : expr.type == HirTypeKind::Tuple ? MirTypeKind::Tuple
-                 : expr.type == HirTypeKind::Struct ? MirTypeKind::Struct
-                                                    : MirTypeKind::Unknown;
+                 : expr.type == HirTypeKind::Tuple   ? MirTypeKind::Tuple
+                 : expr.type == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                                     : MirTypeKind::Unknown;
         v.lhs = lhs_ptr;
         v.rhs = rhs_ptr;
         v.variant_index = expr.variant_index;
@@ -420,7 +438,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
     if (expr.kind == HirExprKind::NoError) {
         auto lhs = mir_value(*expr.lhs, module, fn);
         if (!lhs) return core::make_unexpected(lhs.error());
-        if (!fn->values.push(lhs.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         v.kind = MirValueKind::NoError;
         v.type = MirTypeKind::Bool;
         v.lhs = &fn->values[fn->values.len - 1];
@@ -430,7 +449,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
     if (expr.kind == HirExprKind::HasValue) {
         auto lhs = mir_value(*expr.lhs, module, fn);
         if (!lhs) return core::make_unexpected(lhs.error());
-        if (!fn->values.push(lhs.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         v.kind = MirValueKind::HasValue;
         v.type = MirTypeKind::Bool;
         v.lhs = &fn->values[fn->values.len - 1];
@@ -443,15 +463,16 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
     if (expr.kind == HirExprKind::ValueOf) {
         auto lhs = mir_value(*expr.lhs, module, fn);
         if (!lhs) return core::make_unexpected(lhs.error());
-        if (!fn->values.push(lhs.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         v.kind = MirValueKind::ValueOf;
-        v.type = expr.type == HirTypeKind::Bool    ? MirTypeKind::Bool
-                 : expr.type == HirTypeKind::I32   ? MirTypeKind::I32
-                 : expr.type == HirTypeKind::Str   ? MirTypeKind::Str
+        v.type = expr.type == HirTypeKind::Bool      ? MirTypeKind::Bool
+                 : expr.type == HirTypeKind::I32     ? MirTypeKind::I32
+                 : expr.type == HirTypeKind::Str     ? MirTypeKind::Str
                  : expr.type == HirTypeKind::Variant ? MirTypeKind::Variant
-                 : expr.type == HirTypeKind::Tuple ? MirTypeKind::Tuple
-                 : expr.type == HirTypeKind::Struct ? MirTypeKind::Struct
-                                                    : MirTypeKind::Unknown;
+                 : expr.type == HirTypeKind::Tuple   ? MirTypeKind::Tuple
+                 : expr.type == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                                     : MirTypeKind::Unknown;
         v.variant_index = expr.variant_index;
         v.struct_index = expr.struct_index;
         v.error_struct_index = expr.error_struct_index;
@@ -463,15 +484,16 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
     if (expr.kind == HirExprKind::MissingOf) {
         auto lhs = mir_value(*expr.lhs, module, fn);
         if (!lhs) return core::make_unexpected(lhs.error());
-        if (!fn->values.push(lhs.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         v.kind = MirValueKind::MissingOf;
-        v.type = expr.type == HirTypeKind::Bool    ? MirTypeKind::Bool
-                 : expr.type == HirTypeKind::I32   ? MirTypeKind::I32
-                 : expr.type == HirTypeKind::Str   ? MirTypeKind::Str
+        v.type = expr.type == HirTypeKind::Bool      ? MirTypeKind::Bool
+                 : expr.type == HirTypeKind::I32     ? MirTypeKind::I32
+                 : expr.type == HirTypeKind::Str     ? MirTypeKind::Str
                  : expr.type == HirTypeKind::Variant ? MirTypeKind::Variant
-                 : expr.type == HirTypeKind::Tuple ? MirTypeKind::Tuple
-                 : expr.type == HirTypeKind::Struct ? MirTypeKind::Struct
-                                                    : MirTypeKind::Unknown;
+                 : expr.type == HirTypeKind::Tuple   ? MirTypeKind::Tuple
+                 : expr.type == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                                     : MirTypeKind::Unknown;
         v.may_nil = expr.may_nil;
         v.may_error = expr.may_error;
         v.variant_index = expr.variant_index;
@@ -485,15 +507,16 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
     if (expr.kind == HirExprKind::MatchPayload) {
         auto lhs = mir_value(*expr.lhs, module, fn);
         if (!lhs) return core::make_unexpected(lhs.error());
-        if (!fn->values.push(lhs.value())) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         v.kind = MirValueKind::MatchPayload;
-        v.type = expr.type == HirTypeKind::Bool    ? MirTypeKind::Bool
-                 : expr.type == HirTypeKind::I32   ? MirTypeKind::I32
-                 : expr.type == HirTypeKind::Str   ? MirTypeKind::Str
+        v.type = expr.type == HirTypeKind::Bool      ? MirTypeKind::Bool
+                 : expr.type == HirTypeKind::I32     ? MirTypeKind::I32
+                 : expr.type == HirTypeKind::Str     ? MirTypeKind::Str
                  : expr.type == HirTypeKind::Variant ? MirTypeKind::Variant
-                 : expr.type == HirTypeKind::Tuple ? MirTypeKind::Tuple
-                 : expr.type == HirTypeKind::Struct ? MirTypeKind::Struct
-                                                    : MirTypeKind::Unknown;
+                 : expr.type == HirTypeKind::Tuple   ? MirTypeKind::Tuple
+                 : expr.type == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                                     : MirTypeKind::Unknown;
         v.variant_index = expr.variant_index;
         v.struct_index = expr.struct_index;
         v.case_index = expr.case_index;
@@ -504,13 +527,13 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr, const HirModule& 
     }
     if (expr.kind == HirExprKind::LocalRef) {
         v.kind = MirValueKind::LocalRef;
-        v.type = expr.type == HirTypeKind::Bool    ? MirTypeKind::Bool
-                 : expr.type == HirTypeKind::I32   ? MirTypeKind::I32
-                 : expr.type == HirTypeKind::Str   ? MirTypeKind::Str
+        v.type = expr.type == HirTypeKind::Bool      ? MirTypeKind::Bool
+                 : expr.type == HirTypeKind::I32     ? MirTypeKind::I32
+                 : expr.type == HirTypeKind::Str     ? MirTypeKind::Str
                  : expr.type == HirTypeKind::Variant ? MirTypeKind::Variant
-                 : expr.type == HirTypeKind::Tuple ? MirTypeKind::Tuple
-                 : expr.type == HirTypeKind::Struct ? MirTypeKind::Struct
-                                                    : MirTypeKind::Unknown;
+                 : expr.type == HirTypeKind::Tuple   ? MirTypeKind::Tuple
+                 : expr.type == HirTypeKind::Struct  ? MirTypeKind::Struct
+                                                     : MirTypeKind::Unknown;
         v.variant_index = expr.variant_index;
         v.struct_index = expr.struct_index;
         v.local_index = expr.local_index;
@@ -538,16 +561,14 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         for (u32 ti = 0; ti < shape.tuple_len; ti++) {
             shape.tuple_elem_shape_indices[ti] = module.type_shapes[i].tuple_elem_shape_indices[ti];
         }
-        if (!mir->type_shapes.push(shape))
-            return frontend_error(FrontendError::TooManyItems, {});
+        if (!mir->type_shapes.push(shape)) return frontend_error(FrontendError::TooManyItems, {});
     }
     for (u32 i = 0; i < module.upstreams.len; i++) {
         MirUpstream up{};
         up.span = module.upstreams[i].span;
         up.name = module.upstreams[i].name;
         up.id = module.upstreams[i].id;
-        if (!mir->upstreams.push(up))
-            return frontend_error(FrontendError::TooManyItems, up.span);
+        if (!mir->upstreams.push(up)) return frontend_error(FrontendError::TooManyItems, up.span);
     }
 
     for (u32 i = 0; i < module.structs.len; i++) {
@@ -560,13 +581,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         st.instance_type_arg_count = module.structs[i].instance_type_arg_count;
         for (u32 ai = 0; ai < st.instance_type_arg_count; ai++) {
             st.instance_type_args[ai] =
-                module.structs[i].instance_type_args[ai] == HirTypeKind::Bool    ? MirTypeKind::Bool
-                : module.structs[i].instance_type_args[ai] == HirTypeKind::I32   ? MirTypeKind::I32
-                : module.structs[i].instance_type_args[ai] == HirTypeKind::Str   ? MirTypeKind::Str
-                : module.structs[i].instance_type_args[ai] == HirTypeKind::Variant ? MirTypeKind::Variant
-                : module.structs[i].instance_type_args[ai] == HirTypeKind::Struct ? MirTypeKind::Struct
-                : module.structs[i].instance_type_args[ai] == HirTypeKind::Tuple ? MirTypeKind::Tuple
-                                                                                  : MirTypeKind::Unknown;
+                module.structs[i].instance_type_args[ai] == HirTypeKind::Bool  ? MirTypeKind::Bool
+                : module.structs[i].instance_type_args[ai] == HirTypeKind::I32 ? MirTypeKind::I32
+                : module.structs[i].instance_type_args[ai] == HirTypeKind::Str ? MirTypeKind::Str
+                : module.structs[i].instance_type_args[ai] == HirTypeKind::Variant
+                    ? MirTypeKind::Variant
+                : module.structs[i].instance_type_args[ai] == HirTypeKind::Struct
+                    ? MirTypeKind::Struct
+                : module.structs[i].instance_type_args[ai] == HirTypeKind::Tuple
+                    ? MirTypeKind::Tuple
+                    : MirTypeKind::Unknown;
             st.instance_generic_indices[ai] = module.structs[i].instance_generic_indices[ai];
             st.instance_shape_indices[ai] = module.structs[i].instance_shape_indices[ai];
         }
@@ -581,25 +605,26 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             field.struct_index = module.structs[i].fields[fi].struct_index;
             field.tuple_len = module.structs[i].fields[fi].tuple_len;
             for (u32 ti = 0; ti < field.tuple_len; ti++) {
-                field.tuple_types[ti] = module.structs[i].fields[fi].tuple_types[ti] == HirTypeKind::Bool
-                                            ? MirTypeKind::Bool
-                                        : module.structs[i].fields[fi].tuple_types[ti] == HirTypeKind::I32
-                                            ? MirTypeKind::I32
-                                        : module.structs[i].fields[fi].tuple_types[ti] == HirTypeKind::Str
-                                            ? MirTypeKind::Str
-                                        : module.structs[i].fields[fi].tuple_types[ti] == HirTypeKind::Variant
-                                            ? MirTypeKind::Variant
-                                        : module.structs[i].fields[fi].tuple_types[ti] == HirTypeKind::Struct
-                                            ? MirTypeKind::Struct
-                                            : MirTypeKind::Unknown;
-                field.tuple_variant_indices[ti] = module.structs[i].fields[fi].tuple_variant_indices[ti];
-                field.tuple_struct_indices[ti] = module.structs[i].fields[fi].tuple_struct_indices[ti];
+                field.tuple_types[ti] =
+                    module.structs[i].fields[fi].tuple_types[ti] == HirTypeKind::Bool
+                        ? MirTypeKind::Bool
+                    : module.structs[i].fields[fi].tuple_types[ti] == HirTypeKind::I32
+                        ? MirTypeKind::I32
+                    : module.structs[i].fields[fi].tuple_types[ti] == HirTypeKind::Str
+                        ? MirTypeKind::Str
+                    : module.structs[i].fields[fi].tuple_types[ti] == HirTypeKind::Variant
+                        ? MirTypeKind::Variant
+                    : module.structs[i].fields[fi].tuple_types[ti] == HirTypeKind::Struct
+                        ? MirTypeKind::Struct
+                        : MirTypeKind::Unknown;
+                field.tuple_variant_indices[ti] =
+                    module.structs[i].fields[fi].tuple_variant_indices[ti];
+                field.tuple_struct_indices[ti] =
+                    module.structs[i].fields[fi].tuple_struct_indices[ti];
             }
-            if (!st.fields.push(field))
-                return frontend_error(FrontendError::TooManyItems, st.span);
+            if (!st.fields.push(field)) return frontend_error(FrontendError::TooManyItems, st.span);
         }
-        if (!mir->structs.push(st))
-            return frontend_error(FrontendError::TooManyItems, st.span);
+        if (!mir->structs.push(st)) return frontend_error(FrontendError::TooManyItems, st.span);
     }
 
     for (u32 i = 0; i < module.variants.len; i++) {
@@ -611,13 +636,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         variant.instance_type_arg_count = module.variants[i].instance_type_arg_count;
         for (u32 ai = 0; ai < variant.instance_type_arg_count; ai++) {
             variant.instance_type_args[ai] =
-                module.variants[i].instance_type_args[ai] == HirTypeKind::Bool    ? MirTypeKind::Bool
-                : module.variants[i].instance_type_args[ai] == HirTypeKind::I32   ? MirTypeKind::I32
-                : module.variants[i].instance_type_args[ai] == HirTypeKind::Str   ? MirTypeKind::Str
-                : module.variants[i].instance_type_args[ai] == HirTypeKind::Variant ? MirTypeKind::Variant
-                : module.variants[i].instance_type_args[ai] == HirTypeKind::Struct ? MirTypeKind::Struct
-                : module.variants[i].instance_type_args[ai] == HirTypeKind::Tuple ? MirTypeKind::Tuple
-                                                                                   : MirTypeKind::Unknown;
+                module.variants[i].instance_type_args[ai] == HirTypeKind::Bool  ? MirTypeKind::Bool
+                : module.variants[i].instance_type_args[ai] == HirTypeKind::I32 ? MirTypeKind::I32
+                : module.variants[i].instance_type_args[ai] == HirTypeKind::Str ? MirTypeKind::Str
+                : module.variants[i].instance_type_args[ai] == HirTypeKind::Variant
+                    ? MirTypeKind::Variant
+                : module.variants[i].instance_type_args[ai] == HirTypeKind::Struct
+                    ? MirTypeKind::Struct
+                : module.variants[i].instance_type_args[ai] == HirTypeKind::Tuple
+                    ? MirTypeKind::Tuple
+                    : MirTypeKind::Unknown;
             variant.instance_generic_indices[ai] = module.variants[i].instance_generic_indices[ai];
             variant.instance_shape_indices[ai] = module.variants[i].instance_shape_indices[ai];
         }
@@ -632,9 +660,12 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             case_decl.payload_tuple_len = module.variants[i].cases[ci].payload_tuple_len;
             for (u32 ti = 0; ti < case_decl.payload_tuple_len; ti++) {
                 case_decl.payload_tuple_types[ti] =
-                    module.variants[i].cases[ci].payload_tuple_types[ti] == HirTypeKind::Bool  ? MirTypeKind::Bool
-                    : module.variants[i].cases[ci].payload_tuple_types[ti] == HirTypeKind::I32 ? MirTypeKind::I32
-                    : module.variants[i].cases[ci].payload_tuple_types[ti] == HirTypeKind::Str ? MirTypeKind::Str
+                    module.variants[i].cases[ci].payload_tuple_types[ti] == HirTypeKind::Bool
+                        ? MirTypeKind::Bool
+                    : module.variants[i].cases[ci].payload_tuple_types[ti] == HirTypeKind::I32
+                        ? MirTypeKind::I32
+                    : module.variants[i].cases[ci].payload_tuple_types[ti] == HirTypeKind::Str
+                        ? MirTypeKind::Str
                     : module.variants[i].cases[ci].payload_tuple_types[ti] == HirTypeKind::Variant
                         ? MirTypeKind::Variant
                     : module.variants[i].cases[ci].payload_tuple_types[ti] == HirTypeKind::Struct
@@ -662,14 +693,14 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             const auto& st = mir->structs[i];
             bool ready = true;
             if (is_open_generic_struct_decl(st)) ready = false;
-            if (ready &&
-                !instance_fully_concrete(*mir,
-                                         st.instance_type_arg_count,
-                                         st.instance_type_args,
-                                         st.instance_shape_indices))
+            if (ready && !instance_fully_concrete(*mir,
+                                                  st.instance_type_arg_count,
+                                                  st.instance_type_args,
+                                                  st.instance_shape_indices))
                 ready = false;
             for (u32 fi = 0; ready && fi < st.fields.len; fi++) {
-                if (!field_carrier_ready(*mir, st.fields[fi], struct_ready, variant_ready)) ready = false;
+                if (!field_carrier_ready(*mir, st.fields[fi], struct_ready, variant_ready))
+                    ready = false;
             }
             if (ready) {
                 struct_ready[i] = true;
@@ -681,14 +712,15 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             const auto& variant = mir->variants[i];
             bool ready = true;
             if (is_open_generic_variant_decl(variant)) ready = false;
-            if (ready &&
-                !instance_fully_concrete(*mir,
-                                         variant.instance_type_arg_count,
-                                         variant.instance_type_args,
-                                         variant.instance_shape_indices))
+            if (ready && !instance_fully_concrete(*mir,
+                                                  variant.instance_type_arg_count,
+                                                  variant.instance_type_args,
+                                                  variant.instance_shape_indices))
                 ready = false;
             for (u32 ci = 0; ready && ci < variant.cases.len; ci++) {
-                if (!variant_payload_carrier_ready(*mir, variant.cases[ci], struct_ready, variant_ready)) ready = false;
+                if (!variant_payload_carrier_ready(
+                        *mir, variant.cases[ci], struct_ready, variant_ready))
+                    ready = false;
             }
             if (ready) {
                 variant_ready[i] = true;
@@ -697,7 +729,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         }
     }
     for (u32 i = 0; i < mir->type_shapes.len; i++) {
-        mir->type_shapes[i].carrier_ready = shape_carrier_ready(*mir, i, struct_ready, variant_ready);
+        mir->type_shapes[i].carrier_ready =
+            shape_carrier_ready(*mir, i, struct_ready, variant_ready);
     }
 
     for (u32 i = 0; i < module.routes.len; i++) {
@@ -709,8 +742,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         fn.error_variant_index = module.routes[i].error_variant_index;
 
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
-            if (module.routes[i].locals[li].type == HirTypeKind::Tuple)
-                continue;
+            if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
             MirLocal local{};
             local.span = module.routes[i].locals[li].span;
             local.name = module.routes[i].locals[li].name;
@@ -723,20 +755,22 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             local.struct_index = module.routes[i].locals[li].struct_index;
             local.tuple_len = module.routes[i].locals[li].tuple_len;
             for (u32 ti = 0; ti < local.tuple_len; ti++) {
-                local.tuple_types[ti] = module.routes[i].locals[li].tuple_types[ti] == HirTypeKind::Bool
-                                            ? MirTypeKind::Bool
-                                            : module.routes[i].locals[li].tuple_types[ti] == HirTypeKind::I32
-                                                ? MirTypeKind::I32
-                                                : module.routes[i].locals[li].tuple_types[ti] == HirTypeKind::Str
-                                                    ? MirTypeKind::Str
-                                                    : module.routes[i].locals[li].tuple_types[ti] ==
-                                                              HirTypeKind::Variant
-                                                          ? MirTypeKind::Variant
-                                                          : module.routes[i].locals[li].tuple_types[ti] == HirTypeKind::Struct
-                                                          ? MirTypeKind::Struct
-                                                          : MirTypeKind::Unknown;
-                local.tuple_variant_indices[ti] = module.routes[i].locals[li].tuple_variant_indices[ti];
-                local.tuple_struct_indices[ti] = module.routes[i].locals[li].tuple_struct_indices[ti];
+                local.tuple_types[ti] =
+                    module.routes[i].locals[li].tuple_types[ti] == HirTypeKind::Bool
+                        ? MirTypeKind::Bool
+                    : module.routes[i].locals[li].tuple_types[ti] == HirTypeKind::I32
+                        ? MirTypeKind::I32
+                    : module.routes[i].locals[li].tuple_types[ti] == HirTypeKind::Str
+                        ? MirTypeKind::Str
+                    : module.routes[i].locals[li].tuple_types[ti] == HirTypeKind::Variant
+                        ? MirTypeKind::Variant
+                    : module.routes[i].locals[li].tuple_types[ti] == HirTypeKind::Struct
+                        ? MirTypeKind::Struct
+                        : MirTypeKind::Unknown;
+                local.tuple_variant_indices[ti] =
+                    module.routes[i].locals[li].tuple_variant_indices[ti];
+                local.tuple_struct_indices[ti] =
+                    module.routes[i].locals[li].tuple_struct_indices[ti];
             }
             local.error_struct_index = module.routes[i].locals[li].error_struct_index;
             local.error_variant_index = module.routes[i].locals[li].error_variant_index;
@@ -751,8 +785,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->span = term.span;
             out->status_code = term.status_code;
             out->upstream_index = term.upstream_index;
-            out->kind = term.kind == HirTerminatorKind::ReturnStatus ? MirTerminatorKind::ReturnStatus
-                                                                     : MirTerminatorKind::ForwardUpstream;
+            out->kind = term.kind == HirTerminatorKind::ReturnStatus
+                            ? MirTerminatorKind::ReturnStatus
+                            : MirTerminatorKind::ForwardUpstream;
             out->source_kind = term.source_kind == HirTerminatorSourceKind::LocalRef
                                    ? MirTerminatorSourceKind::LocalRef
                                    : MirTerminatorSourceKind::Literal;
@@ -987,13 +1022,15 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 u32 arm_then_index[HirControl::kMaxMatchArms]{};
                 u32 arm_else_index[HirControl::kMaxMatchArms]{};
                 u32 arm_guard_index[HirControl::kMaxMatchArms][HirMatchArm::kMaxPreludeGuards]{};
-                u32 arm_guard_fail_index[HirControl::kMaxMatchArms][HirMatchArm::kMaxPreludeGuards]{};
+                u32 arm_guard_fail_index[HirControl::kMaxMatchArms]
+                                        [HirMatchArm::kMaxPreludeGuards]{};
                 u32 next_index = guard_count + test_count;
                 for (u32 ai = 0; ai < arm_count; ai++) {
                     const auto& arm = module.routes[i].control.match_arms[ai];
                     arm_block_index[ai] = next_index++;
                     if (arm.guards.len != 0) {
-                        for (u32 gi = 1; gi < arm.guards.len; gi++) arm_guard_index[ai][gi] = next_index++;
+                        for (u32 gi = 1; gi < arm.guards.len; gi++)
+                            arm_guard_index[ai][gi] = next_index++;
                         arm_body_index[ai] = next_index++;
                         for (u32 gi = 0; gi < arm.guards.len; gi++) {
                             arm_guard_fail_index[ai][gi] = next_index;
@@ -1019,7 +1056,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 auto cond0 = mir_value(guard0.cond, module, &fn);
                 if (!cond0) return core::make_unexpected(cond0.error());
                 block.term.cond = cond0.value();
-                block.term.then_block = guard_count > 1 ? 1 : (test_count > 0 ? guard_count : arm_block_index[0]);
+                block.term.then_block =
+                    guard_count > 1 ? 1 : (test_count > 0 ? guard_count : arm_block_index[0]);
                 block.term.else_block = guard_fail_index[0];
                 if (!fn.blocks.push(block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -1034,7 +1072,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (!cond) return core::make_unexpected(cond.error());
                     guard_block.term.cond = cond.value();
                     guard_block.term.then_block =
-                        gi + 1 < guard_count ? gi + 1 : (test_count > 0 ? guard_count : arm_block_index[0]);
+                        gi + 1 < guard_count ? gi + 1
+                                             : (test_count > 0 ? guard_count : arm_block_index[0]);
                     guard_block.term.else_block = guard_fail_index[gi];
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -1094,8 +1133,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         guard_block.term.kind = MirTerminatorKind::Branch;
                         guard_block.term.span = arm.guards[gi].span;
                         guard_block.term.cond = cond.value();
-                        guard_block.term.then_block =
-                            gi + 1 < arm.guards.len ? arm_guard_index[ai][gi + 1] : arm_body_index[ai];
+                        guard_block.term.then_block = gi + 1 < arm.guards.len
+                                                          ? arm_guard_index[ai][gi + 1]
+                                                          : arm_body_index[ai];
                         guard_block.term.else_block = arm_guard_fail_index[ai][gi];
                         if (!fn.blocks.push(guard_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -1150,8 +1190,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             block.term.cond = cond.value();
             block.term.then_block = 1;
             block.term.else_block = 2;
-            if (!fn.blocks.push(block))
-                return frontend_error(FrontendError::TooManyItems, fn.span);
+            if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
 
             MirBlock then_block{};
             then_block.label = then_label();
@@ -1178,7 +1217,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 const auto& arm = module.routes[i].control.match_arms[ai];
                 arm_block_index[ai] = next_index++;
                 if (arm.guards.len != 0) {
-                    for (u32 gi = 1; gi < arm.guards.len; gi++) arm_guard_index[ai][gi] = next_index++;
+                    for (u32 gi = 1; gi < arm.guards.len; gi++)
+                        arm_guard_index[ai][gi] = next_index++;
                     arm_body_index[ai] = next_index++;
                     for (u32 gi = 0; gi < arm.guards.len; gi++) {
                         arm_guard_fail_index[ai][gi] = next_index;
@@ -1280,7 +1320,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     test_block.term.lhs = subject.value();
                     test_block.term.rhs = arm_pattern.value();
                     test_block.term.then_block = arm_block_index[ai];
-                    test_block.term.else_block = ai + 1 < test_count ? ai + 1 : arm_block_index[test_count];
+                    test_block.term.else_block =
+                        ai + 1 < test_count ? ai + 1 : arm_block_index[test_count];
                     if (!fn.blocks.push(test_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
@@ -1319,8 +1360,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         guard_block.term.kind = MirTerminatorKind::Branch;
                         guard_block.term.span = arm.guards[gi].span;
                         guard_block.term.cond = cond.value();
-                        guard_block.term.then_block =
-                            gi + 1 < arm.guards.len ? arm_guard_index[ai][gi + 1] : arm_body_index[ai];
+                        guard_block.term.then_block = gi + 1 < arm.guards.len
+                                                          ? arm_guard_index[ai][gi + 1]
+                                                          : arm_body_index[ai];
                         guard_block.term.else_block = arm_guard_fail_index[ai][gi];
                         if (!fn.blocks.push(guard_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -1339,13 +1381,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         } else {
                             set_term_from_hir(&body_block.term, arm.direct_term);
                         }
-                    if (!fn.blocks.push(body_block))
-                        return frontend_error(FrontendError::TooManyItems, fn.span);
-                    for (u32 gi = 0; gi < arm.guards.len; gi++) {
-                        auto emitted = emit_guard_fail(arm.guards[gi]);
-                        if (!emitted) return core::make_unexpected(emitted.error());
+                        if (!fn.blocks.push(body_block))
+                            return frontend_error(FrontendError::TooManyItems, fn.span);
+                        for (u32 gi = 0; gi < arm.guards.len; gi++) {
+                            auto emitted = emit_guard_fail(arm.guards[gi]);
+                            if (!emitted) return core::make_unexpected(emitted.error());
+                        }
                     }
-                }
                     if (arm.body_kind == HirMatchArm::BodyKind::If) {
                         MirBlock then_block{};
                         then_block.label = then_label();
@@ -1362,11 +1404,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             }
         } else {
             set_term_from_hir(&block.term, module.routes[i].control.direct_term);
-            if (!fn.blocks.push(block))
-                return frontend_error(FrontendError::TooManyItems, fn.span);
+            if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
-        if (!mir->functions.push(fn))
-            return frontend_error(FrontendError::TooManyItems, fn.span);
+        if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }
 
     return mir;

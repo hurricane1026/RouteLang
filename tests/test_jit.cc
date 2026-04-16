@@ -1,10 +1,10 @@
-#include "rut/compiler/rir.h"
-#include "rut/compiler/rir_builder.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/rir.h"
+#include "rut/compiler/rir_builder.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/jit/jit_engine.h"
@@ -52,7 +52,8 @@ static HeapFrontendResult<HirModule> analyze_file_heap(const AstFile& file) {
     return {hir.value()};
 }
 
-static HeapFrontendResult<HirModule> analyze_file_heap_with_path(const AstFile& file, const std::string& source_path) {
+static HeapFrontendResult<HirModule> analyze_file_heap_with_path(const AstFile& file,
+                                                                 const std::string& source_path) {
     Str path{source_path.c_str(), static_cast<u32>(source_path.size())};
     auto hir = analyze_file(file, path);
     if (!hir) return {core::make_unexpected(hir.error())};
@@ -185,7 +186,8 @@ TEST(jit, return_200) {
 
 TEST(jit, frontend_req_header_or_fallback) {
     const char* src =
-        "route GET \"/users\" { let host = req.header(\"Host\") let value = or(host, \"fallback\") return 200 }\n";
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = or(host, \"fallback\") "
+        "return 200 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -360,7 +362,11 @@ route GET "/users" { let state = AuthState.ok match state { case .ok: return 200
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -401,7 +407,11 @@ route GET "/users" { if run(Box(value: 1)) == 1 { return 200 } else { return 500
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -442,7 +452,11 @@ route GET "/users" { if run(Box(value: 123)) == 200 { return 200 } else { return
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -483,7 +497,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -529,7 +547,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -579,7 +601,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -618,14 +644,19 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch) {
+TEST(jit,
+     frontend_import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_jit";
     std::filesystem::create_directories(dir);
     {
@@ -657,14 +688,20 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch_with_parameter) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch_with_parameter) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_param_jit";
     std::filesystem::create_directories(dir);
     {
@@ -696,14 +733,20 @@ route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_optional_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_optional_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_optional_jit";
     std::filesystem::create_directories(dir);
     {
@@ -735,14 +778,20 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_error_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_error_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_error_jit";
     std::filesystem::create_directories(dir);
     {
@@ -774,13 +823,19 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_tuple_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_tuple_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_tuple_jit";
     std::filesystem::create_directories(dir);
     {
@@ -813,14 +868,20 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_jit";
     std::filesystem::create_directories(dir);
     {
@@ -853,13 +914,19 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_equality) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_equality) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_eq_jit";
     std::filesystem::create_directories(dir);
     {
@@ -891,13 +958,19 @@ route GET "/users" { if run(Box(value: 1)) == (200, 500) { return 200 } else { r
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_ordering) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_ordering) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_ord_jit";
     std::filesystem::create_directories(dir);
     {
@@ -929,14 +1002,20 @@ route GET "/users" { if run(Box(value: 1)) < (200, 600) { return 200 } else { re
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_block_jit";
     std::filesystem::create_directories(dir);
     {
@@ -973,14 +1052,20 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_block_jit";
     std::filesystem::create_directories(dir);
     {
@@ -1017,14 +1102,20 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch_with_parameter) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch_with_parameter) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_block_param_jit";
     std::filesystem::create_directories(dir);
     {
@@ -1061,14 +1152,20 @@ route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch_with_parameter) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch_with_parameter) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_block_param_jit";
     std::filesystem::create_directories(dir);
     {
@@ -1105,14 +1202,20 @@ route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_if_body_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_if_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_if_jit";
     std::filesystem::create_directories(dir);
     {
@@ -1144,14 +1247,20 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_if_body_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_if_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_if_jit";
     std::filesystem::create_directories(dir);
     {
@@ -1183,19 +1292,26 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_error_default_method_guard_match) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_error_default_method_guard_match) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_error_guard_match_jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
-        out << "protocol MaybeCode { func code(ok: bool) -> i32 { if ok { 200 } else { error(.timeout) } } }\n";
+        out << "protocol MaybeCode { func code(ok: bool) -> i32 { if ok { 200 } else { "
+               "error(.timeout) } } }\n";
         out << "struct Box<T> { value: T }\n";
         out << "Box<T> impl MaybeCode {}\n";
     }
@@ -1226,7 +1342,11 @@ route GET "/users" { if run(Box(value: 1)) == 401 { return 200 } else { return 5
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1263,7 +1383,11 @@ route GET "/users" { if jwtAuth() == 200 { return 200 } else { return 500 } }
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1299,7 +1423,11 @@ route GET "/users" { if auth.jwtAuth() == 200 { return 200 } else { return 500 }
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1336,7 +1464,11 @@ route GET "/users" { if auth.jwtAuth() == 200 { return 200 } else { return 500 }
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1379,7 +1511,11 @@ route GET "/users" { if jwt.jwtAuth() == 200 { return 200 } else { return 500 } 
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1418,13 +1554,16 @@ route GET "/users" { if run(proto.Box(value: 1)) == read(proto.Box(value: 1)) { 
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-
 
 TEST(jit, frontend_import_namespace_generic_type_ref) {
     const std::string dir = "/tmp/rut_import_namespace_generic_type_ref_jit";
@@ -1456,7 +1595,11 @@ route GET "/users" { let state = wrap(proto.Result<i32>.ok(1)) match state { cas
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1494,7 +1637,11 @@ route GET "/users" { let state = wrap(proto.Result<proto.Box<proto.Result<i32>>>
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1530,7 +1677,11 @@ route GET "/users" { if proto.Box(value: 1).value == 1 { return 200 } else { ret
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1570,7 +1721,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1610,7 +1765,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1652,7 +1811,11 @@ route GET "/users" { if authA.jwtAuth() == 200 { return 200 } else { return 500 
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1688,7 +1851,11 @@ route GET "/users" { if authV1() == 200 { return 200 } else { return 500 } }
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1728,7 +1895,11 @@ route GET "/users" { if run(AuthBox(value: 1)) == 1 { return 200 } else { return
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1768,7 +1939,11 @@ route GET "/users" { if run(Box(value: 1)) == 1 { return 200 } else { return 500
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -1819,7 +1994,8 @@ route GET "/users" { if authV1() == 200 { return 200 } else { return 500 } }
 
 TEST(jit, frontend_req_header_alias_or_fallback) {
     const char* src =
-        "route GET \"/users\" { let host = req.header(\"Host\") let alias = host let value = or(alias, \"fallback\") return 200 }\n";
+        "route GET \"/users\" { let host = req.header(\"Host\") let alias = host let value = "
+        "or(alias, \"fallback\") return 200 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1859,7 +2035,8 @@ TEST(jit, frontend_req_header_alias_or_fallback) {
 TEST(jit, frontend_variant_match) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return 200 case _: return 403 } }\n";
+        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
+        "200 case _: return 403 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1899,7 +2076,8 @@ TEST(jit, frontend_variant_match) {
 TEST(jit, frontend_variant_single_payload_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): return 200 case .err: return 500 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): return 200 "
+        "case .err: return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1939,7 +2117,8 @@ TEST(jit, frontend_variant_single_payload_match) {
 TEST(jit, frontend_variant_payload_binding_match_if) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): if x == 200 { return 200 } else { return 500 } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): if x == 200 "
+        "{ return 200 } else { return 500 } case .err: return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1979,7 +2158,8 @@ TEST(jit, frontend_variant_payload_binding_match_if) {
 TEST(jit, frontend_variant_payload_binding_match_block) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let y = x if y == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let y = x "
+        "if y == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2019,7 +2199,9 @@ TEST(jit, frontend_variant_payload_binding_match_block) {
 TEST(jit, frontend_variant_payload_binding_match_block_with_guard) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed = error(7) guard failed else { return 401 } if x == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed "
+        "= error(7) guard failed else { return 401 } if x == 200 { return 200 } else { return 500 "
+        "} } case .err: return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2059,7 +2241,9 @@ TEST(jit, frontend_variant_payload_binding_match_block_with_guard) {
 TEST(jit, frontend_variant_payload_binding_match_block_with_guard_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed = error(.timeout) guard match failed else { case .timeout: return 401 case _: return 402 } if x == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed "
+        "= error(.timeout) guard match failed else { case .timeout: return 401 case _: return 402 "
+        "} if x == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2097,8 +2281,7 @@ TEST(jit, frontend_variant_payload_binding_match_block_with_guard_match) {
 }
 
 TEST(jit, frontend_if_const) {
-    const char* src =
-        "route GET \"/users\" { if const true { return 200 } else { return 500 } }\n";
+    const char* src = "route GET \"/users\" { if const true { return 200 } else { return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2138,7 +2321,8 @@ TEST(jit, frontend_if_const) {
 TEST(jit, frontend_match_const_variant) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match const state { case .ok(x): if x == 200 { return 200 } else { return 500 } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match const state { case .ok(x): if x "
+        "== 200 { return 200 } else { return 500 } case .err: return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2178,7 +2362,9 @@ TEST(jit, frontend_match_const_variant) {
 TEST(jit, frontend_variant_mixed_payload_match) {
     const char* src =
         "variant Mixed { count(i32), ready(bool), label(str), none }\n"
-        "route GET \"/users\" { let state = Mixed.ready(true) match state { case .count(x): return 200 case .ready(flag): if flag == true { return 201 } else { return 202 } case .label(name): return 203 case .none: return 204 } }\n";
+        "route GET \"/users\" { let state = Mixed.ready(true) match state { case .count(x): return "
+        "200 case .ready(flag): if flag == true { return 201 } else { return 202 } case "
+        ".label(name): return 203 case .none: return 204 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2219,7 +2405,9 @@ TEST(jit, frontend_variant_tuple_payload_match_pipe_multi_slot) {
     const char* src =
         "variant Result { ok((i32, i32)), err }\n"
         "func second(a: i32, b: i32) -> i32 => b\n"
-        "route GET \"/users\" { let state = Result.ok((200, 500)) match state { case .ok(pair): { let code = pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok((200, 500)) match state { case .ok(pair): { "
+        "let code = pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } } case "
+        ".err: return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2507,7 +2695,8 @@ route GET "/users" {
 
 TEST(jit, frontend_known_named_error_match) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout: return 503 case _: return 200 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout: return "
+        "503 case _: return 200 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2547,7 +2736,8 @@ TEST(jit, frontend_known_named_error_match) {
 TEST(jit, frontend_explicit_error_variant_match) {
     const char* src =
         "variant AuthError { timeout, forbidden }\n"
-        "route GET \"/users\" { let failed = error(AuthError.forbidden) match failed { case .forbidden: return 403 case _: return 200 } }\n";
+        "route GET \"/users\" { let failed = error(AuthError.forbidden) match failed { case "
+        ".forbidden: return 403 case _: return 200 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2587,7 +2777,8 @@ TEST(jit, frontend_explicit_error_variant_match) {
 TEST(jit, frontend_custom_error_struct_guard_match) {
     const char* src =
         "struct AuthError { err: Error }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\") guard match failed else { case .timeout: return 503 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\") guard match "
+        "failed else { case .timeout: return 503 case _: return 500 } return 200 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2627,7 +2818,9 @@ TEST(jit, frontend_custom_error_struct_guard_match) {
 TEST(jit, frontend_custom_error_struct_with_extra_fields_guard_match) {
     const char* src =
         "struct AuthError { err: Error, token: str, retry: i32 }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: \"abc\", retry: 3) guard match failed else { case .timeout: return 503 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
+        "\"abc\", retry: 3) guard match failed else { case .timeout: return 503 case _: return 500 "
+        "} return 200 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2667,7 +2860,9 @@ TEST(jit, frontend_custom_error_struct_with_extra_fields_guard_match) {
 TEST(jit, frontend_custom_error_struct_with_tuple_field_guard_match) {
     const char* src =
         "struct AuthError { err: Error, pair: (i32, i32) }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, 500)) guard match failed else { case .timeout: return 503 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, "
+        "500)) guard match failed else { case .timeout: return 503 case _: return 500 } return 200 "
+        "}\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2706,7 +2901,8 @@ TEST(jit, frontend_custom_error_struct_with_tuple_field_guard_match) {
 
 TEST(jit, frontend_multiple_top_level_guards) {
     const char* src =
-        "route GET \"/users\" { let ok = 200 guard ok else { return 401 } let failed = error(7) guard failed else { return 402 } return 200 }\n";
+        "route GET \"/users\" { let ok = 200 guard ok else { return 401 } let failed = error(7) "
+        "guard failed else { return 402 } return 200 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2746,7 +2942,8 @@ TEST(jit, frontend_multiple_top_level_guards) {
 TEST(jit, frontend_generic_struct_constructor_and_field_projection) {
     const char* src =
         "struct Box<T> { value: T }\n"
-        "route GET \"/users\" { let box = Box<i32>(value: 200) if box.value == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let box = Box<i32>(value: 200) if box.value == 200 { return 200 } "
+        "else { return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2786,7 +2983,8 @@ TEST(jit, frontend_generic_struct_constructor_and_field_projection) {
 TEST(jit, frontend_generic_struct_constructor_infers_type_argument_from_field_shape) {
     const char* src =
         "struct Box<T> { value: T }\n"
-        "route GET \"/users\" { let box = Box(value: 200) if box.value == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let box = Box(value: 200) if box.value == 200 { return 200 } else "
+        "{ return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2826,7 +3024,8 @@ TEST(jit, frontend_generic_struct_constructor_infers_type_argument_from_field_sh
 TEST(jit, frontend_concrete_generic_type_refs_are_supported_in_let_types) {
     const char* src =
         "variant Result<T> { ok(T), err }\n"
-        "route GET \"/users\" { let state: Result<i32> = Result.ok(200) match state { case .ok(v): return 200 case .err: return 500 } }\n";
+        "route GET \"/users\" { let state: Result<i32> = Result.ok(200) match state { case .ok(v): "
+        "return 200 case .err: return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2867,7 +3066,8 @@ TEST(jit, frontend_concrete_generic_type_refs_are_supported_in_function_signatur
     const char* src =
         "variant Result<T> { ok(T), err }\n"
         "func wrap(x: Result<i32>) -> Result<i32> => x\n"
-        "route GET \"/users\" { let state = wrap(Result.ok(200)) match state { case .ok(v): return 200 case .err: return 500 } }\n";
+        "route GET \"/users\" { let state = wrap(Result.ok(200)) match state { case .ok(v): return "
+        "200 case .err: return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2911,7 +3111,8 @@ TEST(jit, frontend_concrete_generic_struct_type_refs_are_supported_in_function_s
     const char* src =
         "struct Box<T> { value: T }\n"
         "func wrap(x: Box<i32>) -> Box<i32> => x\n"
-        "route GET \"/users\" { let box = wrap(Box(value: 200)) if box.value == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let box = wrap(Box(value: 200)) if box.value == 200 { return 200 } "
+        "else { return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2950,7 +3151,8 @@ TEST(jit, frontend_concrete_generic_type_refs_are_supported_in_struct_fields) {
     const char* src =
         "variant Result<T> { ok(T), err }\n"
         "struct Holder { state: Result<i32> }\n"
-        "route GET \"/users\" { let holder = Holder(state: Result.ok(200)) match holder.state { case .ok(v): return 200 case .err: return 500 } }\n";
+        "route GET \"/users\" { let holder = Holder(state: Result.ok(200)) match holder.state { "
+        "case .ok(v): return 200 case .err: return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2989,7 +3191,8 @@ TEST(jit, frontend_variant_struct_field_projection_equality) {
     const char* src =
         "variant Result<T> { ok(T), err }\n"
         "struct Holder { state: Result<i32> }\n"
-        "route GET \"/users\" { let holder = Holder(state: Result.ok(200)) if holder.state == Result.ok(200) { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let holder = Holder(state: Result.ok(200)) if holder.state == "
+        "Result.ok(200) { return 200 } else { return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3030,7 +3233,8 @@ TEST(jit, frontend_variant_struct_field_projection_ordering) {
     const char* src =
         "variant Result<T> { ok(T), err }\n"
         "struct Holder { state: Result<i32> }\n"
-        "route GET \"/users\" { let holder = Holder(state: Result.ok(200)) if holder.state < Result.ok(500) { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let holder = Holder(state: Result.ok(200)) if holder.state < "
+        "Result.ok(500) { return 200 } else { return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3173,7 +3377,8 @@ TEST(jit, frontend_tuple_of_struct_field_projection_ordering) {
     const char* src =
         "struct Item { value: i32 }\n"
         "struct Holder { pair: (Item, i32) }\n"
-        "route GET \"/users\" { let holder = Holder(pair: (Item(value: 200), 500)) if holder.pair < (Item(value: 200), 600) { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let holder = Holder(pair: (Item(value: 200), 500)) if holder.pair "
+        "< (Item(value: 200), 600) { return 200 } else { return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3316,7 +3521,9 @@ TEST(jit, frontend_concrete_generic_struct_type_refs_are_supported_in_variant_pa
         "struct Box<T> { value: T }\n"
         "variant Outer { wrap(Box<i32>), bad }\n"
         "func is200(x: Box<i32>) -> bool => x.value == 200\n"
-        "route GET \"/users\" { let state = Outer.wrap(Box(value: 200)) match state { case .wrap(inner): { let ok = is200(inner) if ok { return 200 } else { return 500 } } case .bad: return 404 } }\n";
+        "route GET \"/users\" { let state = Outer.wrap(Box(value: 200)) match state { case "
+        ".wrap(inner): { let ok = is200(inner) if ok { return 200 } else { return 500 } } case "
+        ".bad: return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3353,7 +3560,8 @@ TEST(jit, frontend_concrete_generic_struct_type_refs_are_supported_in_variant_pa
 
 TEST(jit, frontend_route_if_branch_block_with_let) {
     const char* src =
-        "route GET \"/users\" { let ok = true if ok { let code = 200 if code == 200 { return 200 } else { return 500 } } else { return 404 } }\n";
+        "route GET \"/users\" { let ok = true if ok { let code = 200 if code == 200 { return 200 } "
+        "else { return 500 } } else { return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3392,7 +3600,8 @@ TEST(jit, frontend_route_if_branch_block_with_let) {
 
 TEST(jit, frontend_route_if_branch_block_with_guard) {
     const char* src =
-        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard failed else { return 401 } return 200 } else { return 404 } }\n";
+        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard failed else { "
+        "return 401 } return 200 } else { return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3431,7 +3640,8 @@ TEST(jit, frontend_route_if_branch_block_with_guard) {
 
 TEST(jit, frontend_guard_else_block_with_let) {
     const char* src =
-        "route GET \"/users\" { let failed = error(7) guard failed else { let code = 401 if code == 401 { return 401 } else { return 500 } } return 200 }\n";
+        "route GET \"/users\" { let failed = error(7) guard failed else { let code = 401 if code "
+        "== 401 { return 401 } else { return 500 } } return 200 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3471,7 +3681,8 @@ TEST(jit, frontend_guard_else_block_with_let) {
 TEST(jit, frontend_guard_match_routes_fail_and_success_paths) {
     {
         const char* src =
-            "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case .timeout: return 503 case _: return 500 } return 200 }\n";
+            "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
+            ".timeout: return 503 case _: return 500 } return 200 }\n";
 
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
@@ -3510,7 +3721,8 @@ TEST(jit, frontend_guard_match_routes_fail_and_success_paths) {
 
     {
         const char* src =
-            "route GET \"/users\" { let ok = 200 guard match ok else { case .timeout: return 503 case _: return 500 } return 200 }\n";
+            "route GET \"/users\" { let ok = 200 guard match ok else { case .timeout: return 503 "
+            "case _: return 500 } return 200 }\n";
 
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
@@ -3726,10 +3938,10 @@ TEST(jit, runtime_error_code_field_from_mir) {
     REQUIRE(handler != nullptr);
 
     auto r = HandlerResult::unpack(handler(nullptr,
-                                          nullptr,
-                                          reinterpret_cast<const u8*>(kGetApiRequest),
-                                          sizeof(kGetApiRequest) - 1,
-                                          nullptr));
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
 
@@ -5068,7 +5280,9 @@ TEST(jit, lookup_nonexistent) {
 TEST(jit, frontend_custom_error_struct_field_projection) {
     const char* src =
         "struct AuthError { err: Error, token: str, retry: i32 }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: \"abc\", retry: 3) let retry = failed.retry if retry == 3 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
+        "\"abc\", retry: 3) let retry = failed.retry if retry == 3 { return 200 } else { return "
+        "500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5109,7 +5323,9 @@ TEST(jit, frontend_custom_error_struct_tuple_field_projection_pipe) {
     const char* src =
         "struct AuthError { err: Error, pair: (i32, i32) }\n"
         "func second(a: i32, b: i32) -> i32 => b\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, 500)) let code = failed.pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, "
+        "500)) let code = failed.pair | second(_2, _1) if code == 200 { return 200 } else { return "
+        "500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5150,7 +5366,9 @@ TEST(jit, frontend_custom_error_nested_struct_field_projection) {
     const char* src =
         "struct Box { value: i32 }\n"
         "struct AuthError { err: Error, inner: Box }\n"
-        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", inner: Box(value: 200)) let code = failed.inner.value if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", inner: "
+        "Box(value: 200)) let code = failed.inner.value if code == 200 { return 200 } else { "
+        "return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5190,7 +5408,8 @@ TEST(jit, frontend_custom_error_nested_struct_field_projection) {
 TEST(jit, frontend_plain_struct_constructor_and_field_projection) {
     constexpr auto src =
         "struct Foo { code: i32, msg: str }\n"
-        "route GET \"/users\" { let foo = Foo(code: 200, msg: \"ok\") let code = foo.code let msg = foo.msg if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let foo = Foo(code: 200, msg: \"ok\") let code = foo.code let msg "
+        "= foo.msg if code == 200 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5230,7 +5449,8 @@ TEST(jit, frontend_plain_struct_tuple_field_projection_pipe) {
     const char* src =
         "struct Foo { pair: (i32, i32) }\n"
         "func second(a: i32, b: i32) -> i32 => b\n"
-        "route GET \"/users\" { let foo = Foo(pair: (200, 500)) let code = foo.pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let foo = Foo(pair: (200, 500)) let code = foo.pair | second(_2, "
+        "_1) if code == 200 { return 200 } else { return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5271,7 +5491,8 @@ TEST(jit, frontend_nested_struct_field_projection) {
     const char* src =
         "struct Box { value: i32 }\n"
         "struct Outer { inner: Box }\n"
-        "route GET \"/users\" { let outer = Outer(inner: Box(value: 200)) let code = outer.inner.value if code == 200 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let outer = Outer(inner: Box(value: 200)) let code = "
+        "outer.inner.value if code == 200 { return 200 } else { return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5312,7 +5533,8 @@ TEST(jit, frontend_plain_struct_variant_field_projection_match) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
         "struct Foo { state: AuthState }\n"
-        "route GET \"/users\" { let foo = Foo(state: AuthState.timeout) match foo.state { case .timeout: return 200 case _: return 403 } }\n";
+        "route GET \"/users\" { let foo = Foo(state: AuthState.timeout) match foo.state { case "
+        ".timeout: return 200 case _: return 403 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5351,7 +5573,8 @@ TEST(jit, frontend_plain_struct_variant_field_projection_match) {
 
 TEST(jit, frontend_error_standard_field_projection) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = failed.code if code == 0 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = failed.code "
+        "if code == 0 { return 200 } else { return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5390,7 +5613,8 @@ TEST(jit, frontend_error_standard_field_projection) {
 
 TEST(jit, frontend_error_line_field_projection) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let line = failed.line if line == 1 { return 200 } else { return 500 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let line = failed.line "
+        "if line == 1 { return 200 } else { return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5429,7 +5653,8 @@ TEST(jit, frontend_error_line_field_projection) {
 
 TEST(jit, frontend_error_file_and_func_field_projection) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let file_name = failed.file let fn_name = failed.func return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let file_name = "
+        "failed.file let fn_name = failed.func return 200 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -6522,7 +6747,6 @@ route GET "/users" {
     rir.destroy();
 }
 
-
 TEST(jit, frontend_concrete_custom_protocol_method_dispatch_with_parameter) {
     const auto src = R"rut(
 protocol Hashable { func hash(x: i32) -> i32 }
@@ -6569,7 +6793,6 @@ route GET "/users" {
     rir.destroy();
 }
 
-
 TEST(jit, frontend_multi_protocol_impl_block) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 }
@@ -6601,7 +6824,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -6676,7 +6903,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -6711,7 +6942,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -6745,7 +6980,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -6780,7 +7019,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -6815,7 +7058,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -6849,7 +7096,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -6883,7 +7134,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -6928,7 +7183,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -6975,7 +7234,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7021,13 +7284,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_multi_protocol_impl_with_default_bodies) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_multi_protocol_impl_with_default_bodies) {
     const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_default_jit";
     std::filesystem::create_directories(dir);
     {
@@ -7071,13 +7340,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_multi_protocol_impl_with_block_body_default) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_multi_protocol_impl_with_block_body_default) {
     const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_block_body_default_jit";
     std::filesystem::create_directories(dir);
     {
@@ -7124,13 +7399,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_multi_protocol_impl_with_if_body_default) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_multi_protocol_impl_with_if_body_default) {
     const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_if_body_default_jit";
     std::filesystem::create_directories(dir);
     {
@@ -7176,7 +7457,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7219,7 +7504,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7261,13 +7550,18 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_multi_protocol_impl_with_block_body_default) {
+TEST(jit,
+     frontend_import_relative_file_merges_imported_multi_protocol_impl_with_block_body_default) {
     const std::string dir = "/tmp/rut_import_multi_protocol_impl_block_body_default_jit";
     std::filesystem::create_directories(dir);
     {
@@ -7310,7 +7604,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7358,7 +7656,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7400,7 +7702,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7447,7 +7753,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7483,7 +7793,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7517,7 +7831,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7551,7 +7869,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7586,7 +7908,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7620,7 +7946,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7658,7 +7988,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7698,7 +8032,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7737,14 +8075,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
 
-TEST(jit, frontend_generic_receiver_custom_protocol_default_method_supports_block_body_with_parameter) {
+TEST(jit,
+     frontend_generic_receiver_custom_protocol_default_method_supports_block_body_with_parameter) {
     const auto src = R"rut(
 protocol Adder {
     func add(x: i32) -> i32 {
@@ -7777,7 +8120,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7815,7 +8162,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7853,7 +8204,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7894,7 +8249,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7935,7 +8294,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -7970,13 +8333,18 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_impl_overrides_protocol_default_method_with_optional_return) {
+TEST(jit,
+     frontend_import_relative_file_impl_overrides_protocol_default_method_with_optional_return) {
     const std::string dir = "/tmp/rut_import_impl_overrides_optional_default_method_jit";
     std::filesystem::create_directories(dir);
     {
@@ -8010,7 +8378,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8044,7 +8416,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8082,7 +8458,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8119,7 +8499,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8157,7 +8541,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8194,7 +8582,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8234,7 +8626,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8278,7 +8674,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8321,14 +8721,21 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_impl_overrides_protocol_default_method_with_block_body_and_parameter) {
-    const std::string dir = "/tmp/rut_import_impl_overrides_block_body_parameter_default_method_jit";
+TEST(
+    jit,
+    frontend_import_relative_file_impl_overrides_protocol_default_method_with_block_body_and_parameter) {
+    const std::string dir =
+        "/tmp/rut_import_impl_overrides_block_body_parameter_default_method_jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8365,13 +8772,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_impl_overrides_protocol_default_method_with_if_body_and_parameter) {
+TEST(
+    jit,
+    frontend_import_relative_file_impl_overrides_protocol_default_method_with_if_body_and_parameter) {
     const std::string dir = "/tmp/rut_import_impl_overrides_if_body_parameter_default_method_jit";
     std::filesystem::create_directories(dir);
     {
@@ -8408,7 +8821,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8447,7 +8864,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8486,7 +8907,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8530,7 +8955,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8565,13 +8994,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
+TEST(
+    jit,
+    frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
     const auto src = R"rut(
 protocol MaybeCode { func code() -> i32 => nil }
 struct Box<T> { value: T }
@@ -8599,13 +9034,18 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
+TEST(jit,
+     frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
     const auto src = R"rut(
 protocol MaybeCode { func code() -> i32 => error(.timeout) }
 struct Box<T> { value: T }
@@ -8633,13 +9073,18 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
+TEST(jit,
+     frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
     const auto src = R"rut(
 protocol MaybeCode {
     func code() -> i32 {
@@ -8672,7 +9117,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -8710,13 +9159,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
+TEST(
+    jit,
+    frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
     const auto src = R"rut(
 protocol Adder {
     func add(x: i32) -> i32 {
@@ -8749,13 +9204,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
+TEST(
+    jit,
+    frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
     const auto src = R"rut(
 protocol Adder {
     func add(ok: bool) -> i32 {
@@ -8787,14 +9248,21 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_optional_default_method_jit";
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_optional_default_method_jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8827,14 +9295,21 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_error_default_method_jit";
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_error_default_method_jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8867,14 +9342,21 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_block_body_default_method_jit";
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_block_body_default_method_jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8912,14 +9394,21 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_if_body_default_method_jit";
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_if_body_default_method_jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -8956,14 +9445,23 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_block_body_parameter_default_method_jit";
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
+    const std::string dir =
+        "/tmp/"
+        "rut_import_generic_impl_overrides_generic_receiver_block_body_parameter_default_method_"
+        "jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9001,14 +9499,22 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_if_body_parameter_default_method_jit";
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
+    const std::string dir =
+        "/tmp/"
+        "rut_import_generic_impl_overrides_generic_receiver_if_body_parameter_default_method_jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9045,14 +9551,21 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method) {
-    const std::string dir = "/tmp/rut_import_generic_impl_overrides_generic_receiver_default_method_jit";
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_default_method_jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9085,7 +9598,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -9125,13 +9642,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_dispatch_is_supported) {
+TEST(
+    jit,
+    frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_dispatch_is_supported) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 => 200 }
 protocol Adder { func add(x: i32) -> i32 => x }
@@ -9163,7 +9686,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -9202,7 +9729,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -9251,13 +9782,18 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_block_body) {
+TEST(jit,
+     frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_block_body) {
     const auto src = R"rut(
 protocol Hashable {
     func hash() -> i32 {
@@ -9299,7 +9835,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -9346,7 +9886,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -9385,7 +9929,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -9424,13 +9972,18 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_if_body) {
+TEST(jit,
+     frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_if_body) {
     const auto src = R"rut(
 protocol Hashable {
     func hash(ok: bool) -> i32 {
@@ -9470,13 +10023,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_tuple_return) {
+TEST(
+    jit,
+    frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_tuple_return) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 => 200 }
 protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
@@ -9508,13 +10067,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_tuple_return_supports_ordering) {
+TEST(
+    jit,
+    frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_tuple_return_supports_ordering) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 => 200 }
 protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
@@ -9546,13 +10111,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_multi_protocol_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_multi_protocol_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_generic_multi_protocol_jit";
     std::filesystem::create_directories(dir);
     {
@@ -9591,13 +10162,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_tuple_default_impl_generic_multi_protocol_block_jit";
     std::filesystem::create_directories(dir);
     {
@@ -9635,14 +10212,21 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
-    const std::string dir = "/tmp/rut_import_tuple_ordering_default_impl_generic_multi_protocol_block_jit";
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
+    const std::string dir =
+        "/tmp/rut_import_tuple_ordering_default_impl_generic_multi_protocol_block_jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9679,13 +10263,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_if_body_default_impl_generic_multi_protocol_block_jit";
     std::filesystem::create_directories(dir);
     {
@@ -9731,13 +10321,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_tuple_default_impl_multi_protocol_block_jit";
     std::filesystem::create_directories(dir);
     {
@@ -9776,13 +10372,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
     const std::string dir = "/tmp/rut_import_tuple_ordering_default_impl_multi_protocol_block_jit";
     std::filesystem::create_directories(dir);
     {
@@ -9821,13 +10423,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_if_body_default_impl_multi_protocol_block_jit";
     std::filesystem::create_directories(dir);
     {
@@ -9874,13 +10482,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_block_body_default_impl_multi_protocol_block_jit";
     std::filesystem::create_directories(dir);
     {
@@ -9929,14 +10543,21 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
-    const std::string dir = "/tmp/rut_import_block_body_default_impl_generic_multi_protocol_block_jit";
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
+    const std::string dir =
+        "/tmp/rut_import_block_body_default_impl_generic_multi_protocol_block_jit";
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
@@ -9983,13 +10604,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_default_impl_multi_protocol_block_jit";
     std::filesystem::create_directories(dir);
     {
@@ -10028,13 +10655,19 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
     rir.destroy();
 }
-TEST(jit, frontend_import_relative_file_merges_imported_generic_multi_protocol_empty_impl_block_for_default_method_dispatch) {
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_multi_protocol_empty_impl_block_for_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_multi_protocol_block_jit";
     std::filesystem::create_directories(dir);
     {
@@ -10072,7 +10705,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -10106,7 +10743,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -10252,7 +10893,9 @@ route GET "/users" {
     rir.destroy();
 }
 
-TEST(jit, frontend_generic_receiver_custom_protocol_method_dispatch_with_generic_impl_target_tuple_of_struct_arg) {
+TEST(
+    jit,
+    frontend_generic_receiver_custom_protocol_method_dispatch_with_generic_impl_target_tuple_of_struct_arg) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 }
 struct Item { value: i32 }
@@ -10420,7 +11063,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -10584,7 +11231,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -10616,7 +11267,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -10650,7 +11305,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 500);
     engine.shutdown();
@@ -10938,7 +11597,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), static_cast<u32>(sizeof(kGetApiRequest) - 1), nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -11012,7 +11675,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), static_cast<u32>(sizeof(kGetApiRequest) - 1), nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();
@@ -11047,7 +11714,11 @@ route GET "/users" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
-    auto r = HandlerResult::unpack(handler(nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), static_cast<u32>(sizeof(kGetApiRequest) - 1), nullptr));
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
     engine.shutdown();

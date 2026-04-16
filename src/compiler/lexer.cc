@@ -109,7 +109,8 @@ LexResult lex(Str source) {
             tok.text = source.slice(tok.start, tok.end);
             tok.type = tok.text.len == 1 && tok.text.ptr[0] == '_' ? TokenType::Underscore
                                                                    : keyword_type(tok.text);
-            if (!out.tokens.push(tok)) return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+            if (!out.tokens.push(tok))
+                return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
         }
 
@@ -123,7 +124,8 @@ LexResult lex(Str source) {
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
             tok.type = TokenType::IntLit;
-            if (!out.tokens.push(tok)) return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+            if (!out.tokens.push(tok))
+                return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
         }
 
@@ -136,23 +138,23 @@ LexResult lex(Str source) {
                 if (cur == '"') break;
                 if (cur == '\\') {
                     if (pos + 1 >= source.len) {
-                        return frontend_error(
-                            FrontendError::UnterminatedString, Span{quote_start, pos, tok.line, tok.col});
+                        return frontend_error(FrontendError::UnterminatedString,
+                                              Span{quote_start, pos, tok.line, tok.col});
                     }
                     pos += 2;
                     col += 2;
                     continue;
                 }
                 if (cur == '\n') {
-                    return frontend_error(
-                        FrontendError::UnterminatedString, Span{quote_start, pos, tok.line, tok.col});
+                    return frontend_error(FrontendError::UnterminatedString,
+                                          Span{quote_start, pos, tok.line, tok.col});
                 }
                 pos++;
                 col++;
             }
             if (pos >= source.len || source.ptr[pos] != '"') {
-                return frontend_error(
-                    FrontendError::UnterminatedString, Span{quote_start, pos, tok.line, tok.col});
+                return frontend_error(FrontendError::UnterminatedString,
+                                      Span{quote_start, pos, tok.line, tok.col});
             }
             tok.type = TokenType::StringLit;
             tok.start = quote_start + 1;
@@ -160,7 +162,8 @@ LexResult lex(Str source) {
             tok.text = source.slice(tok.start, tok.end);
             pos++;
             col++;
-            if (!out.tokens.push(tok)) return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+            if (!out.tokens.push(tok))
+                return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
         }
 
@@ -174,7 +177,8 @@ LexResult lex(Str source) {
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
             tok.type = TokenType::EqEq;
-            if (!out.tokens.push(tok)) return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+            if (!out.tokens.push(tok))
+                return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
         }
         if (c == '=' && pos < source.len && source.ptr[pos] == '>') {
@@ -183,7 +187,8 @@ LexResult lex(Str source) {
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
             tok.type = TokenType::Arrow;
-            if (!out.tokens.push(tok)) return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+            if (!out.tokens.push(tok))
+                return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
         }
         if (c == '-' && pos < source.len && source.ptr[pos] == '>') {
@@ -192,7 +197,8 @@ LexResult lex(Str source) {
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
             tok.type = TokenType::ThinArrow;
-            if (!out.tokens.push(tok)) return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+            if (!out.tokens.push(tok))
+                return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
         }
         switch (c) {
@@ -238,7 +244,8 @@ LexResult lex(Str source) {
             default:
                 return frontend_error(FrontendError::UnexpectedChar, token_span(tok), tok.text);
         }
-        if (!out.tokens.push(tok)) return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+        if (!out.tokens.push(tok))
+            return frontend_error(FrontendError::TooManyTokens, token_span(tok));
     }
 
     Token eof{};

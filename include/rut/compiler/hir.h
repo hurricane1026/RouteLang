@@ -1,10 +1,9 @@
 #pragma once
 
 #include "rut/common/types.h"
-
+#include "rut/compiler/diagnostic.h"
 #include <deque>
 #include <string>
-#include "rut/compiler/diagnostic.h"
 
 namespace rut {
 
@@ -37,7 +36,6 @@ struct HirAlias {
     Str name{};
     FixedVec<Str, kMaxTargetParts> target_parts;
 };
-
 
 enum class HirExprKind : u8 {
     BoolLit,

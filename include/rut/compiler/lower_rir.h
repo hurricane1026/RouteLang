@@ -18,4 +18,4 @@ struct FrontendRirModule {
 
 FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out);
 
-}
+}  // namespace rut

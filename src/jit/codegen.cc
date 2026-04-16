@@ -495,9 +495,9 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::CmpGe: {
             LLVMValueRef a = c.get_value(inst.operands[0]);
             LLVMValueRef b = c.get_value(inst.operands[1]);
-            const rir::Type* lhs_ty =
-                c.cur_fn && inst.operands[0].id < c.cur_fn->value_cap ? c.cur_fn->values[inst.operands[0].id].type
-                                                                      : nullptr;
+            const rir::Type* lhs_ty = c.cur_fn && inst.operands[0].id < c.cur_fn->value_cap
+                                          ? c.cur_fn->values[inst.operands[0].id].type
+                                          : nullptr;
             if (lhs_ty && lhs_ty->kind == rir::TypeKind::Str) {
                 LLVMValueRef a_ptr = LLVMBuildExtractValue(c.builder, a, 0, "cmp.s.a.ptr");
                 LLVMValueRef a_len = LLVMBuildExtractValue(c.builder, a, 1, "cmp.s.a.len");
@@ -511,11 +511,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                                                      args,
                                                      4,
                                                      "str.eq");
-                    LLVMValueRef as_bool = LLVMBuildICmp(c.builder,
-                                                         LLVMIntNE,
-                                                         eq,
-                                                         LLVMConstInt(c.i8_ty, 0, 0),
-                                                         "str.eq.bool");
+                    LLVMValueRef as_bool = LLVMBuildICmp(
+                        c.builder, LLVMIntNE, eq, LLVMConstInt(c.i8_ty, 0, 0), "str.eq.bool");
                     if (inst.op == rir::Opcode::CmpNe) {
                         as_bool = LLVMBuildNot(c.builder, as_bool, "str.ne.bool");
                     }
@@ -530,14 +527,24 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                                                   "str.cmp");
                 LLVMIntPredicate pred;
                 switch (inst.op) {
-                    case rir::Opcode::CmpLt: pred = LLVMIntSLT; break;
-                    case rir::Opcode::CmpGt: pred = LLVMIntSGT; break;
-                    case rir::Opcode::CmpLe: pred = LLVMIntSLE; break;
-                    case rir::Opcode::CmpGe: pred = LLVMIntSGE; break;
-                    default: pred = LLVMIntEQ; break;
+                    case rir::Opcode::CmpLt:
+                        pred = LLVMIntSLT;
+                        break;
+                    case rir::Opcode::CmpGt:
+                        pred = LLVMIntSGT;
+                        break;
+                    case rir::Opcode::CmpLe:
+                        pred = LLVMIntSLE;
+                        break;
+                    case rir::Opcode::CmpGe:
+                        pred = LLVMIntSGE;
+                        break;
+                    default:
+                        pred = LLVMIntEQ;
+                        break;
                 }
-                LLVMValueRef as_bool =
-                    LLVMBuildICmp(c.builder, pred, cmp, LLVMConstInt(c.i32_ty, 0, 0), "str.ord.bool");
+                LLVMValueRef as_bool = LLVMBuildICmp(
+                    c.builder, pred, cmp, LLVMConstInt(c.i32_ty, 0, 0), "str.ord.bool");
                 c.set_value(inst.result, as_bool);
                 break;
             }
@@ -577,15 +584,20 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::OptNil: {
             LLVMTypeRef out_ty = c.map_type(c.cur_fn->values[inst.result.id].type);
             LLVMValueRef opt = LLVMGetUndef(out_ty);
-            opt = LLVMBuildInsertValue(c.builder, opt, LLVMConstInt(c.i8_ty, 0, 0), 0, "opt.nil.has");
+            opt =
+                LLVMBuildInsertValue(c.builder, opt, LLVMConstInt(c.i8_ty, 0, 0), 0, "opt.nil.has");
             if (out_ty == c.opt_i32_ty) {
-                opt = LLVMBuildInsertValue(c.builder, opt, LLVMConstInt(c.i32_ty, 0, 0), 1, "opt.nil.i32");
+                opt = LLVMBuildInsertValue(
+                    c.builder, opt, LLVMConstInt(c.i32_ty, 0, 0), 1, "opt.nil.i32");
             } else if (out_ty == c.opt_str_ty) {
-                opt = LLVMBuildInsertValue(c.builder, opt, LLVMConstNull(c.ptr_ty), 1, "opt.nil.ptr");
-                opt = LLVMBuildInsertValue(c.builder, opt, LLVMConstInt(c.i32_ty, 0, 0), 2, "opt.nil.len");
+                opt =
+                    LLVMBuildInsertValue(c.builder, opt, LLVMConstNull(c.ptr_ty), 1, "opt.nil.ptr");
+                opt = LLVMBuildInsertValue(
+                    c.builder, opt, LLVMConstInt(c.i32_ty, 0, 0), 2, "opt.nil.len");
             } else {
                 LLVMTypeRef payload_ty = LLVMStructGetTypeAtIndex(out_ty, 1);
-                opt = LLVMBuildInsertValue(c.builder, opt, LLVMGetUndef(payload_ty), 1, "opt.nil.payload");
+                opt = LLVMBuildInsertValue(
+                    c.builder, opt, LLVMGetUndef(payload_ty), 1, "opt.nil.payload");
             }
             c.set_value(inst.result, opt);
             break;
@@ -594,7 +606,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef val = c.get_value(inst.operands[0]);
             LLVMTypeRef out_ty = c.map_type(c.cur_fn->values[inst.result.id].type);
             LLVMValueRef opt = LLVMGetUndef(out_ty);
-            opt = LLVMBuildInsertValue(c.builder, opt, LLVMConstInt(c.i8_ty, 1, 0), 0, "opt.wrap.has");
+            opt = LLVMBuildInsertValue(
+                c.builder, opt, LLVMConstInt(c.i8_ty, 1, 0), 0, "opt.wrap.has");
             if (out_ty == c.opt_i32_ty) {
                 opt = LLVMBuildInsertValue(c.builder, opt, val, 1, "opt.wrap.i32");
             } else if (out_ty == c.opt_str_ty) {
@@ -655,7 +668,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::StructField: {
             LLVMValueRef s = c.get_value(inst.operands[0]);
             auto* struct_ty = c.cur_fn->values[inst.operands[0].id].type;
-            u32 field_index = struct_ty && struct_ty->struct_def ? struct_ty->struct_def->field_count : 0;
+            u32 field_index =
+                struct_ty && struct_ty->struct_def ? struct_ty->struct_def->field_count : 0;
             if (struct_ty && struct_ty->struct_def) {
                 for (u32 i = 0; i < struct_ty->struct_def->field_count; i++) {
                     if (struct_ty->struct_def->fields()[i].name.eq(inst.imm.struct_ref.name)) {

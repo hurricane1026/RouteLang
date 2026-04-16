@@ -269,7 +269,10 @@ struct AstFile {
 
     AstFile() = default;
     AstFile(const AstFile& other)
-        : items(other.items), expr_pool(other.expr_pool), stmt_pool(other.stmt_pool), type_pool(other.type_pool) {
+        : items(other.items),
+          expr_pool(other.expr_pool),
+          stmt_pool(other.stmt_pool),
+          type_pool(other.type_pool) {
         rebase_from(other);
     }
     AstFile& operator=(const AstFile& other) {
@@ -282,7 +285,10 @@ struct AstFile {
         return *this;
     }
     AstFile(AstFile&& other) noexcept
-        : items(other.items), expr_pool(other.expr_pool), stmt_pool(other.stmt_pool), type_pool(other.type_pool) {
+        : items(other.items),
+          expr_pool(other.expr_pool),
+          stmt_pool(other.stmt_pool),
+          type_pool(other.type_pool) {
         rebase_from(other);
     }
     AstFile& operator=(AstFile&& other) noexcept {
@@ -404,17 +410,28 @@ private:
         for (u32 i = 0; i < stmt_pool.len; i++) rebase_stmt(other, stmt_pool[i]);
         for (u32 i = 0; i < items.len; i++) {
             switch (items[i].kind) {
-                case AstItemKind::Func: rebase_func(other, items[i].func); break;
-                case AstItemKind::Struct: rebase_struct(other, items[i].struct_decl); break;
-                case AstItemKind::Variant: rebase_variant(other, items[i].variant); break;
-                case AstItemKind::Protocol: rebase_protocol(other, items[i].protocol); break;
-                case AstItemKind::Impl: rebase_impl(other, items[i].impl_decl); break;
+                case AstItemKind::Func:
+                    rebase_func(other, items[i].func);
+                    break;
+                case AstItemKind::Struct:
+                    rebase_struct(other, items[i].struct_decl);
+                    break;
+                case AstItemKind::Variant:
+                    rebase_variant(other, items[i].variant);
+                    break;
+                case AstItemKind::Protocol:
+                    rebase_protocol(other, items[i].protocol);
+                    break;
+                case AstItemKind::Impl:
+                    rebase_impl(other, items[i].impl_decl);
+                    break;
                 case AstItemKind::Route:
                     for (u32 j = 0; j < items[i].route.statements.len; j++) {
                         rebase_stmt(other, items[i].route.statements[j]);
                     }
                     break;
-                default: break;
+                default:
+                    break;
             }
         }
     }

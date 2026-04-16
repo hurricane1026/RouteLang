@@ -19,9 +19,7 @@ struct Parser {
         return toks->tokens[idx];
     }
 
-    static Span span_from(const Token& tok) {
-        return Span{tok.start, tok.end, tok.line, tok.col};
-    }
+    static Span span_from(const Token& tok) { return Span{tok.start, tok.end, tok.line, tok.col}; }
 
     const Token* take(TokenType type) {
         if (cur().type != type) return nullptr;
@@ -30,13 +28,16 @@ struct Parser {
 
     FrontendResult<const Token*> expect(TokenType type) {
         if (cur().type == type) return &toks->tokens[pos++];
-        if (cur().type == TokenType::Eof) return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
+        if (cur().type == TokenType::Eof)
+            return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
         return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
     }
 
     FrontendResult<const Token*> expect_field_name() {
-        if (cur().type == TokenType::Ident || cur().type == TokenType::KwFunc) return &toks->tokens[pos++];
-        if (cur().type == TokenType::Eof) return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
+        if (cur().type == TokenType::Ident || cur().type == TokenType::KwFunc)
+            return &toks->tokens[pos++];
+        if (cur().type == TokenType::Eof)
+            return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
         return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
     }
 
@@ -53,8 +54,7 @@ struct Parser {
     }
 
     FrontendResult<AstTypeRef*> alloc_type(const AstTypeRef& type) {
-        if (!file->type_pool.push(type))
-            return frontend_error(FrontendError::TooManyItems, Span{});
+        if (!file->type_pool.push(type)) return frontend_error(FrontendError::TooManyItems, Span{});
         return &file->type_pool[file->type_pool.len - 1];
     }
 
@@ -334,7 +334,8 @@ struct Parser {
             }
             if (all_digits && index > 0) {
                 if (index > 10)
-                    return frontend_error(FrontendError::UnsupportedSyntax, span_from(*ident.value()));
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*ident.value()));
                 expr.kind = AstExprKind::Placeholder;
                 expr.int_value = index;
                 expr.span = span_from(*ident.value());
@@ -352,7 +353,8 @@ struct Parser {
         if (!base) return core::make_unexpected(base.error());
         AstExpr expr = base.value();
         while (true) {
-            if (expr.kind == AstExprKind::Ident && expr.type_args.len == 0 && cur().type == TokenType::Lt) {
+            if (expr.kind == AstExprKind::Ident && expr.type_args.len == 0 &&
+                cur().type == TokenType::Lt) {
                 const u32 saved_pos = pos;
                 pos++;
                 FixedVec<AstTypeRef, AstExpr::kMaxTypeArgs> parsed_type_args;
@@ -486,9 +488,10 @@ struct Parser {
             }
             if (take(TokenType::LParen)) {
                 const u32 after_lparen = pos;
-                const bool maybe_named_init = expr.kind == AstExprKind::Ident && cur().type != TokenType::RParen &&
-                                              (cur().type == TokenType::Ident || cur().type == TokenType::KwFunc) &&
-                                              peek().type == TokenType::Colon;
+                const bool maybe_named_init =
+                    expr.kind == AstExprKind::Ident && cur().type != TokenType::RParen &&
+                    (cur().type == TokenType::Ident || cur().type == TokenType::KwFunc) &&
+                    peek().type == TokenType::Colon;
                 if (maybe_named_init) {
                     AstExpr init{};
                     init.kind = AstExprKind::StructInit;
@@ -549,10 +552,14 @@ struct Parser {
         auto lhs = parse_primary_expr();
         if (!lhs) return core::make_unexpected(lhs.error());
         TokenType op = TokenType::Error;
-        if (take(TokenType::EqEq)) op = TokenType::EqEq;
-        else if (take(TokenType::Lt)) op = TokenType::Lt;
-        else if (take(TokenType::Gt)) op = TokenType::Gt;
-        else return lhs.value();
+        if (take(TokenType::EqEq))
+            op = TokenType::EqEq;
+        else if (take(TokenType::Lt))
+            op = TokenType::Lt;
+        else if (take(TokenType::Gt))
+            op = TokenType::Gt;
+        else
+            return lhs.value();
         auto rhs = parse_primary_expr();
         if (!rhs) return core::make_unexpected(rhs.error());
         auto lhs_ptr = alloc_expr(lhs.value());
@@ -560,7 +567,9 @@ struct Parser {
         auto rhs_ptr = alloc_expr(rhs.value());
         if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
         AstExpr expr{};
-        expr.kind = op == TokenType::EqEq ? AstExprKind::Eq : (op == TokenType::Lt ? AstExprKind::Lt : AstExprKind::Gt);
+        expr.kind = op == TokenType::EqEq
+                        ? AstExprKind::Eq
+                        : (op == TokenType::Lt ? AstExprKind::Lt : AstExprKind::Gt);
         expr.lhs = lhs_ptr.value();
         expr.rhs = rhs_ptr.value();
         expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
@@ -686,7 +695,8 @@ struct Parser {
                 auto rbrace = expect(TokenType::RBrace);
                 if (!rbrace) return core::make_unexpected(rbrace.error());
                 if (stmt.match_arms.len == 0)
-                    return frontend_error(FrontendError::UnexpectedToken, span_from(*rbrace.value()));
+                    return frontend_error(FrontendError::UnexpectedToken,
+                                          span_from(*rbrace.value()));
                 stmt.span = Span{start.start, rbrace.value()->end, start.line, start.col};
             } else {
                 auto else_stmt = parse_braced_stmt_body(*lbrace.value());
@@ -796,7 +806,8 @@ struct Parser {
             stmt.span = Span{start.start, name.value()->end, start.line, start.col};
             return stmt;
         }
-        if (cur().type == TokenType::Eof) return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
+        if (cur().type == TokenType::Eof)
+            return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
         return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
     }
 
@@ -843,7 +854,8 @@ struct Parser {
             if (!else_ptr) return core::make_unexpected(else_ptr.error());
             stmt.then_stmt = then_ptr.value();
             stmt.else_stmt = else_ptr.value();
-            stmt.span = Span{cond->span.start, else_rbrace.value()->end, cond->span.line, cond->span.col};
+            stmt.span =
+                Span{cond->span.start, else_rbrace.value()->end, cond->span.line, cond->span.col};
             return stmt;
         }
         if (take(TokenType::KwMatch)) {
@@ -883,7 +895,8 @@ struct Parser {
             if (!rbrace) return core::make_unexpected(rbrace.error());
             if (stmt.match_arms.len == 0)
                 return frontend_error(FrontendError::UnexpectedToken, span_from(*rbrace.value()));
-            stmt.span = Span{subject->span.start, rbrace.value()->end, subject->span.line, subject->span.col};
+            stmt.span = Span{
+                subject->span.start, rbrace.value()->end, subject->span.line, subject->span.col};
             return stmt;
         }
         if (cur().type == TokenType::LBrace) {
@@ -997,13 +1010,16 @@ struct Parser {
                 auto type_arg = parse_func_type_ref();
                 if (!type_arg) return core::make_unexpected(type_arg.error());
                 if (!out.type_arg_namespaces.push(type_arg->namespace_name))
-                    return frontend_error(FrontendError::TooManyItems, span_from(*type_name.value()));
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*type_name.value()));
                 if (!out.type_arg_names.push(type_arg->name))
-                    return frontend_error(FrontendError::TooManyItems, span_from(*type_name.value()));
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*type_name.value()));
                 auto type_arg_ptr = alloc_type(type_arg.value());
                 if (!type_arg_ptr) return core::make_unexpected(type_arg_ptr.error());
                 if (!out.type_args.push(type_arg_ptr.value()))
-                    return frontend_error(FrontendError::TooManyItems, span_from(*type_name.value()));
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*type_name.value()));
                 if (take(TokenType::Gt)) break;
                 auto comma = expect(TokenType::Comma);
                 if (!comma) return core::make_unexpected(comma.error());
@@ -1047,16 +1063,19 @@ struct Parser {
                             decl.constraint = constraint_name;
                         }
                         if (!decl.constraint_namespaces.push(constraint_namespace))
-                            return frontend_error(FrontendError::TooManyItems, span_from(*constraint.value()));
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  span_from(*constraint.value()));
                         if (!decl.constraints.push(constraint_name))
-                            return frontend_error(FrontendError::TooManyItems, span_from(*constraint.value()));
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  span_from(*constraint.value()));
                         if (cur().type != TokenType::Comma || peek(1).type == TokenType::Gt) break;
                         auto comma = expect(TokenType::Comma);
                         if (!comma) return core::make_unexpected(comma.error());
                     }
                 }
                 if (!item.func.type_params.push(decl))
-                    return frontend_error(FrontendError::TooManyItems, span_from(*type_param.value()));
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*type_param.value()));
                 if (take(TokenType::Gt)) break;
                 auto comma = expect(TokenType::Comma);
                 if (!comma) return core::make_unexpected(comma.error());
@@ -1080,7 +1099,8 @@ struct Parser {
                 param.type = type_ref.value();
                 param.has_underscore_label = has_underscore;
                 if (!item.func.params.push(param))
-                    return frontend_error(FrontendError::TooManyItems, span_from(*param_name.value()));
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*param_name.value()));
                 if (take(TokenType::RParen)) break;
                 auto comma = expect(TokenType::Comma);
                 if (!comma) return core::make_unexpected(comma.error());
@@ -1109,7 +1129,8 @@ struct Parser {
         if (!body_ptr) return core::make_unexpected(body_ptr.error());
 
         item.func.body = body_ptr.value();
-        item.span = Span{kw.value()->start, body_ptr.value()->span.end, kw.value()->line, kw.value()->col};
+        item.span =
+            Span{kw.value()->start, body_ptr.value()->span.end, kw.value()->line, kw.value()->col};
         item.func.span = item.span;
         return item;
     }
@@ -1123,14 +1144,16 @@ struct Parser {
         AstItem item{};
         item.kind = AstItemKind::Variant;
         item.variant.name = name.value()->text;
-        item.variant.span = Span{kw.value()->start, kw.value()->end, kw.value()->line, kw.value()->col};
+        item.variant.span =
+            Span{kw.value()->start, kw.value()->end, kw.value()->line, kw.value()->col};
 
         if (take(TokenType::Lt)) {
             while (true) {
                 auto type_param = expect(TokenType::Ident);
                 if (!type_param) return core::make_unexpected(type_param.error());
                 if (!item.variant.type_params.push(type_param.value()->text))
-                    return frontend_error(FrontendError::TooManyItems, span_from(*type_param.value()));
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*type_param.value()));
                 if (take(TokenType::Gt)) break;
                 auto comma = expect(TokenType::Comma);
                 if (!comma) return core::make_unexpected(comma.error());
@@ -1199,7 +1222,8 @@ struct Parser {
                     param.type = type_ref.value();
                     param.has_underscore_label = has_underscore;
                     if (!method.params.push(param))
-                        return frontend_error(FrontendError::TooManyItems, span_from(*param_name.value()));
+                        return frontend_error(FrontendError::TooManyItems,
+                                              span_from(*param_name.value()));
                     if (take(TokenType::RParen)) break;
                     auto comma = expect(TokenType::Comma);
                     if (!comma) return core::make_unexpected(comma.error());
@@ -1275,7 +1299,10 @@ struct Parser {
         }
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());
-        item.span = Span{target.value().name.ptr != nullptr ? kw.value()->start : kw.value()->start, rbrace.value()->end, kw.value()->line, kw.value()->col};
+        item.span = Span{target.value().name.ptr != nullptr ? kw.value()->start : kw.value()->start,
+                         rbrace.value()->end,
+                         kw.value()->line,
+                         kw.value()->col};
         item.impl_decl.span = item.span;
         return item;
     }
@@ -1307,7 +1334,9 @@ struct Parser {
             auto from_kw = expect(TokenType::Ident);
             if (!from_kw) return core::make_unexpected(from_kw.error());
             if (!from_kw.value()->text.eq({"from", 4}))
-                return frontend_error(FrontendError::UnexpectedToken, span_from(*from_kw.value()), from_kw.value()->text);
+                return frontend_error(FrontendError::UnexpectedToken,
+                                      span_from(*from_kw.value()),
+                                      from_kw.value()->text);
         } else if (take(TokenType::Star)) {
             auto as_kw = expect(TokenType::KwAs);
             if (!as_kw) return core::make_unexpected(as_kw.error());
@@ -1318,7 +1347,9 @@ struct Parser {
             auto from_kw = expect(TokenType::Ident);
             if (!from_kw) return core::make_unexpected(from_kw.error());
             if (!from_kw.value()->text.eq({"from", 4}))
-                return frontend_error(FrontendError::UnexpectedToken, span_from(*from_kw.value()), from_kw.value()->text);
+                return frontend_error(FrontendError::UnexpectedToken,
+                                      span_from(*from_kw.value()),
+                                      from_kw.value()->text);
         }
         auto path = expect(TokenType::StringLit);
         if (!path) return core::make_unexpected(path.error());
@@ -1349,8 +1380,11 @@ struct Parser {
                 return frontend_error(FrontendError::TooManyItems, span_from(*part.value()));
         }
         if (item.using_decl.target_parts.len < 2)
-            return frontend_error(FrontendError::UnsupportedSyntax, Span{kw.value()->start, cur().start, kw.value()->line, kw.value()->col});
-        item.span = Span{kw.value()->start, toks->tokens[pos - 1].end, kw.value()->line, kw.value()->col};
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                Span{kw.value()->start, cur().start, kw.value()->line, kw.value()->col});
+        item.span =
+            Span{kw.value()->start, toks->tokens[pos - 1].end, kw.value()->line, kw.value()->col};
         item.using_decl.span = item.span;
         return item;
     }
@@ -1363,13 +1397,15 @@ struct Parser {
         AstItem item{};
         item.kind = AstItemKind::Struct;
         item.struct_decl.name = name.value()->text;
-        item.struct_decl.span = Span{kw.value()->start, kw.value()->end, kw.value()->line, kw.value()->col};
+        item.struct_decl.span =
+            Span{kw.value()->start, kw.value()->end, kw.value()->line, kw.value()->col};
         if (take(TokenType::Lt)) {
             while (true) {
                 auto type_param = expect(TokenType::Ident);
                 if (!type_param) return core::make_unexpected(type_param.error());
                 if (!item.struct_decl.type_params.push(type_param.value()->text))
-                    return frontend_error(FrontendError::TooManyItems, span_from(*type_param.value()));
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*type_param.value()));
                 if (take(TokenType::Gt)) break;
                 auto comma = expect(TokenType::Comma);
                 if (!comma) return core::make_unexpected(comma.error());
@@ -1451,7 +1487,8 @@ struct Parser {
             return frontend_error(FrontendError::UnexpectedToken, span_from(*rbrace.value()));
         item.span = Span{kw_route.start, rbrace.value()->end, kw_route.line, kw_route.col};
         item.route.span = item.span;
-        item.route.body_span = Span{lbrace.value()->start, rbrace.value()->end, lbrace.value()->line, lbrace.value()->col};
+        item.route.body_span = Span{
+            lbrace.value()->start, rbrace.value()->end, lbrace.value()->line, lbrace.value()->col};
         item.route.method = static_cast<u8>(method->type);
         item.route.path = path.value()->text;
         return item;
@@ -1481,8 +1518,7 @@ struct Parser {
         FixedVec<PendingBinding, kMaxBindings> bindings;
 
         // Phase 1: bindings — `@ident "pattern"` while next-after-@ident is StringLit.
-        while (cur().type == TokenType::At &&
-               peek().type == TokenType::Ident &&
+        while (cur().type == TokenType::At && peek().type == TokenType::Ident &&
                peek(2).type == TokenType::StringLit) {
             auto deco = parse_decorator_atom();
             if (!deco) return core::make_unexpected(deco.error());
@@ -1492,8 +1528,7 @@ struct Parser {
             pb.decorator = deco.value();
             pb.pattern = pat.value()->text;
             pb.is_wildcard = pb.pattern.len == 1 && pb.pattern.ptr[0] == '*';
-            if (!bindings.push(pb))
-                return frontend_error(FrontendError::TooManyItems, deco->span);
+            if (!bindings.push(pb)) return frontend_error(FrontendError::TooManyItems, deco->span);
         }
 
         // Phase 2: entries (with optional entry-prefix decorators).
@@ -1509,9 +1544,11 @@ struct Parser {
             auto entry = parse_route_entry(*kw.value());
             if (!entry) return core::make_unexpected(entry.error());
             for (u32 i = 0; i < bindings.len; i++) {
-                if (binding_matches(bindings[i].pattern, bindings[i].is_wildcard, entry->route.path)) {
+                if (binding_matches(
+                        bindings[i].pattern, bindings[i].is_wildcard, entry->route.path)) {
                     if (!entry->route.decorators.push(bindings[i].decorator))
-                        return frontend_error(FrontendError::TooManyItems, bindings[i].decorator.span);
+                        return frontend_error(FrontendError::TooManyItems,
+                                              bindings[i].decorator.span);
                 }
             }
             for (u32 i = 0; i < entry_decorators.len; i++) {
@@ -1544,10 +1581,12 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
         if (!name) return core::make_unexpected(name.error());
         file->has_package_decl = true;
         file->package_name = name.value()->text;
-        file->package_span = Span{kw.value()->start, name.value()->end, kw.value()->line, kw.value()->col};
+        file->package_span =
+            Span{kw.value()->start, name.value()->end, kw.value()->line, kw.value()->col};
     }
     while (p.cur().type != TokenType::Eof) {
-        FrontendResult<AstItem> item = frontend_error(FrontendError::UnexpectedToken, Parser::span_from(p.cur()), p.cur().text);
+        FrontendResult<AstItem> item = frontend_error(
+            FrontendError::UnexpectedToken, Parser::span_from(p.cur()), p.cur().text);
         switch (p.cur().type) {
             case TokenType::KwUpstream:
                 item = p.parse_upstream();
@@ -1585,10 +1624,12 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 }
                 if (p.cur().type == TokenType::Eof)
                     return frontend_error(FrontendError::UnexpectedEof, Parser::span_from(p.cur()));
-                return frontend_error(FrontendError::UnexpectedToken, Parser::span_from(p.cur()), p.cur().text);
+                return frontend_error(
+                    FrontendError::UnexpectedToken, Parser::span_from(p.cur()), p.cur().text);
         }
         if (!item) return core::make_unexpected(item.error());
-        if (!file->items.push(item.value())) return frontend_error(FrontendError::TooManyItems, item.value().span);
+        if (!file->items.push(item.value()))
+            return frontend_error(FrontendError::TooManyItems, item.value().span);
     }
     return file.release();
 }

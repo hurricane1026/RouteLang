@@ -753,6 +753,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->upstream_index = term.upstream_index;
             out->kind = term.kind == HirTerminatorKind::ReturnStatus ? MirTerminatorKind::ReturnStatus
                                                                      : MirTerminatorKind::ForwardUpstream;
+            out->source_kind = term.source_kind == HirTerminatorSourceKind::LocalRef
+                                   ? MirTerminatorSourceKind::LocalRef
+                                   : MirTerminatorSourceKind::Literal;
+            out->local_ref_index = term.local_ref_index;
         };
         auto guard_fail_block_count = [&](const HirGuard& guard) -> u32 {
             if (guard.fail_kind == HirGuard::FailKind::Term) return 1;

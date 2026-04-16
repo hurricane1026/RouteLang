@@ -327,6 +327,7 @@ struct HirFunction {
         u32 tuple_variant_indices[kMaxTupleSlots]{};
         u32 tuple_struct_indices[kMaxTupleSlots]{};
         u32 shape_index = 0xffffffffu;
+        bool has_underscore_label = false;
     };
 
     Span span{};
@@ -519,10 +520,20 @@ enum class HirTerminatorKind : u8 {
     ForwardUpstream,
 };
 
+// Where the runtime status value comes from, when kind == ReturnStatus.
+// Literal: status_code is the i32 to return (compile-time constant).
+// LocalRef: read the value of route.locals[local_ref_index] at runtime.
+enum class HirTerminatorSourceKind : u8 {
+    Literal,
+    LocalRef,
+};
+
 struct HirTerminator {
     HirTerminatorKind kind = HirTerminatorKind::ReturnStatus;
     Span span{};
+    HirTerminatorSourceKind source_kind = HirTerminatorSourceKind::Literal;
     i32 status_code = 0;
+    u32 local_ref_index = 0xffffffffu;
     u32 upstream_index = 0;
 };
 

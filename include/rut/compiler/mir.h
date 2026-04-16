@@ -168,10 +168,17 @@ struct MirLocal {
     MirValue init{};
 };
 
+enum class MirTerminatorSourceKind : u8 {
+    Literal,
+    LocalRef,
+};
+
 struct MirTerminator {
     MirTerminatorKind kind = MirTerminatorKind::ReturnStatus;
     Span span{};
+    MirTerminatorSourceKind source_kind = MirTerminatorSourceKind::Literal;
     i32 status_code = 0;
+    u32 local_ref_index = 0xffffffffu;
     u32 upstream_index = 0;
     bool use_cmp = false;
     MirValue cond{};

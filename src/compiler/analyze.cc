@@ -1032,6 +1032,28 @@ static u32 find_function_index(const HirModule& mod, Str name) {
     return mod.functions.len;
 }
 
+// Validates a function's signature for use as a route decorator (middleware).
+// Rules:
+//   - At least one parameter (the implicit Request slot).
+//   - First parameter declared with `_ name: Type` (Swift omitted-label).
+//     Strict from day one — relaxing later is non-breaking, tightening is.
+//   - Return type must be i32. The runtime convention: 0 = pass through to
+//     the next pre-middleware/handler, non-zero = reject and short-circuit
+//     return that value as the HTTP status code.
+//
+// Deliberately does NOT check that the first param's *type* is `Request` —
+// HirTypeKind has no Request yet (only Bool/I32/Str/Variant/Struct/Tuple/
+// Generic/Unknown). Extend when the runtime Request type lands.
+static FrontendResult<u32> validate_decorator_signature(const HirFunction& fn, Span decorator_span) {
+    if (fn.params.len == 0)
+        return frontend_error(FrontendError::UnsupportedSyntax, decorator_span, fn.name);
+    if (!fn.params[0].has_underscore_label)
+        return frontend_error(FrontendError::UnsupportedSyntax, decorator_span, fn.params[0].name);
+    if (fn.return_type != HirTypeKind::I32)
+        return frontend_error(FrontendError::UnsupportedSyntax, decorator_span, fn.name);
+    return 0u;
+}
+
 static const HirAlias* find_alias(const HirModule& mod, Str name) {
     for (u32 i = 0; i < mod.aliases.len; i++) {
         if (mod.aliases[i].name.eq(name)) return &mod.aliases[i];
@@ -7428,6 +7450,7 @@ static FrontendResult<HirModule*> analyze_file_internal(const AstFile& file,
             }
             HirFunction::ParamDecl param{};
             param.name = ast_func.params[pi].name;
+            param.has_underscore_label = ast_func.params[pi].has_underscore_label;
             const auto& param_ref = ast_func.params[pi].type;
             if (!param_ref.is_tuple && param_ref.type_arg_names.len != 0) {
                 u32 template_variant_index = 0xffffffffu;
@@ -7960,6 +7983,7 @@ static FrontendResult<HirModule*> analyze_file_internal(const AstFile& file,
             }
             HirFunction::ParamDecl param{};
             param.name = item.func.params[pi].name;
+            param.has_underscore_label = item.func.params[pi].has_underscore_label;
             const auto& param_ref = item.func.params[pi].type;
             if (!param_ref.is_tuple && param_ref.type_arg_names.len != 0) {
                 u32 template_variant_index = 0xffffffffu;
@@ -9066,6 +9090,103 @@ resolve_concrete_impl_target:
                         &route.control.match_arms[ai].cond, route.error_variant_index);
                 }
             }
+        }
+
+        // Resolve route decorators (@auth, @requestId, ...) to function indices,
+        // validate signatures, then inline each decorator's body into a synthetic
+        // local + guard pair. Pre-middleware short-circuit is achieved by guards:
+        // each guard checks `local == 0`; on non-zero, fail_term returns the
+        // local's runtime value (HirTerminatorSourceKind::LocalRef).
+        const u32 first_decorator_guard_index = route.guards.len;
+        for (u32 di = 0; di < item.route.decorators.len; di++) {
+            const auto& ast_deco = item.route.decorators[di];
+            const u32 fn_index = find_function_index(mod, ast_deco.name);
+            if (fn_index == mod.functions.len)
+                return frontend_error(FrontendError::UnsupportedSyntax, ast_deco.span, ast_deco.name);
+            auto sig_check = validate_decorator_signature(mod.functions[fn_index], ast_deco.span);
+            if (!sig_check) return core::make_unexpected(sig_check.error());
+
+            // Inline the decorator's body and bind the result to a synthetic local.
+            // The implicit `req` parameter (slot 0) is filled with IntConst(0) — a
+            // placeholder until the runtime Request type lands. Decorators that need
+            // request data should use `req.header(...)` sugar (parser-level construct
+            // independent of the param value).
+            HirExpr placeholder_req{};
+            placeholder_req.kind = HirExprKind::IntLit;
+            placeholder_req.type = HirTypeKind::I32;
+            placeholder_req.int_value = 0;
+            placeholder_req.span = ast_deco.span;
+            HirExpr deco_args[1] = {placeholder_req};
+            const auto& deco_fn = mod.functions[fn_index];
+            auto inlined =
+                instantiate_function_expr(deco_fn.body, &route, mod, deco_args, 1u, nullptr, 0u);
+            if (!inlined) return core::make_unexpected(inlined.error());
+
+            HirLocal deco_local{};
+            deco_local.span = ast_deco.span;
+            deco_local.name = intern_generated_name(
+                std::string("_deco_") + std::to_string(di) + "_" + std::string(ast_deco.name.ptr, ast_deco.name.len));
+            deco_local.ref_index = next_local_ref_index(&route, route.locals.data, route.locals.len);
+            deco_local.type = HirTypeKind::I32;
+            deco_local.init = inlined.value();
+            const u32 deco_ref = deco_local.ref_index;
+            if (!route.locals.push(deco_local))
+                return frontend_error(FrontendError::TooManyItems, ast_deco.span);
+
+            // guard cond: Eq(LocalRef(deco_ref), IntConst(0)) — true means "pass through"
+            HirExpr lhs_local{};
+            lhs_local.kind = HirExprKind::LocalRef;
+            lhs_local.type = HirTypeKind::I32;
+            lhs_local.local_index = deco_ref;
+            lhs_local.span = ast_deco.span;
+            HirExpr rhs_zero{};
+            rhs_zero.kind = HirExprKind::IntLit;
+            rhs_zero.type = HirTypeKind::I32;
+            rhs_zero.int_value = 0;
+            rhs_zero.span = ast_deco.span;
+            HirGuard deco_guard{};
+            deco_guard.span = ast_deco.span;
+            deco_guard.cond.kind = HirExprKind::Eq;
+            deco_guard.cond.type = HirTypeKind::Bool;
+            deco_guard.cond.span = ast_deco.span;
+            // Allocate Eq operands from route's expression pool so they survive HirRoute
+            // copy/move (which rebases pointers via rebase_expr).
+            if (route.exprs.len + 2 > HirRoute::kMaxExprs)
+                return frontend_error(FrontendError::TooManyItems, ast_deco.span);
+            route.exprs.push(lhs_local);
+            deco_guard.cond.lhs = &route.exprs[route.exprs.len - 1];
+            route.exprs.push(rhs_zero);
+            deco_guard.cond.rhs = &route.exprs[route.exprs.len - 1];
+            // fail_term: ReturnStatus reading from the synthetic local at runtime.
+            deco_guard.fail_kind = HirGuard::FailKind::Term;
+            deco_guard.fail_term.kind = HirTerminatorKind::ReturnStatus;
+            deco_guard.fail_term.source_kind = HirTerminatorSourceKind::LocalRef;
+            deco_guard.fail_term.local_ref_index = deco_ref;
+            deco_guard.fail_term.span = ast_deco.span;
+            if (!route.guards.push(deco_guard))
+                return frontend_error(FrontendError::TooManyItems, ast_deco.span);
+
+            HirRoute::DecoratorRef ref{};
+            ref.span = ast_deco.span;
+            ref.name = ast_deco.name;
+            ref.function_index = fn_index;
+            if (!route.decorators.push(ref))
+                return frontend_error(FrontendError::TooManyItems, ast_deco.span);
+        }
+
+        // Decorator guards must run BEFORE any user-written top-level guard so a
+        // rejected decorator short-circuits before user logic. We appended them
+        // at the end above; rotate so they sit in front while preserving the
+        // user guards' relative order. HirGuards are value-copied; their cond
+        // expressions point into route.exprs (stable storage), so rotating in
+        // place doesn't invalidate any pointers.
+        const u32 num_user_guards = first_decorator_guard_index;
+        const u32 num_deco_guards = route.guards.len - first_decorator_guard_index;
+        if (num_deco_guards > 0 && num_user_guards > 0) {
+            HirGuard tmp[HirRoute::kMaxGuards];
+            for (u32 i = 0; i < route.guards.len; i++) tmp[i] = route.guards[i];
+            for (u32 i = 0; i < num_deco_guards; i++) route.guards[i] = tmp[num_user_guards + i];
+            for (u32 i = 0; i < num_user_guards; i++) route.guards[num_deco_guards + i] = tmp[i];
         }
 
         if (!mod.routes.push(route))

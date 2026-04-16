@@ -215,6 +215,93 @@ TEST(frontend, parse_func_param_without_underscore_label) {
     CHECK(!ast->items[0].func.params[0].has_underscore_label);
 }
 
+TEST(frontend, analyze_resolves_route_decorator_to_function_index) {
+    const char* src = R"rut(
+func auth(_ req: i32) -> i32 => 0
+route {
+    @auth "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].decorators.len, 1u);
+    CHECK(hir->routes[0].decorators[0].name.eq(lit("auth")));
+    CHECK_EQ(hir->routes[0].decorators[0].function_index, 0u);  // auth is the only func
+}
+
+TEST(frontend, analyze_rejects_unknown_route_decorator) {
+    const char* src = R"rut(
+route {
+    @doesNotExist "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, analyze_rejects_decorator_function_with_zero_params) {
+    const char* src = R"rut(
+func auth() -> i32 => 0
+route {
+    @auth "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, analyze_rejects_decorator_function_missing_underscore_first_param) {
+    const char* src = R"rut(
+func auth(req: i32) -> i32 => 0
+route {
+    @auth "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, analyze_rejects_decorator_function_with_non_i32_return_type) {
+    const char* src = R"rut(
+func auth(_ req: i32) -> bool => true
+route {
+    @auth "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
 TEST(frontend, parse_file_header_package_decl_is_recorded) {
     const char* src = "package auth\nfunc jwtAuth() -> i32 => 200\n";
     auto lexed = lex(lit(src));

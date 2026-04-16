@@ -2302,6 +2302,14 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         return {};
     }
     if (term.kind == MirTerminatorKind::ReturnStatus) {
+        if (term.source_kind == MirTerminatorSourceKind::LocalRef) {
+            if (term.local_ref_index >= local_count)
+                return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            const auto code_id = locals[term.local_ref_index];
+            if (!b.emit_ret_status(code_id, {term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            return {};
+        }
         if (!b.emit_ret_status(term.status_code, {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};

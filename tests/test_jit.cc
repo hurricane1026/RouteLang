@@ -12995,6 +12995,116 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_route_decorator_pass_runs_handler) {
+    const auto src = R"rut(
+func passing(_ req: i32) -> i32 => 0
+route {
+    @passing "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK_EQ(r.status_code, 200);  // handler ran
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_decorator_reject_short_circuits_handler) {
+    const auto src = R"rut(
+func rejecting(_ req: i32) -> i32 => 401
+route {
+    @rejecting "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK_EQ(r.status_code, 401);  // decorator's return short-circuited the handler
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_decorator_chain_second_rejects) {
+    const auto src = R"rut(
+func passing(_ req: i32) -> i32 => 0
+func rejecting(_ req: i32) -> i32 => 403
+route {
+    @passing "*"
+    @rejecting "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK_EQ(r.status_code, 403);  // first decorator passed, second rejected
+    engine.shutdown();
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

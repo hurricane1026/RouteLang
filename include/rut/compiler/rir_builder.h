@@ -689,6 +689,17 @@ struct Builder {
         return {};
     }
 
+    // Runtime-value form: status code is read from a SSA value (e.g. result
+    // of a decorator call) instead of a compile-time literal. Codegen reads
+    // the value via inst.operands[0] (see codegen.cc RetStatus handling).
+    VoidResult emit_ret_status(ValueId code, SourceLoc loc = {}) {
+        if (!valid_val(code)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RetStatus, nullptr, loc));
+        r.inst->operands[0] = code;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
     VoidResult emit_ret_forward(ValueId upstream, SourceLoc loc = {}) {
         if (!valid_val(upstream)) return err(RirError::InvalidState);
         // Upstream operand must be an integer type (upstream id).

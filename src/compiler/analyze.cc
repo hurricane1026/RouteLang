@@ -7004,8 +7004,7 @@ static FrontendResult<void> load_imported_modules(
         std::unique_ptr<AstFile> ast_owned(ast.value());
         auto kept_path = stash_owned_string(owned_strings, normalized);
         g_import_analysis_counter++;
-        auto imported =
-            analyze_file_internal(*ast_owned, kept_path, import_stack, &owned_strings);
+        auto imported = analyze_file_internal(*ast_owned, kept_path, import_stack, &owned_strings);
         if (!imported) return core::make_unexpected(imported.error());
         imported_storage.push_back(std::unique_ptr<HirModule>(imported.value()));
         ImportedModuleInfo info{};

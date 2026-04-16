@@ -26,9 +26,39 @@ static u32 block_op_count(const rir::Block& block, rir::Opcode op) {
     }
     return count;
 }
+// RAII wrapper for FrontendResult<T*>. The frontend APIs (parse_file,
+// analyze_file, build_mir) all .release() a unique_ptr and hand back a raw
+// pointer. Tests allocated hundreds of these without ever deleting; before
+// this guard the test binaries leaked ~75 MB per test case, pushing the full
+// test_frontend suite to ~44 GB resident and tripping CI OOM kills.
 template <typename T>
 struct HeapFrontendResult {
     FrontendResult<T*> inner;
+
+    HeapFrontendResult() = default;
+    HeapFrontendResult(FrontendResult<T*> v) : inner(std::move(v)) {}
+    HeapFrontendResult(const HeapFrontendResult&) = delete;
+    HeapFrontendResult& operator=(const HeapFrontendResult&) = delete;
+    HeapFrontendResult(HeapFrontendResult&& other) noexcept : inner(std::move(other.inner)) {
+        other.inner = core::make_unexpected(Diagnostic{});
+    }
+    HeapFrontendResult& operator=(HeapFrontendResult&& other) noexcept {
+        if (this != &other) {
+            reset();
+            inner = std::move(other.inner);
+            other.inner = core::make_unexpected(Diagnostic{});
+        }
+        return *this;
+    }
+    ~HeapFrontendResult() { reset(); }
+
+    void reset() {
+        if (inner.has_value()) {
+            delete inner.value();
+            inner = core::make_unexpected(Diagnostic{});
+        }
+    }
+
     bool has_value() const { return inner.has_value(); }
     explicit operator bool() const { return static_cast<bool>(inner); }
     T* operator->() { return inner.value(); }

@@ -6997,10 +6997,15 @@ static FrontendResult<void> load_imported_modules(
         if (!lexed) return core::make_unexpected(lexed.error());
         auto ast = parse_file(lexed.value());
         if (!ast) return core::make_unexpected(ast.error());
+        // parse_file returns a raw pointer via unique_ptr::release(); take
+        // ownership immediately so the imported AstFile is freed after analyze
+        // consumes it. Without this wrapper an import-heavy test suite leaks
+        // ~58 MB per imported file (confirmed via RSS growth).
+        std::unique_ptr<AstFile> ast_owned(ast.value());
         auto kept_path = stash_owned_string(owned_strings, normalized);
         g_import_analysis_counter++;
         auto imported =
-            analyze_file_internal(*ast.value(), kept_path, import_stack, &owned_strings);
+            analyze_file_internal(*ast_owned, kept_path, import_stack, &owned_strings);
         if (!imported) return core::make_unexpected(imported.error());
         imported_storage.push_back(std::unique_ptr<HirModule>(imported.value()));
         ImportedModuleInfo info{};

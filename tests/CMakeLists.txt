@@ -232,6 +232,7 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_buffer>
     COMMAND $<TARGET_FILE:test_types>
     COMMAND $<TARGET_FILE:test_rir>
+    COMMAND $<TARGET_FILE:test_frontend>
     COMMAND $<TARGET_FILE:test_drain>
     COMMAND $<TARGET_FILE:test_access_log>
     COMMAND $<TARGET_FILE:test_metrics>
@@ -242,6 +243,6 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_traffic_replay>
     COMMAND $<TARGET_FILE:test_sim>
     COMMAND $<TARGET_FILE:test_simulate_engine>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_drain test_access_log test_metrics test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine
+    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine
     COMMENT "Running all tests..."
 )

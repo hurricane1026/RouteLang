@@ -67,11 +67,15 @@ bool JitEngine::init() {
     // MangleAndIntern produces correctly mangled names for the target.
     LLVMOrcJITDylibRef main_jd = LLVMOrcLLJITGetMainJITDylib(lljit);
 
+    // Fixed stack buffer; raise kMaxHelpers in lockstep when kHelpers grows.
+    // Without the clamp on `count` the loop below can leave tail pairs
+    // uninitialized yet still hand them to LLVMOrcAbsoluteSymbols.
+    static constexpr u32 kMaxHelpers = 16;
     u32 count = 0;
-    for (const auto* h = kHelpers; h->name; h++) count++;
+    for (const auto* h = kHelpers; h->name && count < kMaxHelpers; h++) count++;
 
-    LLVMOrcCSymbolMapPair pairs[16];
-    for (u32 i = 0; i < count && i < 16; i++) {
+    LLVMOrcCSymbolMapPair pairs[kMaxHelpers];
+    for (u32 i = 0; i < count; i++) {
         pairs[i].Name = LLVMOrcLLJITMangleAndIntern(lljit, kHelpers[i].name);
         pairs[i].Sym.Address = reinterpret_cast<LLVMOrcExecutorAddress>(kHelpers[i].addr);
         pairs[i].Sym.Flags.GenericFlags = LLVMJITSymbolGenericFlagsExported;

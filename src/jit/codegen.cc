@@ -314,7 +314,13 @@ struct Ctx {
             case rir::TypeKind::Struct:
                 if (ty->struct_def) {
                     auto* sd = ty->struct_def;
-                    LLVMTypeRef fields[16]{};
+                    // Stack buffer capped at 16 to avoid heap/arena plumbing in
+                    // the type mapper. MirStruct::kMaxFields is 8 upstream, so
+                    // 16 is 2x headroom; if frontend capacity ever grows, raise
+                    // this in lockstep. Trap instead of silently truncating.
+                    static constexpr u32 kMaxStructFields = 16;
+                    if (sd->field_count > kMaxStructFields) __builtin_trap();
+                    LLVMTypeRef fields[kMaxStructFields]{};
                     for (u32 i = 0; i < sd->field_count; i++) {
                         fields[i] = map_type(sd->fields()[i].type);
                     }
@@ -833,6 +839,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_remote_addr = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;
+    c.fn_str_cmp = nullptr;
     c.fn_str_trim_prefix = nullptr;
     c.cur_fn = nullptr;
 

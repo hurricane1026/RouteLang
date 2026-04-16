@@ -267,8 +267,6 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         apply_expr_shape_if_available(module, expr, &v);
         return v;
     }
-    if (expr.kind == HirExprKind::TupleSlot)
-        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     if (expr.kind == HirExprKind::VariantCase) {
         v.kind = MirValueKind::VariantCase;
         v.type = MirTypeKind::Variant;

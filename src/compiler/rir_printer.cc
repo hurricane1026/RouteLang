@@ -576,7 +576,11 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::RetStatus:
             buf.put(' ');
-            buf.put_i32(inst.imm.i32_val);
+            if (inst.operand_count > 0) {
+                print_value_ref(buf, inst.operands[0]);
+            } else {
+                buf.put_i32(inst.imm.i32_val);
+            }
             break;
         case Opcode::RetForward:
             buf.put(' ');

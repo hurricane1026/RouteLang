@@ -15,17 +15,19 @@ namespace rut::jit {
 // ── Error logging (no stdlib) ──────────────────────────────────────
 
 static void log_error(const char* prefix, LLVMErrorRef err) {
-    char* msg = LLVMGetErrorMessage(err);
     auto write_str = [](const char* s) {
         int len = 0;
         while (s[len]) len++;
         (void)::write(2, s, len);
     };
     write_str(prefix);
-    write_str(": ");
-    write_str(msg);
+    if (err) {
+        char* msg = LLVMGetErrorMessage(err);
+        write_str(": ");
+        write_str(msg);
+        LLVMDisposeErrorMessage(msg);
+    }
     write_str("\n");
-    LLVMDisposeErrorMessage(msg);
 }
 
 // ── Runtime Helper Symbol Table ────────────────────────────────────
@@ -70,9 +72,18 @@ bool JitEngine::init() {
     // Fixed stack buffer; raise kMaxHelpers in lockstep when kHelpers grows.
     // Without the clamp on `count` the loop below can leave tail pairs
     // uninitialized yet still hand them to LLVMOrcAbsoluteSymbols.
+    // If kHelpers ever grows past kMaxHelpers, fail loudly instead of
+    // silently skipping helpers (which would produce opaque JIT link
+    // failures at runtime).
     static constexpr u32 kMaxHelpers = 16;
     u32 count = 0;
-    for (const auto* h = kHelpers; h->name && count < kMaxHelpers; h++) count++;
+    for (const auto* h = kHelpers; h->name; h++) count++;
+    if (count > kMaxHelpers) {
+        log_error("jit: helper table exceeds kMaxHelpers — raise the cap", nullptr);
+        LLVMOrcDisposeLLJIT(lljit);
+        lljit = nullptr;
+        return false;
+    }
 
     LLVMOrcCSymbolMapPair pairs[kMaxHelpers];
     for (u32 i = 0; i < count; i++) {

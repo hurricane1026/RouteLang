@@ -85,6 +85,20 @@ struct Ctx {
     LLVMValueRef fn_str_cmp;
     LLVMValueRef fn_str_trim_prefix;
 
+    // Cache for map_type: LLVM literal structs (Optional<composite>, Struct
+    // with a StructDef) are identity-compared, so emitting a fresh
+    // LLVMStructTypeInContext call per lookup produces *different* LLVM types
+    // for the same RIR type — breaking PHIs, selects, and other operations
+    // that require exact type equality. Key by the rir::Type pointer, which
+    // is arena-allocated and stable for the module's lifetime.
+    static constexpr u32 kMaxCachedTypes = 256;
+    struct TypeCacheEntry {
+        const rir::Type* key;
+        LLVMTypeRef value;
+    };
+    TypeCacheEntry type_cache[kMaxCachedTypes];
+    u32 type_cache_count;
+
     void init_types() {
         i1_ty = LLVMInt1TypeInContext(llvm_ctx);
         i8_ty = LLVMInt8TypeInContext(llvm_ctx);
@@ -275,8 +289,18 @@ struct Ctx {
 
     // ── Type mapping ───────────────────────────────────────────────
 
+    LLVMTypeRef cache_type(const rir::Type* ty, LLVMTypeRef t) {
+        if (type_cache_count < kMaxCachedTypes) {
+            type_cache[type_cache_count++] = {ty, t};
+        }
+        return t;
+    }
+
     LLVMTypeRef map_type(const rir::Type* ty) {
         if (!ty) return void_ty;
+        for (u32 i = 0; i < type_cache_count; i++) {
+            if (type_cache[i].key == ty) return type_cache[i].value;
+        }
         switch (ty->kind) {
             case rir::TypeKind::Void:
                 return void_ty;
@@ -309,7 +333,7 @@ struct Ctx {
                 {
                     LLVMTypeRef payload = map_type(ty->inner);
                     LLVMTypeRef fields[] = {i8_ty, payload};
-                    return LLVMStructTypeInContext(llvm_ctx, fields, 2, 0);
+                    return cache_type(ty, LLVMStructTypeInContext(llvm_ctx, fields, 2, 0));
                 }
             case rir::TypeKind::Struct:
                 if (ty->struct_def) {
@@ -324,7 +348,8 @@ struct Ctx {
                     for (u32 i = 0; i < sd->field_count; i++) {
                         fields[i] = map_type(sd->fields()[i].type);
                     }
-                    return LLVMStructTypeInContext(llvm_ctx, fields, sd->field_count, 0);
+                    return cache_type(
+                        ty, LLVMStructTypeInContext(llvm_ctx, fields, sd->field_count, 0));
                 }
                 return ptr_ty;
             default:
@@ -842,6 +867,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_str_cmp = nullptr;
     c.fn_str_trim_prefix = nullptr;
     c.cur_fn = nullptr;
+    c.type_cache_count = 0;
 
     c.init_types();
 

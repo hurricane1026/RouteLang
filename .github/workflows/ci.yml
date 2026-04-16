@@ -94,7 +94,7 @@ jobs:
         run: ninja -C build
 
       - name: Test
-        run: ninja -C build check
+        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
 
   coverage:
     name: Code Coverage

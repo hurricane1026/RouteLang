@@ -46,7 +46,7 @@ struct FixedVec {
     T data[Cap];
     u32 len = 0;
 
-    bool push(T val) {
+    bool push(const T& val) {
         if (len >= Cap) return false;
         data[len++] = val;
         return true;

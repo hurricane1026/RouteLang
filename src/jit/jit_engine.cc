@@ -2,6 +2,7 @@
 
 #include "rut/jit/runtime_helpers.h"
 
+#include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
 #include <llvm-c/Error.h>
 #include <llvm-c/LLJIT.h>
@@ -14,17 +15,19 @@ namespace rut::jit {
 // ── Error logging (no stdlib) ──────────────────────────────────────
 
 static void log_error(const char* prefix, LLVMErrorRef err) {
-    char* msg = LLVMGetErrorMessage(err);
     auto write_str = [](const char* s) {
         int len = 0;
         while (s[len]) len++;
         (void)::write(2, s, len);
     };
     write_str(prefix);
-    write_str(": ");
-    write_str(msg);
+    if (err) {
+        char* msg = LLVMGetErrorMessage(err);
+        write_str(": ");
+        write_str(msg);
+        LLVMDisposeErrorMessage(msg);
+    }
     write_str("\n");
-    LLVMDisposeErrorMessage(msg);
 }
 
 // ── Runtime Helper Symbol Table ────────────────────────────────────
@@ -41,6 +44,8 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_req_header", reinterpret_cast<void*>(&rut_helper_req_header)},
     {"rut_helper_req_remote_addr", reinterpret_cast<void*>(&rut_helper_req_remote_addr)},
     {"rut_helper_str_has_prefix", reinterpret_cast<void*>(&rut_helper_str_has_prefix)},
+    {"rut_helper_str_eq", reinterpret_cast<void*>(&rut_helper_str_eq)},
+    {"rut_helper_str_cmp", reinterpret_cast<void*>(&rut_helper_str_cmp)},
     {"rut_helper_str_trim_prefix", reinterpret_cast<void*>(&rut_helper_str_trim_prefix)},
     {nullptr, nullptr},
 };
@@ -64,11 +69,24 @@ bool JitEngine::init() {
     // MangleAndIntern produces correctly mangled names for the target.
     LLVMOrcJITDylibRef main_jd = LLVMOrcLLJITGetMainJITDylib(lljit);
 
+    // Fixed stack buffer; raise kMaxHelpers in lockstep when kHelpers grows.
+    // Without the clamp on `count` the loop below can leave tail pairs
+    // uninitialized yet still hand them to LLVMOrcAbsoluteSymbols.
+    // If kHelpers ever grows past kMaxHelpers, fail loudly instead of
+    // silently skipping helpers (which would produce opaque JIT link
+    // failures at runtime).
+    static constexpr u32 kMaxHelpers = 16;
     u32 count = 0;
     for (const auto* h = kHelpers; h->name; h++) count++;
+    if (count > kMaxHelpers) {
+        log_error("jit: helper table exceeds kMaxHelpers — raise the cap", nullptr);
+        LLVMOrcDisposeLLJIT(lljit);
+        lljit = nullptr;
+        return false;
+    }
 
-    LLVMOrcCSymbolMapPair pairs[16];
-    for (u32 i = 0; i < count && i < 16; i++) {
+    LLVMOrcCSymbolMapPair pairs[kMaxHelpers];
+    for (u32 i = 0; i < count; i++) {
         pairs[i].Name = LLVMOrcLLJITMangleAndIntern(lljit, kHelpers[i].name);
         pairs[i].Sym.Address = reinterpret_cast<LLVMOrcExecutorAddress>(kHelpers[i].addr);
         pairs[i].Sym.Flags.GenericFlags = LLVMJITSymbolGenericFlagsExported;
@@ -105,6 +123,24 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
     const char* triple = LLVMOrcLLJITGetTripleString(lljit);
     if (triple) LLVMSetTarget(mod, triple);
 
+    char* verify_msg = nullptr;
+    if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &verify_msg)) {
+        if (verify_msg) {
+            auto write_str = [](const char* s) {
+                int len = 0;
+                while (s[len]) len++;
+                (void)::write(2, s, len);
+            };
+            write_str("jit: module verification failed: ");
+            write_str(verify_msg);
+            write_str("\n");
+            LLVMDisposeMessage(verify_msg);
+        }
+        LLVMDisposeModule(mod);
+        LLVMContextDispose(ctx);
+        return false;
+    }
+
     // Wrap module into a ThreadSafeModule for submission to LLJIT.
     // We create a fresh ThreadSafeContext as the lock wrapper. Its internal
     // context differs from the module's context, but LLJIT only uses it
@@ -115,19 +151,26 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
     LLVMOrcThreadSafeModuleRef tsm = LLVMOrcCreateNewThreadSafeModule(mod, tsctx);
     LLVMOrcDisposeThreadSafeContext(tsctx);
 
-    // Track the orphaned context for cleanup.
-    if (ctx_count < kMaxContexts) {
-        contexts[ctx_count++] = ctx;
-    }
-
     // Submit to the main JITDylib. On success, LLJIT owns tsm.
+    // We defer tracking `ctx` until *after* the module is accepted: on failure
+    // we dispose ctx here rather than letting a failed compile consume a slot
+    // in `contexts[]` (and eventually exhaust kMaxContexts).
     LLVMOrcJITDylibRef main_jd = LLVMOrcLLJITGetMainJITDylib(lljit);
     LLVMErrorRef err = LLVMOrcLLJITAddLLVMIRModule(lljit, main_jd, tsm);
     if (err) {
         log_error("jit: module compilation failed", err);
-        // On failure, ownership of tsm stays with us.
+        // On failure, ownership of tsm stays with us; disposing tsm also
+        // disposes the inner module. We still own `ctx` (module's original
+        // context) — dispose it here to match the verification-failure path.
         LLVMOrcDisposeThreadSafeModule(tsm);
+        LLVMContextDispose(ctx);
         return false;
+    }
+
+    // Track the orphaned context for cleanup in shutdown(), after LLJIT
+    // has accepted the module.
+    if (ctx_count < kMaxContexts) {
+        contexts[ctx_count++] = ctx;
     }
 
     return true;

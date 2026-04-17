@@ -118,6 +118,15 @@ target_include_directories(test_rir PRIVATE
 add_test(NAME test_rir COMMAND test_rir)
 set_tests_properties(test_rir PROPERTIES LABELS "unit")
 
+add_executable(test_frontend test_frontend.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_link_libraries(test_frontend rut_compiler)
+target_include_directories(test_frontend PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_frontend COMMAND test_frontend)
+set_tests_properties(test_frontend PROPERTIES LABELS "unit;compiler")
+
 add_executable(test_drain test_drain.cc)
 target_link_libraries(test_drain rut_runtime)
 target_include_directories(test_drain PRIVATE
@@ -223,6 +232,7 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_buffer>
     COMMAND $<TARGET_FILE:test_types>
     COMMAND $<TARGET_FILE:test_rir>
+    COMMAND $<TARGET_FILE:test_frontend>
     COMMAND $<TARGET_FILE:test_drain>
     COMMAND $<TARGET_FILE:test_access_log>
     COMMAND $<TARGET_FILE:test_metrics>
@@ -233,6 +243,6 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_traffic_replay>
     COMMAND $<TARGET_FILE:test_sim>
     COMMAND $<TARGET_FILE:test_simulate_engine>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_drain test_access_log test_metrics test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine
+    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine
     COMMENT "Running all tests..."
 )

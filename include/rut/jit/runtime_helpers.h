@@ -44,6 +44,12 @@ rut::u32 rut_helper_req_remote_addr(void* conn);
 // Check if string s has prefix pfx. Returns 1 (true) or 0 (false).
 rut::u8 rut_helper_str_has_prefix(const char* s, rut::u32 s_len, const char* pfx, rut::u32 pfx_len);
 
+// Check if two strings are equal. Returns 1 (true) or 0 (false).
+rut::u8 rut_helper_str_eq(const char* a, rut::u32 a_len, const char* b, rut::u32 b_len);
+
+// Lexicographic string comparison. Returns <0, 0, >0 like strcmp.
+rut::i32 rut_helper_str_cmp(const char* a, rut::u32 a_len, const char* b, rut::u32 b_len);
+
 // Trim prefix from string. If s starts with pfx, out = remainder.
 // Otherwise out = s unchanged.
 void rut_helper_str_trim_prefix(const char* s,

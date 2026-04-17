@@ -1,3 +1,8 @@
+#include "rut/compiler/analyze.h"
+#include "rut/compiler/lexer.h"
+#include "rut/compiler/lower_rir.h"
+#include "rut/compiler/mir_build.h"
+#include "rut/compiler/parser.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_builder.h"
 #include "rut/jit/codegen.h"
@@ -6,6 +11,8 @@
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/connection.h"
 #include "test.h"
+#include <filesystem>
+#include <fstream>
 
 using namespace rut;
 using namespace rut::rir;
@@ -17,6 +24,73 @@ static Str lit(const char* s) {
     u32 n = 0;
     while (s[n]) n++;
     return {s, n};
+}
+
+// RAII wrapper — frontend APIs (parse_file/analyze_file/build_mir) all
+// .release() a unique_ptr. Without ownership the raw pointer leaks; the
+// test suite was leaking ~75 MB per test case before this guard landed.
+template <typename T>
+struct HeapFrontendResult {
+    FrontendResult<T*> inner;
+
+    HeapFrontendResult() = default;
+    HeapFrontendResult(FrontendResult<T*> v) : inner(std::move(v)) {}
+    HeapFrontendResult(const HeapFrontendResult&) = delete;
+    HeapFrontendResult& operator=(const HeapFrontendResult&) = delete;
+    HeapFrontendResult(HeapFrontendResult&& other) noexcept : inner(std::move(other.inner)) {
+        other.inner = core::make_unexpected(Diagnostic{});
+    }
+    HeapFrontendResult& operator=(HeapFrontendResult&& other) noexcept {
+        if (this != &other) {
+            reset();
+            inner = std::move(other.inner);
+            other.inner = core::make_unexpected(Diagnostic{});
+        }
+        return *this;
+    }
+    ~HeapFrontendResult() { reset(); }
+
+    void reset() {
+        if (inner.has_value()) {
+            delete inner.value();
+            inner = core::make_unexpected(Diagnostic{});
+        }
+    }
+
+    bool has_value() const { return inner.has_value(); }
+    explicit operator bool() const { return static_cast<bool>(inner); }
+    T* operator->() { return inner.value(); }
+    const T* operator->() const { return inner.value(); }
+    T& value() { return *inner.value(); }
+    const T& value() const { return *inner.value(); }
+    Diagnostic& error() { return inner.error(); }
+    const Diagnostic& error() const { return inner.error(); }
+};
+
+static HeapFrontendResult<AstFile> parse_file_heap(const LexedTokens& tokens) {
+    auto ast = parse_file(tokens);
+    if (!ast) return {core::make_unexpected(ast.error())};
+    return {ast.value()};
+}
+
+static HeapFrontendResult<HirModule> analyze_file_heap(const AstFile& file) {
+    auto hir = analyze_file(file);
+    if (!hir) return {core::make_unexpected(hir.error())};
+    return {hir.value()};
+}
+
+static HeapFrontendResult<HirModule> analyze_file_heap_with_path(const AstFile& file,
+                                                                 const std::string& source_path) {
+    Str path{source_path.c_str(), static_cast<u32>(source_path.size())};
+    auto hir = analyze_file(file, path);
+    if (!hir) return {core::make_unexpected(hir.error())};
+    return {hir.value()};
+}
+
+static HeapFrontendResult<MirModule> build_mir_heap(const HirModule& module) {
+    auto mir = build_mir(module);
+    if (!mir) return {core::make_unexpected(mir.error())};
+    return {mir.value()};
 }
 
 // Unwrap Expected.
@@ -135,6 +209,3771 @@ TEST(jit, return_200) {
 
     engine.shutdown();
     tc.destroy();
+}
+
+TEST(jit, frontend_req_header_or_fallback) {
+    const char* src =
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = or(host, \"fallback\") "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_relative_file_merges_imported_function_symbols) {
+    const std::string dir = "/tmp/rut_import_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/auth.rut", std::ios::binary);
+        out << "func jwtAuth() -> i32 => 200\n";
+    }
+    const auto src = R"rut(
+import "auth.rut"
+route GET "/users" { if jwtAuth() == 200 { return 200 } else { return 500 } }
+)rut";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_relative_file_with_package_decl_merges_imported_function_symbols) {
+    const std::string dir = "/tmp/rut_import_packaged_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/auth.rut", std::ios::binary);
+        out << "package auth\n";
+        out << "func jwtAuth() -> i32 => 200\n";
+    }
+    const auto src = R"rut(
+import "auth.rut"
+route GET "/users" { if jwtAuth() == 200 { return 200 } else { return 500 } }
+)rut";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    if (!hir) {
+        std::fprintf(stderr,
+                     "hir error code=%d detail=%.*s span=(%u,%u)\n",
+                     static_cast<int>(hir.error().code),
+                     static_cast<int>(hir.error().detail.len),
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    }
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_relative_file_merges_imported_variant_symbol) {
+    const std::string dir = "/tmp/rut_import_variant_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/types.rut", std::ios::binary);
+        out << "variant AuthState { ok, err }\n";
+    }
+    const auto src = R"rut(
+import "types.rut"
+route GET "/users" { let state = AuthState.ok match state { case .ok: return 200 case _: return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    if (!lowered) {
+        std::fprintf(stderr,
+                     "lower err code=%d line=%u col=%u\n",
+                     static_cast<int>(lowered.error().code),
+                     lowered.error().span.line,
+                     lowered.error().span.col);
+    }
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_relative_file_merges_imported_impl_symbol) {
+    const std::string dir = "/tmp/rut_import_impl_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" { if run(Box(value: 1)) == 1 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_relative_file_merges_imported_generic_impl_symbol) {
+    const std::string dir = "/tmp/rut_import_generic_impl_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 200\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" { if run(Box(value: 123)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_relative_file_merges_imported_concrete_generic_impl_symbol) {
+    const std::string dir = "/tmp/rut_import_concrete_generic_impl_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<i32> impl Hashable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 7)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_relative_file_allows_distinct_local_concrete_generic_impl) {
+    const std::string dir = "/tmp/rut_import_concrete_generic_impl_distinct_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<i32> impl Hashable {\n";
+        out << "    func hash(self: Box<i32>) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+Box<str> impl Hashable {
+    func hash(self: Box<str>) -> i32 => 200
+}
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: "ok")) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_relative_file_dispatches_distinct_concrete_generic_impls) {
+    const std::string dir = "/tmp/rut_import_concrete_generic_impl_dual_dispatch_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<i32> impl Hashable {\n";
+        out << "    func hash(self: Box<i32>) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+Box<str> impl Hashable {
+    func hash(self: Box<str>) -> i32 => 200
+}
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 7)) == 7 {
+        if run(Box(value: "ok")) == 200 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_relative_file_merges_imported_empty_impl_for_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_default_impl_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit,
+     frontend_import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch_with_parameter) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_param_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder { func add(x: i32) -> i32 => x }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_optional_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_optional_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => nil }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_error_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_error_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => error(.timeout) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_tuple_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_tuple_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func second(a: i32, b: i32) -> i32 => b
+func run<T: Pairable>(x: T) -> i32 => x.pair() | second(_2, _1)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func second(a: i32, b: i32) -> i32 => b
+func run<T: Pairable>(x: T) -> i32 => x.pair() | second(_2, _1)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_equality) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_eq_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Pairable>(x: T) -> (i32, i32) => x.pair()
+route GET "/users" { if run(Box(value: 1)) == (200, 500) { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_tuple_default_method_ordering) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_tuple_ord_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Pairable>(x: T) -> (i32, i32) => x.pair()
+route GET "/users" { if run(Box(value: 1)) < (200, 600) { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code()
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code()
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_block_body_default_method_dispatch_with_parameter) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_block_param_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_block_body_default_method_dispatch_with_parameter) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_block_param_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" { if run(Box(value: 1)) == 201 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_if_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_if_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code(ok: bool) -> i32 { if ok { 200 } else { 500 } } }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code(true)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_if_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_if_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code(ok: bool) -> i32 { if ok { 200 } else { 500 } } }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code(true)
+route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_error_default_method_guard_match) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_error_guard_match_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code(ok: bool) -> i32 { if ok { 200 } else { "
+               "error(.timeout) } } }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 {
+    let failed = x.code(false)
+    guard match failed else { case .timeout => 401 case _ => 500 }
+    200
+}
+route GET "/users" { if run(Box(value: 1)) == 401 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_selective_import_relative_file_merges_selected_function_symbol) {
+    const std::string dir = "/tmp/rut_selective_import_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/auth.rut", std::ios::binary);
+        out << "func jwtAuth() -> i32 => 200\n";
+        out << "func basicAuth() -> i32 => 500\n";
+    }
+    const auto src = R"rut(
+import { jwtAuth } from "auth.rut"
+route GET "/users" { if jwtAuth() == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_namespace_function_call) {
+    const std::string dir = "/tmp/rut_import_namespace_function_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/auth.rut", std::ios::binary);
+        out << "func jwtAuth() -> i32 => 200\n";
+    }
+    const auto src = R"rut(
+import "auth.rut"
+route GET "/users" { if auth.jwtAuth() == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_namespace_function_call_for_file_with_package_decl) {
+    const std::string dir = "/tmp/rut_import_namespace_packaged_function_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/auth.rut", std::ios::binary);
+        out << "package auth\n";
+        out << "func jwtAuth() -> i32 => 200\n";
+    }
+    const auto src = R"rut(
+import "auth.rut"
+route GET "/users" { if auth.jwtAuth() == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_same_package_multiple_files_still_use_file_namespaces) {
+    const std::string dir = "/tmp/rut_import_same_package_file_namespaces_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/jwt.rut", std::ios::binary);
+        out << "package auth\n";
+        out << "func jwtAuth() -> i32 => 200\n";
+    }
+    {
+        std::ofstream out(dir + "/basic.rut", std::ios::binary);
+        out << "package auth\n";
+        out << "func basicAuth() -> i32 => 200\n";
+    }
+    const auto src = R"rut(
+import "jwt.rut"
+import "basic.rut"
+route GET "/users" { if jwt.jwtAuth() == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_import_namespace_type_ref_and_protocol_constraint) {
+    const std::string dir = "/tmp/rut_import_namespace_type_ref_constraint_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box { value: i32 }\n";
+    }
+    const auto src = R"rut(
+import * as proto from "proto.rut"
+proto.Box impl proto.Hashable { func hash(self: proto.Box) -> i32 => self.value }
+func run<T: proto.Hashable>(x: T) -> i32 => x.hash()
+func read(x: proto.Box) -> i32 => x.value
+route GET "/users" { if run(proto.Box(value: 1)) == read(proto.Box(value: 1)) { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_namespace_generic_type_ref) {
+    const std::string dir = "/tmp/rut_import_namespace_generic_type_ref_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result<T> { ok(T), err }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func wrap(x: proto.Result<i32>) -> proto.Result<i32> => x
+route GET "/users" { let state = wrap(proto.Result<i32>.ok(1)) match state { case .ok(v): return 200 case .err: return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_namespace_nested_generic_payload_lowering_path) {
+    const std::string dir = "/tmp/rut_import_namespace_nested_generic_type_arg_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box<T> { value: T }\n";
+        out << "variant Result<T> { ok(T), err }\n";
+    }
+    const auto src = R"rut(
+import * as proto from "proto.rut"
+func wrap(x: proto.Result<proto.Box<proto.Result<i32>>>) -> proto.Result<proto.Box<proto.Result<i32>>> => x
+route GET "/users" { let state = wrap(proto.Result<proto.Box<proto.Result<i32>>>.ok(proto.Box<proto.Result<i32>>(value: proto.Result<i32>.ok(1)))) match state { case .ok(v): return 200 case .err: return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_namespace_struct_init) {
+    const std::string dir = "/tmp/rut_import_namespace_struct_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" { if proto.Box(value: 1).value == 1 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_import_namespace_variant_constructor) {
+    const std::string dir = "/tmp/rut_import_namespace_variant_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result { ok(i32), err }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    match proto.Result.ok(200) {
+    case .ok(v): return 200
+    case .err: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_import_namespace_payloadless_variant_case) {
+    const std::string dir = "/tmp/rut_import_namespace_payloadless_variant_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Token { ready, wait }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    match proto.Token.ready {
+    case .ready: return 200
+    case .wait: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_namespace_alias_resolves_same_stem_conflict) {
+    const std::string dir = "/tmp/rut_import_namespace_alias_conflict_jit";
+    std::filesystem::create_directories(dir + "/a");
+    std::filesystem::create_directories(dir + "/b");
+    {
+        std::ofstream out(dir + "/a/auth.rut", std::ios::binary);
+        out << "func jwtAuth() -> i32 => 200\n";
+    }
+    {
+        std::ofstream out(dir + "/b/auth.rut", std::ios::binary);
+        out << "func jwtAuth() -> i32 => 500\n";
+    }
+    const auto src = R"rut(
+import * as authA from "a/auth.rut"
+import * as authB from "b/auth.rut"
+route GET "/users" { if authA.jwtAuth() == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_selective_import_relative_file_aliases_selected_function_symbol) {
+    const std::string dir = "/tmp/rut_selective_import_alias_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/auth.rut", std::ios::binary);
+        out << "func jwtAuth() -> i32 => 200\n";
+        out << "func basicAuth() -> i32 => 500\n";
+    }
+    const auto src = R"rut(
+import { jwtAuth as authV1 } from "auth.rut"
+route GET "/users" { if authV1() == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_selective_import_relative_file_aliases_selected_protocol_and_struct_with_impl) {
+    const std::string dir = "/tmp/rut_selective_import_alias_impl_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import { Hashable as Digestible, Box as AuthBox } from "proto.rut"
+func run<T: Digestible>(x: T) -> i32 => x.hash()
+route GET "/users" { if run(AuthBox(value: 1)) == 1 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_selective_import_relative_file_merges_selected_protocol_and_struct_with_impl) {
+    const std::string dir = "/tmp/rut_selective_import_impl_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import { Hashable, Box } from "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" { if run(Box(value: 1)) == 1 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_using_alias_function_call) {
+    const auto src = R"rut(
+using authV1 = v1.jwtAuth
+func jwtAuth() -> i32 => 200
+route GET "/users" { if authV1() == 200 { return 200 } else { return 500 } }
+)rut";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_header_alias_or_fallback) {
+    const char* src =
+        "route GET \"/users\" { let host = req.header(\"Host\") let alias = host let value = "
+        "or(alias, \"fallback\") return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_match) {
+    const char* src =
+        "variant AuthState { timeout, forbidden }\n"
+        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
+        "200 case _: return 403 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_single_payload_match) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): return 200 "
+        "case .err: return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_payload_binding_match_if) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): if x == 200 "
+        "{ return 200 } else { return 500 } case .err: return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_payload_binding_match_block) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let y = x "
+        "if y == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_payload_binding_match_block_with_guard) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed "
+        "= error(7) guard failed else { return 401 } if x == 200 { return 200 } else { return 500 "
+        "} } case .err: return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_payload_binding_match_block_with_guard_match) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed "
+        "= error(.timeout) guard match failed else { case .timeout: return 401 case _: return 402 "
+        "} if x == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_if_const) {
+    const char* src = "route GET \"/users\" { if const true { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_match_const_variant) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/users\" { let state = Result.ok(200) match const state { case .ok(x): if x "
+        "== 200 { return 200 } else { return 500 } case .err: return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_mixed_payload_match) {
+    const char* src =
+        "variant Mixed { count(i32), ready(bool), label(str), none }\n"
+        "route GET \"/users\" { let state = Mixed.ready(true) match state { case .count(x): return "
+        "200 case .ready(flag): if flag == true { return 201 } else { return 202 } case "
+        ".label(name): return 203 case .none: return 204 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 201);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_tuple_payload_match_pipe_multi_slot) {
+    const char* src =
+        "variant Result { ok((i32, i32)), err }\n"
+        "func second(a: i32, b: i32) -> i32 => b\n"
+        "route GET \"/users\" { let state = Result.ok((200, 500)) match state { case .ok(pair): { "
+        "let code = pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } } case "
+        ".err: return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_variant_constructor_and_match) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+route GET "/users" {
+    let state = Result<i32>.ok(200)
+    match state {
+    case .ok(v): return 200
+    case .err: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_explicit_generic_variant_constructor_nested_type_arg) {
+    const auto src = R"rut(
+struct Box<T> { value: T }
+variant Wrap<T> { some(T), none }
+route GET "/users" {
+    match Wrap<Box<i32>>.some(Box<i32>(value: 200)) {
+    case .some(v): {
+        if v.value == 200 { return 200 } else { return 500 }
+    }
+    case .none: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_tuple_of_struct_payload_binding) {
+    const auto src = R"rut(
+struct Box { value: i32 }
+variant Result { ok((Box, i32)), err }
+func boxCode(x: Box) -> i32 => x.value
+route GET "/users" {
+    match Result.ok((Box(value: 200), 7)) {
+    case .ok(v): {
+        let code = v | boxCode(_1)
+        if code == 200 { return 200 } else { return 500 }
+    }
+    case .err: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_match_nested_struct_payload_projection) {
+    const auto src = R"rut(
+struct Box { value: i32 }
+struct Outer { inner: Box }
+variant Result { ok(Outer), err }
+route GET "/users" {
+    let state = Result.ok(Outer(inner: Box(value: 200)))
+    match state {
+    case .ok(v): {
+        let code = v.inner.value
+        if code == 200 { return 200 } else { return 500 }
+    }
+    case .err: return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_variant_tuple_of_struct_payload_binding) {
+    const auto src = R"rut(
+struct Item { value: i32 }
+variant Result<T> { ok(T), err }
+func itemCode(x: Item) -> i32 => x.value
+route GET "/users" {
+    match Result.ok((Item(value: 200), 7)) {
+    case .ok(v): {
+        let code = v | itemCode(_1)
+        if code == 200 { return 200 } else { return 500 }
+    }
+    case .err: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_variant_constructor_infers_type_argument_from_single_payload_case) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+route GET "/users" {
+    let state = Result.ok(200)
+    match state {
+    case .ok(v): return 200
+    case .err: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_known_named_error_match) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout: return "
+        "503 case _: return 200 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 503);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_explicit_error_variant_match) {
+    const char* src =
+        "variant AuthError { timeout, forbidden }\n"
+        "route GET \"/users\" { let failed = error(AuthError.forbidden) match failed { case "
+        ".forbidden: return 403 case _: return 200 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 403);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_error_struct_guard_match) {
+    const char* src =
+        "struct AuthError { err: Error }\n"
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\") guard match "
+        "failed else { case .timeout: return 503 case _: return 500 } return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 503);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_error_struct_with_extra_fields_guard_match) {
+    const char* src =
+        "struct AuthError { err: Error, token: str, retry: i32 }\n"
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
+        "\"abc\", retry: 3) guard match failed else { case .timeout: return 503 case _: return 500 "
+        "} return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 503);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_error_struct_with_tuple_field_guard_match) {
+    const char* src =
+        "struct AuthError { err: Error, pair: (i32, i32) }\n"
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, "
+        "500)) guard match failed else { case .timeout: return 503 case _: return 500 } return 200 "
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 503);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_multiple_top_level_guards) {
+    const char* src =
+        "route GET \"/users\" { let ok = 200 guard ok else { return 401 } let failed = error(7) "
+        "guard failed else { return 402 } return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 402);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_struct_constructor_and_field_projection) {
+    const char* src =
+        "struct Box<T> { value: T }\n"
+        "route GET \"/users\" { let box = Box<i32>(value: 200) if box.value == 200 { return 200 } "
+        "else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_struct_constructor_infers_type_argument_from_field_shape) {
+    const char* src =
+        "struct Box<T> { value: T }\n"
+        "route GET \"/users\" { let box = Box(value: 200) if box.value == 200 { return 200 } else "
+        "{ return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_generic_type_refs_are_supported_in_let_types) {
+    const char* src =
+        "variant Result<T> { ok(T), err }\n"
+        "route GET \"/users\" { let state: Result<i32> = Result.ok(200) match state { case .ok(v): "
+        "return 200 case .err: return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_generic_type_refs_are_supported_in_function_signatures) {
+    const char* src =
+        "variant Result<T> { ok(T), err }\n"
+        "func wrap(x: Result<i32>) -> Result<i32> => x\n"
+        "route GET \"/users\" { let state = wrap(Result.ok(200)) match state { case .ok(v): return "
+        "200 case .err: return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    if (r.status_code != 200) {
+        rut::test::out("    status=");
+        rut::test::out_int(r.status_code);
+        rut::test::out("\n");
+    }
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(r.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_generic_struct_type_refs_are_supported_in_function_signatures) {
+    const char* src =
+        "struct Box<T> { value: T }\n"
+        "func wrap(x: Box<i32>) -> Box<i32> => x\n"
+        "route GET \"/users\" { let box = wrap(Box(value: 200)) if box.value == 200 { return 200 } "
+        "else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_generic_type_refs_are_supported_in_struct_fields) {
+    const char* src =
+        "variant Result<T> { ok(T), err }\n"
+        "struct Holder { state: Result<i32> }\n"
+        "route GET \"/users\" { let holder = Holder(state: Result.ok(200)) match holder.state { "
+        "case .ok(v): return 200 case .err: return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_struct_field_projection_equality) {
+    const char* src =
+        "variant Result<T> { ok(T), err }\n"
+        "struct Holder { state: Result<i32> }\n"
+        "route GET \"/users\" { let holder = Holder(state: Result.ok(200)) if holder.state == "
+        "Result.ok(200) { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_variant_struct_field_projection_ordering) {
+    const char* src =
+        "variant Result<T> { ok(T), err }\n"
+        "struct Holder { state: Result<i32> }\n"
+        "route GET \"/users\" { let holder = Holder(state: Result.ok(200)) if holder.state < "
+        "Result.ok(500) { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_namespace_variant_struct_field_projection_equality) {
+    const std::string dir = "/tmp/rut_import_namespace_variant_field_eq_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result { ok(i32), err }\n";
+        out << "struct Holder { state: Result }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let holder = proto.Holder(state: proto.Result.ok(200))
+    if holder.state == proto.Result.ok(200) { return 200 } else { return 500 }
+}
+)rut";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_namespace_variant_struct_field_projection_ordering) {
+    const std::string dir = "/tmp/rut_import_namespace_variant_field_ord_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result { ok(i32), err }\n";
+        out << "struct Holder { state: Result }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let holder = proto.Holder(state: proto.Result.ok(200))
+    if holder.state < proto.Result.ok(500) { return 200 } else { return 500 }
+}
+)rut";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_tuple_of_struct_field_projection_ordering) {
+    const char* src =
+        "struct Item { value: i32 }\n"
+        "struct Holder { pair: (Item, i32) }\n"
+        "route GET \"/users\" { let holder = Holder(pair: (Item(value: 200), 500)) if holder.pair "
+        "< (Item(value: 200), 600) { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_import_namespace_tuple_of_struct_field_projection_ordering) {
+    const std::string dir = "/tmp/rut_import_namespace_tuple_struct_field_ord_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Item { value: i32 }\n";
+        out << "struct Holder { pair: (Item, i32) }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let holder = proto.Holder(pair: (proto.Item(value: 200), 500))
+    if holder.pair < (proto.Item(value: 200), 600) { return 200 } else { return 500 }
+}
+)rut";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_generic_type_refs_are_supported_in_variant_payloads) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+variant Outer { wrap(Result<i32>), bad }
+route GET "/users" {
+    let state = Outer.wrap(Result.ok(200))
+    match state {
+    case .wrap(inner): {
+        let copied = inner
+        return 200
+    }
+    case .bad:
+        return 404
+    }
+}
+)rut";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(r.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_generic_struct_type_refs_are_supported_in_variant_payloads) {
+    const char* src =
+        "struct Box<T> { value: T }\n"
+        "variant Outer { wrap(Box<i32>), bad }\n"
+        "func is200(x: Box<i32>) -> bool => x.value == 200\n"
+        "route GET \"/users\" { let state = Outer.wrap(Box(value: 200)) match state { case "
+        ".wrap(inner): { let ok = is200(inner) if ok { return 200 } else { return 500 } } case "
+        ".bad: return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_if_branch_block_with_let) {
+    const char* src =
+        "route GET \"/users\" { let ok = true if ok { let code = 200 if code == 200 { return 200 } "
+        "else { return 500 } } else { return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_if_branch_block_with_guard) {
+    const char* src =
+        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard failed else { "
+        "return 401 } return 200 } else { return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_guard_else_block_with_let) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(7) guard failed else { let code = 401 if code "
+        "== 401 { return 401 } else { return 500 } } return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_guard_match_routes_fail_and_success_paths) {
+    {
+        const char* src =
+            "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
+            ".timeout: return 503 case _: return 500 } return 200 }\n";
+
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler != nullptr);
+
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(kGetApiRequest),
+                                               sizeof(kGetApiRequest) - 1,
+                                               nullptr));
+        CHECK(r.action == HandlerAction::ReturnStatus);
+        CHECK(r.status_code == 503);
+
+        engine.shutdown();
+        rir.destroy();
+    }
+
+    {
+        const char* src =
+            "route GET \"/users\" { let ok = 200 guard match ok else { case .timeout: return 503 "
+            "case _: return 500 } return 200 }\n";
+
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler != nullptr);
+
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(kGetApiRequest),
+                                               sizeof(kGetApiRequest) - 1,
+                                               nullptr));
+        CHECK(r.action == HandlerAction::ReturnStatus);
+        CHECK(r.status_code == 200);
+
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
+TEST(jit, runtime_error_kind_match_from_mir) {
+    auto* mir = new MirModule{};
+    MirVariant err_variant{};
+    err_variant.span = {1, 1, 1, 1};
+    err_variant.name = lit("AuthError");
+    MirVariant::CaseDecl timeout{};
+    timeout.name = lit("timeout");
+    MirVariant::CaseDecl forbidden{};
+    forbidden.name = lit("forbidden");
+    REQUIRE(err_variant.cases.push(timeout));
+    REQUIRE(err_variant.cases.push(forbidden));
+    REQUIRE(mir->variants.push(err_variant));
+
+    MirFunction fn{};
+    fn.span = {1, 1, 1, 1};
+    fn.method = 'G';
+    fn.path = lit("/users");
+    fn.name = lit("route");
+
+    MirLocal failed{};
+    failed.span = fn.span;
+    failed.name = lit("failed");
+    failed.type = MirTypeKind::I32;
+    failed.may_error = true;
+    failed.error_variant_index = 0;
+    failed.init.kind = MirValueKind::Error;
+    failed.init.type = MirTypeKind::Unknown;
+    failed.init.may_error = true;
+    failed.init.error_variant_index = 0;
+    failed.init.error_case_index = 1;
+    REQUIRE(fn.locals.push(failed));
+
+    MirValue subject{};
+    subject.kind = MirValueKind::LocalRef;
+    subject.type = MirTypeKind::I32;
+    subject.may_error = true;
+    subject.local_index = 0;
+    subject.error_variant_index = 0;
+    REQUIRE(fn.values.push(subject));
+
+    MirValue timeout_pat{};
+    timeout_pat.kind = MirValueKind::VariantCase;
+    timeout_pat.type = MirTypeKind::Variant;
+    timeout_pat.variant_index = 0;
+    timeout_pat.case_index = 0;
+    timeout_pat.int_value = 0;
+    REQUIRE(fn.values.push(timeout_pat));
+
+    MirBlock test{};
+    test.label = lit("entry");
+    test.term.kind = MirTerminatorKind::Branch;
+    test.term.use_cmp = true;
+    test.term.span = fn.span;
+    test.term.lhs = fn.values[0];
+    test.term.rhs = fn.values[1];
+    test.term.then_block = 1;
+    test.term.else_block = 2;
+    REQUIRE(fn.blocks.push(test));
+
+    MirBlock then_block{};
+    then_block.label = lit("then");
+    then_block.term.kind = MirTerminatorKind::ReturnStatus;
+    then_block.term.span = fn.span;
+    then_block.term.status_code = 503;
+    REQUIRE(fn.blocks.push(then_block));
+
+    MirBlock else_block{};
+    else_block.label = lit("else");
+    else_block.term.kind = MirTerminatorKind::ReturnStatus;
+    else_block.term.span = fn.span;
+    else_block.term.status_code = 403;
+    REQUIRE(fn.blocks.push(else_block));
+    REQUIRE(mir->functions.push(fn));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir, rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 403);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, runtime_error_code_field_from_mir) {
+    auto* hir = new HirModule{};
+    HirRoute route{};
+    route.span = {1, 1, 1, 1};
+    route.method = 'G';
+    route.path = lit("/users");
+
+    HirLocal failed{};
+    failed.span = route.span;
+    failed.name = lit("failed");
+    failed.type = HirTypeKind::I32;
+    failed.may_error = true;
+    failed.init.kind = HirExprKind::Error;
+    failed.init.type = HirTypeKind::Unknown;
+    failed.init.may_error = true;
+    failed.init.int_value = 503;
+    failed.init.msg = lit("boom");
+    REQUIRE(route.locals.push(failed));
+
+    HirExpr failed_ref{};
+    failed_ref.kind = HirExprKind::LocalRef;
+    failed_ref.type = HirTypeKind::I32;
+    failed_ref.may_error = true;
+    failed_ref.local_index = 0;
+    REQUIRE(route.exprs.push(failed_ref));
+
+    HirLocal code{};
+    code.span = route.span;
+    code.name = lit("code");
+    code.type = HirTypeKind::I32;
+    code.init.kind = HirExprKind::Field;
+    code.init.type = HirTypeKind::I32;
+    code.init.lhs = &route.exprs[0];
+    code.init.str_value = lit("code");
+    REQUIRE(route.locals.push(code));
+
+    route.control.kind = HirControlKind::If;
+    route.control.cond.kind = HirExprKind::Eq;
+    route.control.cond.type = HirTypeKind::Bool;
+
+    HirExpr code_ref{};
+    code_ref.kind = HirExprKind::LocalRef;
+    code_ref.type = HirTypeKind::I32;
+    code_ref.local_index = 1;
+    REQUIRE(route.exprs.push(code_ref));
+
+    HirExpr expected{};
+    expected.kind = HirExprKind::IntLit;
+    expected.type = HirTypeKind::I32;
+    expected.int_value = 503;
+    REQUIRE(route.exprs.push(expected));
+
+    route.control.cond.lhs = &route.exprs[1];
+    route.control.cond.rhs = &route.exprs[2];
+    route.control.then_term.kind = HirTerminatorKind::ReturnStatus;
+    route.control.then_term.status_code = 200;
+    route.control.else_term.kind = HirTerminatorKind::ReturnStatus;
+    route.control.else_term.status_code = 500;
+    REQUIRE(hir->routes.push(route));
+
+    auto mir = build_mir(*hir);
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
 }
 
 // Test: Handler with path prefix guard.
@@ -784,6 +4623,380 @@ TEST(jit, opt_unwrap_and_use) {
     tc.destroy();
 }
 
+// handler:
+//   %some = opt.wrap 7
+//   %nil = opt.is_nil %some
+//   %val = opt.unwrap %some
+//   %fb = const.i32 200
+//   %sel = select %nil, %fb, %val
+//   %want = const.i32 7
+//   %ok = cmp.eq %sel, %want
+//   br %ok, ok, bad
+//   ok: ret.status 207
+//   bad: ret.status 500
+TEST(jit, optional_i32_select_value_flow) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("opt_i32_select"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok = V(b.create_block(fn, lit("ok")));
+    auto bad = V(b.create_block(fn, lit("bad")));
+
+    auto i32_ty = V(b.make_type(TypeKind::I32));
+
+    b.set_insert_point(fn, entry);
+    auto seven = V(b.emit_const_i32(7));
+    auto some = V(b.emit_opt_wrap(seven));
+    auto is_nil = V(b.emit_opt_is_nil(some));
+    auto unwrapped = V(b.emit_opt_unwrap(some, i32_ty));
+    auto fallback = V(b.emit_const_i32(200));
+    auto selected = V(b.emit_select(is_nil, fallback, unwrapped));
+    auto want = V(b.emit_const_i32(7));
+    auto eq = V(b.emit_cmp(Opcode::CmpEq, selected, want));
+    VOK(b.emit_br(eq, ok, bad));
+
+    b.set_insert_point(fn, ok);
+    VOK(b.emit_ret_status(207));
+
+    b.set_insert_point(fn, bad);
+    VOK(b.emit_ret_status(500));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_opt_i32_select"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 207);
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+// handler:
+//   %none = opt.nil(i32)
+//   %nil = opt.is_nil %none
+//   %val = opt.unwrap %none
+//   %fb = const.i32 200
+//   %sel = select %nil, %fb, %val
+//   %want = const.i32 200
+//   %ok = cmp.eq %sel, %want
+//   br %ok, ok, bad
+//   ok: ret.status 200
+//   bad: ret.status 500
+TEST(jit, optional_i32_select_fallback_from_nil) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("opt_i32_nil_select"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok = V(b.create_block(fn, lit("ok")));
+    auto bad = V(b.create_block(fn, lit("bad")));
+
+    auto i32_ty = V(b.make_type(TypeKind::I32));
+
+    b.set_insert_point(fn, entry);
+    auto none = V(b.emit_opt_nil(i32_ty));
+    auto is_nil = V(b.emit_opt_is_nil(none));
+    auto unwrapped = V(b.emit_opt_unwrap(none, i32_ty));
+    auto fallback = V(b.emit_const_i32(200));
+    auto selected = V(b.emit_select(is_nil, fallback, unwrapped));
+    auto want = V(b.emit_const_i32(200));
+    auto eq = V(b.emit_cmp(Opcode::CmpEq, selected, want));
+    VOK(b.emit_br(eq, ok, bad));
+
+    b.set_insert_point(fn, ok);
+    VOK(b.emit_ret_status(200));
+
+    b.set_insert_point(fn, bad);
+    VOK(b.emit_ret_status(500));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_opt_i32_nil_select"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+// handler:
+//   %v = opt.wrap 7
+//   %nil = opt.is_nil %v
+//   %false = const.bool false
+//   %ok = cmp.eq %nil, %false
+//   br %ok, pass, fail
+//   pass: ret.status 200
+//   fail: ret.status 401
+TEST(jit, optional_i32_no_error_guard_shape) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("opt_i32_guard"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto pass = V(b.create_block(fn, lit("pass")));
+    auto fail = V(b.create_block(fn, lit("fail")));
+
+    b.set_insert_point(fn, entry);
+    auto seven = V(b.emit_const_i32(7));
+    auto wrapped = V(b.emit_opt_wrap(seven));
+    auto is_nil = V(b.emit_opt_is_nil(wrapped));
+    auto false_v = V(b.emit_const_bool(false));
+    auto no_error = V(b.emit_cmp(Opcode::CmpEq, is_nil, false_v));
+    VOK(b.emit_br(no_error, pass, fail));
+
+    b.set_insert_point(fn, pass);
+    VOK(b.emit_ret_status(200));
+
+    b.set_insert_point(fn, fail);
+    VOK(b.emit_ret_status(401));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_opt_i32_guard"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+// handler:
+//   %prefix = const.str "api"
+//   %some = opt.wrap %prefix
+//   %nil = opt.is_nil %some
+//   %fb = const.str "fallback"
+//   %val = opt.unwrap %some
+//   %sel = select %nil, %fb, %val
+//   %want = const.str "api"
+//   %ok = str.has_prefix %sel, %want
+//   br %ok, ok, bad
+//   ok: ret.status 200
+//   bad: ret.status 500
+TEST(jit, optional_str_select_value_flow) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("opt_str_select"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok = V(b.create_block(fn, lit("ok")));
+    auto bad = V(b.create_block(fn, lit("bad")));
+
+    auto str_ty = V(b.make_type(TypeKind::Str));
+
+    b.set_insert_point(fn, entry);
+    auto prefix = V(b.emit_const_str(lit("api")));
+    auto some = V(b.emit_opt_wrap(prefix));
+    auto is_nil = V(b.emit_opt_is_nil(some));
+    auto fallback = V(b.emit_const_str(lit("fallback")));
+    auto unwrapped = V(b.emit_opt_unwrap(some, str_ty));
+    auto selected = V(b.emit_select(is_nil, fallback, unwrapped));
+    auto want = V(b.emit_const_str(lit("api")));
+    auto has_prefix = V(b.emit_str_has_prefix(selected, want));
+    VOK(b.emit_br(has_prefix, ok, bad));
+
+    b.set_insert_point(fn, ok);
+    VOK(b.emit_ret_status(200));
+
+    b.set_insert_point(fn, bad);
+    VOK(b.emit_ret_status(500));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_opt_str_select"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+// handler:
+//   %inner_none = opt.nil(i32)
+//   %outer_some = opt.wrap %inner_none
+//   %is_error = opt.is_nil %outer_some
+//   %inner = opt.unwrap %outer_some
+//   %is_nil = opt.is_nil %inner
+//   %t = const.bool true
+//   %missing = select %is_error, %t, %is_nil
+//   %val = opt.unwrap %inner
+//   %fb = const.i32 200
+//   %sel = select %missing, %fb, %val
+//   ...
+TEST(jit, optional_optional_i32_select_value_flow) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("opt_opt_i32_select"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok = V(b.create_block(fn, lit("ok")));
+    auto bad = V(b.create_block(fn, lit("bad")));
+
+    auto i32_ty = V(b.make_type(TypeKind::I32));
+    auto opt_i32_ty = V(b.make_type(TypeKind::Optional, i32_ty));
+    b.set_insert_point(fn, entry);
+    auto inner_none = V(b.emit_opt_nil(i32_ty));
+    auto outer_some = V(b.emit_opt_wrap(inner_none));
+    auto is_error = V(b.emit_opt_is_nil(outer_some));
+    auto inner = V(b.emit_opt_unwrap(outer_some, opt_i32_ty));
+    auto is_nil = V(b.emit_opt_is_nil(inner));
+    auto t = V(b.emit_const_bool(true));
+    auto missing = V(b.emit_select(is_error, t, is_nil));
+    auto val = V(b.emit_opt_unwrap(inner, i32_ty));
+    auto fallback = V(b.emit_const_i32(200));
+    auto selected = V(b.emit_select(missing, fallback, val));
+    auto want = V(b.emit_const_i32(200));
+    auto eq = V(b.emit_cmp(Opcode::CmpEq, selected, want));
+    VOK(b.emit_br(eq, ok, bad));
+
+    b.set_insert_point(fn, ok);
+    VOK(b.emit_ret_status(200));
+
+    b.set_insert_point(fn, bad);
+    VOK(b.emit_ret_status(500));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_opt_opt_i32_select"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+// handler:
+//   %inner_none = opt.nil(i32)
+//   %outer_some = opt.wrap %inner_none
+//   %is_error = opt.is_nil %outer_some
+//   %false = const.bool false
+//   %ok = cmp.eq %is_error, %false
+//   br %ok, pass, fail
+TEST(jit, optional_optional_i32_no_error_guard_shape) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("opt_opt_i32_guard"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto pass = V(b.create_block(fn, lit("pass")));
+    auto fail = V(b.create_block(fn, lit("fail")));
+
+    auto i32_ty = V(b.make_type(TypeKind::I32));
+
+    b.set_insert_point(fn, entry);
+    auto inner_none = V(b.emit_opt_nil(i32_ty));
+    auto outer_some = V(b.emit_opt_wrap(inner_none));
+    auto is_error = V(b.emit_opt_is_nil(outer_some));
+    auto false_v = V(b.emit_const_bool(false));
+    auto no_error = V(b.emit_cmp(Opcode::CmpEq, is_error, false_v));
+    VOK(b.emit_br(no_error, pass, fail));
+
+    b.set_insert_point(fn, pass);
+    VOK(b.emit_ret_status(200));
+
+    b.set_insert_point(fn, fail);
+    VOK(b.emit_ret_status(401));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_opt_opt_i32_guard"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    tc.destroy();
+}
+
 // ── Codegen: StrTrimPrefix ────────────────────────────────────────
 
 // handler:
@@ -1091,6 +5304,420 @@ TEST(jit, lookup_nonexistent) {
     engine.shutdown();
 }
 
+TEST(jit, frontend_custom_error_struct_field_projection) {
+    const char* src =
+        "struct AuthError { err: Error, token: str, retry: i32 }\n"
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
+        "\"abc\", retry: 3) let retry = failed.retry if retry == 3 { return 200 } else { return "
+        "500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_error_struct_tuple_field_projection_pipe) {
+    const char* src =
+        "struct AuthError { err: Error, pair: (i32, i32) }\n"
+        "func second(a: i32, b: i32) -> i32 => b\n"
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, "
+        "500)) let code = failed.pair | second(_2, _1) if code == 200 { return 200 } else { return "
+        "500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_error_nested_struct_field_projection) {
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "struct AuthError { err: Error, inner: Box }\n"
+        "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", inner: "
+        "Box(value: 200)) let code = failed.inner.value if code == 200 { return 200 } else { "
+        "return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_plain_struct_constructor_and_field_projection) {
+    constexpr auto src =
+        "struct Foo { code: i32, msg: str }\n"
+        "route GET \"/users\" { let foo = Foo(code: 200, msg: \"ok\") let code = foo.code let msg "
+        "= foo.msg if code == 200 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_plain_struct_tuple_field_projection_pipe) {
+    const char* src =
+        "struct Foo { pair: (i32, i32) }\n"
+        "func second(a: i32, b: i32) -> i32 => b\n"
+        "route GET \"/users\" { let foo = Foo(pair: (200, 500)) let code = foo.pair | second(_2, "
+        "_1) if code == 200 { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_nested_struct_field_projection) {
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "struct Outer { inner: Box }\n"
+        "route GET \"/users\" { let outer = Outer(inner: Box(value: 200)) let code = "
+        "outer.inner.value if code == 200 { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_plain_struct_variant_field_projection_match) {
+    const char* src =
+        "variant AuthState { timeout, forbidden }\n"
+        "struct Foo { state: AuthState }\n"
+        "route GET \"/users\" { let foo = Foo(state: AuthState.timeout) match foo.state { case "
+        ".timeout: return 200 case _: return 403 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_error_standard_field_projection) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = failed.code "
+        "if code == 0 { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_error_line_field_projection) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let line = failed.line "
+        "if line == 1 { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_error_file_and_func_field_projection) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let file_name = "
+        "failed.file let fn_name = failed.func return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 // ── Codegen: RetForward ─────────────────────────────────────────────
 
 // handler:
@@ -1244,6 +5871,7936 @@ TEST(jit, multi_guard) {
 
     engine.shutdown();
     tc.destroy();
+}
+
+TEST(jit, frontend_function_call_inlines_i32_expression_body) {
+    const auto src = R"(
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = id(200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    if (r.status_code != 200) {
+        rut::test::out("    status=");
+        rut::test::out_int(r.status_code);
+        rut::test::out("\n");
+    }
+    CHECK_EQ(r.status_code, 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_struct_can_reference_generic_variant_with_same_type_arg) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+struct Holder<T> { state: Result<T> }
+route GET "/users" {
+    let holder = Holder<i32>(state: Result.ok(200))
+    match holder.state {
+    case .ok(v): return 200
+    case .err: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_variant_can_reference_generic_struct_with_same_type_arg) {
+    const auto src = R"rut(
+struct Box<T> { value: T }
+variant Wrap<T> { some(Box<T>), none }
+route GET "/users" {
+    let state = Wrap<i32>.some(Box(value: 200))
+    match state {
+    case .some(box): {
+        if box.value == 200 { return 200 } else { return 500 }
+    }
+    case .none:
+        return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_match_payload_binding_preserves_protocol_constraint) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+i32 impl Hashable { func hash(self: i32) -> i32 => self }
+variant Wrap<T> { some(T) }
+func run<T: Hashable>(state: Wrap<T>) -> i32 {
+    match state {
+    case .some(v) => v.hash()
+    }
+}
+route GET "/users" {
+    let code = run(Wrap<i32>.some(200))
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_struct_field_projection_preserves_protocol_constraint) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+i32 impl Hashable { func hash(self: i32) -> i32 => self }
+struct Holder<T> { state: T }
+func run<T: Hashable>(x: Holder<T>) -> i32 => x.state.hash()
+route GET "/users" {
+    let code = run(Holder<i32>(state: 200))
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_nested_generic_struct_type_refs_are_supported_in_function_signatures) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+struct Holder<T> { state: Result<T> }
+func unwrap(x: Holder<i32>) -> Result<i32> => x.state
+route GET "/users" {
+    let state = unwrap(Holder<i32>(state: Result.ok(200)))
+    match state {
+    case .ok(v): return 200
+    case .err: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_imported_function_body_struct_init_projection) {
+    const std::string dir = "/tmp/rut_import_function_body_struct_init_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+        out << "func make() -> Box => Box(value: 200)\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let box = make()
+    if box.value == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_imported_function_body_variant_case_projection) {
+    const std::string dir = "/tmp/rut_import_function_body_variant_case_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result { ok(i32), err }\n";
+        out << "struct Holder { state: Result }\n";
+        out << "func make() -> Result => Result.ok(200)\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let holder = proto.Holder(state: make())
+    if holder.state == proto.Result.ok(200) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_imported_function_body_ifelse_struct_projection) {
+    const std::string dir = "/tmp/rut_import_function_body_ifelse_struct_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+        out << "func make(ok: bool) -> Box {\n";
+        out << "    if ok { Box(value: 200) } else { Box(value: 500) }\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let box = make(true)
+    if box.value == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_imported_function_body_or) {
+    const std::string dir = "/tmp/rut_import_function_body_or_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "func maybe(ok: bool) { if ok { 200 } else { nil } }\n";
+        out << "func pick(ok: bool) -> i32 => or(maybe(ok), 500)\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let code = pick(true)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_imported_function_body_match) {
+    const std::string dir = "/tmp/rut_import_function_body_match_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "variant Result { ok, err }\n";
+        out << "func pick(x: Result) -> i32 {\n";
+        out << "    match x {\n";
+        out << "        case .ok => 200\n";
+        out << "        case .err => 500\n";
+        out << "    }\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let code = pick(proto.Result.ok)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_nested_generic_struct_type_ref_preserves_instance_shape_index) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+struct Holder<T> { state: T }
+func unwrap(x: Holder<Result<i32>>) -> Result<i32> => x.state
+route GET "/users" {
+    let state = unwrap(Holder<Result<i32>>(state: Result.ok(200)))
+    match state {
+    case .ok(v): return 200
+    case .err: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_explicit_generic_struct_init_nested_type_arg) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+struct Holder<T> { state: T }
+route GET "/users" {
+    let holder = Holder<Result<i32>>(state: Result<i32>.ok(200))
+    match holder.state {
+    case .ok(v): return 200
+    case .err: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_nested_generic_variant_type_refs_are_supported_in_function_signatures) {
+    const auto src = R"rut(
+struct Box<T> { value: T }
+variant Wrap<T> { some(Box<T>), none }
+func make() -> Wrap<i32> => Wrap<i32>.some(Box(value: 200))
+route GET "/users" {
+    let x = make()
+    match x {
+    case .some(box): {
+        if box.value == 200 { return 200 } else { return 500 }
+    }
+    case .none:
+        return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK_EQ(r.status_code, 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_call_inlines_i32_expression_body_without_return_annotation) {
+    const auto src = R"(
+func id(x: i32) => x
+route GET "/users" {
+    let code = id(200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_call_inlines_i32_expression_body) {
+    const auto src = R"rut(
+func id<T>(x: T) -> T => x
+route GET "/users" {
+    let code = id(200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_reuses_same_type_parameter_shape) {
+    const auto src = R"rut(
+func first<T>(x: T, y: T) -> T => x
+route GET "/users" {
+    let code = first(200, 500)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_explicit_type_arguments) {
+    const auto src = R"rut(
+func id<T>(x: T) -> T => x
+route GET "/users" {
+    let code = id<i32>(200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_supports_nested_generic_param_and_return_shapes) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+struct Holder<T> { state: Result<T> }
+func unwrap<T>(x: Holder<T>) -> Result<T> => x.state
+route GET "/users" {
+    let state = unwrap(Holder(state: Result.ok(200)))
+    match state {
+    case .ok(v): return 200
+    case .err: return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_custom_protocol_method_dispatch) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+struct Box { value: i32 }
+Box impl Hashable {
+    func hash(self: Box) -> i32 => self.value
+}
+route GET "/users" {
+    if Box(value: 200).hash() == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_receiver_custom_protocol_method_dispatch) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+struct Box { value: i32 }
+Box impl Hashable {
+    func hash(self: Box) -> i32 => self.value
+}
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 200)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_custom_protocol_method_dispatch_with_parameter) {
+    const auto src = R"rut(
+protocol Hashable { func hash(x: i32) -> i32 }
+struct Box { value: i32 }
+Box impl Hashable {
+    func hash(self: Box, x: i32) -> i32 => x
+}
+route GET "/users" {
+    if Box(value: 200).hash(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_multi_protocol_impl_block) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+protocol Adder { func add(x: i32) -> i32 }
+struct Box { value: i32 }
+Box impl Hashable, Adder {
+    func hash(self: Box) -> i32 => self.value
+    func add(self: Box, x: i32) -> i32 => x
+}
+route GET "/users" {
+    if Box(value: 7).hash() == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_struct_field_projection_method_dispatch) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+struct Box { value: i32 }
+Box impl Hashable { func hash(self: Box) -> i32 => self.value }
+struct Holder { state: Box }
+route GET "/users" {
+    let holder = Holder(state: Box(value: 200))
+    let code = holder.state.hash()
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_custom_protocol_default_method_dispatch) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+struct Box { value: i32 }
+Box impl Hashable {}
+route GET "/users" {
+    if Box(value: 7).hash() == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_receiver_custom_protocol_default_method_dispatch) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+struct Box { value: i32 }
+Box impl Hashable {}
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 7)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_custom_protocol_default_method_dispatch_with_parameter) {
+    const auto src = R"rut(
+protocol Adder { func add(x: i32) -> i32 => x }
+struct Box { value: i32 }
+Box impl Adder {}
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_receiver_custom_protocol_default_method_dispatch_with_parameter) {
+    const auto src = R"rut(
+protocol Adder { func add(x: i32) -> i32 => x }
+struct Box { value: i32 }
+Box impl Adder {}
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" {
+    if run(Box(value: 7)) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_generic_receiver_custom_protocol_default_method_supports_tuple_return) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+func second(a: i32, b: i32) -> i32 => b
+func run<T: Pairable>(x: T) -> i32 => x.pair() | second(_2, _1)
+route GET "/users" {
+    if run(Box(value: 7)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_generic_receiver_custom_protocol_default_method_tuple_return_supports_ordering) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+func run<T: Pairable>(x: T) -> (i32, i32) => x.pair()
+route GET "/users" {
+    if run(Box(value: 7)) < (200, 600) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_generic_receiver_custom_protocol_default_method_tuple_return_supports_equality) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+func run<T: Pairable>(x: T) -> (i32, i32) => x.pair()
+route GET "/users" {
+    if run(Box(value: 7)) == (200, 500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_multi_protocol_impl_may_omit_methods_with_default_bodies) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+protocol Adder {
+    func add(x: i32) -> i32 => x
+}
+struct Box<T> { value: T }
+Box<T> impl Hashable, Adder {
+    func hash(self: Box<T>) -> i32 => 7
+}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_generic_multi_protocol_impl_may_omit_methods_with_block_body_default) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl Hashable, Adder {
+    func hash(self: Box<T>) -> i32 => 7
+}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_generic_multi_protocol_impl_may_omit_methods_with_if_body_default) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl Hashable, Adder {
+    func hash(self: Box<T>) -> i32 => 7
+}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(true) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_multi_protocol_impl_with_default_bodies) {
+    const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_default_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 => x\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_multi_protocol_impl_with_block_body_default) {
+    const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_block_body_default_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_multi_protocol_impl_with_if_body_default) {
+    const std::string dir = "/tmp/rut_import_generic_multi_protocol_impl_if_body_default_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {\n";
+        out << "    func hash(self: Box<T>) -> i32 => 7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 7 { x.add(true) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 11)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_multi_protocol_impl_may_omit_methods_with_block_body_default) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {
+    func hash(self: Box) -> i32 => self.value
+}
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_multi_protocol_impl_may_omit_methods_with_if_body_default) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+}
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {
+    func hash(self: Box) -> i32 => self.value
+}
+route GET "/users" {
+    if Box(value: 7).add(true) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit,
+     frontend_import_relative_file_merges_imported_multi_protocol_impl_with_block_body_default) {
+    const std::string dir = "/tmp/rut_import_multi_protocol_impl_block_body_default_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_import_relative_file_merges_imported_multi_protocol_impl_with_if_body_default) {
+    const std::string dir = "/tmp/rut_import_multi_protocol_impl_if_body_default_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(true) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_multi_protocol_impl_may_omit_methods_with_default_bodies) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+    func add(x: i32) -> i32 => x
+}
+protocol Adder {
+    func mul(x: i32) -> i32 => x
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {
+    func hash(self: Box) -> i32 => self.value
+}
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_import_relative_file_merges_imported_multi_protocol_impl_with_default_bodies) {
+    const std::string dir = "/tmp/rut_import_multi_protocol_impl_default_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "    func add(x: i32) -> i32 => x\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func mul(x: i32) -> i32 => x\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_protocol_default_method_supports_tuple_return) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+func second(a: i32, b: i32) -> i32 => b
+route GET "/users" {
+    let code = Box(value: 7).pair() | second(_2, _1)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_protocol_default_method_tuple_return_supports_ordering) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+route GET "/users" {
+    if Box(value: 7).pair() < (200, 600) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_protocol_default_method_tuple_return_supports_equality) {
+    const auto src = R"rut(
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Pairable {}
+route GET "/users" {
+    if Box(value: 7).pair() == (200, 500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_protocol_default_method_supports_optional_return) {
+    const auto src = R"rut(
+protocol MaybeCode { func code() -> i32 => nil }
+struct Box { value: i32 }
+Box impl MaybeCode {}
+route GET "/users" {
+    let code = or(Box(value: 7).code(), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_custom_protocol_default_method_supports_error_return) {
+    const auto src = R"rut(
+protocol MaybeCode { func code() -> i32 => error(.timeout) }
+struct Box { value: i32 }
+Box impl MaybeCode {}
+route GET "/users" {
+    let code = or(Box(value: 7).code(), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_custom_protocol_default_method_supports_block_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code() -> i32 {
+        let x = 200
+        x
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode {}
+route GET "/users" {
+    if Box(value: 7).code() == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_receiver_custom_protocol_default_method_supports_block_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code() -> i32 {
+        let x = 200
+        x
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode {}
+func run<T: MaybeCode>(x: T) -> i32 => x.code()
+route GET "/users" {
+    if run(Box(value: 7)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_protocol_default_method_supports_block_body_with_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Adder {}
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit,
+     frontend_generic_receiver_custom_protocol_default_method_supports_block_body_with_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Adder {}
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" {
+    if run(Box(value: 7)) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_protocol_default_method_supports_if_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode {}
+route GET "/users" {
+    if Box(value: 7).code(true) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_generic_receiver_custom_protocol_default_method_supports_if_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode {}
+func run<T: MaybeCode>(x: T) -> i32 => x.code(true)
+route GET "/users" {
+    if run(Box(value: 7)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_protocol_default_method_supports_guard_prefix) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code(ok: bool) -> i32 {
+        let y = maybefail(ok)
+        guard y else { 401 }
+        200
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode {}
+func maybefail(ok: bool) -> i32 { if ok { 200 } else { error(.timeout) } }
+route GET "/users" {
+    if Box(value: 7).code(true) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_custom_protocol_default_method_supports_guard_match_prefix) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code(ok: bool) -> i32 {
+        let y = maybefail(ok)
+        guard match y else { case .timeout => 401 case _ => 500 }
+        200
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode {}
+func maybefail(ok: bool) -> i32 { if ok { 200 } else { error(.timeout) } }
+route GET "/users" {
+    if Box(value: 7).code(false) == 401 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_impl_overrides_protocol_default_method_with_optional_return) {
+    const auto src = R"rut(
+protocol MaybeCode { func code() -> i32 => nil }
+struct Box { value: i32 }
+Box impl MaybeCode { func code(self: Box) -> i32 => self.value }
+route GET "/users" {
+    let code = or(Box(value: 7).code(), 200)
+    if code == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit,
+     frontend_import_relative_file_impl_overrides_protocol_default_method_with_optional_return) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_optional_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => nil }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl MaybeCode { func code(self: Box) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let code = or(Box(value: 7).code(), 200)
+    if code == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_impl_overrides_protocol_default_method_with_error_return) {
+    const auto src = R"rut(
+protocol MaybeCode { func code() -> i32 => error(.timeout) }
+struct Box { value: i32 }
+Box impl MaybeCode { func code(self: Box) -> i32 => self.value }
+route GET "/users" {
+    let code = or(Box(value: 7).code(), 200)
+    if code == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_impl_overrides_protocol_default_method_with_block_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code() -> i32 {
+        let x = 200
+        x
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode { func code(self: Box) -> i32 => self.value }
+route GET "/users" {
+    if Box(value: 7).code() == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_impl_overrides_protocol_default_method_with_if_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+struct Box { value: i32 }
+Box impl MaybeCode { func code(self: Box, ok: bool) -> i32 => self.value }
+route GET "/users" {
+    if Box(value: 7).code(true) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_impl_overrides_protocol_default_method_with_block_body_and_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Adder { func add(self: Box, x: i32) -> i32 => self.value }
+route GET "/users" {
+    if Box(value: 7).add(201) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_impl_overrides_protocol_default_method_with_if_body_and_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box { value: i32 }
+Box impl Adder { func add(self: Box, ok: bool) -> i32 => self.value }
+route GET "/users" {
+    if Box(value: 7).add(true) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_import_relative_file_impl_overrides_protocol_default_method_with_error_return) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_error_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => error(.timeout) }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl MaybeCode { func code(self: Box) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let code = or(Box(value: 7).code(), 200)
+    if code == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_import_relative_file_impl_overrides_protocol_default_method_with_block_body) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_block_body_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl MaybeCode { func code(self: Box) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).code() == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_import_relative_file_impl_overrides_protocol_default_method_with_if_body) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_if_body_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code(ok: bool) -> i32 {\n";
+        out << "        if ok { 200 } else { 500 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl MaybeCode { func code(self: Box, ok: bool) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).code(true) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_impl_overrides_protocol_default_method_with_block_body_and_parameter) {
+    const std::string dir =
+        "/tmp/rut_import_impl_overrides_block_body_parameter_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Adder { func add(self: Box, x: i32) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(201) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_impl_overrides_protocol_default_method_with_if_body_and_parameter) {
+    const std::string dir = "/tmp/rut_import_impl_overrides_if_body_parameter_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Adder { func add(self: Box, ok: bool) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(true) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_import_relative_file_impl_takes_precedence_over_protocol_default_method) {
+    const std::string dir = "/tmp/rut_import_impl_precedence_over_default_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable { func hash(self: Box) -> i32 => self.value }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).hash() == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_impl_may_omit_protocol_method_with_default_body) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32
+    func add(x: i32) -> i32 => x
+}
+struct Box { value: i32 }
+Box impl Hashable {
+    func hash(self: Box) -> i32 => self.value
+}
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_import_relative_file_impl_may_omit_protocol_method_with_default_body) {
+    const std::string dir = "/tmp/rut_import_impl_omit_default_body_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32\n";
+        out << "    func add(x: i32) -> i32 => x\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable {\n";
+        out << "    func hash(self: Box) -> i32 => self.value\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    if Box(value: 7).add(201) == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_impl_overrides_generic_receiver_protocol_default_method) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+struct Box<T> { value: T }
+Box<T> impl Hashable { func hash(self: Box<T>) -> i32 => 7 }
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
+    const auto src = R"rut(
+protocol MaybeCode { func code() -> i32 => nil }
+struct Box<T> { value: T }
+Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit,
+     frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
+    const auto src = R"rut(
+protocol MaybeCode { func code() -> i32 => error(.timeout) }
+struct Box<T> { value: T }
+Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit,
+     frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code() -> i32 {
+        let x = 200
+        x
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }
+func run<T: MaybeCode>(x: T) -> i32 => x.code()
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body) {
+    const auto src = R"rut(
+protocol MaybeCode {
+    func code(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl MaybeCode { func code(self: Box<T>, ok: bool) -> i32 => 7 }
+func run<T: MaybeCode>(x: T) -> i32 => x.code(true)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl Adder { func add(self: Box<T>, x: i32) -> i32 => 7 }
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
+    const auto src = R"rut(
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box<T> { value: T }
+Box<T> impl Adder { func add(self: Box<T>, ok: bool) -> i32 => 7 }
+func run<T: Adder>(x: T) -> i32 => x.add(true)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_optional_return) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_optional_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => nil }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_error_return) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_error_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode { func code() -> i32 => error(.timeout) }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_block_body_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code()
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_if_body_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol MaybeCode {\n";
+        out << "    func code(ok: bool) -> i32 {\n";
+        out << "        if ok { 200 } else { 500 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl MaybeCode { func code(self: Box<T>, ok: bool) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: MaybeCode>(x: T) -> i32 => x.code(true)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_block_body_and_parameter) {
+    const std::string dir =
+        "/tmp/"
+        "rut_import_generic_impl_overrides_generic_receiver_block_body_parameter_default_method_"
+        "jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Adder { func add(self: Box<T>, x: i32) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Adder>(x: T) -> i32 => x.add(201)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method_with_if_body_and_parameter) {
+    const std::string dir =
+        "/tmp/"
+        "rut_import_generic_impl_overrides_generic_receiver_if_body_parameter_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Adder { func add(self: Box<T>, ok: bool) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Adder>(x: T) -> i32 => x.add(true)
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_generic_impl_overrides_generic_receiver_protocol_default_method) {
+    const std::string dir =
+        "/tmp/rut_import_generic_impl_overrides_generic_receiver_default_method_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable { func hash(self: Box<T>) -> i32 => 7 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_receiver_multi_protocol_default_method_dispatch_is_supported) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Adder { func add(x: i32) -> i32 => x }
+struct Box { value: i32 }
+Box impl Hashable {}
+Box impl Adder {}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_dispatch_is_supported) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Adder { func add(x: i32) -> i32 => x }
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_multi_protocol_empty_impl_block_default_method_dispatch_is_supported) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Adder { func add(x: i32) -> i32 => x }
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).add(3) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_multi_protocol_empty_impl_block_default_method_supports_block_body) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32 {
+        let x = 200
+        x
+    }
+}
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).add(3) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit,
+     frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_block_body) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash() -> i32 {
+        let x = 200
+        x
+    }
+}
+protocol Adder {
+    func add(x: i32) -> i32 {
+        let y = x
+        y
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_multi_protocol_empty_impl_block_default_method_supports_if_body) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+route GET "/users" {
+    let h = Box(value: 7).hash(true)
+    if h == 200 {
+        if Box(value: 7).add(true) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_multi_protocol_empty_impl_block_default_method_supports_tuple_return) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Hashable, Pairable {}
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).pair() == (200, 500) { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit, frontend_multi_protocol_empty_impl_block_default_method_tuple_return_supports_ordering) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Hashable, Pairable {}
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).pair() < (200, 600) { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(jit,
+     frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_if_body) {
+    const auto src = R"rut(
+protocol Hashable {
+    func hash(ok: bool) -> i32 {
+        if ok { 200 } else { 500 }
+    }
+}
+protocol Adder {
+    func add(ok: bool) -> i32 {
+        if ok { 3 } else { 0 }
+    }
+}
+struct Box { value: i32 }
+Box impl Hashable, Adder {}
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash(true)
+    if h == 200 { x.add(true) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_supports_tuple_return) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Hashable, Pairable {}
+func run<T: Hashable, Pairable>(x: T) -> (i32, i32) {
+    let h = x.hash()
+    if h == 200 { x.pair() } else { (0, 0) }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == (200, 500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_generic_receiver_multi_protocol_empty_impl_block_default_method_tuple_return_supports_ordering) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+protocol Pairable { func pair() -> (i32, i32) => (200, 500) }
+struct Box { value: i32 }
+Box impl Hashable, Pairable {}
+func run<T: Hashable, Pairable>(x: T) -> (i32, i32) {
+    let h = x.hash()
+    if h == 200 { x.pair() } else { (0, 0) }
+}
+route GET "/users" {
+    if run(Box(value: 7)) < (200, 600) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_empty_impl_for_generic_receiver_multi_protocol_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_generic_multi_protocol_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Adder { func add(x: i32) -> i32 => x }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable {}\n";
+        out << "Box<T> impl Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_tuple_default_impl_generic_multi_protocol_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Pairable>(x: T) -> (i32, i32) {
+    let h = x.hash()
+    if h == 200 { x.pair() } else { (0, 0) }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == (200, 500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
+    const std::string dir =
+        "/tmp/rut_import_tuple_ordering_default_impl_generic_multi_protocol_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Pairable>(x: T) -> (i32, i32) {
+    let h = x.hash()
+    if h == 200 { x.pair() } else { (0, 0) }
+}
+route GET "/users" {
+    if run(Box(value: 7)) < (200, 600) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_if_body_default_impl_generic_multi_protocol_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash(ok: bool) -> i32 {\n";
+        out << "        if ok { 200 } else { 500 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash(true)
+    if h == 200 { x.add(true) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_tuple_default_impl_multi_protocol_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).pair() == (200, 500) { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_tuple_default_method_ordering) {
+    const std::string dir = "/tmp/rut_import_tuple_ordering_default_impl_multi_protocol_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Pairable { func pair() -> (i32, i32) => (200, 500) }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Pairable {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).pair() < (200, 600) { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_if_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_if_body_default_impl_multi_protocol_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash(ok: bool) -> i32 {\n";
+        out << "        if ok { 200 } else { 500 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(ok: bool) -> i32 {\n";
+        out << "        if ok { 3 } else { 0 }\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let h = Box(value: 7).hash(true)
+    if h == 200 {
+        if Box(value: 7).add(true) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_block_body_default_impl_multi_protocol_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).add(3) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_receiver_multi_protocol_empty_impl_block_for_block_body_default_method_dispatch) {
+    const std::string dir =
+        "/tmp/rut_import_block_body_default_impl_generic_multi_protocol_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {\n";
+        out << "    func hash() -> i32 {\n";
+        out << "        let x = 200\n";
+        out << "        x\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "protocol Adder {\n";
+        out << "    func add(x: i32) -> i32 {\n";
+        out << "        let y = x\n";
+        out << "        y\n";
+        out << "    }\n";
+        out << "}\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_multi_protocol_empty_impl_block_for_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_default_impl_multi_protocol_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Adder { func add(x: i32) -> i32 => x }\n";
+        out << "struct Box { value: i32 }\n";
+        out << "Box impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+route GET "/users" {
+    let h = Box(value: 7).hash()
+    if h == 200 {
+        if Box(value: 7).add(3) == 3 { return 200 } else { return 500 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+TEST(
+    jit,
+    frontend_import_relative_file_merges_imported_generic_multi_protocol_empty_impl_block_for_default_method_dispatch) {
+    const std::string dir = "/tmp/rut_import_generic_default_impl_multi_protocol_block_jit";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable { func hash() -> i32 => 200 }\n";
+        out << "protocol Adder { func add(x: i32) -> i32 => x }\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "Box<T> impl Hashable, Adder {}\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func run<T: Hashable, Adder>(x: T) -> i32 {
+    let h = x.hash()
+    if h == 200 { x.add(3) } else { 0 }
+}
+route GET "/users" {
+    if run(Box(value: 7)) == 3 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_impl_takes_precedence_over_protocol_default_method) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+struct Box { value: i32 }
+Box impl Hashable { func hash(self: Box) -> i32 => self.value }
+route GET "/users" {
+    if Box(value: 7).hash() == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_concrete_generic_struct_impl_method_dispatch) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+struct Box<T> { value: T }
+Box<i32> impl Hashable {
+    func hash(self: Box<i32>) -> i32 => self.value
+}
+route GET "/users" {
+    if Box(value: 200).hash() == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_struct_impl_method_dispatch) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+struct Box<T> { value: T }
+Box<T> impl Hashable {
+    func hash(self: Box<T>) -> i32 => 200
+}
+route GET "/users" {
+    if Box(value: 123).hash() == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_receiver_custom_protocol_method_dispatch_with_generic_impl_target) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+struct Box<T> { value: T }
+Box<T> impl Hashable {
+    func hash(self: Box<T>) -> i32 => 200
+}
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 123)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(
+    jit,
+    frontend_generic_receiver_custom_protocol_method_dispatch_with_generic_impl_target_tuple_of_struct_arg) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+struct Item { value: i32 }
+struct Box<T> { value: T }
+Box<T> impl Hashable {
+    func hash(self: Box<T>) -> i32 => 200
+}
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: (Item(value: 7), 9))) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_impl_target_accepts_renamed_placeholder) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+struct Box<T> { value: T }
+Box<U> impl Hashable {
+    func hash(self: Box<U>) -> i32 => 200
+}
+route GET "/users" {
+    if Box(value: 7).hash() == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_impl_target_accepts_multiple_type_params) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 }
+struct Pair<T, U> { left: T, right: U }
+Pair<A, B> impl Hashable {
+    func hash(self: Pair<A, B>) -> i32 => 200
+}
+route GET "/users" {
+    if Pair(left: 7, right: "x").hash() == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_struct_instance_custom_protocol_conformance_is_supported) {
+    const auto src = R"rut(
+protocol Hashable { func hash() -> i32 => 200 }
+struct Box<T> { value: T }
+Box<i32> impl Hashable {}
+func run<T: Hashable>(x: T) -> i32 => x.hash()
+route GET "/users" {
+    if run(Box(value: 7)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_custom_protocol_constraint_for_builtin_conformance) {
+    const auto src = R"rut(
+protocol Hashable {}
+i32 impl Hashable {}
+func hash<T: Hashable>(x: T) -> i32 => 200
+route GET "/users" {
+    if hash(200) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_custom_protocol_constraint_for_struct_conformance) {
+    const auto src = R"rut(
+protocol Hashable {}
+struct Box { value: i32 }
+Box impl Hashable {}
+func hash<T: Hashable>(x: T) -> i32 => 200
+route GET "/users" {
+    if hash(Box(value: 200)) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_error_constraint_and_standard_field_access) {
+    const auto src = R"rut(
+struct AuthError { err: Error, retry: i32 }
+func codeOf<E: Error>(x: E) -> i32 => x.code
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_eq_constraint_and_ne_method) {
+    const auto src = R"rut(
+func diff<T: Eq>(x: T, y: T) -> bool => x.ne(y)
+route GET "/users" {
+    if diff(200, 300) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_ord_constraint_and_le_ge_methods) {
+    const auto src = R"rut(
+func clampOk<T: Ord>(x: T, lo: T, hi: T) -> bool => x.ge(lo).eq(x.le(hi))
+route GET "/users" {
+    if clampOk(5, 1, 9) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_error_standard_fields_are_accessible_via_methods) {
+    const auto src = R"rut(
+route GET "/users" {
+    let failed = error(.timeout, "timed out")
+    let code = failed.code()
+    let line = failed.line()
+    if code == line { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 500);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_eq_constraint_and_eq_method) {
+    const auto src = R"rut(
+func same<T: Eq>(x: T, y: T) -> bool => x.eq(y)
+route GET "/users" {
+    if same(200, 200) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_ord_constraint_and_lt_method) {
+    const auto src = R"rut(
+func min<T: Ord>(x: T, y: T) -> T {
+    if x.lt(y) { x } else { y }
+}
+route GET "/users" {
+    if min(200, 300) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_eq_constraint_and_equality) {
+    const auto src = R"rut(
+func same<T: Eq>(x: T, y: T) -> bool => x == y
+route GET "/users" {
+    if same("a", "a") { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_eq_constraint_for_tuple) {
+    const auto src = R"rut(
+func same<T: Eq>(x: T, y: T) -> bool => x == y
+route GET "/users" {
+    if same((200, 500), (200, 500)) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_eq_constraint_for_tuple_of_struct) {
+    const auto src = R"rut(
+struct Box { value: i32 }
+func same<T: Eq>(x: T, y: T) -> bool => x == y
+route GET "/users" {
+    if same((Box(value: 200), 500), (Box(value: 200), 500)) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_ord_constraint_and_lt_for_str) {
+    const auto src = R"rut(
+func min<T: Ord>(x: T, y: T) -> T {
+    if x < y { x } else { y }
+}
+route GET "/users" {
+    if min("alpha", "beta") == "alpha" { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_ord_constraint_for_tuple) {
+    const auto src = R"rut(
+func min<T: Ord>(x: T, y: T) -> T {
+    if x < y { x } else { y }
+}
+route GET "/users" {
+    if min((200, 500), (200, 600)) == (200, 500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_ord_constraint_for_tuple_of_struct) {
+    const auto src = R"rut(
+struct Box { value: i32 }
+func min<T: Ord>(x: T, y: T) -> T {
+    if x < y { x } else { y }
+}
+route GET "/users" {
+    if min((Box(value: 200), 500), (Box(value: 200), 600)) == (Box(value: 200), 500) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_ord_constraint_for_struct) {
+    const auto src = R"rut(
+struct Box<T> { value: T }
+func min<T: Ord>(x: T, y: T) -> T {
+    if x < y { x } else { y }
+}
+route GET "/users" {
+    if min(Box(value: 200), Box(value: 500)) == Box(value: 200) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_ord_constraint_for_variant) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+func min<T: Ord>(x: T, y: T) -> T {
+    if x < y { x } else { y }
+}
+route GET "/users" {
+    if min(Result<i32>.ok(200), Result<i32>.ok(500)) == Result<i32>.ok(200) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_eq_constraint_for_struct) {
+    const auto src = R"rut(
+struct Box<T> { value: T }
+func same<T: Eq>(x: T, y: T) -> bool => x == y
+route GET "/users" {
+    if same(Box(value: 200), Box(value: 200)) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_ord_constraint_and_lt) {
+    const auto src = R"rut(
+func min<T: Ord>(x: T, y: T) -> T {
+    if x < y { x } else { y }
+}
+route GET "/users" {
+    if min(200, 500) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_accepts_eq_constraint_for_variant_payload) {
+    const auto src = R"rut(
+variant Result<T> { ok(T), err }
+func same<T: Eq>(x: T, y: T) -> bool => x == y
+route GET "/users" {
+    if same(Result.ok(200), Result.ok(500)) { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 500);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_call_inlines_variant_expression_body) {
+    const auto src = R"(
+variant AuthState { ok, err }
+func success() -> AuthState => AuthState.ok
+route GET "/users" {
+    match success() {
+    case .ok: return 200
+    case _: return 500
+    }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_call_inlines_variant_expression_body_without_return_annotation) {
+    const auto src = R"(
+variant AuthState { ok, err }
+func success() => AuthState.ok
+route GET "/users" {
+    match success() {
+    case .ok: return 200
+    case _: return 500
+    }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_supports_explicit_tuple_return_type) {
+    const auto src = R"(
+func pair() -> (i32, i32) { (200, 500) }
+func second(a: i32, b: i32) -> i32 => b
+route GET "/users" {
+    let code = pair() | second(_2, _1)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_supports_explicit_tuple_param_type) {
+    const auto src = R"(
+func second(a: i32, b: i32) -> i32 => b
+func pick(pair: (i32, i32)) -> i32 => pair | second(_2, _1)
+route GET "/users" {
+    let code = pick((200, 500))
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_let_supports_explicit_tuple_type) {
+    const auto src = R"(
+func second(a: i32, b: i32) -> i32 => b
+route GET "/users" {
+    let pair: (i32, i32) = (200, 500)
+    let code = pair | second(_2, _1)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_block_let_supports_explicit_tuple_type) {
+    const auto src = R"(
+func second(a: i32, b: i32) -> i32 => b
+func pick() -> i32 {
+    let pair: (i32, i32) = (200, 500)
+    pair | second(_2, _1)
+}
+route GET "/users" {
+    let code = pick()
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_call_propagates_optional_value_flow) {
+    const auto src = R"(
+func maybe() -> i32 => nil
+route GET "/users" {
+    let code = or(maybe(), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_block_body_allows_pure_nil_with_explicit_return_type) {
+    const auto src = R"(
+func maybe() -> i32 {
+    nil
+}
+route GET "/users" {
+    let code = or(maybe(), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_infers_optional_return_from_if_without_annotation) {
+    const auto src = R"(
+func maybe(ok: bool) {
+    if ok { 200 } else { nil }
+}
+route GET "/users" {
+    let code = or(maybe(true), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_call_propagates_error_value_flow) {
+    const auto src = R"(
+func fail() -> i32 => error(.timeout)
+route GET "/users" {
+    let code = or(fail(), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_block_body_allows_pure_error_with_explicit_return_type) {
+    const auto src = R"(
+func fail() -> i32 {
+    error(.timeout)
+}
+route GET "/users" {
+    let code = or(fail(), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_infers_error_return_from_if_without_annotation) {
+    const auto src = R"(
+func maybefail(ok: bool) {
+    if ok { 200 } else { error(.timeout) }
+}
+route GET "/users" {
+    let code = or(maybefail(true), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_allows_pure_nil_if_with_explicit_return_type) {
+    const auto src = R"(
+func maybe(ok: bool) -> i32 {
+    if ok { nil } else { nil }
+}
+route GET "/users" {
+    let code = or(maybe(true), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_block_body_with_let_prefix_inlines) {
+    const auto src = R"(
+func wrap(x: i32) -> i32 {
+    let y = x
+    y
+}
+route GET "/users" {
+    let code = wrap(200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_block_body_with_guard_prefix_inlines) {
+    const auto src = R"(
+func maybefail(ok: bool) -> i32 {
+    if ok { 200 } else { error(.timeout) }
+}
+func wrap(ok: bool) -> i32 {
+    let y = maybefail(ok)
+    guard y else { 401 }
+    200
+}
+route GET "/users" {
+    let code = wrap(false)
+    if code == 401 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_block_body_with_guard_let_prefix_binds_value) {
+    const auto src = R"(
+func maybefail(ok: bool) -> i32 {
+    if ok { 200 } else { error(.timeout) }
+}
+func wrap(ok: bool) -> i32 {
+    guard let y = maybefail(ok) else { 401 }
+    y
+}
+route GET "/users" {
+    let code = wrap(true)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_block_body_with_guard_match_prefix_inlines) {
+    const auto src = R"(
+func maybefail(ok: bool) -> i32 {
+    if ok { 200 } else { error(.timeout) }
+}
+func wrap(ok: bool) -> i32 {
+    let y = maybefail(ok)
+    guard match y else { case .timeout => 401 case _ => 500 }
+    200
+}
+route GET "/users" {
+    let code = wrap(false)
+    if code == 401 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_block_body_with_final_if_inlines) {
+    const auto src = R"(
+func wrap(x: i32) -> i32 {
+    let y = x
+    if y == 200 { 200 } else { 500 }
+}
+route GET "/users" {
+    let code = wrap(200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_block_body_with_final_match_inlines) {
+    const auto src = R"(
+variant Result { ok, err }
+func pick(x: Result) -> i32 {
+    let y = x
+    match y {
+        case .ok => 200
+        case .err => 500
+    }
+}
+route GET "/users" {
+    let code = pick(Result.ok)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_match_arm_block_with_let_inlines) {
+    const auto src = R"(
+variant Result { ok, err }
+func pick(x: Result) -> i32 {
+    match x {
+        case .ok => { let y = 200 y }
+        case .err => { let z = 500 z }
+    }
+}
+route GET "/users" {
+    let code = pick(Result.ok)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_infers_optional_return_from_match_without_annotation) {
+    const auto src = R"(
+variant Result { ok, err }
+func pick(x: Result) {
+    match x {
+        case .ok => 200
+        case .err => nil
+    }
+}
+route GET "/users" {
+    let code = or(pick(Result.ok), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_infers_error_return_from_match_without_annotation) {
+    const auto src = R"(
+variant Result { ok, err }
+func pick(x: Result) {
+    match x {
+        case .ok => 200
+        case .err => error(.timeout)
+    }
+}
+route GET "/users" {
+    let code = or(pick(Result.ok), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_function_allows_pure_error_match_with_explicit_return_type) {
+    const auto src = R"(
+variant Result { ok, err }
+func pick(x: Result) -> i32 {
+    match x {
+        case .ok => error(.timeout)
+        case .err => error(.timeout)
+    }
+}
+route GET "/users" {
+    let code = or(pick(Result.ok), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_single_stage) {
+    const auto src = R"(
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = 200 | id(_)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_chained_stages) {
+    const auto src = R"(
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = 200 | id(_) | id(_)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_placeholder_position) {
+    const auto src = R"(
+func second(a: i32, b: i32) -> i32 => b
+route GET "/users" {
+    let code = 200 | second(500, _)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_placeholder_slot_one_alias) {
+    const auto src = R"(
+func second(a: i32, b: i32) -> i32 => b
+route GET "/users" {
+    let code = 200 | second(500, _1)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_tuple_literal_multi_slot_placeholders) {
+    const auto src = R"(
+func second(a: i32, b: i32) -> i32 => b
+route GET "/users" {
+    let code = (200, 500) | second(_2, _1)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_tuple_returning_function_multi_slot_placeholders) {
+    const auto src = R"(
+func pair() { (200, 500) }
+func second(a: i32, b: i32) -> i32 => b
+route GET "/users" {
+    let code = pair() | second(_2, _1)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_tuple_of_struct_binding_preserves_struct_slots) {
+    const auto src = R"rut(
+struct Box { value: i32 }
+func id<T>(x: T) -> T => x
+func boxCode(b: Box) -> i32 => b.value
+route GET "/users" {
+    let pair = id((Box(value: 200), 1))
+    let code = pair | boxCode(_1)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_generic_function_explicit_tuple_of_struct_type_arg_preserves_struct_slots) {
+    const auto src = R"rut(
+struct Box { value: i32 }
+func id<T>(x: T) -> T => x
+func boxCode(b: Box) -> i32 => b.value
+route GET "/users" {
+    let pair = id<(Box, i32)>((Box(value: 200), 1))
+    let code = pair | boxCode(_1)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_tuple_local_alias_multi_slot_placeholders) {
+    const auto src = R"(
+func second(a: i32, b: i32) -> i32 => b
+route GET "/users" {
+    let pair = (200, 500)
+    let code = pair | second(_2, _1)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_chains_tuple_returning_stage_multi_slot_placeholders) {
+    const auto src = R"(
+func swap(a: i32, b: i32) { (b, a) }
+func second(a: i32, b: i32) -> i32 => b
+route GET "/users" {
+    let code = (200, 500) | swap(_1, _2) | second(_1, _2)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_placeholder_slot_eleven_is_rejected_at_parse) {
+    const auto src = R"(
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = 200 | id(_11)
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(jit, frontend_pipe_runtime_fallible_lhs_slot_two_is_rejected) {
+    const auto src = R"(
+func id(x: str) -> str => x
+route GET "/users" {
+    let code = req.header("Host") | id(_2)
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(jit, frontend_pipe_known_nil_falls_back_via_or) {
+    const auto src = R"(
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = nil | id(_)
+    let safe = or(code, 200)
+    if safe == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_known_error_falls_back_via_or) {
+    const auto src = R"(
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let failed = error(.timeout)
+    let code = failed | id(_)
+    let safe = or(code, 200)
+    if safe == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_runtime_optional_lhs_flows_via_or) {
+    const auto src = R"(
+func id(x: str) -> str => x
+route GET "/users" {
+    let host = req.header("Host") | id(_)
+    let safe = or(host, "missing")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_runtime_error_lhs_flows_via_or) {
+    const auto src = R"(
+func fail() -> i32 => error(.timeout)
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = fail() | id(_)
+    let safe = or(code, 200)
+    if safe == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_runtime_optional_error_lhs_flows_via_or_nil_branch) {
+    const auto src = R"(
+func maybefail(ok: bool) -> i32 {
+    if ok { nil } else { error(.timeout) }
+}
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = maybefail(true) | id(_)
+    let safe = or(code, 200)
+    if safe == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_runtime_optional_error_lhs_flows_via_or_error_branch) {
+    const auto src = R"(
+func maybefail(ok: bool) -> i32 {
+    if ok { nil } else { error(.timeout) }
+}
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = maybefail(false) | id(_)
+    let safe = or(code, 200)
+    if safe == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_runtime_optional_lhs_flows_into_optional_stage_via_or) {
+    const auto src = R"(
+func drop(x: str) -> str { nil }
+route GET "/users" {
+    let host = req.header("Host") | drop(_)
+    let safe = or(host, "missing")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_runtime_optional_lhs_flows_into_error_stage_via_or) {
+    const auto src = R"(
+func failstage(x: str) -> str => error(.timeout)
+route GET "/users" {
+    let host = req.header("Host") | failstage(_)
+    let safe = or(host, "missing")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_runtime_error_lhs_flows_into_optional_stage_via_or) {
+    const auto src = R"(
+func fail() -> str => error(.timeout)
+func drop(x: str) -> str { nil }
+route GET "/users" {
+    let host = fail() | drop(_)
+    let safe = or(host, "missing")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_runtime_error_lhs_flows_into_error_stage_via_or) {
+    const auto src = R"(
+func fail() -> str => error(.timeout)
+func failstage(x: str) -> str => error(.timeout)
+route GET "/users" {
+    let host = fail() | failstage(_)
+    let safe = or(host, "missing")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_runtime_optional_lhs_flows_into_optional_error_stage_via_or) {
+    const auto src = R"(
+func tri(x: str) -> str {
+    if x == "host" { nil } else { error(.timeout) }
+}
+route GET "/users" {
+    let host = req.header("Host") | tri(_)
+    let safe = or(host, "missing")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_runtime_optional_error_stage_direct_via_or) {
+    const auto src = R"(
+func tri(x: str) -> str {
+    if x == "host" { nil } else { error(.timeout) }
+}
+route GET "/users" {
+    let raw = req.header("Host")
+    let input = or(raw, "fallback")
+    let host = tri(input)
+    let safe = or(host, "missing")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_pipe_runtime_error_lhs_flows_into_optional_error_stage_via_or) {
+    const auto src = R"(
+func fail() -> str => error(.timeout)
+func tri(x: str) -> str {
+    if x == "host" { nil } else { error(.timeout) }
+}
+route GET "/users" {
+    let host = fail() | tri(_)
+    let safe = or(host, "missing")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_decorator_pass_runs_handler) {
+    const auto src = R"rut(
+func passing(_ req: i32) -> i32 => 0
+route {
+    @passing "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK_EQ(r.status_code, 200);  // handler ran
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_decorator_reject_short_circuits_handler) {
+    const auto src = R"rut(
+func rejecting(_ req: i32) -> i32 => 401
+route {
+    @rejecting "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK_EQ(r.status_code, 401);  // decorator's return short-circuited the handler
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_decorator_chain_second_rejects) {
+    const auto src = R"rut(
+func passing(_ req: i32) -> i32 => 0
+func rejecting(_ req: i32) -> i32 => 403
+route {
+    @passing "*"
+    @rejecting "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK_EQ(r.status_code, 403);  // first decorator passed, second rejected
+    engine.shutdown();
+    rir.destroy();
 }
 
 int main(int argc, char** argv) {

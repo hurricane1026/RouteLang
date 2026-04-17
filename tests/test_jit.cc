@@ -10,6 +10,7 @@
 #include "rut/jit/jit_engine.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/jit_dispatch.h"
 #include "test.h"
 #include <filesystem>
 #include <fstream>
@@ -13910,6 +13911,73 @@ route GET "/sleep" { wait(500) wait(1000) return 201 }
 
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(jit_dispatch, timer_seconds_rounds_up_from_ms) {
+    CHECK_EQ(timer_seconds_from_ms(0), 0);
+    CHECK_EQ(timer_seconds_from_ms(1), 1);     // 1ms → 1s
+    CHECK_EQ(timer_seconds_from_ms(999), 1);   // 999ms → 1s
+    CHECK_EQ(timer_seconds_from_ms(1000), 1);  // 1000ms → 1s (exact)
+    CHECK_EQ(timer_seconds_from_ms(1001), 2);  // 1001ms → 2s
+    CHECK_EQ(timer_seconds_from_ms(2500), 3);  // 2500ms → 3s
+}
+
+TEST(jit_dispatch, wait_handler_yields_then_resumes_to_status) {
+    const auto src = R"rut(
+route GET "/sleep" { wait(1500) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    HandlerCtx ctx{};
+    ctx.state = 0;
+
+    // First call: TimerYield with seconds rounded up from 1500ms.
+    auto o0 = invoke_jit_handler(handler,
+                                 nullptr,
+                                 ctx,
+                                 reinterpret_cast<const u8*>(kGetRootRequest),
+                                 sizeof(kGetRootRequest) - 1,
+                                 nullptr);
+    CHECK_EQ(static_cast<u8>(o0.kind), static_cast<u8>(JitDispatchOutcome::Kind::TimerYield));
+    CHECK_EQ(o0.next_state, 1u);
+    CHECK_EQ(o0.timer_seconds, 2u);  // 1500ms → 2s
+
+    // Resume: caller sets ctx.state to next_state, invoke again → ReturnStatus.
+    ctx.state = o0.next_state;
+    auto o1 = invoke_jit_handler(handler,
+                                 nullptr,
+                                 ctx,
+                                 reinterpret_cast<const u8*>(kGetRootRequest),
+                                 sizeof(kGetRootRequest) - 1,
+                                 nullptr);
+    CHECK_EQ(static_cast<u8>(o1.kind), static_cast<u8>(JitDispatchOutcome::Kind::ReturnStatus));
+    CHECK_EQ(o1.status_code, 200u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit_dispatch, null_handler_returns_error_outcome) {
+    HandlerCtx ctx{};
+    auto o = invoke_jit_handler(nullptr, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK_EQ(static_cast<u8>(o.kind), static_cast<u8>(JitDispatchOutcome::Kind::Error));
 }
 
 int main(int argc, char** argv) {

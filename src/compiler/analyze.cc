@@ -9402,6 +9402,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
         for (u32 si = 0; si < item.route.statements.len; si++) {
             const auto& stmt = item.route.statements[si];
+            if (stmt.kind == AstStmtKind::Wait) {
+                // TODO: slice 0 frontend/codegen follow-up will lower this.
+                // For now reject loudly so we don't silently accept and drop.
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            }
             if (stmt.kind == AstStmtKind::Let) {
                 HirLocal local{};
                 local.span = stmt.span;

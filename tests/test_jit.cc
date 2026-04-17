@@ -1763,14 +1763,14 @@ TEST(jit, frontend_import_namespace_payloadless_variant_case) {
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
-        out << "variant Token { ready, wait }\n";
+        out << "variant Token { ready, pending }\n";
     }
     const auto src = R"rut(
 import "proto.rut"
 route GET "/users" {
     match proto.Token.ready {
     case .ready: return 200
-    case .wait: return 500
+    case .pending: return 500
     }
 }
 )rut";

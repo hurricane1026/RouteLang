@@ -129,6 +129,58 @@ TEST(frontend, lex_recognizes_lowercase_http_methods) {
     CHECK_EQ(static_cast<u8>(lexed->tokens[6].type), static_cast<u8>(TokenType::KwOptions));
 }
 
+TEST(frontend, lex_recognizes_wait_keyword) {
+    const char* src = "wait";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 2u);  // wait, EOF
+    CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwWait));
+}
+
+TEST(frontend, parse_route_accepts_wait_statement) {
+    const char* src = "route GET \"/sleep\" { wait(1000) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Wait));
+    CHECK_EQ(route.statements[0].status_code, 1000);  // ms stored in status_code field
+    CHECK_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(route.statements[1].status_code, 200);
+}
+
+TEST(frontend, analyze_rejects_wait_statement_pending_impl) {
+    // Parser accepts wait; analyze currently rejects until codegen lands.
+    // This test pins the current behavior so we notice when codegen is wired up.
+    const char* src = "route GET \"/sleep\" { wait(1000) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_route_rejects_wait_without_parens) {
+    const char* src = "route GET \"/sleep\" { wait 1000 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+}
+
+TEST(frontend, parse_route_rejects_wait_non_integer_arg) {
+    const char* src = "route GET \"/sleep\" { wait(\"1s\") return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+}
+
 TEST(frontend, parse_route_block_single_entry_no_decorators) {
     const char* src = "route { GET \"/users\" { return 200 } }\n";
     auto lexed = lex(lit(src));
@@ -2052,14 +2104,14 @@ TEST(frontend, import_namespace_payloadless_variant_case_is_supported) {
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
-        out << "variant Token { ready, wait }\n";
+        out << "variant Token { ready, pending }\n";
     }
     const auto src = R"rut(
 import "proto.rut"
 route GET "/users" {
     match proto.Token.ready {
     case .ready: return 200
-    case .wait: return 500
+    case .pending: return 500
     }
 }
 )rut";

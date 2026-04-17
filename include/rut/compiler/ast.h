@@ -26,6 +26,7 @@ enum class AstStmtKind : u8 {
     If,
     Match,
     Block,
+    Wait,  // `wait(N)` — suspend handler for N milliseconds (v1: IntLit only)
 };
 
 enum class AstExprKind : u8 {

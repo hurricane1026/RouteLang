@@ -304,18 +304,21 @@ void handle_jit_outcome(Loop* loop,
             conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
             loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             return;
-        case JitDispatchOutcome::Kind::TimerYield:
+        case JitDispatchOutcome::Kind::TimerYield: {
             // Stash fn + next_state so the tick callback can tell resume from
             // keepalive expiry and re-enter the handler. Slots stay clear:
-            // no recv/send pending while sleeping. One-second resolution is
-            // a known limitation of the current TimerWheel — see
-            // timer_seconds_from_ms() in jit_dispatch.h.
+            // no recv/send pending while sleeping. TimerWheel has 1-second
+            // resolution, so sub-second waits get rounded up; the ms-precise
+            // paths (IORING_OP_TIMEOUT, epoll min-heap) will consume
+            // outcome.timer_ms directly in later slices.
             conn.pending_handler_fn = fn;
             conn.handler_state = outcome.next_state;
             conn.state = ConnState::ExecHandler;
             conn.set_slots(nullptr, nullptr, nullptr, nullptr);
-            loop->timer.add(&conn, outcome.timer_seconds);
+            const u32 secs = timer_seconds_from_ms(outcome.timer_ms);
+            loop->timer.add(&conn, secs);
             return;
+        }
         case JitDispatchOutcome::Kind::Forward:
         case JitDispatchOutcome::Kind::Error:
         default:

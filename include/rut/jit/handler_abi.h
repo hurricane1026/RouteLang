@@ -80,11 +80,21 @@ struct HandlerResult {
         return {HandlerAction::Yield, 0, 0, state, kind};
     }
 
-    // Yield with 16-bit payload carried in the status_code slot. For Timer
-    // kind, payload is milliseconds; for future kinds it can mean buffer
-    // index, handle id, etc.
-    static HandlerResult make_yield_payload(u16 state, YieldKind kind, u16 payload) {
-        return {HandlerAction::Yield, payload, 0, state, kind};
+    // Yield with 32-bit payload carried in (upstream_id << 16 | status_code).
+    // For Timer kind, payload is milliseconds (u32 ≈ 49 days). Status_code
+    // and upstream_id are unused for Yield actions so we co-opt them.
+    static HandlerResult make_yield_payload(u16 state, YieldKind kind, u32 payload) {
+        return {HandlerAction::Yield,
+                static_cast<u16>(payload & 0xFFFFu),
+                static_cast<u16>((payload >> 16) & 0xFFFFu),
+                state,
+                kind};
+    }
+
+    // Decode the 32-bit yield payload from a Yield HandlerResult. Caller
+    // must have already checked action == Yield.
+    u32 yield_payload_u32() const {
+        return static_cast<u32>(status_code) | (static_cast<u32>(upstream_id) << 16);
     }
 };
 

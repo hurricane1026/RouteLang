@@ -13948,7 +13948,7 @@ route GET "/sleep" { wait(1500) return 200 }
     HandlerCtx ctx{};
     ctx.state = 0;
 
-    // First call: TimerYield with seconds rounded up from 1500ms.
+    // First call: TimerYield carrying raw 1500 ms payload.
     auto o0 = invoke_jit_handler(handler,
                                  nullptr,
                                  ctx,
@@ -13957,7 +13957,8 @@ route GET "/sleep" { wait(1500) return 200 }
                                  nullptr);
     CHECK_EQ(static_cast<u8>(o0.kind), static_cast<u8>(JitDispatchOutcome::Kind::TimerYield));
     CHECK_EQ(o0.next_state, 1u);
-    CHECK_EQ(o0.timer_seconds, 2u);  // 1500ms → 2s
+    CHECK_EQ(o0.timer_ms, 1500u);
+    CHECK_EQ(timer_seconds_from_ms(o0.timer_ms), 2u);  // legacy wheel path rounds up
 
     // Resume: caller sets ctx.state to next_state, invoke again → ReturnStatus.
     ctx.state = o0.next_state;
@@ -13969,6 +13970,47 @@ route GET "/sleep" { wait(1500) return 200 }
                                  nullptr);
     CHECK_EQ(static_cast<u8>(o1.kind), static_cast<u8>(JitDispatchOutcome::Kind::ReturnStatus));
     CHECK_EQ(o1.status_code, 200u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit_dispatch, timer_payload_round_trips_through_u32_packing) {
+    // Payload >65535 must survive: status_code + upstream_id slots combine
+    // into the 32-bit ms payload. Handler-side: codegen packs; runtime-side:
+    // invoke_jit_handler decodes via yield_payload_u32.
+    const auto src = R"rut(
+route GET "/long" { wait(100000) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    HandlerCtx ctx{};
+    ctx.state = 0;
+    auto outcome = invoke_jit_handler(handler,
+                                      nullptr,
+                                      ctx,
+                                      reinterpret_cast<const u8*>(kGetRootRequest),
+                                      sizeof(kGetRootRequest) - 1,
+                                      nullptr);
+    CHECK_EQ(static_cast<u8>(outcome.kind), static_cast<u8>(JitDispatchOutcome::Kind::TimerYield));
+    CHECK_EQ(outcome.timer_ms, 100000u);
 
     engine.shutdown();
     rir.destroy();

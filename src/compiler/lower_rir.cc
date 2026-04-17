@@ -2884,9 +2884,9 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
         }
         if (mir.functions[i].waits.len > 0) {
-            u16 ms_list[MirFunction::kMaxWaits]{};
+            u32 ms_list[MirFunction::kMaxWaits]{};
             for (u32 wi = 0; wi < mir.functions[i].waits.len; wi++)
-                ms_list[wi] = static_cast<u16>(mir.functions[i].waits[wi].ms);
+                ms_list[wi] = static_cast<u32>(mir.functions[i].waits[wi].ms);
             if (!b.set_yield_payload(fn.value(), ms_list, mir.functions[i].waits.len)) {
                 out.destroy();
                 return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);

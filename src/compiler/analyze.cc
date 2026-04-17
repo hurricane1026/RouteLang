@@ -9403,10 +9403,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         for (u32 si = 0; si < item.route.statements.len; si++) {
             const auto& stmt = item.route.statements[si];
             if (stmt.kind == AstStmtKind::Wait) {
-                // v1 constraint: ms must fit in u16 (handler-result yield payload
-                // currently has 2 bytes). Duration literals like `1s` will lift
-                // this cap.
-                if (stmt.status_code < 0 || stmt.status_code > 0xFFFF)
+                // ms payload is carried in the 32-bit Yield slot (status_code +
+                // upstream_id co-opted); any non-negative i32 fits. Duration
+                // literals like `1s` remain future work for the parser.
+                if (stmt.status_code < 0)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 HirRoute::Wait w{};
                 w.span = stmt.span;

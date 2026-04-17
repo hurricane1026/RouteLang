@@ -335,10 +335,10 @@ struct Function {
     u32 yield_count;
 
     // Per-yield payload. For a Timer yield, yield_payload[i] is the
-    // duration in milliseconds. Arena-allocated, length = yield_count.
-    // (Other yield kinds will extend this or use a richer structure;
-    // for v1 timer-only it stays a flat u16 array.)
-    u16* yield_payload;
+    // duration in milliseconds (u32 ≈ 49 days). Arena-allocated, length
+    // = yield_count. Other yield kinds will extend this or use a richer
+    // structure; for v1 timer-only it stays a flat u32 array.
+    u32* yield_payload;
 
     Block* entry() { return block_count > 0 ? &blocks[0] : nullptr; }
     const Block* entry() const { return block_count > 0 ? &blocks[0] : nullptr; }

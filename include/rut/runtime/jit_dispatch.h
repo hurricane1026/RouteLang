@@ -33,17 +33,17 @@ struct JitDispatchOutcome {
     u16 status_code = 0;
     u16 upstream_id = 0;
     u16 next_state = 0;
-    u16 timer_seconds = 0;  // rounded up from the handler's ms payload
+    u32 timer_ms = 0;  // raw ms payload; callers pick their own precision
 };
 
-// Round-up conversion from ms to seconds. Exposed so callers and tests
-// agree on the clamping semantics. TimerWheel has 1s resolution today;
-// if a finer wheel / io_uring timeout is added later, callers can switch
-// to the raw ms payload stored in HandlerResult::status_code directly.
-inline u16 timer_seconds_from_ms(u16 ms) {
+// Round-up conversion from ms to seconds. Callers using a 1-second
+// TimerWheel (legacy keepalive mechanism) can use this to bucket timer_ms.
+// Native ms-precision paths (IORING_OP_TIMEOUT / epoll min-heap) should
+// consume outcome.timer_ms directly.
+inline u32 timer_seconds_from_ms(u32 ms) {
     if (ms == 0) return 0;
-    const u32 secs = (static_cast<u32>(ms) + 999u) / 1000u;
-    return secs > 0xFFFFu ? static_cast<u16>(0xFFFFu) : static_cast<u16>(secs);
+    const u64 secs = (static_cast<u64>(ms) + 999u) / 1000u;
+    return secs > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<u32>(secs);
 }
 
 // Invoke a JIT-compiled handler once and translate the packed result
@@ -80,8 +80,7 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             if (r.yield_kind == jit::YieldKind::Timer) {
                 out.kind = JitDispatchOutcome::Kind::TimerYield;
                 out.next_state = r.next_state;
-                // status_code slot carries the ms payload for Timer yields.
-                out.timer_seconds = timer_seconds_from_ms(r.status_code);
+                out.timer_ms = r.yield_payload_u32();
                 return out;
             }
             // HttpGet/HttpPost/Forward yields — future slices.

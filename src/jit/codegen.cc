@@ -287,12 +287,13 @@ struct Ctx {
         return LLVMConstInt(i64_ty, packed, 0);
     }
 
-    // Build packed HandlerResult for a Yield. Payload rides the status_code
-    // slot (bytes 1-2). For YieldKind::Timer the payload is ms.
-    LLVMValueRef make_result_yield(u16 next_state, u8 yield_kind, u16 payload) {
+    // Build packed HandlerResult for a Yield. Payload spans bytes 1-4
+    // (status_code + upstream_id), giving 32 bits for kinds like Timer
+    // where ms can exceed u16. See HandlerResult::make_yield_payload.
+    LLVMValueRef make_result_yield(u16 next_state, u8 yield_kind, u32 payload) {
         u64 packed = 0;
         packed |= static_cast<u64>(2);                 // action = Yield
-        packed |= static_cast<u64>(payload) << 8;      // status_code = payload
+        packed |= static_cast<u64>(payload) << 8;      // status + upstream slots
         packed |= static_cast<u64>(next_state) << 40;  // next_state
         packed |= static_cast<u64>(yield_kind) << 56;  // yield_kind
         return LLVMConstInt(i64_ty, packed, 0);
@@ -886,7 +887,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
             ylabel[lpos] = 0;
             LLVMBasicBlockRef yield_bb = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, ylabel);
             LLVMMoveBasicBlockBefore(yield_bb, terminal_bb);
-            const u16 payload = fn.yield_payload ? fn.yield_payload[si] : 0;
+            const u32 payload = fn.yield_payload ? fn.yield_payload[si] : 0;
             LLVMPositionBuilderAtEnd(c.builder, yield_bb);
             LLVMValueRef result =
                 c.make_result_yield(static_cast<u16>(si + 1), kYieldKindTimer, payload);

@@ -179,15 +179,18 @@ TEST(frontend, analyze_records_multiple_waits_in_order) {
     CHECK_EQ(hir->routes[0].waits[2].ms, 300);
 }
 
-TEST(frontend, analyze_rejects_wait_larger_than_u16_max) {
+TEST(frontend, analyze_accepts_wait_larger_than_u16_max) {
+    // After the u32 payload widening, any non-negative ms value is legal.
+    // Carry 100000ms (~100s) through HIR — well past the old 65535 cap.
     const char* src = "route GET \"/x\" { wait(100000) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
-    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 100000);
 }
 
 TEST(frontend, rir_function_carries_yield_payload_for_waits) {

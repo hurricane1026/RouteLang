@@ -109,6 +109,7 @@ struct Builder {
         fn->route_pattern = route_pattern;
         fn->http_method = http_method;
         fn->yield_count = 0;
+        fn->yield_payload = nullptr;
         fn->blocks = blocks;
         fn->block_count = 0;
         fn->block_cap = kInitBlocks;
@@ -117,6 +118,24 @@ struct Builder {
         fn->value_cap = kInitValues;
 
         return fn;
+    }
+
+    // Record the wait(ms) list for a function: arena-allocates a u16 array
+    // sized to count and copies the ms values in order. After this call,
+    // fn->yield_count reflects the number of state-machine yield points
+    // and codegen can consume fn->yield_payload[i].
+    VoidResult set_yield_payload(Function* fn, const u16* ms_list, u32 count) {
+        if (count == 0) {
+            fn->yield_count = 0;
+            fn->yield_payload = nullptr;
+            return {};
+        }
+        auto* buf = mod->arena->alloc_array<u16>(count);
+        if (!buf) return err(RirError::OutOfMemory);
+        for (u32 i = 0; i < count; i++) buf[i] = ms_list[i];
+        fn->yield_payload = buf;
+        fn->yield_count = count;
+        return {};
     }
 
     Result<BlockId> create_block(Function* fn, Str label) {

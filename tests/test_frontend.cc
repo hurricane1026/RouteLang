@@ -190,6 +190,32 @@ TEST(frontend, analyze_rejects_wait_larger_than_u16_max) {
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
+TEST(frontend, rir_function_carries_yield_payload_for_waits) {
+    const char* src = "route GET \"/x\" { wait(500) wait(1000) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].waits.len, 2u);
+    CHECK_EQ(mir->functions[0].waits[0].ms, 500);
+    CHECK_EQ(mir->functions[0].waits[1].ms, 1000);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE(rir.module.func_count >= 1u);
+    CHECK_EQ(rir.module.functions[0].yield_count, 2u);
+    REQUIRE(rir.module.functions[0].yield_payload != nullptr);
+    CHECK_EQ(rir.module.functions[0].yield_payload[0], 500u);
+    CHECK_EQ(rir.module.functions[0].yield_payload[1], 1000u);
+    rir.destroy();
+}
+
 TEST(frontend, parse_route_rejects_wait_without_parens) {
     const char* src = "route GET \"/sleep\" { wait 1000 return 200 }\n";
     auto lexed = lex(lit(src));

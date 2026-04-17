@@ -11,6 +11,7 @@
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
@@ -21,9 +22,76 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace rut {
+
+namespace epoll_yield {
+
+inline u64 monotonic_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<u64>(ts.tv_sec) * 1'000'000'000ull + static_cast<u64>(ts.tv_nsec);
+}
+
+// Min-heap of pending JIT yield deadlines. The heap's top entry determines
+// when backend.yield_timer_fd must fire next. Entries are tagged with the
+// connection's req_start_us so stale entries (connection closed and
+// reassigned to a different request) can be filtered on pop.
+//
+// Capacity: one live entry per connection at most; handler chains (yield →
+// resume → yield) push a new entry each time, but the prior entry has
+// already been popped. Sized at kMaxConns + small slack for safety.
+struct YieldHeap {
+    struct Entry {
+        u64 deadline_ns;
+        u64 req_start_us;
+        u32 conn_id;
+    };
+    static constexpr u32 kCap = 16384 + 256;
+    Entry entries[kCap];
+    u32 size = 0;
+
+    void clear() { size = 0; }
+    bool empty() const { return size == 0; }
+    const Entry& top() const { return entries[0]; }
+
+    bool push(u64 deadline_ns, u64 req_start_us, u32 conn_id) {
+        if (size >= kCap) return false;
+        u32 i = size++;
+        entries[i] = {deadline_ns, req_start_us, conn_id};
+        while (i > 0) {
+            u32 parent = (i - 1) / 2;
+            if (entries[parent].deadline_ns <= entries[i].deadline_ns) break;
+            Entry tmp = entries[parent];
+            entries[parent] = entries[i];
+            entries[i] = tmp;
+            i = parent;
+        }
+        return true;
+    }
+
+    void pop() {
+        if (size == 0) return;
+        entries[0] = entries[--size];
+        u32 i = 0;
+        while (true) {
+            u32 l = 2 * i + 1;
+            u32 r = 2 * i + 2;
+            u32 smallest = i;
+            if (l < size && entries[l].deadline_ns < entries[smallest].deadline_ns) smallest = l;
+            if (r < size && entries[r].deadline_ns < entries[smallest].deadline_ns) smallest = r;
+            if (smallest == i) break;
+            Entry tmp = entries[smallest];
+            entries[smallest] = entries[i];
+            entries[i] = tmp;
+            i = smallest;
+        }
+    }
+};
+
+}  // namespace epoll_yield
 
 // EpollEventLoop — concrete, non-template event loop for epoll backend.
 //
@@ -33,6 +101,11 @@ namespace rut {
 struct EpollEventLoop : EventLoopCRTP<EpollEventLoop> {
     EpollBackend backend;
     TimerWheel timer;
+    epoll_yield::YieldHeap yield_heap;
+    // Absolute deadline currently programmed into backend.yield_timer_fd.
+    // 0 means disarmed. Used to avoid redundant timerfd_settime syscalls
+    // when a new push does not change the heap's top.
+    u64 yield_timer_armed_ns = 0;
     u32 shard_id;
 
 private:
@@ -299,11 +372,71 @@ public:
         this->free_conn(c);
     }
 
+    // --- Yield timer (ms precision via one-shot timerfd + min-heap) ---
+
+    // Schedule a JIT handler yield wake-up in `ms` milliseconds. Unlike
+    // timer.add (1-second resolution, slotted wheel), this pushes an
+    // absolute CLOCK_MONOTONIC deadline onto yield_heap and re-arms
+    // backend.yield_timer_fd when the heap's top deadline moves earlier.
+    // Slots should be cleared before calling — no recv/send in flight.
+    void schedule_yield_timer(Connection& conn, u32 ms) {
+        u64 now = epoll_yield::monotonic_ns();
+        u64 deadline = now + static_cast<u64>(ms) * 1'000'000ull;
+        if (!yield_heap.push(deadline, conn.req_start_us, conn.id)) {
+            // Heap full — fall back to 1-second timer wheel. Degrades
+            // precision but preserves liveness.
+            timer.add(&conn, timer_seconds_from_ms(ms));
+            return;
+        }
+        rearm_yield_timerfd();
+    }
+
+    // (Re-)arm backend.yield_timer_fd for the current heap top. Called after
+    // every push and after every drain. Uses yield_timer_armed_ns to skip
+    // redundant timerfd_settime calls.
+    void rearm_yield_timerfd() {
+        if (yield_heap.empty()) {
+            if (yield_timer_armed_ns != 0) {
+                backend.arm_yield_timerfd(0);
+                yield_timer_armed_ns = 0;
+            }
+            return;
+        }
+        u64 top = yield_heap.top().deadline_ns;
+        if (top == yield_timer_armed_ns) return;
+        backend.arm_yield_timerfd(top);
+        yield_timer_armed_ns = top;
+    }
+
+    // Drain all heap entries whose deadline has passed. Resume each
+    // connection's pending JIT handler (skipping stale entries whose
+    // req_start_us no longer matches — indicating the slot was closed
+    // and reused before the timer fired).
+    void drain_yield_heap() {
+        u64 now = epoll_yield::monotonic_ns();
+        while (!yield_heap.empty() && yield_heap.top().deadline_ns <= now) {
+            auto entry = yield_heap.top();
+            yield_heap.pop();
+            if (entry.conn_id >= kMaxConns) continue;
+            auto& c = conns[entry.conn_id];
+            if (!c.pending_handler_fn) continue;
+            if (c.req_start_us != entry.req_start_us) continue;  // stale
+            resume_jit_handler<EpollEventLoop>(this, c);
+        }
+        rearm_yield_timerfd();
+    }
+
     // --- Dispatch ---
 
     void dispatch(const IoEvent& ev) {
         if (ev.type == IoEventType::Accept) {
             on_accept(ev);
+            return;
+        }
+        if (ev.type == IoEventType::HandlerTimer) {
+            // yield_timer_fd expired; drain all entries at/past the
+            // current clock.
+            drain_yield_heap();
             return;
         }
         if (ev.type == IoEventType::Timeout) {

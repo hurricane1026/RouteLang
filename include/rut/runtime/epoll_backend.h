@@ -30,6 +30,10 @@ struct EpollBackend {
 
     i32 epoll_fd = -1;
     i32 timer_fd = -1;
+    // One-shot timerfd for JIT handler yield precision. EpollEventLoop
+    // maintains a min-heap of pending yield deadlines and re-arms this
+    // fd via arm_yield_timerfd() whenever the heap's top entry changes.
+    i32 yield_timer_fd = -1;
     i32 listen_fd = -1;
 
     // conn_id → fd mappings. Separate maps for client and upstream so that
@@ -98,6 +102,11 @@ struct EpollBackend {
 
     // Shutdown and close fds.
     void shutdown();
+
+    // Arm yield_timer_fd for a one-shot deadline `deadline_ns` in the
+    // CLOCK_MONOTONIC epoch. Call with 0 to disarm. Used by
+    // EpollEventLoop when its yield-timer heap changes its top deadline.
+    void arm_yield_timerfd(u64 deadline_ns);
 
 private:
     // Encode conn_id + type into epoll_event.data.u64

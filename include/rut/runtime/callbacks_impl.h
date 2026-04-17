@@ -305,18 +305,17 @@ void handle_jit_outcome(Loop* loop,
             loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         case JitDispatchOutcome::Kind::TimerYield: {
-            // Stash fn + next_state so the tick callback can tell resume from
-            // keepalive expiry and re-enter the handler. Slots stay clear:
-            // no recv/send pending while sleeping. TimerWheel has 1-second
-            // resolution, so sub-second waits get rounded up; the ms-precise
-            // paths (IORING_OP_TIMEOUT, epoll min-heap) will consume
-            // outcome.timer_ms directly in later slices.
+            // Stash fn + next_state so the resume path can re-enter the
+            // handler with ctx.state = handler_state. Slots stay clear —
+            // no recv/send in flight while sleeping. Delegates to the
+            // loop's schedule_yield_timer: ms precision on both backends
+            // (IORING_OP_TIMEOUT on io_uring, one-shot timerfd + min-heap
+            // on epoll).
             conn.pending_handler_fn = fn;
             conn.handler_state = outcome.next_state;
             conn.state = ConnState::ExecHandler;
             conn.set_slots(nullptr, nullptr, nullptr, nullptr);
-            const u32 secs = timer_seconds_from_ms(outcome.timer_ms);
-            loop->timer.add(&conn, secs);
+            loop->schedule_yield_timer(conn, outcome.timer_ms);
             return;
         }
         case JitDispatchOutcome::Kind::Forward:

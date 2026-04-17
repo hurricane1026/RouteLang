@@ -133,6 +133,7 @@ core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
     listen_fd = lfd;
     epoll_fd = -1;
     timer_fd = -1;
+    yield_timer_fd = -1;
     pending_count = 0;
     for (u32 i = 0; i < kMaxFdMap; i++) {
         downstream_fd_map[i] = -1;
@@ -166,7 +167,39 @@ core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
         return core::make_unexpected(Error::make(err, Error::Source::Epoll));
     }
 
+    // yield_timer_fd — one-shot, armed on demand when the JIT-yield heap's
+    // top deadline changes. Disarmed at init (it_value = 0). Carries the
+    // HandlerTimer event type so wait()/dispatch can route it through the
+    // per-conn resume path.
+    yield_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (yield_timer_fd < 0) {
+        i32 err = errno;
+        shutdown();
+        return core::make_unexpected(Error::make(err, Error::Source::Timerfd));
+    }
+    struct epoll_event yev;
+    yev.events = EPOLLIN;
+    yev.data.u64 = encode_data(kTimerConnId, IoEventType::HandlerTimer);
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, yield_timer_fd, &yev) < 0) {
+        i32 err = errno;
+        shutdown();
+        return core::make_unexpected(Error::make(err, Error::Source::Epoll));
+    }
+
     return {};
+}
+
+void EpollBackend::arm_yield_timerfd(u64 deadline_ns) {
+    if (yield_timer_fd < 0) return;
+    struct itimerspec ts;
+    __builtin_memset(&ts, 0, sizeof(ts));
+    if (deadline_ns > 0) {
+        ts.it_value.tv_sec = static_cast<time_t>(deadline_ns / 1'000'000'000ull);
+        ts.it_value.tv_nsec = static_cast<long>(deadline_ns % 1'000'000'000ull);
+    }
+    // TFD_TIMER_ABSTIME — deadline_ns is absolute CLOCK_MONOTONIC. A zero
+    // value disarms the timer. it_interval stays zero → one-shot.
+    timerfd_settime(yield_timer_fd, TFD_TIMER_ABSTIME, &ts, nullptr);
 }
 
 void EpollBackend::add_accept() {
@@ -469,12 +502,16 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 out++;
             }
         } else if (conn_id == kTimerConnId) {
+            // Two timerfds share kTimerConnId; the decoded type disambiguates.
+            // HandlerTimer → yield_timer_fd (one-shot, ms precision, per-heap-top).
+            // Timeout      → timer_fd      (1 Hz interval, drives keepalive wheel).
+            i32 fd = (type == IoEventType::HandlerTimer) ? yield_timer_fd : timer_fd;
             u64 ticks = 0;
-            ssize_t rr = read(timer_fd, &ticks, sizeof(ticks));
+            ssize_t rr = read(fd, &ticks, sizeof(ticks));
             if (rr != static_cast<ssize_t>(sizeof(ticks))) continue;
             if (out < max_events) {
                 events[out].conn_id = 0;
-                events[out].type = IoEventType::Timeout;
+                events[out].type = type;
                 events[out].result = (ticks > 0x7FFFFFFF) ? 0x7FFFFFFF : static_cast<i32>(ticks);
                 events[out].buf_id = 0;
                 events[out].has_buf = 0;
@@ -721,6 +758,10 @@ void EpollBackend::shutdown() {
     if (timer_fd >= 0) {
         close(timer_fd);
         timer_fd = -1;
+    }
+    if (yield_timer_fd >= 0) {
+        close(yield_timer_fd);
+        yield_timer_fd = -1;
     }
     if (epoll_fd >= 0) {
         close(epoll_fd);

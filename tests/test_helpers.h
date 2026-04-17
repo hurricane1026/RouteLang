@@ -160,6 +160,13 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
     }
+    // Test shim: record the ms for assertions, fall back to 1s wheel so
+    // pending_handler_fn is still re-entered when the test ticks.
+    u32 last_yield_ms = 0;
+    void schedule_yield_timer(Connection& c, u32 ms) {
+        last_yield_ms = ms;
+        timer.add(&c, timer_seconds_from_ms(ms));
+    }
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
         // Mirror real EventLoop: cancel in-flight I/O before freeing.
@@ -505,6 +512,14 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         }
     }
 
+    // Test shim matching SmallLoop's: drive the legacy wheel so existing
+    // 1-second tick tests continue to resume the handler.
+    u32 last_yield_ms = 0;
+    void schedule_yield_timer(Connection& c, u32 ms) {
+        last_yield_ms = ms;
+        timer.add(&c, timer_seconds_from_ms(ms));
+    }
+
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
         if (c.pending_ops > 0) {
@@ -730,6 +745,11 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     }
     void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) c.pending_ops++;
+    }
+    u32 last_yield_ms = 0;
+    void schedule_yield_timer(Connection& c, u32 ms) {
+        last_yield_ms = ms;
+        timer.add(&c, timer_seconds_from_ms(ms));
     }
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();

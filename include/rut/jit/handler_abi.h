@@ -21,6 +21,7 @@ enum class YieldKind : u8 {
     HttpGet = 0,
     HttpPost = 1,
     Forward = 2,
+    Timer = 3,  // sleep for N ms; payload stored in status_code slot (v1: u16 max)
 };
 
 // ── Handler Result ─────────────────────────────────────────────────
@@ -77,6 +78,13 @@ struct HandlerResult {
 
     static HandlerResult make_yield(u16 state, YieldKind kind) {
         return {HandlerAction::Yield, 0, 0, state, kind};
+    }
+
+    // Yield with 16-bit payload carried in the status_code slot. For Timer
+    // kind, payload is milliseconds; for future kinds it can mean buffer
+    // index, handle id, etc.
+    static HandlerResult make_yield_payload(u16 state, YieldKind kind, u16 payload) {
+        return {HandlerAction::Yield, payload, 0, state, kind};
     }
 };
 

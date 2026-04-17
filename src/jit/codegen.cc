@@ -287,6 +287,17 @@ struct Ctx {
         return LLVMConstInt(i64_ty, packed, 0);
     }
 
+    // Build packed HandlerResult for a Yield. Payload rides the status_code
+    // slot (bytes 1-2). For YieldKind::Timer the payload is ms.
+    LLVMValueRef make_result_yield(u16 next_state, u8 yield_kind, u16 payload) {
+        u64 packed = 0;
+        packed |= static_cast<u64>(2);                 // action = Yield
+        packed |= static_cast<u64>(payload) << 8;      // status_code = payload
+        packed |= static_cast<u64>(next_state) << 40;  // next_state
+        packed |= static_cast<u64>(yield_kind) << 56;  // yield_kind
+        return LLVMConstInt(i64_ty, packed, 0);
+    }
+
     // ── Type mapping ───────────────────────────────────────────────
 
     LLVMTypeRef cache_type(const rir::Type* ty, LLVMTypeRef t) {
@@ -827,6 +838,61 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         auto& blk = fn.blocks[i];
         const char* label = blk.label.ptr ? blk.label.ptr : "bb";
         c.block_map[blk.id.id] = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, label);
+    }
+
+    // State-machine prologue. When the RIR function has yield points, the
+    // handler is called multiple times (once per state) and the first
+    // LLVM basic block dispatches on HandlerCtx::state:
+    //
+    //   dispatch:
+    //     switch state {
+    //       0 -> yield_0   // emit Yield(next=1, payload=payload[0])
+    //       1 -> yield_1   // ... up to yield_{N-1}
+    //       default -> <original entry block>   // terminal state
+    //     }
+    //
+    // Each yield_k block returns a packed Yield HandlerResult without
+    // running any of the original code; the terminal state runs the
+    // original RIR blocks unchanged. Single-function model — no frame
+    // needed for this slice (nothing lives across the yield).
+    if (fn.yield_count > 0) {
+        LLVMBasicBlockRef dispatch_bb = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, "dispatch");
+        // Move dispatch to be the first block; it will become the function's
+        // entry point automatically because LLVM uses block-append order and
+        // we append it AFTER the other blocks — so move it to the front.
+        LLVMMoveBasicBlockBefore(dispatch_bb, c.block_map[fn.blocks[0].id.id]);
+
+        LLVMPositionBuilderAtEnd(c.builder, dispatch_bb);
+        // HandlerCtx layout: state (u16) @ offset 0.
+        LLVMValueRef state = LLVMBuildLoad2(c.builder, c.i16_ty, c.param_ctx, "state");
+
+        LLVMBasicBlockRef terminal_bb = c.block_map[fn.blocks[0].id.id];
+        LLVMValueRef sw = LLVMBuildSwitch(c.builder, state, terminal_bb, fn.yield_count);
+
+        // Use function-specific yield kind. v1: all yields are Timer; later
+        // layers will branch on per-yield metadata.
+        constexpr u8 kYieldKindTimer = 3;
+        for (u32 si = 0; si < fn.yield_count; si++) {
+            char ylabel[24];
+            u32 lpos = 0;
+            const char* prefix = "yield_";
+            while (*prefix && lpos < sizeof(ylabel) - 1) ylabel[lpos++] = *prefix++;
+            // minimal itoa for single-digit state indices; slice 0 limits wait_count <= 4
+            if (si < 10) {
+                ylabel[lpos++] = static_cast<char>('0' + si);
+            } else {
+                ylabel[lpos++] = '?';
+            }
+            ylabel[lpos] = 0;
+            LLVMBasicBlockRef yield_bb = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, ylabel);
+            LLVMMoveBasicBlockBefore(yield_bb, terminal_bb);
+            const u16 payload = fn.yield_payload ? fn.yield_payload[si] : 0;
+            LLVMPositionBuilderAtEnd(c.builder, yield_bb);
+            LLVMValueRef result =
+                c.make_result_yield(static_cast<u16>(si + 1), kYieldKindTimer, payload);
+            LLVMBuildRet(c.builder, result);
+            LLVMAddCase(sw, LLVMConstInt(c.i16_ty, si, 0), yield_bb);
+        }
     }
 
     // Emit instructions block by block.

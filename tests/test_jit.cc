@@ -13803,6 +13803,115 @@ route {
     rir.destroy();
 }
 
+TEST(jit, frontend_route_wait_emits_yield_then_terminal_status) {
+    // Source: one wait(1000) followed by return 200.
+    // Expected: first handler call returns Yield(next_state=1, kind=Timer, payload=1000);
+    //           second call with ctx.state = 1 returns ReturnStatus 200.
+    const auto src = R"rut(
+route GET "/sleep" { wait(1000) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    HandlerCtx ctx{};
+    ctx.state = 0;
+    ctx.handler_idx = 0;
+    ctx.slot_count = 0;
+
+    // First call: state=0 → yield
+    auto r0 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r0.action), static_cast<u8>(HandlerAction::Yield));
+    CHECK_EQ(r0.next_state, 1);
+    CHECK_EQ(static_cast<u8>(r0.yield_kind), static_cast<u8>(YieldKind::Timer));
+    CHECK_EQ(r0.status_code, 1000);  // payload slot carries ms
+
+    // Second call: state=1 → terminal return 200
+    ctx.state = 1;
+    auto r1 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r1.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(r1.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_multiple_waits_chain_through_states) {
+    // Two waits: state 0 yields 500ms, state 1 yields 1000ms, state 2 returns 201.
+    const auto src = R"rut(
+route GET "/sleep" { wait(500) wait(1000) return 201 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    HandlerCtx ctx{};
+    ctx.state = 0;
+    ctx.handler_idx = 0;
+
+    // Drive the state machine: expect yield(500) → yield(1000) → status(201).
+    const u16 kExpectedMs[] = {500, 1000};
+    for (u16 s = 0; s < 2; s++) {
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               &ctx,
+                                               reinterpret_cast<const u8*>(kGetRootRequest),
+                                               sizeof(kGetRootRequest) - 1,
+                                               nullptr));
+        CHECK_EQ(static_cast<u8>(r.action), static_cast<u8>(HandlerAction::Yield));
+        CHECK_EQ(r.next_state, static_cast<u16>(s + 1));
+        CHECK_EQ(r.status_code, kExpectedMs[s]);
+        ctx.state = r.next_state;
+    }
+    auto rf = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(rf.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(rf.status_code, 201);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

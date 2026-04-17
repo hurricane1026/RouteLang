@@ -1,5 +1,12 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
 #include "epoll_tls_test_hooks.h"
+#include "rut/compiler/analyze.h"
+#include "rut/compiler/lexer.h"
+#include "rut/compiler/lower_rir.h"
+#include "rut/compiler/mir_build.h"
+#include "rut/compiler/parser.h"
+#include "rut/jit/codegen.h"
+#include "rut/jit/jit_engine.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/shard.h"
@@ -2078,6 +2085,81 @@ TEST(route, capture_real_socket) {
     loop->shutdown();
     close(lfd);
     destroy_real_loop(loop);
+}
+
+// End-to-end wait(ms) through the real EpollEventLoop: compile a route
+// that yields for 1 second and returns 204, register it as a JitHandler
+// in the RouteConfig, drive a real TCP connection, and assert the client
+// observes the 204 response after the timer fires.
+//
+// Timing note: TimerWheel has 1-second resolution driven by a shared
+// timerfd; wait(1000) yields timer_seconds=1, so the elapsed wall time
+// from request to response is 1–2s depending on where in the current
+// tick interval the request arrived. recv_timeout is therefore set to
+// 3000ms to avoid flakes on slow CI.
+TEST(route, wait_jit_handler_real_socket) {
+    using namespace rut;  // pull in compiler helpers (lex / parse_file / ...)
+
+    const char* src = "route GET \"/sleep\" { wait(1000) return 204 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/sleep", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /sleep HTTP/1.1\r\nHost: x\r\n\r\n", 32);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 3000);
+    CHECK_GT(n, 0);
+    // Response should contain the 204 status code.
+    bool found_204 = false;
+    for (i32 i = 0; i + 2 < n; i++) {
+        if (buf[i] == '2' && buf[i + 1] == '0' && buf[i + 2] == '4') {
+            found_204 = true;
+            break;
+        }
+    }
+    CHECK(found_204);
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
 }
 
 int main(int argc, char** argv) {

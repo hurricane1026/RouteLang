@@ -39,6 +39,8 @@ add_executable(test_integration
 )
 target_link_libraries(test_integration
     rut_runtime
+    rut_compiler
+    rut_jit
     Threads::Threads
     ssl
     crypto

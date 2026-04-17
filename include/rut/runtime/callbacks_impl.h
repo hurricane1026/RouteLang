@@ -8,6 +8,7 @@
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
@@ -36,6 +37,24 @@ extern const char kResponse200Close[];
 
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size);
+
+// ── JIT handler dispatch ───────────────────────────────────────────
+// Route-matched JitHandler action → invoke the compiled handler and
+// translate JitDispatchOutcome into event-loop operations (send, forward,
+// register timer for resume, or 500). Shared between the initial call
+// (on_header_received) and timer-driven resumes.
+template <typename Loop>
+void handle_jit_outcome(Loop* loop,
+                        Connection& conn,
+                        const JitDispatchOutcome& outcome,
+                        jit::HandlerFn fn,
+                        bool keep_alive);
+
+// Called from timer.tick when the timer firing was a JIT handler yield
+// (conn.pending_handler_fn != nullptr). Re-enters the handler with
+// ctx.state = conn.handler_state, then re-dispatches on the outcome.
+template <typename Loop>
+void resume_jit_handler(Loop* loop, Connection& conn);
 
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn);
@@ -207,6 +226,18 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         format_static_response(conn, route->status_code, kKeepAlive);
         conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    } else if (route && route->action == RouteAction::JitHandler && route->fn) {
+        conn.state = ConnState::ExecHandler;
+        conn.handler_state = 0;  // entry state
+        jit::HandlerCtx ctx{};
+        ctx.state = 0;
+        auto outcome = invoke_jit_handler(route->fn,
+                                          static_cast<void*>(&conn),
+                                          ctx,
+                                          conn.recv_buf.data(),
+                                          conn.recv_buf.len(),
+                                          /*arena=*/nullptr);
+        handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive);
     } else {
         conn.state = ConnState::Sending;
         conn.resp_status = kStatusOK;
@@ -256,6 +287,65 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.state = ConnState::ReadingHeader;
     conn.set_slots(&on_header_received<Loop>, nullptr, nullptr, nullptr);
     loop->submit_recv(conn);
+}
+
+template <typename Loop>
+void handle_jit_outcome(Loop* loop,
+                        Connection& conn,
+                        const JitDispatchOutcome& outcome,
+                        jit::HandlerFn fn,
+                        bool keep_alive) {
+    switch (outcome.kind) {
+        case JitDispatchOutcome::Kind::ReturnStatus:
+            conn.pending_handler_fn = nullptr;
+            conn.state = ConnState::Sending;
+            conn.resp_status = outcome.status_code;
+            format_static_response(conn, outcome.status_code, keep_alive);
+            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        case JitDispatchOutcome::Kind::TimerYield:
+            // Stash fn + next_state so the tick callback can tell resume from
+            // keepalive expiry and re-enter the handler. Slots stay clear:
+            // no recv/send pending while sleeping. One-second resolution is
+            // a known limitation of the current TimerWheel — see
+            // timer_seconds_from_ms() in jit_dispatch.h.
+            conn.pending_handler_fn = fn;
+            conn.handler_state = outcome.next_state;
+            conn.state = ConnState::ExecHandler;
+            conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+            loop->timer.add(&conn, outcome.timer_seconds);
+            return;
+        case JitDispatchOutcome::Kind::Forward:
+        case JitDispatchOutcome::Kind::Error:
+        default:
+            // Forward from JIT path not yet wired end-to-end; fall through
+            // to 500 for safety so the client never hangs. Proper Forward
+            // integration rides the existing Proxy path once the upstream
+            // id resolution is connected — future slice.
+            conn.pending_handler_fn = nullptr;
+            conn.state = ConnState::Sending;
+            conn.resp_status = 500;
+            format_static_response(conn, 500, /*keep_alive=*/false);
+            conn.keep_alive = false;
+            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+    }
+}
+
+template <typename Loop>
+void resume_jit_handler(Loop* loop, Connection& conn) {
+    auto* fn = conn.pending_handler_fn;
+    jit::HandlerCtx ctx{};
+    ctx.state = conn.handler_state;
+    auto outcome = invoke_jit_handler(fn,
+                                      static_cast<void*>(&conn),
+                                      ctx,
+                                      conn.recv_buf.data(),
+                                      conn.recv_buf.len(),
+                                      /*arena=*/nullptr);
+    handle_jit_outcome<Loop>(loop, conn, outcome, fn, conn.keep_alive);
 }
 
 template <typename Loop>

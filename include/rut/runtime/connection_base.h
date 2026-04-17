@@ -2,6 +2,7 @@
 
 #include "rut/common/buffer.h"
 #include "rut/common/types.h"
+#include "rut/jit/handler_abi.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
 
@@ -69,9 +70,19 @@ struct ConnectionBase {
     i32 upstream_fd;
     u16 upstream_idx;
 
-    // JIT handler state
+    // JIT handler state.
+    //   handler_state: current state-machine index; handler reads this at
+    //     entry and dispatches. On yield the runtime stores next_state here.
+    //   handler_ctx:   reserved for future frame / slot storage (SlicePool
+    //     slice or arena-allocated HandlerCtx). Slice 0 (wait only) keeps
+    //     this null and uses a stack-local HandlerCtx.
+    //   pending_handler_fn: non-null while the handler has yielded and is
+    //     waiting for its timer/io completion. The tick callback uses this
+    //     to distinguish "resume JIT handler" from "keepalive expired,
+    //     close connection". Reset to null on terminal outcome.
     u16 handler_state;
     void* handler_ctx;
+    jit::HandlerFn pending_handler_fn;
 
     bool keep_alive;
     bool tls_active;
@@ -173,6 +184,7 @@ struct ConnectionBase {
         upstream_idx = 0;
         handler_state = 0;
         handler_ctx = nullptr;
+        pending_handler_fn = nullptr;
         keep_alive = false;
         tls_active = false;
         tls_handshake_complete = false;

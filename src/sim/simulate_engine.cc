@@ -606,8 +606,36 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     ctx.handler_idx = 0;
     ctx.slot_count = 0;
 
-    const u64 kPacked = route->fn(&conn, &ctx, entry.raw_headers, entry.raw_header_len, nullptr);
-    const auto kUnpacked = jit::HandlerResult::unpack(kPacked);
+    // Drive the handler's state machine to completion. Yields are the
+    // handler's signal "I need I/O, resume me with state=next_state".
+    // In simulate mode we skip the actual I/O (timers don't tick, no
+    // sockets open) and just advance the state — the point of this
+    // engine is to verify the routing/branching logic offline, not to
+    // reproduce wall-clock latency.
+    //
+    // Cap iteration to catch infinite-yield bugs (handler claiming it
+    // needs to yield but never setting a terminal state). kMaxHandlerYields
+    // is deliberately small: real handlers yield at most a handful of times
+    // per spec (submit + wait batches, not loops).
+    static constexpr u32 kMaxHandlerYields = 32;
+    jit::HandlerResult kUnpacked{};
+    for (u32 iter = 0; iter <= kMaxHandlerYields; iter++) {
+        const u64 kPacked =
+            route->fn(&conn, &ctx, entry.raw_headers, entry.raw_header_len, nullptr);
+        kUnpacked = jit::HandlerResult::unpack(kPacked);
+        if (kUnpacked.action != jit::HandlerAction::Yield) break;
+        result.yield_count++;
+        // Advance to the continuation segment. Next-state is encoded in
+        // the HandlerResult; the status_code slot carries the yield
+        // payload (ms for Timer, etc.) which we ignore in sim mode.
+        ctx.state = kUnpacked.next_state;
+    }
+    if (kUnpacked.action == jit::HandlerAction::Yield) {
+        // Exceeded the cap — treat as failure rather than silently
+        // returning a stale state.
+        result.verdict = Verdict::Failed;
+        return result;
+    }
     result.action = kUnpacked.action;
 
     if (kUnpacked.action == jit::HandlerAction::ReturnStatus) {

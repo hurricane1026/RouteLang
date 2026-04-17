@@ -11,6 +11,7 @@
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
@@ -394,8 +395,18 @@ public:
     // precision — kernel drives the timer, CQE arrives as IoEvent with
     // type=HandlerTimer carrying conn_id. Slots should already be
     // cleared before calling (no recv/send in flight while waiting).
+    //
+    // Takes the conn off the keepalive wheel while the precise timer
+    // owns its wakeup — otherwise waits longer than keepalive_timeout
+    // get resumed early by the wheel's 1-second tick.
+    //
+    // Falls back to the 1-second wheel if the SQ is full; the wheel
+    // tick callback checks pending_handler_fn and resumes from there,
+    // degrading precision but preserving liveness.
     void schedule_yield_timer(Connection& conn, u32 ms) {
-        backend.add_yield_timeout(conn.id, conn, ms);
+        timer.remove(&conn);
+        if (backend.add_yield_timeout(conn.id, conn, ms)) return;
+        timer.add(&conn, timer_seconds_from_ms(ms));
     }
 
     void dispatch(const IoEvent& ev) {

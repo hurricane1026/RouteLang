@@ -2245,6 +2245,94 @@ TEST(route, wait_ms_precision_sub_second) {
     rir.destroy();
 }
 
+// Regression: a wait(ms) longer than keepalive_timeout must NOT be woken
+// early by the 1-second TimerWheel tick. Before the fix, yielded conns
+// remained on the keepalive wheel and the tick callback resumed them via
+// the `pending_handler_fn` branch — a wait(2000) would fire at ~1000ms.
+//
+// Uses keepalive_timeout=1s + wait(2000ms) to hit the bug fast. Asserts
+// elapsed >= 1700ms (clear margin above the 1s tick).
+TEST(route, wait_longer_than_keepalive_not_resumed_by_wheel) {
+    using namespace rut;
+
+    const char* src = "route GET \"/deep\" { wait(2000) return 204 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/deep", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    // Shrink keepalive so a 2s wait clearly exceeds it. Wheel tick
+    // before the fix would resume the handler around 1s.
+    loop->keepalive_timeout = 1;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    send_all(c, "GET /deep HTTP/1.1\r\nHost: x\r\n\r\n", 31);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 4000);
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    u64 elapsed_ms = static_cast<u64>(t1.tv_sec - t0.tv_sec) * 1000ull +
+                     static_cast<u64>(t1.tv_nsec - t0.tv_nsec) / 1'000'000ull;
+
+    CHECK_GT(n, 0);
+    bool found_204 = false;
+    for (i32 i = 0; i + 2 < n; i++) {
+        if (buf[i] == '2' && buf[i + 1] == '0' && buf[i + 2] == '4') {
+            found_204 = true;
+            break;
+        }
+    }
+    CHECK(found_204);
+    // Must not have been woken by the 1s wheel tick. 1700ms floor leaves
+    // comfortable margin above the tick; 3000ms ceiling catches stuck
+    // timers. wait(2000) on an unloaded loop lands near 2000ms.
+    CHECK_GT(static_cast<i32>(elapsed_ms), 1700);
+    CHECK_LT(static_cast<i32>(elapsed_ms), 3000);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

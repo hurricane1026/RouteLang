@@ -379,12 +379,20 @@ public:
     // absolute CLOCK_MONOTONIC deadline onto yield_heap and re-arms
     // backend.yield_timer_fd when the heap's top deadline moves earlier.
     // Slots should be cleared before calling — no recv/send in flight.
+    //
+    // Takes the conn off the keepalive wheel while the precise timer
+    // owns its wakeup — otherwise waits longer than keepalive_timeout
+    // get resumed early by the wheel's 1-second tick. Keepalive gets
+    // re-armed automatically by dispatch()'s timer.refresh when the
+    // handler resumes and submits its next I/O.
     void schedule_yield_timer(Connection& conn, u32 ms) {
+        timer.remove(&conn);
         u64 now = epoll_yield::monotonic_ns();
         u64 deadline = now + static_cast<u64>(ms) * 1'000'000ull;
         if (!yield_heap.push(deadline, conn.req_start_us, conn.id)) {
             // Heap full — fall back to 1-second timer wheel. Degrades
-            // precision but preserves liveness.
+            // precision but preserves liveness via the wheel tick's
+            // pending_handler_fn branch.
             timer.add(&conn, timer_seconds_from_ms(ms));
             return;
         }

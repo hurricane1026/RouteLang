@@ -388,6 +388,28 @@ bool IoUringBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr
     return true;
 }
 
+bool IoUringBackend::add_yield_timeout(u32 conn_id, Connection& conn, u32 ms) {
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    // Relative timeout; kernel reads &conn.yield_timespec asynchronously
+    // so the storage must live on the Connection (not on the stack).
+    conn.yield_timespec.tv_sec = ms / 1000;
+    conn.yield_timespec.tv_nsec = static_cast<long long>(ms % 1000) * 1'000'000LL;
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_TIMEOUT;
+    sqe->fd = -1;  // unused for IORING_OP_TIMEOUT
+    sqe->addr = reinterpret_cast<u64>(&conn.yield_timespec);
+    sqe->len = 1;  // one timespec
+    sqe->off = 0;  // count=0 → plain relative timeout (no "wait for N events" semantics)
+    sqe->user_data = encode_user_data(conn_id, IoEventType::HandlerTimer);
+
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
 void IoUringBackend::cancel_accept() {
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return;

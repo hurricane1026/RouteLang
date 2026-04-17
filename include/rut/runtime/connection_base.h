@@ -6,6 +6,7 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
 
+#include <linux/time_types.h>
 #include <openssl/base.h>
 
 namespace rut {
@@ -83,6 +84,13 @@ struct ConnectionBase {
     u16 handler_state;
     void* handler_ctx;
     jit::HandlerFn pending_handler_fn;
+
+    // Per-connection timespec storage for IORING_OP_TIMEOUT yields. The
+    // kernel reads this asynchronously after SQE submission, so it must
+    // outlive the submit call — on-connection storage is the simplest
+    // stable lifetime. Unused by the epoll backend (which uses a shared
+    // yield_timer_fd + min-heap).
+    __kernel_timespec yield_timespec;
 
     bool keep_alive;
     bool tls_active;
@@ -185,6 +193,8 @@ struct ConnectionBase {
         handler_state = 0;
         handler_ctx = nullptr;
         pending_handler_fn = nullptr;
+        yield_timespec.tv_sec = 0;
+        yield_timespec.tv_nsec = 0;
         keep_alive = false;
         tls_active = false;
         tls_handshake_complete = false;

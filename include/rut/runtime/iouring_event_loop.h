@@ -390,9 +390,31 @@ public:
 
     // --- Dispatch ---
 
+    // Schedule a JIT handler yield timer via IORING_OP_TIMEOUT. ms
+    // precision — kernel drives the timer, CQE arrives as IoEvent with
+    // type=HandlerTimer carrying conn_id. Slots should already be
+    // cleared before calling (no recv/send in flight while waiting).
+    void schedule_yield_timer(Connection& conn, u32 ms) {
+        backend.add_yield_timeout(conn.id, conn, ms);
+    }
+
     void dispatch(const IoEvent& ev) {
         if (ev.type == IoEventType::Accept) {
             on_accept(ev);
+            return;
+        }
+        if (ev.type == IoEventType::HandlerTimer) {
+            // JIT handler yield timer expired. conn_id identifies the
+            // connection whose pending_handler_fn should resume. The
+            // ETIME result from IORING_OP_TIMEOUT is expected; any other
+            // CQE result is still treated as "resume now" — the handler
+            // outcome will bubble up the error.
+            if (ev.conn_id < kMaxConns) {
+                auto& c = conns[ev.conn_id];
+                if (c.pending_handler_fn) {
+                    resume_jit_handler<IoUringEventLoop>(this, c);
+                }
+            }
             return;
         }
         if (ev.type == IoEventType::Timeout) {

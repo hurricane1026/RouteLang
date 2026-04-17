@@ -623,6 +623,10 @@ struct HirRoute {
         Str name{};
         u32 function_index = 0xffffffffu;  // resolved in analyze; 0xffffffffu = unresolved
     };
+    struct Wait {
+        Span span{};
+        i32 ms = 0;  // duration in milliseconds (u16 fits in HandlerResult yield payload)
+    };
 
     Span span{};
     u8 method = 0;
@@ -631,10 +635,12 @@ struct HirRoute {
     static constexpr u32 kMaxGuards = 8;
     static constexpr u32 kMaxExprs = 64;
     static constexpr u32 kMaxDecorators = 8;
+    static constexpr u32 kMaxWaits = 4;
     FixedVec<HirExpr, kMaxExprs> exprs;
     FixedVec<HirLocal, kMaxLocals> locals;
     FixedVec<HirGuard, kMaxGuards> guards;
     FixedVec<DecoratorRef, kMaxDecorators> decorators;
+    FixedVec<Wait, kMaxWaits> waits;
     HirControl control{};
     u32 error_variant_index = 0xffffffffu;
 
@@ -647,6 +653,7 @@ struct HirRoute {
           locals(other.locals),
           guards(other.guards),
           decorators(other.decorators),
+          waits(other.waits),
           control(other.control),
           error_variant_index(other.error_variant_index) {
         rebase_from(other);
@@ -660,6 +667,7 @@ struct HirRoute {
         locals = other.locals;
         guards = other.guards;
         decorators = other.decorators;
+        waits = other.waits;
         control = other.control;
         error_variant_index = other.error_variant_index;
         rebase_from(other);
@@ -673,6 +681,7 @@ struct HirRoute {
           locals(other.locals),
           guards(other.guards),
           decorators(other.decorators),
+          waits(other.waits),
           control(other.control),
           error_variant_index(other.error_variant_index) {
         rebase_from(other);
@@ -686,6 +695,7 @@ struct HirRoute {
         locals = other.locals;
         guards = other.guards;
         decorators = other.decorators;
+        waits = other.waits;
         control = other.control;
         error_variant_index = other.error_variant_index;
         rebase_from(other);

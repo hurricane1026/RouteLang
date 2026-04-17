@@ -152,10 +152,35 @@ TEST(frontend, parse_route_accepts_wait_statement) {
     CHECK_EQ(route.statements[1].status_code, 200);
 }
 
-TEST(frontend, analyze_rejects_wait_statement_pending_impl) {
-    // Parser accepts wait; analyze currently rejects until codegen lands.
-    // This test pins the current behavior so we notice when codegen is wired up.
+TEST(frontend, analyze_records_wait_in_hir_route) {
     const char* src = "route GET \"/sleep\" { wait(1000) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 1000);
+}
+
+TEST(frontend, analyze_records_multiple_waits_in_order) {
+    const char* src = "route GET \"/x\" { wait(100) wait(200) wait(300) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 3u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 100);
+    CHECK_EQ(hir->routes[0].waits[1].ms, 200);
+    CHECK_EQ(hir->routes[0].waits[2].ms, 300);
+}
+
+TEST(frontend, analyze_rejects_wait_larger_than_u16_max) {
+    const char* src = "route GET \"/x\" { wait(100000) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());

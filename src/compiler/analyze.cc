@@ -9403,9 +9403,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
         for (u32 si = 0; si < item.route.statements.len; si++) {
             const auto& stmt = item.route.statements[si];
             if (stmt.kind == AstStmtKind::Wait) {
-                // TODO: slice 0 frontend/codegen follow-up will lower this.
-                // For now reject loudly so we don't silently accept and drop.
-                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                // v1 constraint: ms must fit in u16 (handler-result yield payload
+                // currently has 2 bytes). Duration literals like `1s` will lift
+                // this cap.
+                if (stmt.status_code < 0 || stmt.status_code > 0xFFFF)
+                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                HirRoute::Wait w{};
+                w.span = stmt.span;
+                w.ms = stmt.status_code;
+                if (!route.waits.push(w))
+                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                continue;
             }
             if (stmt.kind == AstStmtKind::Let) {
                 HirLocal local{};

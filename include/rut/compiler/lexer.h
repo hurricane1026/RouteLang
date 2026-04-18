@@ -13,6 +13,10 @@ enum class TokenType : u8 {
     StringLit,
     IntLit,
     FloatLit,
+    // Duration literal: digit run + unit suffix (ms, s, m, h). Emitted
+    // only when the suffix follows the digits with no whitespace.
+    // Value and unit both live in `text`; parser does the conversion.
+    DurLit,
 
     // Keywords
     KwFunc,

@@ -285,6 +285,73 @@ TEST(frontend, analyze_rejects_let_after_wait) {
     CHECK(!hir);
 }
 
+TEST(frontend, parse_wait_accepts_ms_suffix) {
+    const char* src = "route GET \"/x\" { wait(500ms) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 500u);
+}
+
+TEST(frontend, parse_wait_accepts_s_suffix) {
+    const char* src = "route GET \"/x\" { wait(2s) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 2000u);
+}
+
+TEST(frontend, parse_wait_accepts_m_suffix) {
+    const char* src = "route GET \"/x\" { wait(5m) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 5u * 60u * 1000u);
+}
+
+TEST(frontend, parse_wait_accepts_h_suffix) {
+    const char* src = "route GET \"/x\" { wait(1h) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 3600u * 1000u);
+}
+
+TEST(frontend, parse_wait_rejects_duration_overflowing_u32) {
+    // ~50 days in ms > UINT32_MAX (~49.7 days). 50h * 3600 * 1000 is
+    // well under, so use 50000h ≈ 5.7 years.
+    const char* src = "route GET \"/x\" { wait(50000h) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    CHECK(!ast);
+}
+
+TEST(frontend, parse_wait_rejects_unknown_suffix) {
+    // `5d` — days aren't a supported unit. Lexer still tokenizes `5`
+    // as IntLit (boundary check rejects suffix d because single-char
+    // match only accepts s/m/h), so parser sees wait(5 d) which is
+    // a syntax error at the `d`.
+    const char* src = "route GET \"/x\" { wait(5d) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    CHECK(!ast);
+}
+
 TEST(frontend, analyze_rejects_wait_after_let_guard) {
     // Non-let non-wait statements still gate subsequent waits. A guard
     // between a let and a wait introduces a terminal-ish control path

@@ -122,6 +122,36 @@ LexResult lex(Str source) {
                 pos++;
                 col++;
             }
+            // Duration suffix check. Must immediately follow the digits
+            // (no whitespace). Recognized units: ms, s, m, h. "ms" is
+            // greedier than "m", so check it first. Unit must be at a
+            // token boundary (not followed by another identifier char)
+            // so e.g. `5mystery` isn't consumed as "5m" + "ystery".
+            auto is_boundary = [&](u32 after) {
+                return after >= source.len || !is_ident_continue(source.ptr[after]);
+            };
+            bool dur_matched = false;
+            u32 unit_end = pos;
+            if (pos + 1 < source.len && source.ptr[pos] == 'm' && source.ptr[pos + 1] == 's' &&
+                is_boundary(pos + 2)) {
+                unit_end = pos + 2;
+                dur_matched = true;
+            } else if (pos < source.len && is_boundary(pos + 1) &&
+                       (source.ptr[pos] == 's' || source.ptr[pos] == 'm' ||
+                        source.ptr[pos] == 'h')) {
+                unit_end = pos + 1;
+                dur_matched = true;
+            }
+            if (dur_matched) {
+                col += unit_end - pos;
+                pos = unit_end;
+                tok.end = pos;
+                tok.text = source.slice(tok.start, tok.end);
+                tok.type = TokenType::DurLit;
+                if (!out.tokens.push(tok))
+                    return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+                continue;
+            }
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
             tok.type = TokenType::IntLit;

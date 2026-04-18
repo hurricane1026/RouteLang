@@ -727,24 +727,55 @@ struct Parser {
             return stmt;
         }
         if (take(TokenType::KwWait)) {
-            // v1: `wait(IntLit)` — IntLit is milliseconds. Duration literals
-            // (`1s`, `500ms`) are future work.
+            // Accepts either a bare IntLit (milliseconds, legacy form) or
+            // a DurLit (digits + ms/s/m/h suffix). u64 accumulator +
+            // UINT32_MAX cap — the yield payload is 32 bits wide, so
+            // waits up to ~49 days are expressible.
             auto lparen = expect(TokenType::LParen);
             if (!lparen) return core::make_unexpected(lparen.error());
-            auto ms_tok = expect(TokenType::IntLit);
-            if (!ms_tok) return core::make_unexpected(ms_tok.error());
-            // u64 accumulator + UINT32_MAX cap — the yield payload is 32
-            // bits wide (status_code + upstream_id packed), so waits up
-            // to ~49 days are expressible.
-            u64 ms = 0;
-            for (u32 i = 0; i < ms_tok.value()->text.len; i++) {
-                const u32 digit = static_cast<u32>(ms_tok.value()->text.ptr[i] - '0');
-                if (ms > (static_cast<u64>(0xffffffffu) - static_cast<u64>(digit)) / 10)
-                    return frontend_error(FrontendError::InvalidInteger,
-                                          span_from(*ms_tok.value()),
-                                          ms_tok.value()->text);
-                ms = ms * 10 + static_cast<u64>(digit);
+            const Token* arg = nullptr;
+            if (const Token* t = take(TokenType::IntLit)) {
+                arg = t;
+            } else if (const Token* t = take(TokenType::DurLit)) {
+                arg = t;
+            } else {
+                return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
             }
+            // Peel the unit suffix (if any) off the end of the text:
+            // DurLit ends in ms/s/m/h; IntLit has no suffix.
+            u32 digit_len = arg->text.len;
+            u64 multiplier_ms = 1;  // default: bare IntLit = ms
+            if (arg->type == TokenType::DurLit) {
+                if (digit_len >= 2 && arg->text.ptr[digit_len - 2] == 'm' &&
+                    arg->text.ptr[digit_len - 1] == 's') {
+                    digit_len -= 2;
+                    multiplier_ms = 1;
+                } else if (digit_len >= 1) {
+                    char unit = arg->text.ptr[digit_len - 1];
+                    digit_len -= 1;
+                    if (unit == 's')
+                        multiplier_ms = 1000;
+                    else if (unit == 'm')
+                        multiplier_ms = 60ull * 1000;
+                    else if (unit == 'h')
+                        multiplier_ms = 3600ull * 1000;
+                    else
+                        return frontend_error(
+                            FrontendError::InvalidInteger, span_from(*arg), arg->text);
+                }
+            }
+            u64 value = 0;
+            for (u32 i = 0; i < digit_len; i++) {
+                const u32 digit = static_cast<u32>(arg->text.ptr[i] - '0');
+                if (value > (static_cast<u64>(0xffffffffu) - static_cast<u64>(digit)) / 10)
+                    return frontend_error(
+                        FrontendError::InvalidInteger, span_from(*arg), arg->text);
+                value = value * 10 + static_cast<u64>(digit);
+            }
+            // Apply unit; re-check against u32 range after multiplication.
+            const u64 ms = value * multiplier_ms;
+            if (ms > 0xffffffffull)
+                return frontend_error(FrontendError::InvalidInteger, span_from(*arg), arg->text);
             auto rparen = expect(TokenType::RParen);
             if (!rparen) return core::make_unexpected(rparen.error());
             AstStatement stmt{};

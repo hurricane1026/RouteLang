@@ -9402,9 +9402,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
 
         // Slice-1 constraint: a route body has the shape
-        //   let* ; wait* ; terminal*
-        // — zero or more `let`s, zero or more `wait`s, then the rest
-        // (guard / if / match / return / forward).
+        //   let* ; wait* ; terminal
+        // — zero or more `let`s, zero or more `wait`s, then one
+        // top-level terminal statement (return / forward / guard /
+        // if / match / block containing that terminal region).
         //
         // Mechanism (slice 1, pure-expression surface): codegen routes
         // states 0..N-1 to dead-end yield blocks that emit the packed
@@ -9458,12 +9459,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 continue;
             }
             // Pre-wait lets are allowed; post-wait lets are not. Any
-            // other statement (guard/if/match/return/forward) counts
+            // other statement (guard/if/match/return/forward/...) counts
             // as the terminal region and gates further waits.
-            if (stmt.kind == AstStmtKind::Let) {
-                if (seen_wait) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-            } else {
+            if (stmt.kind != AstStmtKind::Let) {
                 seen_non_let_non_wait = true;
+            } else if (seen_wait) {
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
             }
             if (stmt.kind == AstStmtKind::Let) {
                 HirLocal local{};

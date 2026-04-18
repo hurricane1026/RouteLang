@@ -137,6 +137,37 @@ TEST(frontend, lex_recognizes_wait_keyword) {
     CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwWait));
 }
 
+TEST(frontend, lex_duration_suffix_boundary) {
+    // `5ms` is one DurLit; the suffix must sit at a token boundary so
+    // `5mystery` stays `5` (IntLit) + `mystery` (Ident). Similarly
+    // `5ms2` can't consume `s2` — the boundary check rejects the
+    // whole suffix, yielding `5` (IntLit) + `ms2` (Ident).
+    struct Case {
+        const char* src;
+        TokenType first_type;
+        const char* first_text;  // nullptr = don't check text
+        u32 token_count;         // including the EOF token
+    };
+    const Case cases[] = {
+        {"5ms", TokenType::DurLit, "5ms", 2},
+        {"500ms", TokenType::DurLit, "500ms", 2},
+        {"2s", TokenType::DurLit, "2s", 2},
+        {"5m", TokenType::DurLit, "5m", 2},
+        {"1h", TokenType::DurLit, "1h", 2},
+        {"5mystery", TokenType::IntLit, "5", 3},
+        {"5ms2", TokenType::IntLit, "5", 3},
+        {"5sec", TokenType::IntLit, "5", 3},
+        {"5", TokenType::IntLit, "5", 2},
+    };
+    for (const auto& tc : cases) {
+        auto lexed = lex(lit(tc.src));
+        REQUIRE(lexed);
+        REQUIRE_EQ(lexed->tokens.len, tc.token_count);
+        CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(tc.first_type));
+        if (tc.first_text) CHECK(lexed->tokens[0].text.eq(lit(tc.first_text)));
+    }
+}
+
 TEST(frontend, parse_route_accepts_wait_statement) {
     const char* src = "route GET \"/sleep\" { wait(1000) return 200 }\n";
     auto lexed = lex(lit(src));
@@ -335,9 +366,10 @@ TEST(frontend, analyze_wait_accepts_h_suffix) {
 
 TEST(frontend, parse_wait_rejects_duration_overflowing_u32) {
     // UINT32_MAX ms ≈ 49.7 days ≈ 1193h. Anything above ~1193h
-    // overflows the 32-bit ms payload. 50000h (~5.7 years) is well
-    // past the cap, so the parser must reject before multiplication
-    // completes.
+    // overflows the 32-bit ms payload. The parser computes
+    // `value * multiplier_ms` in u64 and then range-checks the
+    // result against UINT32_MAX, so 50000h (~5.7 years) is rejected
+    // at that post-multiplication check.
     const char* src = "route GET \"/x\" { wait(50000h) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);

@@ -522,14 +522,18 @@ public:
                 // buffer to the ring so an in-flight multishot recv
                 // doesn't leak buffers.
                 if (ev.has_buf) backend.return_buffer(ev.buf_id);
-                // Peer-close during wait(ms): client disconnects while
-                // the handler is sleeping. Without this, the slot stays
-                // allocated until the yield deadline fires — long waits
-                // + early disconnects would exhaust slots under load.
-                // close_conn cancels the yield timer via yield_armed.
-                const bool kPeerClosed = (ev.type == IoEventType::Recv && !ev.more &&
-                                          ev.result <= 0 && ev.result != -ECANCELED);
-                if (kPeerClosed) {
+                // Multishot recv stays armed during yield (canceling
+                // causes zombie -ECANCELED CQEs after resume — see
+                // review 7). That means the kernel can deliver data
+                // CQEs for bytes the peer sends while the handler is
+                // asleep. With no on_recv callback, we can't buffer or
+                // parse those bytes, so leaving the connection open
+                // would silently swallow protocol data (e.g., a
+                // pipelined request during a long wait). Close on any
+                // recv activity — positive (data), zero/-errno (peer
+                // close), or any other terminal state. close_conn
+                // cancels the yield timer via yield_armed.
+                if (ev.type == IoEventType::Recv && ev.result != -ECANCELED) {
                     this->close_conn(conn);
                 }
             } else if (conn.pending_ops == 0) {

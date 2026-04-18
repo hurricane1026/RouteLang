@@ -443,6 +443,11 @@ public:
     // handler resumes and submits its next I/O.
     void schedule_yield_timer(Connection& conn, u32 ms) {
         timer.remove(&conn);
+        // Epoll is level-triggered: with all callback slots null during
+        // yield, an adversarial peer sending bytes while recv_buf is
+        // full would keep waking us on EPOLLIN for no work. Suspend
+        // recv interest until the next submit_recv rearms it.
+        backend.pause_recv(conn.id);
         u64 now = epoll_yield::monotonic_ns();
         u64 deadline = now + static_cast<u64>(ms) * 1'000'000ull;
         if (!yield_heap.push(deadline, conn.handler_gen, conn.id)) {

@@ -13,11 +13,14 @@ namespace rut {
 //
 //   - ReturnStatus: send HTTP response with `status_code` and finish.
 //   - Forward:     proxy to upstream #`upstream_id`.
-//   - TimerYield:  schedule `timer_seconds` later and resume the same
-//                   handler with `ctx.state = next_state`. The handler
-//                   was paused at a `wait(ms)` (or later `any(wait(h, ms))`)
-//                   boundary; the event loop decides which timer
-//                   mechanism to use (timerfd wheel / IORING_OP_TIMEOUT).
+//   - TimerYield:  schedule a wake `timer_ms` from now and resume the
+//                   same handler with `ctx.state = next_state`. The
+//                   handler was paused at a `wait(ms)` (or later
+//                   `any(wait(h, ms))`) boundary; the event loop picks
+//                   the timer mechanism and precision — for example,
+//                   consuming `timer_ms` directly via IORING_OP_TIMEOUT
+//                   or a min-heap + one-shot timerfd, or bucketing via
+//                   the 1-second TimerWheel.
 //   - Error:       handler returned an unsupported action — event loop
 //                   should close the connection with 500.
 

@@ -75,6 +75,14 @@ struct EpollBackend {
     bool add_recv(i32 fd, u32 conn_id);
     bool add_recv_upstream(i32 fd, u32 conn_id);
 
+    // Suspend EPOLLIN on the downstream fd for conn_id. Used when a JIT
+    // handler yields so client bytes arriving mid-wait don't spin the
+    // event loop (epoll is level-triggered, so a full recv_buf + unread
+    // kernel data would keep firing). The next submit_recv re-arms
+    // EPOLLIN via add_recv's set_fd_interest path. No-op if the conn_id
+    // has no registered downstream fd.
+    void pause_recv(u32 conn_id);
+
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);

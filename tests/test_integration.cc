@@ -2092,11 +2092,10 @@ TEST(route, capture_real_socket) {
 // in the RouteConfig, drive a real TCP connection, and assert the client
 // observes the 204 response after the timer fires.
 //
-// Timing note: TimerWheel has 1-second resolution driven by a shared
-// timerfd; wait(1000) yields timer_seconds=1, so the elapsed wall time
-// from request to response is 1–2s depending on where in the current
-// tick interval the request arrived. recv_timeout is therefore set to
-// 3000ms to avoid flakes on slow CI.
+// Timing note: EpollEventLoop now uses a one-shot yield_timer_fd + min-heap
+// driven by absolute CLOCK_MONOTONIC deadlines, so wait(1000) lands near
+// 1000ms with ms precision (no TimerWheel bucketing). recv_timeout is
+// 3000ms to tolerate scheduler jitter on slow CI.
 TEST(route, wait_jit_handler_real_socket) {
     using namespace rut;  // pull in compiler helpers (lex / parse_file / ...)
 

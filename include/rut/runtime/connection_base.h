@@ -90,7 +90,11 @@ struct ConnectionBase {
     // stale entries left behind by a close+reuse that lands in the same
     // microsecond as the new request — req_start_us alone is not
     // strictly unique at μs granularity under close-during-yield churn.
-    u32 handler_gen;
+    //
+    // Default-initialized and deliberately NOT reset in reset(): the
+    // counter must persist across slot reuse so every generation on a
+    // given slot is distinct (first use: 0 → 1; reuse: N → N+1; …).
+    u32 handler_gen = 0;
 
     // Per-connection timespec storage for IORING_OP_TIMEOUT yields. The
     // kernel reads this asynchronously after SQE submission, so it must

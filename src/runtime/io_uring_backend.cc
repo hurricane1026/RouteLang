@@ -390,7 +390,19 @@ bool IoUringBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr
 
 bool IoUringBackend::add_yield_timeout(u32 conn_id, Connection& conn, u32 ms) {
     io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return false;
+    if (!sqe) {
+        // SQ full — flush pending SQEs to make room, then retry once.
+        // Mirrors cancel_by_user_data's pattern. wait(ms) semantics
+        // require the timer to actually be scheduled; failing here would
+        // force the caller into the wheel fallback, which caps precision
+        // AND (for ms > 63000) wraps the deadline mod 64 seconds.
+        if (pending > 0) {
+            i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+            if (flushed > 0) pending -= static_cast<u32>(flushed);
+        }
+        sqe = get_sqe();
+        if (!sqe) return false;
+    }
 
     // Relative timeout; kernel reads &conn.yield_timespec asynchronously
     // so the storage must live on the Connection (not on the stack).

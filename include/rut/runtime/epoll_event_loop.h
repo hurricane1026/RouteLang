@@ -29,6 +29,10 @@ namespace rut {
 
 namespace epoll_yield {
 
+// Shared max-conn constant: both YieldHeap and EpollEventLoop derive
+// their sizes from this single source so they can't drift.
+static constexpr u32 kMaxConns = 16384;
+
 inline u64 monotonic_ns() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -51,7 +55,11 @@ struct YieldHeap {
         u32 handler_gen;
         u32 conn_id;
     };
-    static constexpr u32 kCap = 16384 + 256;
+    // One live entry per connection at most, plus headroom for stale
+    // entries that linger briefly between close and their deadline.
+    // Derived from the shared epoll_yield::kMaxConns so the heap and
+    // EpollEventLoop always agree on capacity.
+    static constexpr u32 kCap = kMaxConns + 256;
     Entry entries[kCap];
     u32 size = 0;
 
@@ -63,6 +71,44 @@ struct YieldHeap {
         if (size >= kCap) return false;
         u32 i = size++;
         entries[i] = {deadline_ns, handler_gen, conn_id};
+        sift_up(i);
+        return true;
+    }
+
+    // Remove every entry with this conn_id. O(n) scan — expected to be
+    // called at most once per close_conn, and n is bounded by the number
+    // of concurrent yielded handlers (≤ kMaxConns). Restores the heap
+    // invariant by sifting up/down the swapped-in tail entries. Returns
+    // the number of entries removed.
+    u32 remove_by_conn(u32 conn_id) {
+        u32 removed = 0;
+        u32 i = 0;
+        while (i < size) {
+            if (entries[i].conn_id != conn_id) {
+                i++;
+                continue;
+            }
+            entries[i] = entries[--size];
+            removed++;
+            // Sift the swapped entry up or down as needed. Only one of
+            // the two branches can do work because the swapped entry
+            // is either smaller than its parent (sift up) or larger
+            // than one of its children (sift down), but not both.
+            if (i < size) sift(i);
+            // Don't advance i — the slot now holds the swapped tail,
+            // which may itself match conn_id on chained yields (rare).
+        }
+        return removed;
+    }
+
+    void pop() {
+        if (size == 0) return;
+        entries[0] = entries[--size];
+        sift_down(0);
+    }
+
+private:
+    void sift_up(u32 i) {
         while (i > 0) {
             u32 parent = (i - 1) / 2;
             if (entries[parent].deadline_ns <= entries[i].deadline_ns) break;
@@ -71,13 +117,8 @@ struct YieldHeap {
             entries[i] = tmp;
             i = parent;
         }
-        return true;
     }
-
-    void pop() {
-        if (size == 0) return;
-        entries[0] = entries[--size];
-        u32 i = 0;
+    void sift_down(u32 i) {
         while (true) {
             u32 l = 2 * i + 1;
             u32 r = 2 * i + 2;
@@ -90,6 +131,12 @@ struct YieldHeap {
             entries[i] = tmp;
             i = smallest;
         }
+    }
+    void sift(u32 i) {
+        // A swapped-in tail entry must sift in exactly one direction; try
+        // both (each is a no-op when not applicable).
+        sift_up(i);
+        sift_down(i);
     }
 };
 
@@ -117,7 +164,7 @@ private:
     std::atomic<u32> drain_period_;
 
 public:
-    static constexpr u32 kMaxConns = 16384;
+    static constexpr u32 kMaxConns = epoll_yield::kMaxConns;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     SlicePool pool;
     Connection conns[kMaxConns];
@@ -348,6 +395,13 @@ public:
 
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
+        // If a yield is scheduled, drop its heap entry now so a long wait
+        // doesn't keep an unused heap slot occupied until its deadline.
+        // Only the pending_handler_fn path can have an entry; no-op
+        // otherwise. Rearm in case this conn owned the heap's top.
+        if (c.pending_handler_fn) {
+            if (yield_heap.remove_by_conn(c.id) > 0) rearm_yield_timerfd();
+        }
         if (c.fd >= 0) {
             ::close(c.fd);
             c.fd = -1;
@@ -394,8 +448,11 @@ public:
         if (!yield_heap.push(deadline, conn.handler_gen, conn.id)) {
             // Heap full — fall back to 1-second timer wheel. Degrades
             // precision but preserves liveness via the wheel tick's
-            // pending_handler_fn branch.
-            timer.add(&conn, timer_seconds_from_ms(ms));
+            // pending_handler_fn branch. Clamp to 63s so seconds > 63
+            // don't wrap mod-kSlots and fire immediately.
+            u32 secs = timer_seconds_from_ms(ms);
+            if (secs >= TimerWheel::kSlots) secs = TimerWheel::kSlots - 1;
+            timer.add(&conn, secs);
             return;
         }
         rearm_yield_timerfd();

@@ -416,7 +416,15 @@ public:
             conn.pending_ops++;
             return;
         }
-        timer.add(&conn, timer_seconds_from_ms(ms));
+        // Catastrophic SQ pressure — add_yield_timeout already did one
+        // flush+retry. Fall back to the 1-second wheel. The wheel has
+        // only 64 slots (kSlots), so seconds > 63 would wrap mod 64 and
+        // could fire immediately. Clamp to 63s so the handler resumes
+        // too early rather than too early-AND-wrong. In practice this
+        // branch is only reachable if the kernel refuses to drain SQEs.
+        u32 secs = timer_seconds_from_ms(ms);
+        if (secs >= TimerWheel::kSlots) secs = TimerWheel::kSlots - 1;
+        timer.add(&conn, secs);
     }
 
     void dispatch(const IoEvent& ev) {

@@ -533,18 +533,19 @@ public:
                 // buffer to the ring so an in-flight multishot recv
                 // doesn't leak buffers.
                 if (ev.has_buf) backend.return_buffer(ev.buf_id);
-                // Multishot recv stays armed during yield (canceling
-                // causes zombie -ECANCELED CQEs after resume — see
-                // review 7). That means the kernel can deliver data
-                // CQEs for bytes the peer sends while the handler is
-                // asleep. With no on_recv callback, we can't buffer or
-                // parse those bytes, so leaving the connection open
-                // would silently swallow protocol data (e.g., a
-                // pipelined request during a long wait). Close on any
-                // recv activity — positive (data), zero/-errno (peer
-                // close), or any other terminal state. close_conn
-                // cancels the yield timer via yield_armed.
-                if (ev.type == IoEventType::Recv && ev.result != -ECANCELED) {
+                // Close only on terminal recv (peer FIN / error). The
+                // multishot may deliver positive-length CQEs for bytes
+                // the peer sends during wait(ms) — e.g., a segmented
+                // POST body, or a pipelined next request. Slice 0's
+                // analyze rejects routes that would interact with
+                // either case (non-wait-before-wait, decorators, etc.),
+                // so the bytes are contractually noise; dropping the
+                // buffer is safe. Closing on positive reads would kill
+                // otherwise-legitimate clients that happened to send
+                // anything during the wait.
+                const bool kTerminal = (ev.type == IoEventType::Recv && !ev.more &&
+                                        ev.result <= 0 && ev.result != -ECANCELED);
+                if (kTerminal) {
                     this->close_conn(conn);
                 }
             } else if (conn.pending_ops == 0) {

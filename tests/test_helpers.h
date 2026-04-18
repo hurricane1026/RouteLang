@@ -233,7 +233,18 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
             return;
         }
         if (ev.type == IoEventType::Timeout) {
-            timer.tick([this](Connection* c) { this->close_conn(*c); });
+            timer.tick([this](Connection* c) {
+                // Mirror EpollEventLoop/IoUringEventLoop: a tick can
+                // represent either keepalive expiry (close) or a JIT
+                // yield fallback (resume). schedule_yield_timer on
+                // this mock uses the wheel, so tests exercising
+                // wait(...) reach this branch.
+                if (c->pending_handler_fn) {
+                    resume_jit_handler<SmallLoop>(this, *c);
+                } else {
+                    this->close_conn(*c);
+                }
+            });
             return;
         }
         if (ev.conn_id < kMaxConns) {
@@ -585,7 +596,15 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             return;
         }
         if (ev.type == IoEventType::Timeout) {
-            timer.tick([this](Connection* c) { this->close_conn(*c); });
+            timer.tick([this](Connection* c) {
+                // See SmallLoop: a tick resumes yielded JIT handlers and
+                // otherwise closes on keepalive expiry.
+                if (c->pending_handler_fn) {
+                    resume_jit_handler<AsyncSmallLoop>(this, *c);
+                } else {
+                    this->close_conn(*c);
+                }
+            });
             return;
         }
         if (ev.conn_id < kMaxConns) {

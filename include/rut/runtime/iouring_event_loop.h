@@ -556,6 +556,14 @@ public:
                     (ev.type == IoEventType::Recv && !ev.more && ev.result == 0);
                 if (kRecvError || kPeerClose) {
                     this->close_conn(conn);
+                } else if (ev.type == IoEventType::Recv && !ev.more && ev.result > 0) {
+                    // Positive-data terminal CQE: multishot ended (the
+                    // generic accounting above cleared recv_armed).
+                    // Re-arm so a subsequent peer disconnect during the
+                    // remaining wait(ms) still produces a CQE and
+                    // reaches the close_conn branch — otherwise the
+                    // slot would sit occupied until the yield deadline.
+                    this->submit_recv(conn);
                 }
             } else if (conn.pending_ops == 0) {
                 // Stale CQE for a genuinely closed connection.

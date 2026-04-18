@@ -166,6 +166,11 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
         last_yield_ms = ms;
         u32 secs = timer_seconds_from_ms(ms);
+        // Mirror real-loop wheel-fallback boundary: 64 slots × 1s, so
+        // seconds >= kSlots would wrap mod-64. Fail the request so
+        // tests exercising long waits under simulated SQ pressure
+        // behave like the production loops.
+        if (secs >= TimerWheel::kSlots) return false;
         if (secs == 0) secs = 1;
         timer.add(&c, secs);
         return true;
@@ -532,6 +537,11 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
         last_yield_ms = ms;
         u32 secs = timer_seconds_from_ms(ms);
+        // Mirror real-loop wheel-fallback boundary: 64 slots × 1s, so
+        // seconds >= kSlots would wrap mod-64. Fail the request so
+        // tests exercising long waits under simulated SQ pressure
+        // behave like the production loops.
+        if (secs >= TimerWheel::kSlots) return false;
         if (secs == 0) secs = 1;
         timer.add(&c, secs);
         return true;
@@ -775,6 +785,11 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
         last_yield_ms = ms;
         u32 secs = timer_seconds_from_ms(ms);
+        // Mirror real-loop wheel-fallback boundary: 64 slots × 1s, so
+        // seconds >= kSlots would wrap mod-64. Fail the request so
+        // tests exercising long waits under simulated SQ pressure
+        // behave like the production loops.
+        if (secs >= TimerWheel::kSlots) return false;
         if (secs == 0) secs = 1;
         timer.add(&c, secs);
         return true;

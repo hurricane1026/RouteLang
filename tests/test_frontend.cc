@@ -285,7 +285,7 @@ TEST(frontend, analyze_rejects_let_after_wait) {
     CHECK(!hir);
 }
 
-TEST(frontend, parse_wait_accepts_ms_suffix) {
+TEST(frontend, analyze_wait_accepts_ms_suffix) {
     const char* src = "route GET \"/x\" { wait(500ms) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -297,7 +297,7 @@ TEST(frontend, parse_wait_accepts_ms_suffix) {
     CHECK_EQ(hir->routes[0].waits[0].ms, 500u);
 }
 
-TEST(frontend, parse_wait_accepts_s_suffix) {
+TEST(frontend, analyze_wait_accepts_s_suffix) {
     const char* src = "route GET \"/x\" { wait(2s) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -309,7 +309,7 @@ TEST(frontend, parse_wait_accepts_s_suffix) {
     CHECK_EQ(hir->routes[0].waits[0].ms, 2000u);
 }
 
-TEST(frontend, parse_wait_accepts_m_suffix) {
+TEST(frontend, analyze_wait_accepts_m_suffix) {
     const char* src = "route GET \"/x\" { wait(5m) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -321,7 +321,7 @@ TEST(frontend, parse_wait_accepts_m_suffix) {
     CHECK_EQ(hir->routes[0].waits[0].ms, 5u * 60u * 1000u);
 }
 
-TEST(frontend, parse_wait_accepts_h_suffix) {
+TEST(frontend, analyze_wait_accepts_h_suffix) {
     const char* src = "route GET \"/x\" { wait(1h) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -334,8 +334,10 @@ TEST(frontend, parse_wait_accepts_h_suffix) {
 }
 
 TEST(frontend, parse_wait_rejects_duration_overflowing_u32) {
-    // ~50 days in ms > UINT32_MAX (~49.7 days). 50h * 3600 * 1000 is
-    // well under, so use 50000h ≈ 5.7 years.
+    // UINT32_MAX ms ≈ 49.7 days ≈ 1193h. Anything above ~1193h
+    // overflows the 32-bit ms payload. 50000h (~5.7 years) is well
+    // past the cap, so the parser must reject before multiplication
+    // completes.
     const char* src = "route GET \"/x\" { wait(50000h) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);

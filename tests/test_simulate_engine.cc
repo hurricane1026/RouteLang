@@ -393,10 +393,11 @@ TEST(simulate_engine, wait_handler_drives_state_machine_to_terminal_status) {
 }
 
 TEST(simulate_engine, let_before_wait_drives_to_terminal) {
-    // Slice 1: a let before a wait runs when the terminal state
-    // reaches the entry block. For a pure constant initializer like
-    // `let k = 200`, the value is materialized fresh in the terminal
-    // block and the return picks it up.
+    // Slice 1 acceptance: a let before a wait runs when the terminal
+    // state reaches the entry block, and the yield chain still drives
+    // to the terminal status cleanly. The let's value doesn't
+    // participate in the return here — that's covered by
+    // let_used_after_wait_in_if below.
     const char* src = "route GET \"/x\" { let k = 200 wait(50) return 200 }\n";
     FrontendRirModule rir{};
     REQUIRE(compile_to_rir(src, rir));

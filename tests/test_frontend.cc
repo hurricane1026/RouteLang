@@ -255,8 +255,10 @@ TEST(frontend, analyze_rejects_wait_zero) {
 }
 
 TEST(frontend, analyze_accepts_let_before_wait) {
-    // Slice 1: lets can appear before waits. Codegen spills them into
-    // HandlerCtx slots so they survive across yields.
+    // Slice 1: lets can appear before waits. Codegen re-materializes
+    // the value in the terminal/entry block across the yield boundary;
+    // for the pure initializers slice 0 supports, this is idempotent
+    // so no HandlerCtx spill/reload machinery is needed yet.
     const char* src = "route GET \"/x\" { let k = 42 wait(50) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -266,6 +268,21 @@ TEST(frontend, analyze_accepts_let_before_wait) {
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+}
+
+TEST(frontend, analyze_rejects_let_after_wait) {
+    // Slice-1 shape is `let* ; wait* ; terminal*`. A let between
+    // waits (or after all waits) would still execute only in the
+    // terminal block, which misrepresents source order and extends
+    // awkwardly once impure initializers land. Defer until the
+    // state machine gains real per-state code generation.
+    const char* src = "route GET \"/x\" { wait(50) let k = 42 wait(50) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
 }
 
 TEST(frontend, analyze_rejects_wait_after_let_guard) {

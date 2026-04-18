@@ -254,6 +254,34 @@ TEST(frontend, analyze_rejects_wait_zero) {
     CHECK(!hir);
 }
 
+TEST(frontend, analyze_accepts_let_before_wait) {
+    // Slice 1: lets can appear before waits. Codegen spills them into
+    // HandlerCtx slots so they survive across yields.
+    const char* src = "route GET \"/x\" { let k = 42 wait(50) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+}
+
+TEST(frontend, analyze_rejects_wait_after_let_guard) {
+    // Non-let non-wait statements still gate subsequent waits. A guard
+    // between a let and a wait introduces a terminal-ish control path
+    // the state machine can't yet thread through.
+    const char* src =
+        "route GET \"/x\" { let k = 42 guard k else { return 401 } wait(50) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
 TEST(frontend, analyze_rejects_wait_in_decorated_route) {
     // The codegen state-machine prologue routes states 0..yield_count-1
     // to yield blocks before the entry block. Once decorators are wired

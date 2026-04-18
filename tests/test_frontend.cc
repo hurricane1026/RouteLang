@@ -305,6 +305,7 @@ TEST(frontend, parse_wait_accepts_s_suffix) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
     CHECK_EQ(hir->routes[0].waits[0].ms, 2000u);
 }
 
@@ -316,6 +317,7 @@ TEST(frontend, parse_wait_accepts_m_suffix) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
     CHECK_EQ(hir->routes[0].waits[0].ms, 5u * 60u * 1000u);
 }
 
@@ -327,6 +329,7 @@ TEST(frontend, parse_wait_accepts_h_suffix) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
     CHECK_EQ(hir->routes[0].waits[0].ms, 3600u * 1000u);
 }
 

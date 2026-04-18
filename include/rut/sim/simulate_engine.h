@@ -85,6 +85,11 @@ struct SimulateResult {
     char expected_upstream[32]{};
     char actual_upstream[32]{};
 
+    // Number of Yield actions observed before the terminal one
+    // (ReturnStatus/Forward). 0 for simple static/proxy handlers,
+    // >0 when the handler used wait/submit/etc.
+    u32 yield_count = 0;
+
     Verdict verdict = Verdict::Failed;
 };
 

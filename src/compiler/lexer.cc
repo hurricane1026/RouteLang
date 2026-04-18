@@ -45,6 +45,7 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"route", 5})) return TokenType::KwRoute;
     if (text.eq({"return", 6})) return TokenType::KwReturn;
     if (text.eq({"forward", 7})) return TokenType::KwForward;
+    if (text.eq({"wait", 4})) return TokenType::KwWait;
     if (text.eq({"true", 4})) return TokenType::KwTrue;
     if (text.eq({"false", 5})) return TokenType::KwFalse;
     if (text.eq({"GET", 3}) || text.eq({"get", 3})) return TokenType::KwGet;

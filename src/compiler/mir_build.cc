@@ -739,6 +739,15 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         fn.name = {"route", 5};
         fn.error_variant_index = module.routes[i].error_variant_index;
 
+        // Propagate wait(ms) list 1:1. Codegen will turn each into a yield
+        // boundary in the generated state machine.
+        for (u32 wi = 0; wi < module.routes[i].waits.len; wi++) {
+            MirFunction::Wait w{};
+            w.span = module.routes[i].waits[wi].span;
+            w.ms = module.routes[i].waits[wi].ms;
+            if (!fn.waits.push(w)) return frontend_error(FrontendError::TooManyItems, w.span);
+        }
+
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
             MirLocal local{};

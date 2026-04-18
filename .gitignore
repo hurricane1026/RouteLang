@@ -5,3 +5,5 @@ build-release/
 build-review/
 node_modules/
 .codex
+build-dbg/
+.claude/

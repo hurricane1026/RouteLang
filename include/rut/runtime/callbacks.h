@@ -87,6 +87,12 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void on_early_upstream_recvd(void* lp, Connection& conn, IoEvent ev);
 
+// JIT handler dispatch — invoked from timer.tick when pending_handler_fn
+// is set (distinguishes resume from keepalive expiry). Defined in
+// callbacks_impl.h alongside the rest of the handler-chain logic.
+template <typename Loop>
+void resume_jit_handler(Loop* loop, Connection& conn);
+
 template <typename Loop>
 void on_early_upstream_recvd_send_inflight(void* lp, Connection& conn, IoEvent ev);
 

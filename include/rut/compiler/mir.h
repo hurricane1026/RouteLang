@@ -194,6 +194,11 @@ struct MirBlock {
 };
 
 struct MirFunction {
+    struct Wait {
+        Span span{};
+        u32 ms = 0;
+    };
+
     Span span{};
     u8 method = 0;
     Str path{};
@@ -201,9 +206,11 @@ struct MirFunction {
     static constexpr u32 kMaxLocals = 16;
     static constexpr u32 kMaxBlocks = 16;
     static constexpr u32 kMaxValues = 64;
+    static constexpr u32 kMaxWaits = 4;
     FixedVec<MirValue, kMaxValues> values;
     FixedVec<MirLocal, kMaxLocals> locals;
     FixedVec<MirBlock, kMaxBlocks> blocks;
+    FixedVec<Wait, kMaxWaits> waits;
     u32 error_variant_index = 0xffffffffu;
 
     MirFunction() = default;
@@ -215,6 +222,7 @@ struct MirFunction {
           values(other.values),
           locals(other.locals),
           blocks(other.blocks),
+          waits(other.waits),
           error_variant_index(other.error_variant_index) {
         rebase_from(other);
     }
@@ -227,6 +235,7 @@ struct MirFunction {
         values = other.values;
         locals = other.locals;
         blocks = other.blocks;
+        waits = other.waits;
         error_variant_index = other.error_variant_index;
         rebase_from(other);
         return *this;
@@ -239,6 +248,7 @@ struct MirFunction {
           values(other.values),
           locals(other.locals),
           blocks(other.blocks),
+          waits(other.waits),
           error_variant_index(other.error_variant_index) {
         rebase_from(other);
     }
@@ -251,6 +261,7 @@ struct MirFunction {
         values = other.values;
         locals = other.locals;
         blocks = other.blocks;
+        waits = other.waits;
         error_variant_index = other.error_variant_index;
         rebase_from(other);
         return *this;

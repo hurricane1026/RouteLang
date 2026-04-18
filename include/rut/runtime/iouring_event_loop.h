@@ -11,6 +11,7 @@
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
@@ -369,7 +370,8 @@ public:
                                             c.send_armed,
                                             c.upstream_recv_armed,
                                             c.upstream_send_armed,
-                                            c.upstream_fd >= 0);
+                                            c.upstream_fd >= 0,
+                                            c.yield_armed);
         }
         if (c.fd >= 0) {
             ::close(c.fd);
@@ -390,9 +392,99 @@ public:
 
     // --- Dispatch ---
 
+    // Schedule a JIT handler yield timer via IORING_OP_TIMEOUT. ms
+    // precision — kernel drives the timer, CQE arrives as IoEvent with
+    // type=HandlerTimer carrying conn_id. Slots should already be
+    // cleared before calling (no recv/send in flight while waiting).
+    //
+    // Takes the conn off the keepalive wheel while the precise timer
+    // owns its wakeup — otherwise waits longer than keepalive_timeout
+    // get resumed early by the wheel's 1-second tick.
+    //
+    // Falls back to the 1-second wheel if the SQ is full; the wheel
+    // tick callback checks pending_handler_fn and resumes from there,
+    // degrading precision but preserving liveness.
+    //
+    // On success, increments pending_ops and sets yield_armed so
+    // close_conn_impl will submit a cancel SQE — keeping the slot
+    // pinned until the timer's CQE is harvested, so a late stale
+    // HandlerTimer can't resume a handler on a reused slot.
+    //
+    // Returns false if no timer could be scheduled faithfully: under
+    // catastrophic SQ pressure (IORING_OP_TIMEOUT fails even after
+    // flush+retry) AND the requested wait exceeds what the 1-second
+    // wheel fallback can represent (~63s). Caller fails the request.
+    [[nodiscard]] bool schedule_yield_timer(Connection& conn, u32 ms) {
+        timer.remove(&conn);
+        // Ensure a recv is in flight so peer disconnect during wait(ms)
+        // produces a CQE the mid-yield dispatch branch can close on.
+        // submit_recv is idempotent (checks recv_armed), so this is a
+        // no-op when multishot is still running. It matters when the
+        // prior multishot terminated with !ev.more before this yield
+        // (e.g., buffer-ring edge case) and would otherwise leave no
+        // in-flight recv to surface a silent client FIN.
+        this->submit_recv(conn);
+        // submit_recv silently no-ops under SQ pressure (add_recv fails
+        // with no retry). If recv still isn't armed, we'd sleep without
+        // a disconnect detector — fail the request instead of leaking
+        // the slot until the yield deadline expires.
+        if (!conn.recv_armed) return false;
+        // NOTE: we deliberately do NOT cancel the multishot recv here.
+        // A cancel SQE would make the canceled target's -ECANCELED CQE
+        // arrive after the handler resumes and re-sets on_recv, where
+        // it would be interpreted as a peer close and kill the
+        // connection (or break keep-alive). The dispatch-level
+        // pending_handler_fn branch closes on any mid-yield recv CQE,
+        // so an adversarial peer can't exhaust buffers or silently
+        // inject data.
+        if (backend.add_yield_timeout(conn.id, conn, ms)) {
+            conn.yield_armed = true;
+            conn.pending_ops++;
+            return true;
+        }
+        // Catastrophic SQ pressure — add_yield_timeout already did one
+        // flush+retry. Fall back to the 1-second wheel, but only if
+        // the wait actually fits: 64 slots × 1s, so seconds in
+        // [1, 63] land faithfully; seconds 64+ would wrap mod-64 and
+        // fire far too early. Fail the request rather than shorten.
+        u32 secs = timer_seconds_from_ms(ms);
+        if (secs >= TimerWheel::kSlots) return false;
+        // Minimum 1 second: wait(0) on the wheel would land in the
+        // current slot, which the ongoing tick has already drained —
+        // the entry would then sit idle until the wheel wraps (~64s).
+        // analyze rejects wait(0) upstream, so this is defence-in-depth.
+        if (secs == 0) secs = 1;
+        timer.add(&conn, secs);
+        return true;
+    }
+
     void dispatch(const IoEvent& ev) {
         if (ev.type == IoEventType::Accept) {
             on_accept(ev);
+            return;
+        }
+        if (ev.type == IoEventType::HandlerTimer) {
+            // JIT handler yield timer fired (or was cancelled — same
+            // resume path; any error bubbles through the handler).
+            //
+            // Decrement pending_ops unconditionally: IORING_OP_TIMEOUT
+            // never sets CQE_F_MORE, and the cancel SQE submitted in
+            // close_conn_impl shares this user_data — both CQEs route
+            // here and must each decrement. yield_armed can't gate this
+            // because free_conn_impl::reset() clears the flag when a
+            // close lands while the timer is in flight.
+            if (ev.conn_id < kMaxConns) {
+                auto& c = conns[ev.conn_id];
+                if (c.pending_ops > 0) c.pending_ops--;
+                c.yield_armed = false;
+                if (c.pending_handler_fn) {
+                    resume_jit_handler<IoUringEventLoop>(this, c);
+                } else if (c.pending_ops == 0) {
+                    // Stale CQE for an already-closed slot; safe to
+                    // reclaim now that the last in-flight op has drained.
+                    reclaim_slot(ev.conn_id);
+                }
+            }
             return;
         }
         if (ev.type == IoEventType::Timeout) {
@@ -400,7 +492,15 @@ public:
             const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
             if (ticks > max_ticks) ticks = max_ticks;
             for (i32 t = 0; t < ticks; t++) {
-                timer.tick([this](Connection* c) { this->close_conn(*c); });
+                timer.tick([this](Connection* c) {
+                    // See epoll_event_loop.h: timer fires for keepalive OR
+                    // for a JIT handler resume (pending_handler_fn set).
+                    if (c->pending_handler_fn) {
+                        resume_jit_handler<IoUringEventLoop>(this, *c);
+                    } else {
+                        this->close_conn(*c);
+                    }
+                });
             }
             if (draining_.load(std::memory_order_acquire)) {
                 u64 start = drain_start_.load(std::memory_order_relaxed);
@@ -428,11 +528,46 @@ public:
             if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
-            } else {
-                // Stale CQE for a closed connection.
-                if (conn.pending_ops == 0) {
-                    reclaim_slot(ev.conn_id);
+            } else if (conn.pending_handler_fn) {
+                // Stray CQE for a conn that's mid-yield (all slots null
+                // while the timer owns the wakeup). Provided-buffer
+                // lifetime is already handled inside
+                // IoUringBackend::wait(); this branch only decides
+                // whether the stray completion should terminate the
+                // connection.
+                //
+                // Rules:
+                //   - ev.result > 0                 → keep alive. Bytes
+                //     the peer sends during wait(ms) — segmented body,
+                //     pipelined next request — are contractually noise
+                //     for slice 0 (analyze rejects the patterns where
+                //     they'd be meaningful). Killing here would punish
+                //     legitimate clients.
+                //   - ev.result == 0 && !ev.more    → peer FIN. Close.
+                //   - ev.result < 0 (non-CANCEL)    → recv error,
+                //     including -ENOBUFS when recv_buf fills. On older
+                //     kernels -ENOBUFS can arrive with ev.more still set,
+                //     so relying on !ev.more here would let the loop
+                //     hot-spin on repeated error CQEs until the yield
+                //     timer fires. Close unconditionally.
+                const bool kRecvError =
+                    (ev.type == IoEventType::Recv && ev.result < 0 && ev.result != -ECANCELED);
+                const bool kPeerClose =
+                    (ev.type == IoEventType::Recv && !ev.more && ev.result == 0);
+                if (kRecvError || kPeerClose) {
+                    this->close_conn(conn);
+                } else if (ev.type == IoEventType::Recv && !ev.more && ev.result > 0) {
+                    // Positive-data terminal CQE: multishot ended (the
+                    // generic accounting above cleared recv_armed).
+                    // Re-arm so a subsequent peer disconnect during the
+                    // remaining wait(ms) still produces a CQE and
+                    // reaches the close_conn branch — otherwise the
+                    // slot would sit occupied until the yield deadline.
+                    this->submit_recv(conn);
                 }
+            } else if (conn.pending_ops == 0) {
+                // Stale CQE for a genuinely closed connection.
+                reclaim_slot(ev.conn_id);
             }
         }
     }

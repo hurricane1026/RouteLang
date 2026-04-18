@@ -114,6 +114,13 @@ struct IoUringBackend {
     // Returns false if SQ is full (no SQE submitted).
     bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
 
+    // Submit IORING_OP_TIMEOUT for a JIT handler yield. ms granularity —
+    // the timespec storage lives on the Connection because the kernel
+    // reads it asynchronously. CQE completes with res == -ETIME under
+    // normal expiry; the wait() path emits IoEvent{HandlerTimer, conn_id}
+    // regardless of res so the dispatcher can resume the handler.
+    bool add_yield_timeout(u32 conn_id, Connection& conn, u32 ms);
+
     // Cancel outstanding operations for a connection (by user_data match).
     // Only submits cancel SQEs for op types actually in flight.
     // Returns the number of cancel SQEs submitted (for pending_ops tracking).
@@ -123,7 +130,8 @@ struct IoUringBackend {
                bool send_armed,
                bool upstream_recv_armed,
                bool upstream_send_armed,
-               bool has_upstream);
+               bool has_upstream,
+               bool yield_armed = false);
 
     // Cancel the multishot accept request. Must be called before closing
     // listen_fd during drain to stop io_uring from accepting new connections.

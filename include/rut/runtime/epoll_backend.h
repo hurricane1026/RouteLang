@@ -30,6 +30,10 @@ struct EpollBackend {
 
     i32 epoll_fd = -1;
     i32 timer_fd = -1;
+    // One-shot timerfd for JIT handler yield precision. EpollEventLoop
+    // maintains a min-heap of pending yield deadlines and re-arms this
+    // fd via arm_yield_timerfd() whenever the heap's top entry changes.
+    i32 yield_timer_fd = -1;
     i32 listen_fd = -1;
 
     // conn_id → fd mappings. Separate maps for client and upstream so that
@@ -71,6 +75,14 @@ struct EpollBackend {
     bool add_recv(i32 fd, u32 conn_id);
     bool add_recv_upstream(i32 fd, u32 conn_id);
 
+    // Suspend EPOLLIN on the downstream fd for conn_id. Used when a JIT
+    // handler yields so client bytes arriving mid-wait don't spin the
+    // event loop (epoll is level-triggered, so a full recv_buf + unread
+    // kernel data would keep firing). The next submit_recv re-arms
+    // EPOLLIN via add_recv's set_fd_interest path. No-op if the conn_id
+    // has no registered downstream fd.
+    void pause_recv(u32 conn_id);
+
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);
@@ -98,6 +110,11 @@ struct EpollBackend {
 
     // Shutdown and close fds.
     void shutdown();
+
+    // Arm yield_timer_fd for a one-shot deadline `deadline_ns` in the
+    // CLOCK_MONOTONIC epoch. Call with 0 to disarm. Used by
+    // EpollEventLoop when its yield-timer heap changes its top deadline.
+    void arm_yield_timerfd(u64 deadline_ns);
 
 private:
     // Encode conn_id + type into epoll_event.data.u64

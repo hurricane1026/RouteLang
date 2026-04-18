@@ -8,6 +8,7 @@
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
@@ -36,6 +37,24 @@ extern const char kResponse200Close[];
 
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size);
+
+// ── JIT handler dispatch ───────────────────────────────────────────
+// Route-matched JitHandler action → invoke the compiled handler and
+// translate JitDispatchOutcome into event-loop operations (send, forward,
+// register timer for resume, or 500). Shared between the initial call
+// (on_header_received) and timer-driven resumes.
+template <typename Loop>
+void handle_jit_outcome(Loop* loop,
+                        Connection& conn,
+                        const JitDispatchOutcome& outcome,
+                        jit::HandlerFn fn,
+                        bool keep_alive);
+
+// Called from timer.tick when the timer firing was a JIT handler yield
+// (conn.pending_handler_fn != nullptr). Re-enters the handler with
+// ctx.state = conn.handler_state, then re-dispatches on the outcome.
+template <typename Loop>
+void resume_jit_handler(Loop* loop, Connection& conn);
 
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn);
@@ -148,6 +167,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 
     capture_request_metadata(conn);
 
+    // Tag the request with a fresh generation so the yield-heap stale
+    // filter can reliably reject entries left by a close+reuse even if
+    // the new request's req_start_us lands in the same microsecond.
+    conn.handler_gen++;
     conn.req_start_us = monotonic_us();
     if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();
@@ -157,7 +180,12 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.keep_alive = kKeepAlive;
 
     // Route matching: config_ptr → active RouteConfig (may be null in tests).
+    // Pin on the connection so handle_jit_outcome resumes (post-wait) see
+    // the same config the route was matched against — hot-swap during a
+    // long wait(ms) could otherwise resolve upstream_id against a
+    // different upstream table.
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    conn.request_config = config;
     const RouteEntry* route = nullptr;
     if (config) {
         // Map LogHttpMethod back to RouteConfig's method_char format.
@@ -207,6 +235,18 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         format_static_response(conn, route->status_code, kKeepAlive);
         conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    } else if (route && route->action == RouteAction::JitHandler && route->fn) {
+        conn.state = ConnState::ExecHandler;
+        conn.handler_state = 0;  // entry state
+        jit::HandlerCtx ctx{};
+        ctx.state = 0;
+        auto outcome = invoke_jit_handler(route->fn,
+                                          static_cast<void*>(&conn),
+                                          ctx,
+                                          conn.recv_buf.data(),
+                                          conn.recv_buf.len(),
+                                          /*arena=*/nullptr);
+        handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive);
     } else {
         conn.state = ConnState::Sending;
         conn.resp_status = kStatusOK;
@@ -256,6 +296,131 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.state = ConnState::ReadingHeader;
     conn.set_slots(&on_header_received<Loop>, nullptr, nullptr, nullptr);
     loop->submit_recv(conn);
+}
+
+template <typename Loop>
+void handle_jit_outcome(Loop* loop,
+                        Connection& conn,
+                        const JitDispatchOutcome& outcome,
+                        jit::HandlerFn fn,
+                        bool keep_alive) {
+    switch (outcome.kind) {
+        case JitDispatchOutcome::Kind::ReturnStatus:
+            conn.pending_handler_fn = nullptr;
+            conn.state = ConnState::Sending;
+            conn.resp_status = outcome.status_code;
+            format_static_response(conn, outcome.status_code, keep_alive);
+            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        case JitDispatchOutcome::Kind::TimerYield: {
+            // Stash fn + next_state so the resume path can re-enter the
+            // handler with ctx.state = handler_state. Slots stay clear —
+            // no recv/send in flight while sleeping. Delegates to the
+            // loop's schedule_yield_timer: ms precision on both backends
+            // (IORING_OP_TIMEOUT on io_uring, one-shot timerfd + min-heap
+            // on epoll).
+            conn.pending_handler_fn = fn;
+            conn.handler_state = outcome.next_state;
+            conn.state = ConnState::ExecHandler;
+            conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+            if (loop->schedule_yield_timer(conn, outcome.timer_ms)) return;
+            // Couldn't schedule faithfully (SQ / heap catastrophically
+            // pressured AND wait too long for the wheel fallback). Fail
+            // the request rather than resume early and silently violate
+            // wait(ms) semantics.
+            conn.pending_handler_fn = nullptr;
+            conn.state = ConnState::Sending;
+            conn.resp_status = 500;
+            format_static_response(conn, 500, /*keep_alive=*/false);
+            conn.keep_alive = false;
+            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            // schedule_yield_timer already called timer.remove(&conn);
+            // re-arm keepalive before the send so a stalled response
+            // (client backpressure) can't leak the slot indefinitely.
+            // on_response_sent's normal dispatch refresh would eventually
+            // cover it, but only if the Send CQE arrives.
+            loop->timer.add(&conn, loop->keepalive_timeout);
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
+        case JitDispatchOutcome::Kind::Forward: {
+            conn.pending_handler_fn = nullptr;
+            // Resolve upstream by id against the config pinned at
+            // on_header_received. Reading loop->config_ptr here would
+            // pick up a post-swap config whose upstream table doesn't
+            // match the indexing the handler compiled against.
+            const RouteConfig* config = conn.request_config;
+            if (!config || outcome.upstream_id >= config->upstream_count) {
+                // Unresolvable upstream id — handler returned a value
+                // the config doesn't know. Fail closed with 502 rather
+                // than hanging or silently discarding the request.
+                conn.state = ConnState::Sending;
+                conn.resp_status = kStatusBadGateway;
+                format_static_response(conn, 502, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
+            conn.state = ConnState::Proxying;
+            auto& target = config->upstreams[outcome.upstream_id];
+            for (u32 i = 0; i < sizeof(conn.upstream_name) && i < target.name_len; i++)
+                conn.upstream_name[i] = target.name[i];
+            if (target.name_len < sizeof(conn.upstream_name))
+                conn.upstream_name[target.name_len] = '\0';
+            else
+                conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
+            const i32 kUpstreamFd = UpstreamPool::create_socket();
+            if (kUpstreamFd < 0) {
+                conn.state = ConnState::Sending;
+                conn.resp_status = kStatusBadGateway;
+                format_static_response(conn, 502, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
+            conn.upstream_fd = kUpstreamFd;
+            conn.upstream_start_us = monotonic_us();
+            conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+            loop->submit_connect(conn, &target.addr, sizeof(target.addr));
+            return;
+        }
+        case JitDispatchOutcome::Kind::Error:
+        default:
+            // Handler returned an unsupported action kind (or nullptr fn);
+            // fail closed with 500 rather than hang.
+            conn.pending_handler_fn = nullptr;
+            conn.state = ConnState::Sending;
+            conn.resp_status = 500;
+            format_static_response(conn, 500, /*keep_alive=*/false);
+            conn.keep_alive = false;
+            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+    }
+}
+
+template <typename Loop>
+void resume_jit_handler(Loop* loop, Connection& conn) {
+    // schedule_yield_timer took the conn off the keepalive wheel while
+    // the precise timer owned its wakeup. Restore it before running the
+    // handler: non-TimerYield outcomes submit I/O whose completion will
+    // call timer.refresh via dispatch_event, but until that happens a
+    // silent peer has no backstop. A chained wait removes again via
+    // schedule_yield_timer, so this is harmless when yielding again.
+    loop->timer.add(&conn, loop->keepalive_timeout);
+    auto* fn = conn.pending_handler_fn;
+    jit::HandlerCtx ctx{};
+    ctx.state = conn.handler_state;
+    auto outcome = invoke_jit_handler(fn,
+                                      static_cast<void*>(&conn),
+                                      ctx,
+                                      conn.recv_buf.data(),
+                                      conn.recv_buf.len(),
+                                      /*arena=*/nullptr);
+    handle_jit_outcome<Loop>(loop, conn, outcome, fn, conn.keep_alive);
 }
 
 template <typename Loop>

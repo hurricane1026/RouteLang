@@ -5244,7 +5244,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         if (stmt.status_code < 100 || stmt.status_code > 999)
             return frontend_error(FrontendError::InvalidStatusCode, stmt.span);
         term.kind = HirTerminatorKind::ReturnStatus;
-        term.status_code = stmt.status_code;
+        // Validated to 100..999 above; fits in HirTerminator::status_code.
+        term.status_code = static_cast<i32>(stmt.status_code);
         return term;
     }
 
@@ -9400,8 +9401,48 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (route.method == 0)
             return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
 
+        // Slice-0 constraint: all waits must appear as a contiguous prefix
+        // of the route body (possibly empty, followed by non-wait code).
+        // The current codegen dispatches the state-machine prologue BEFORE
+        // the entry block, so a wait placed after other statements would
+        // run those statements only after the final yield — source order
+        // would not match execution order for interleaved guard/let/wait.
+        // Proper mid-body yields land with the submit/any/all slices.
+        //
+        // Decorators are also routed through the entry block (once wired
+        // from HIR to codegen), so mixing waits with decorators would
+        // sleep before running the decorator — a route like
+        // `@auth GET "/x" { wait(50) return 204 }` would let an
+        // unauthorized request sleep before rejecting. Reject that
+        // combination here until decorators land in codegen with a
+        // proper pre-yield placement.
+        //
+        // wait(0) is rejected: it has no meaning for a sleep primitive
+        // and would stall 1s under the wheel fallback. If concurrent-I/O
+        // primitives grow a legitimate "yield control" use-case, this
+        // check can be lifted.
+        bool seen_non_wait = false;
         for (u32 si = 0; si < item.route.statements.len; si++) {
             const auto& stmt = item.route.statements[si];
+            if (stmt.kind == AstStmtKind::Wait) {
+                if (seen_non_wait)
+                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                if (stmt.status_code == 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                if (!item.route.decorators.empty())
+                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                // ms payload is the 32-bit Yield slot (status_code +
+                // upstream_id co-opted); the parser already caps at
+                // UINT32_MAX. Duration literals (`1s`, `500ms`) are future
+                // work for the parser.
+                HirRoute::Wait w{};
+                w.span = stmt.span;
+                w.ms = stmt.status_code;
+                if (!route.waits.push(w))
+                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                continue;
+            }
+            seen_non_wait = true;
             if (stmt.kind == AstStmtKind::Let) {
                 HirLocal local{};
                 local.span = stmt.span;

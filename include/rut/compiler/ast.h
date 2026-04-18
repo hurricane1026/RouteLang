@@ -26,6 +26,7 @@ enum class AstStmtKind : u8 {
     If,
     Match,
     Block,
+    Wait,  // `wait(N)` — suspend handler for N milliseconds (v1: IntLit only)
 };
 
 enum class AstExprKind : u8 {
@@ -95,7 +96,10 @@ struct AstStatement {
     bool has_type = false;
     AstTypeRef type{};
     AstExpr expr{};
-    i32 status_code = 0;
+    // Dual use: HTTP status code for `return <N>`, or milliseconds for
+    // `wait(N)`. u32 fits both the HTTP range and the full u32 yield
+    // payload range (~49 days); semantic validation is in analyze.
+    u32 status_code = 0;
     AstStatement* then_stmt = nullptr;
     AstStatement* else_stmt = nullptr;
     static constexpr u32 kMaxBlockStatements = 8;

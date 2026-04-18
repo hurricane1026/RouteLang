@@ -648,6 +648,13 @@ public:
         }
     }
 
+    // Legacy EventLoop<Backend> predates the JIT-yield primitive; it lacks
+    // the HandlerTimer dispatch path that EpollEventLoop / IoUringEventLoop
+    // implement. Returning false from schedule_yield_timer makes
+    // handle_jit_outcome::TimerYield respond 500 instead of hanging.
+    // Remove this stub if/when the legacy loop gains real yield support.
+    [[nodiscard]] bool schedule_yield_timer(Connection& /*conn*/, u32 /*ms*/) { return false; }
+
 private:
     using Self = EventLoop<Backend>;
 

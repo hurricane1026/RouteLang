@@ -1,5 +1,12 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
 #include "epoll_tls_test_hooks.h"
+#include "rut/compiler/analyze.h"
+#include "rut/compiler/lexer.h"
+#include "rut/compiler/lower_rir.h"
+#include "rut/compiler/mir_build.h"
+#include "rut/compiler/parser.h"
+#include "rut/jit/codegen.h"
+#include "rut/jit/jit_engine.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/shard.h"
@@ -2074,6 +2081,380 @@ TEST(route, capture_real_socket) {
     for (i32 i = 0; i < 200 && ring.available() == 0; i++) usleep(1000);
     CHECK_EQ(ring.available(), 1u);
 
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+// End-to-end wait(ms) through the real EpollEventLoop: compile a route
+// that yields for 1 second and returns 204, register it as a JitHandler
+// in the RouteConfig, drive a real TCP connection, and assert the client
+// observes the 204 response after the timer fires.
+//
+// Timing note: EpollEventLoop now uses a one-shot yield_timer_fd + min-heap
+// driven by absolute CLOCK_MONOTONIC deadlines, so wait(1000) lands near
+// 1000ms with ms precision (no TimerWheel bucketing). recv_timeout is
+// 3000ms to tolerate scheduler jitter on slow CI.
+TEST(route, wait_jit_handler_real_socket) {
+    using namespace rut;  // pull in compiler helpers (lex / parse_file / ...)
+
+    const char* src = "route GET \"/sleep\" { wait(1000) return 204 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/sleep", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /sleep HTTP/1.1\r\nHost: x\r\n\r\n", 32);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 3000);
+    CHECK_GT(n, 0);
+    // Response should contain the 204 status code.
+    bool found_204 = false;
+    for (i32 i = 0; i + 2 < n; i++) {
+        if (buf[i] == '2' && buf[i + 1] == '0' && buf[i + 2] == '4') {
+            found_204 = true;
+            break;
+        }
+    }
+    CHECK(found_204);
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// wait(50) — sub-second precision verification. The legacy TimerWheel
+// would round this up to 1000ms (one full tick), so this test fails
+// immediately if the yield_timer_fd / min-heap path regresses back to
+// the wheel. Observed wall time must land well below one second.
+TEST(route, wait_ms_precision_sub_second) {
+    using namespace rut;
+
+    const char* src = "route GET \"/snooze\" { wait(50) return 204 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/snooze", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    send_all(c, "GET /snooze HTTP/1.1\r\nHost: x\r\n\r\n", 33);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    // Compute delta in signed nanoseconds so tv_nsec underflow (t1.tv_nsec
+    // < t0.tv_nsec) doesn't wrap to a huge u64 when the tv_sec carry should
+    // handle it.
+    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
+                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ms = elapsed_ns / 1'000'000LL;
+
+    CHECK_GT(n, 0);
+    bool found_204 = false;
+    for (i32 i = 0; i + 2 < n; i++) {
+        if (buf[i] == '2' && buf[i + 1] == '0' && buf[i + 2] == '4') {
+            found_204 = true;
+            break;
+        }
+    }
+    CHECK(found_204);
+    // 50ms wait should complete in well under a second. The legacy
+    // TimerWheel rounds to 1000ms; a 500ms ceiling proves we're using
+    // the yield_timer_fd / IORING_OP_TIMEOUT path. Floor at 40ms
+    // protects against any accidental zero-wait regression.
+    CHECK_GT(elapsed_ms, 40);
+    CHECK_LT(elapsed_ms, 500);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// Regression: a wait(ms) longer than keepalive_timeout must NOT be woken
+// early by the 1-second TimerWheel tick. Before the fix, yielded conns
+// remained on the keepalive wheel and the tick callback resumed them via
+// the `pending_handler_fn` branch — a wait(2000) would fire at ~1000ms.
+//
+// Uses keepalive_timeout=1s + wait(2000ms) to hit the bug fast. Asserts
+// elapsed >= 1700ms (clear margin above the 1s tick).
+TEST(route, wait_longer_than_keepalive_not_resumed_by_wheel) {
+    using namespace rut;
+
+    const char* src = "route GET \"/deep\" { wait(2000) return 204 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/deep", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    // Shrink keepalive so a 2s wait clearly exceeds it. Wheel tick
+    // before the fix would resume the handler around 1s.
+    loop->keepalive_timeout = 1;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    send_all(c, "GET /deep HTTP/1.1\r\nHost: x\r\n\r\n", 31);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 4000);
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    // Compute delta in signed nanoseconds so tv_nsec underflow (t1.tv_nsec
+    // < t0.tv_nsec) doesn't wrap to a huge u64 when the tv_sec carry should
+    // handle it.
+    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
+                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ms = elapsed_ns / 1'000'000LL;
+
+    CHECK_GT(n, 0);
+    bool found_204 = false;
+    for (i32 i = 0; i + 2 < n; i++) {
+        if (buf[i] == '2' && buf[i + 1] == '0' && buf[i + 2] == '4') {
+            found_204 = true;
+            break;
+        }
+    }
+    CHECK(found_204);
+    // Must not have been woken by the 1s wheel tick. 1700ms floor leaves
+    // comfortable margin above the tick; 3000ms ceiling catches stuck
+    // timers. wait(2000) on an unloaded loop lands near 2000ms.
+    CHECK_GT(elapsed_ms, 1700);
+    CHECK_LT(elapsed_ms, 3000);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// Minimal hand-written handler that returns a Forward action. Matches the
+// jit::HandlerFn ABI so callbacks_impl.h's handle_jit_outcome can dispatch
+// it the same way it would a real JIT-compiled handler.
+static u64 forward_upstream_0_handler(void* /*conn*/,
+                                      rut::jit::HandlerCtx* /*ctx*/,
+                                      const u8* /*req*/,
+                                      u32 /*len*/,
+                                      void* /*arena*/) {
+    auto r = rut::jit::HandlerResult::make_forward(0);
+    return r.pack();
+}
+
+// End-to-end: a JIT handler returning Forward must kick off the same
+// proxy flow as a RouteAction::Proxy match. Before the JIT forward wire-up,
+// handle_jit_outcome::Forward returned 500; this test guards against that
+// regression. Mirrors replay_gap::proxy_route_enters_proxy_state but with
+// the JitHandler route action.
+TEST(route, forward_jit_handler_enters_proxy_state) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    auto up = cfg.add_upstream("backend", 0x7F000001, 9999);
+    REQUIRE(up.has_value());
+    REQUIRE_EQ(up.value(), 0u);  // first upstream → id 0 in cfg
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_upstream_0_handler));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /api HTTP/1.1\r\nHost: x\r\n\r\n", 30);
+
+    // The request triggers the JIT handler → Forward → submit_connect
+    // to 127.0.0.1:9999. No upstream is listening, so the connect will
+    // fail with ECONNREFUSED and the loop will send a 502 (or close).
+    // The assertion we care about is that a 502 came back — proving
+    // Forward routed through the proxy path instead of the pre-fix
+    // 500 response.
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    bool found_502 = false;
+    for (i32 i = 0; i + 2 < n; i++) {
+        if (buf[i] == '5' && buf[i + 1] == '0' && buf[i + 2] == '2') {
+            found_502 = true;
+            break;
+        }
+    }
+    CHECK(found_502);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+// Bad upstream_id (out of bounds) → handle_jit_outcome must return 502
+// rather than crash or hang. Guards the defensive bound check in the
+// Forward branch.
+static u64 forward_upstream_99_handler(void* /*conn*/,
+                                       rut::jit::HandlerCtx* /*ctx*/,
+                                       const u8* /*req*/,
+                                       u32 /*len*/,
+                                       void* /*arena*/) {
+    auto r = rut::jit::HandlerResult::make_forward(99);
+    return r.pack();
+}
+
+TEST(route, forward_jit_handler_rejects_unknown_upstream_id) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    // Only one upstream at id 0; handler returns 99.
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9999));
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_upstream_99_handler));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /api HTTP/1.1\r\nHost: x\r\n\r\n", 30);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    bool found_502 = false;
+    for (i32 i = 0; i + 2 < n; i++) {
+        if (buf[i] == '5' && buf[i + 1] == '0' && buf[i + 2] == '2') {
+            found_502 = true;
+            break;
+        }
+    }
+    CHECK(found_502);
+
+    close(c);
     lt.stop();
     loop->shutdown();
     close(lfd);

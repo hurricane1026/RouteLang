@@ -129,6 +129,194 @@ TEST(frontend, lex_recognizes_lowercase_http_methods) {
     CHECK_EQ(static_cast<u8>(lexed->tokens[6].type), static_cast<u8>(TokenType::KwOptions));
 }
 
+TEST(frontend, lex_recognizes_wait_keyword) {
+    const char* src = "wait";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 2u);  // wait, EOF
+    CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwWait));
+}
+
+TEST(frontend, parse_route_accepts_wait_statement) {
+    const char* src = "route GET \"/sleep\" { wait(1000) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Wait));
+    CHECK_EQ(route.statements[0].status_code, 1000);  // ms stored in status_code field
+    CHECK_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(route.statements[1].status_code, 200);
+}
+
+TEST(frontend, analyze_records_wait_in_hir_route) {
+    const char* src = "route GET \"/sleep\" { wait(1000) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 1000);
+}
+
+TEST(frontend, analyze_records_multiple_waits_in_order) {
+    const char* src = "route GET \"/x\" { wait(100) wait(200) wait(300) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 3u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 100);
+    CHECK_EQ(hir->routes[0].waits[1].ms, 200);
+    CHECK_EQ(hir->routes[0].waits[2].ms, 300);
+}
+
+TEST(frontend, analyze_accepts_wait_larger_than_u16_max) {
+    // After the u32 payload widening, any non-negative ms value is legal.
+    // Carry 100000ms (~100s) through HIR — well past the old 65535 cap.
+    const char* src = "route GET \"/x\" { wait(100000) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 100000u);
+}
+
+TEST(frontend, analyze_accepts_wait_near_u32_max) {
+    // UINT32_MAX-1 is the largest wait representable through the parser's
+    // u64 accumulator + UINT32_MAX cap. Round-trips through to HIR as-is.
+    const char* src = "route GET \"/x\" { wait(4294967294) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 4294967294u);
+}
+
+TEST(frontend, parser_rejects_wait_above_u32_max) {
+    // 2^32 overflows the u32 cap even with the u64 accumulator.
+    const char* src = "route GET \"/x\" { wait(4294967296) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    CHECK(!ast);
+}
+
+TEST(frontend, analyze_rejects_wait_after_non_wait_statement) {
+    // Slice 0 codegen dispatches yields before the entry block, so waits
+    // must be a contiguous prefix. `guard ...; wait(50); return 204`
+    // would otherwise run the wait before the guard check.
+    const char* src = "route GET \"/x\" { guard true else { return 500 } wait(50) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_accepts_wait_as_prefix_with_return) {
+    // Two waits then a return is the canonical slice-0 shape.
+    const char* src = "route GET \"/x\" { wait(10) wait(20) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 2u);
+}
+
+TEST(frontend, analyze_rejects_wait_zero) {
+    // wait(0) has no meaning for a sleep primitive and would stall
+    // ~1s under the wheel fallback path. Reject until the DSL grows
+    // a legitimate "yield control" semantic.
+    const char* src = "route GET \"/x\" { wait(0) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_rejects_wait_in_decorated_route) {
+    // The codegen state-machine prologue routes states 0..yield_count-1
+    // to yield blocks before the entry block. Once decorators are wired
+    // from HIR to codegen, they'd run AFTER all waits — unauthorized
+    // requests would sleep before rejecting. Reject the combination
+    // until decorators land with a proper pre-yield placement.
+    const char* src = R"rut(
+func auth(_ req: i32) -> i32 => 0
+route {
+    @auth "*"
+    GET "/x" { wait(50) return 204 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, rir_function_carries_yield_payload_for_waits) {
+    const char* src = "route GET \"/x\" { wait(500) wait(1000) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].waits.len, 2u);
+    CHECK_EQ(mir->functions[0].waits[0].ms, 500);
+    CHECK_EQ(mir->functions[0].waits[1].ms, 1000);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE(rir.module.func_count >= 1u);
+    CHECK_EQ(rir.module.functions[0].yield_count, 2u);
+    REQUIRE(rir.module.functions[0].yield_payload != nullptr);
+    CHECK_EQ(rir.module.functions[0].yield_payload[0], 500u);
+    CHECK_EQ(rir.module.functions[0].yield_payload[1], 1000u);
+    rir.destroy();
+}
+
+TEST(frontend, parse_route_rejects_wait_without_parens) {
+    const char* src = "route GET \"/sleep\" { wait 1000 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+}
+
+TEST(frontend, parse_route_rejects_wait_non_integer_arg) {
+    const char* src = "route GET \"/sleep\" { wait(\"1s\") return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+}
+
 TEST(frontend, parse_route_block_single_entry_no_decorators) {
     const char* src = "route { GET \"/users\" { return 200 } }\n";
     auto lexed = lex(lit(src));
@@ -2052,14 +2240,14 @@ TEST(frontend, import_namespace_payloadless_variant_case_is_supported) {
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
-        out << "variant Token { ready, wait }\n";
+        out << "variant Token { ready, pending }\n";
     }
     const auto src = R"rut(
 import "proto.rut"
 route GET "/users" {
     match proto.Token.ready {
     case .ready: return 200
-    case .wait: return 500
+    case .pending: return 500
     }
 }
 )rut";

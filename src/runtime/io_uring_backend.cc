@@ -388,6 +388,40 @@ bool IoUringBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr
     return true;
 }
 
+bool IoUringBackend::add_yield_timeout(u32 conn_id, Connection& conn, u32 ms) {
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) {
+        // SQ full — flush pending SQEs to make room, then retry once.
+        // Mirrors cancel_by_user_data's pattern. wait(ms) semantics
+        // require the timer to actually be scheduled; failing here would
+        // force the caller into the wheel fallback, which caps precision
+        // AND (for ms > 63000) wraps the deadline mod 64 seconds.
+        if (pending > 0) {
+            i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+            if (flushed > 0) pending -= static_cast<u32>(flushed);
+        }
+        sqe = get_sqe();
+        if (!sqe) return false;
+    }
+
+    // Relative timeout; kernel reads &conn.yield_timespec asynchronously
+    // so the storage must live on the Connection (not on the stack).
+    conn.yield_timespec.tv_sec = ms / 1000;
+    conn.yield_timespec.tv_nsec = static_cast<long long>(ms % 1000) * 1'000'000LL;
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_TIMEOUT;
+    sqe->fd = -1;  // unused for IORING_OP_TIMEOUT
+    sqe->addr = reinterpret_cast<u64>(&conn.yield_timespec);
+    sqe->len = 1;  // one timespec
+    sqe->off = 0;  // count=0 → plain relative timeout (no "wait for N events" semantics)
+    sqe->user_data = encode_user_data(conn_id, IoEventType::HandlerTimer);
+
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
 void IoUringBackend::cancel_accept() {
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return;
@@ -447,7 +481,8 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
                            bool send_armed,
                            bool upstream_recv_armed,
                            bool upstream_send_armed,
-                           bool has_upstream) {
+                           bool has_upstream,
+                           bool yield_armed) {
     // Only cancel op types that are actually in flight to avoid wasting
     // SQ/CQ capacity with no-op cancels that produce -ENOENT completions.
     u32 submitted = 0;
@@ -479,6 +514,15 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
         if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::UpstreamConnect),
                                 conn_id,
                                 IoEventType::UpstreamConnect))
+            submitted++;
+    }
+    // JIT handler yield timer (IORING_OP_TIMEOUT) — cancel pins the slot
+    // until the target CQE arrives, preventing stale HandlerTimer events
+    // from resuming a handler on a reused slot.
+    if (yield_armed) {
+        if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::HandlerTimer),
+                                conn_id,
+                                IoEventType::HandlerTimer))
             submitted++;
     }
 

@@ -160,6 +160,26 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
     }
+    // Test shim: record the ms for assertions, fall back to 1s wheel so
+    // pending_handler_fn is still re-entered when the test ticks.
+    u32 last_yield_ms = 0;
+    [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
+        last_yield_ms = ms;
+        u32 secs = timer_seconds_from_ms(ms);
+        // Mirror real-loop wheel-fallback boundary: 64 slots × 1s, so
+        // seconds >= kSlots would wrap mod-64. Fail the request so
+        // tests exercising long waits under simulated SQ pressure
+        // behave like the production loops.
+        if (secs >= TimerWheel::kSlots) return false;
+        if (secs == 0) secs = 1;
+        // timer.add doesn't detach an existing entry — calling it twice
+        // on the same connection would double-insert and corrupt the
+        // intrusive list. Production loops remove first; mirror that
+        // so keepalive-armed conns can yield safely.
+        timer.remove(&c);
+        timer.add(&c, secs);
+        return true;
+    }
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
         // Mirror real EventLoop: cancel in-flight I/O before freeing.
@@ -223,7 +243,18 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
             return;
         }
         if (ev.type == IoEventType::Timeout) {
-            timer.tick([this](Connection* c) { this->close_conn(*c); });
+            timer.tick([this](Connection* c) {
+                // Mirror EpollEventLoop/IoUringEventLoop: a tick can
+                // represent either keepalive expiry (close) or a JIT
+                // yield fallback (resume). schedule_yield_timer on
+                // this mock uses the wheel, so tests exercising
+                // wait(...) reach this branch.
+                if (c->pending_handler_fn) {
+                    resume_jit_handler<SmallLoop>(this, *c);
+                } else {
+                    this->close_conn(*c);
+                }
+            });
             return;
         }
         if (ev.conn_id < kMaxConns) {
@@ -505,6 +536,27 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         }
     }
 
+    // Test shim matching SmallLoop's: drive the legacy wheel so existing
+    // 1-second tick tests continue to resume the handler.
+    u32 last_yield_ms = 0;
+    [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
+        last_yield_ms = ms;
+        u32 secs = timer_seconds_from_ms(ms);
+        // Mirror real-loop wheel-fallback boundary: 64 slots × 1s, so
+        // seconds >= kSlots would wrap mod-64. Fail the request so
+        // tests exercising long waits under simulated SQ pressure
+        // behave like the production loops.
+        if (secs >= TimerWheel::kSlots) return false;
+        if (secs == 0) secs = 1;
+        // timer.add doesn't detach an existing entry — calling it twice
+        // on the same connection would double-insert and corrupt the
+        // intrusive list. Production loops remove first; mirror that
+        // so keepalive-armed conns can yield safely.
+        timer.remove(&c);
+        timer.add(&c, secs);
+        return true;
+    }
+
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
         if (c.pending_ops > 0) {
@@ -564,7 +616,15 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             return;
         }
         if (ev.type == IoEventType::Timeout) {
-            timer.tick([this](Connection* c) { this->close_conn(*c); });
+            timer.tick([this](Connection* c) {
+                // See SmallLoop: a tick resumes yielded JIT handlers and
+                // otherwise closes on keepalive expiry.
+                if (c->pending_handler_fn) {
+                    resume_jit_handler<AsyncSmallLoop>(this, *c);
+                } else {
+                    this->close_conn(*c);
+                }
+            });
             return;
         }
         if (ev.conn_id < kMaxConns) {
@@ -730,6 +790,24 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     }
     void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) c.pending_ops++;
+    }
+    u32 last_yield_ms = 0;
+    [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
+        last_yield_ms = ms;
+        u32 secs = timer_seconds_from_ms(ms);
+        // Mirror real-loop wheel-fallback boundary: 64 slots × 1s, so
+        // seconds >= kSlots would wrap mod-64. Fail the request so
+        // tests exercising long waits under simulated SQ pressure
+        // behave like the production loops.
+        if (secs >= TimerWheel::kSlots) return false;
+        if (secs == 0) secs = 1;
+        // timer.add doesn't detach an existing entry — calling it twice
+        // on the same connection would double-insert and corrupt the
+        // intrusive list. Production loops remove first; mirror that
+        // so keepalive-armed conns can yield safely.
+        timer.remove(&c);
+        timer.add(&c, secs);
+        return true;
     }
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();

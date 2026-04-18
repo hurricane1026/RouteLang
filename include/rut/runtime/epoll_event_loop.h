@@ -11,6 +11,7 @@
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
@@ -21,9 +22,125 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace rut {
+
+namespace epoll_yield {
+
+// Shared max-conn constant: both YieldHeap and EpollEventLoop derive
+// their sizes from this single source so they can't drift.
+static constexpr u32 kMaxConns = 16384;
+
+inline u64 monotonic_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<u64>(ts.tv_sec) * 1'000'000'000ull + static_cast<u64>(ts.tv_nsec);
+}
+
+// Min-heap of pending JIT yield deadlines. The heap's top entry determines
+// when backend.yield_timer_fd must fire next. Entries are tagged with the
+// connection's handler_gen so stale entries (connection closed and
+// reassigned to a different request) are filtered on pop. handler_gen is
+// a monotonic per-connection counter — strictly unique across reuse even
+// under μs-granularity close/reuse churn that could alias req_start_us.
+//
+// Capacity: one live entry per connection at most; handler chains (yield →
+// resume → yield) push a new entry each time, but the prior entry has
+// already been popped. Sized at kMaxConns + small slack for safety.
+struct YieldHeap {
+    struct Entry {
+        u64 deadline_ns;
+        u32 handler_gen;
+        u32 conn_id;
+    };
+    // One live entry per connection at most, plus headroom for stale
+    // entries that linger briefly between close and their deadline.
+    // Derived from the shared epoll_yield::kMaxConns so the heap and
+    // EpollEventLoop always agree on capacity.
+    static constexpr u32 kCap = kMaxConns + 256;
+    Entry entries[kCap];
+    u32 size = 0;
+
+    void clear() { size = 0; }
+    bool empty() const { return size == 0; }
+    const Entry& top() const { return entries[0]; }
+
+    bool push(u64 deadline_ns, u32 handler_gen, u32 conn_id) {
+        if (size >= kCap) return false;
+        u32 i = size++;
+        entries[i] = {deadline_ns, handler_gen, conn_id};
+        sift_up(i);
+        return true;
+    }
+
+    // Remove every entry with this conn_id. O(n) scan — expected to be
+    // called at most once per close_conn, and n is bounded by the number
+    // of concurrent yielded handlers (≤ kMaxConns). Restores the heap
+    // invariant by sifting up/down the swapped-in tail entries. Returns
+    // the number of entries removed.
+    u32 remove_by_conn(u32 conn_id) {
+        u32 removed = 0;
+        u32 i = 0;
+        while (i < size) {
+            if (entries[i].conn_id != conn_id) {
+                i++;
+                continue;
+            }
+            entries[i] = entries[--size];
+            removed++;
+            // Sift the swapped entry up or down as needed. Only one of
+            // the two branches can do work because the swapped entry
+            // is either smaller than its parent (sift up) or larger
+            // than one of its children (sift down), but not both.
+            if (i < size) sift(i);
+            // Don't advance i — the slot now holds the swapped tail,
+            // which may itself match conn_id on chained yields (rare).
+        }
+        return removed;
+    }
+
+    void pop() {
+        if (size == 0) return;
+        entries[0] = entries[--size];
+        sift_down(0);
+    }
+
+private:
+    void sift_up(u32 i) {
+        while (i > 0) {
+            u32 parent = (i - 1) / 2;
+            if (entries[parent].deadline_ns <= entries[i].deadline_ns) break;
+            Entry tmp = entries[parent];
+            entries[parent] = entries[i];
+            entries[i] = tmp;
+            i = parent;
+        }
+    }
+    void sift_down(u32 i) {
+        while (true) {
+            u32 l = 2 * i + 1;
+            u32 r = 2 * i + 2;
+            u32 smallest = i;
+            if (l < size && entries[l].deadline_ns < entries[smallest].deadline_ns) smallest = l;
+            if (r < size && entries[r].deadline_ns < entries[smallest].deadline_ns) smallest = r;
+            if (smallest == i) break;
+            Entry tmp = entries[smallest];
+            entries[smallest] = entries[i];
+            entries[i] = tmp;
+            i = smallest;
+        }
+    }
+    void sift(u32 i) {
+        // A swapped-in tail entry must sift in exactly one direction; try
+        // both (each is a no-op when not applicable).
+        sift_up(i);
+        sift_down(i);
+    }
+};
+
+}  // namespace epoll_yield
 
 // EpollEventLoop — concrete, non-template event loop for epoll backend.
 //
@@ -33,6 +150,11 @@ namespace rut {
 struct EpollEventLoop : EventLoopCRTP<EpollEventLoop> {
     EpollBackend backend;
     TimerWheel timer;
+    epoll_yield::YieldHeap yield_heap;
+    // Absolute deadline currently programmed into backend.yield_timer_fd.
+    // 0 means disarmed. Used to avoid redundant timerfd_settime syscalls
+    // when a new push does not change the heap's top.
+    u64 yield_timer_armed_ns = 0;
     u32 shard_id;
 
 private:
@@ -42,7 +164,7 @@ private:
     std::atomic<u32> drain_period_;
 
 public:
-    static constexpr u32 kMaxConns = 16384;
+    static constexpr u32 kMaxConns = epoll_yield::kMaxConns;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     SlicePool pool;
     Connection conns[kMaxConns];
@@ -273,6 +395,13 @@ public:
 
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
+        // If a yield is scheduled, drop its heap entry now so a long wait
+        // doesn't keep an unused heap slot occupied until its deadline.
+        // Only the pending_handler_fn path can have an entry; no-op
+        // otherwise. Rearm in case this conn owned the heap's top.
+        if (c.pending_handler_fn) {
+            if (yield_heap.remove_by_conn(c.id) > 0) rearm_yield_timerfd();
+        }
         if (c.fd >= 0) {
             ::close(c.fd);
             c.fd = -1;
@@ -299,6 +428,86 @@ public:
         this->free_conn(c);
     }
 
+    // --- Yield timer (ms precision via one-shot timerfd + min-heap) ---
+
+    // Schedule a JIT handler yield wake-up in `ms` milliseconds. Unlike
+    // timer.add (1-second resolution, slotted wheel), this pushes an
+    // absolute CLOCK_MONOTONIC deadline onto yield_heap and re-arms
+    // backend.yield_timer_fd when the heap's top deadline moves earlier.
+    // Slots should be cleared before calling — no recv/send in flight.
+    //
+    // Takes the conn off the keepalive wheel while the precise timer
+    // owns its wakeup — otherwise waits longer than keepalive_timeout
+    // get resumed early by the wheel's 1-second tick. Keepalive gets
+    // re-armed automatically by dispatch()'s timer.refresh when the
+    // handler resumes and submits its next I/O.
+    //
+    // Returns false if the request can't be scheduled faithfully —
+    // yield_heap is full AND the wait exceeds what the 1-second wheel
+    // fallback can represent (~63s). Caller fails the request.
+    [[nodiscard]] bool schedule_yield_timer(Connection& conn, u32 ms) {
+        timer.remove(&conn);
+        // Epoll is level-triggered: with all callback slots null during
+        // yield, an adversarial peer sending bytes while recv_buf is
+        // full would keep waking us on EPOLLIN for no work. Suspend
+        // recv interest until the next submit_recv rearms it.
+        backend.pause_recv(conn.id);
+        u64 now = epoll_yield::monotonic_ns();
+        u64 deadline = now + static_cast<u64>(ms) * 1'000'000ull;
+        if (yield_heap.push(deadline, conn.handler_gen, conn.id)) {
+            rearm_yield_timerfd();
+            return true;
+        }
+        // Heap full — fall back to 1-second timer wheel, but only if
+        // the wait fits. 64 slots × 1s: seconds in [1, 63] land
+        // faithfully; 64+ would wrap mod-64. Fail the request
+        // rather than silently shorten the wait.
+        u32 secs = timer_seconds_from_ms(ms);
+        if (secs >= TimerWheel::kSlots) return false;
+        // Minimum 1 second: wait(0) on the wheel would land in the
+        // current slot, which the ongoing tick has already drained —
+        // the entry would then sit idle until the wheel wraps (~64s).
+        // analyze rejects wait(0) upstream, so this is defence-in-depth.
+        if (secs == 0) secs = 1;
+        timer.add(&conn, secs);
+        return true;
+    }
+
+    // (Re-)arm backend.yield_timer_fd for the current heap top. Called after
+    // every push and after every drain. Uses yield_timer_armed_ns to skip
+    // redundant timerfd_settime calls.
+    void rearm_yield_timerfd() {
+        if (yield_heap.empty()) {
+            if (yield_timer_armed_ns != 0) {
+                backend.arm_yield_timerfd(0);
+                yield_timer_armed_ns = 0;
+            }
+            return;
+        }
+        u64 top = yield_heap.top().deadline_ns;
+        if (top == yield_timer_armed_ns) return;
+        backend.arm_yield_timerfd(top);
+        yield_timer_armed_ns = top;
+    }
+
+    // Drain all heap entries whose deadline has passed. Resume each
+    // connection's pending JIT handler (skipping stale entries whose
+    // handler_gen no longer matches — indicating the slot was closed
+    // and reused before the timer fired).
+    void drain_yield_heap() {
+        u64 now = epoll_yield::monotonic_ns();
+        while (!yield_heap.empty() && yield_heap.top().deadline_ns <= now) {
+            auto entry = yield_heap.top();
+            yield_heap.pop();
+            if (entry.conn_id >= kMaxConns) continue;
+            auto& c = conns[entry.conn_id];
+            if (!c.pending_handler_fn) continue;
+            if (c.handler_gen != entry.handler_gen) continue;  // stale
+            resume_jit_handler<EpollEventLoop>(this, c);
+        }
+        rearm_yield_timerfd();
+    }
+
     // --- Dispatch ---
 
     void dispatch(const IoEvent& ev) {
@@ -306,12 +515,29 @@ public:
             on_accept(ev);
             return;
         }
+        if (ev.type == IoEventType::HandlerTimer) {
+            // yield_timer_fd expired; drain all entries at/past the
+            // current clock.
+            drain_yield_heap();
+            return;
+        }
         if (ev.type == IoEventType::Timeout) {
             i32 ticks = ev.result > 0 ? ev.result : 1;
             const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
             if (ticks > max_ticks) ticks = max_ticks;
             for (i32 t = 0; t < ticks; t++) {
-                timer.tick([this](Connection* c) { this->close_conn(*c); });
+                timer.tick([this](Connection* c) {
+                    // A timer can now expire for two reasons:
+                    //   (1) keepalive — close the connection (existing).
+                    //   (2) a JIT handler yielded with wait(ms) and asked to
+                    //       be resumed; pending_handler_fn is the handler to
+                    //       re-enter with ctx.state = c->handler_state.
+                    if (c->pending_handler_fn) {
+                        resume_jit_handler<EpollEventLoop>(this, *c);
+                    } else {
+                        this->close_conn(*c);
+                    }
+                });
             }
             if (draining_.load(std::memory_order_acquire)) {
                 u64 start = drain_start_.load(std::memory_order_relaxed);
@@ -331,6 +557,16 @@ public:
             if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
+            } else if (conn.pending_handler_fn) {
+                // Mid-yield (all callback slots null while the yield timer
+                // owns the wakeup). Close on terminal recv (peer FIN / RST /
+                // hang-up) so a client disconnect during wait(ms) can't
+                // keep the slot allocated until the deadline fires.
+                // close_conn takes the yield timer down via yield_heap
+                // remove_by_conn in close_conn_impl.
+                if (ev.type == IoEventType::Recv && ev.result <= 0) {
+                    this->close_conn(conn);
+                }
             }
         }
     }

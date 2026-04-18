@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/types.h"
+#include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
 
 #include <errno.h>
@@ -12,8 +13,9 @@ namespace rut {
 
 // Action for a matched route.
 enum class RouteAction : u8 {
-    Static,  // respond with fixed status (e.g., 200 OK, 404)
-    Proxy,   // forward to upstream target
+    Static,      // respond with fixed status (e.g., 200 OK, 404)
+    Proxy,       // forward to upstream target
+    JitHandler,  // invoke JIT-compiled handler, may yield for I/O/timer
 };
 
 // Upstream target — address:port for a backend server.
@@ -54,8 +56,9 @@ struct RouteEntry {
 
     // Action
     RouteAction action;
-    u16 upstream_id;  // index into RouteConfig::upstreams (if action == Proxy)
-    u16 status_code;  // status code (if action == Static, e.g., 200, 404)
+    u16 upstream_id;              // index into RouteConfig::upstreams (if action == Proxy)
+    u16 status_code;              // status code (if action == Static, e.g., 200, 404)
+    jit::HandlerFn fn = nullptr;  // JIT-compiled handler (if action == JitHandler)
 };
 
 // RouteConfig — immutable after construction, atomically swappable.
@@ -91,6 +94,7 @@ struct RouteConfig {
         r.action = RouteAction::Proxy;
         r.upstream_id = upstream_id;
         r.status_code = 0;
+        r.fn = nullptr;
         route_count++;
         return true;
     }
@@ -110,6 +114,30 @@ struct RouteConfig {
         r.action = RouteAction::Static;
         r.upstream_id = 0;
         r.status_code = status;
+        r.fn = nullptr;
+        route_count++;
+        return true;
+    }
+
+    // Add a JIT-handler route. Handler is invoked on match; its HandlerResult
+    // tells the runtime what to do next (return status, forward, or yield).
+    // Returns false if table full, path too long, or fn is null.
+    bool add_jit_handler(const char* path, u8 method, jit::HandlerFn fn) {
+        if (route_count >= kMaxRoutes) return false;
+        if (fn == nullptr) return false;
+        auto& r = routes[route_count];
+        r.path_len = 0;
+        while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
+            r.path[r.path_len] = path[r.path_len];
+            r.path_len++;
+        }
+        if (path[r.path_len] != '\0') return false;  // path too long
+        r.path[r.path_len] = '\0';
+        r.method = method;
+        r.action = RouteAction::JitHandler;
+        r.upstream_id = 0;
+        r.status_code = 0;
+        r.fn = fn;
         route_count++;
         return true;
     }

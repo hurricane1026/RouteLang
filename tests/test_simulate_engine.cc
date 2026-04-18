@@ -1,3 +1,8 @@
+#include "rut/compiler/analyze.h"
+#include "rut/compiler/lexer.h"
+#include "rut/compiler/lower_rir.h"
+#include "rut/compiler/mir_build.h"
+#include "rut/compiler/parser.h"
 #include "rut/sim/simulate_engine.h"
 #include "test.h"
 
@@ -345,6 +350,64 @@ TEST(simulate_engine, static_status_match) {
 
     engine.shutdown();
     ctx.destroy();
+}
+
+// Helper: compile a .rut source to an RIR module owned by `rir`.
+// The caller must keep `rir` alive for as long as the Engine.
+static bool compile_to_rir(const char* src, FrontendRirModule& rir) {
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    if (!lexed) return false;
+    auto ast = parse_file(lexed.value());
+    if (!ast) return false;
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    if (!hir) return false;
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    if (!mir) return false;
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    return lowered.has_value();
+}
+
+TEST(simulate_engine, wait_handler_drives_state_machine_to_terminal_status) {
+    // Source handler: one wait(500) then return 204. The simulate engine
+    // must drive the yield chain to completion offline (skipping the
+    // actual 500ms) and report the terminal status.
+    const char* src = "route GET \"/sleep\" { wait(500) return 204 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result =
+        simulate_one(engine, make_entry("GET /sleep HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, multiple_waits_all_drive_then_return) {
+    const char* src = "route GET \"/multi\" { wait(100) wait(200) wait(300) return 201 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result =
+        simulate_one(engine, make_entry("GET /multi HTTP/1.1\r\nHost: x\r\n\r\n", 201));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 201u);
+    CHECK_EQ(result.yield_count, 3u);
+
+    engine.shutdown();
+    rir.destroy();
 }
 
 TEST(simulate_engine, forward_upstream_match) {

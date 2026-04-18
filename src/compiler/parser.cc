@@ -726,6 +726,33 @@ struct Parser {
             stmt.span = Span{start.start, status.value()->end, start.line, start.col};
             return stmt;
         }
+        if (take(TokenType::KwWait)) {
+            // v1: `wait(IntLit)` — IntLit is milliseconds. Duration literals
+            // (`1s`, `500ms`) are future work.
+            auto lparen = expect(TokenType::LParen);
+            if (!lparen) return core::make_unexpected(lparen.error());
+            auto ms_tok = expect(TokenType::IntLit);
+            if (!ms_tok) return core::make_unexpected(ms_tok.error());
+            // u64 accumulator + UINT32_MAX cap — the yield payload is 32
+            // bits wide (status_code + upstream_id packed), so waits up
+            // to ~49 days are expressible.
+            u64 ms = 0;
+            for (u32 i = 0; i < ms_tok.value()->text.len; i++) {
+                const u32 digit = static_cast<u32>(ms_tok.value()->text.ptr[i] - '0');
+                if (ms > (static_cast<u64>(0xffffffffu) - static_cast<u64>(digit)) / 10)
+                    return frontend_error(FrontendError::InvalidInteger,
+                                          span_from(*ms_tok.value()),
+                                          ms_tok.value()->text);
+                ms = ms * 10 + static_cast<u64>(digit);
+            }
+            auto rparen = expect(TokenType::RParen);
+            if (!rparen) return core::make_unexpected(rparen.error());
+            AstStatement stmt{};
+            stmt.kind = AstStmtKind::Wait;
+            stmt.status_code = static_cast<u32>(ms);  // reused field: ms to sleep
+            stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
+            return stmt;
+        }
         if (take(TokenType::KwIf)) {
             const bool is_const = take(TokenType::KwConst) != nullptr;
             auto cond = parse_expr();
@@ -1476,7 +1503,9 @@ struct Parser {
             if (!stmt) return core::make_unexpected(stmt.error());
             if (!item.route.statements.push(stmt.value()))
                 return frontend_error(FrontendError::TooManyItems, stmt.value().span);
-            if (stmt->kind != AstStmtKind::Let && stmt->kind != AstStmtKind::Guard) break;
+            if (stmt->kind != AstStmtKind::Let && stmt->kind != AstStmtKind::Guard &&
+                stmt->kind != AstStmtKind::Wait)
+                break;
         }
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());

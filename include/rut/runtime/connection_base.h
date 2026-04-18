@@ -2,12 +2,16 @@
 
 #include "rut/common/buffer.h"
 #include "rut/common/types.h"
+#include "rut/jit/handler_abi.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
 
+#include <linux/time_types.h>
 #include <openssl/base.h>
 
 namespace rut {
+
+struct RouteConfig;  // forward for per-request config pin below
 
 enum class BodyMode : u8 {
     None,           // No body
@@ -69,9 +73,44 @@ struct ConnectionBase {
     i32 upstream_fd;
     u16 upstream_idx;
 
-    // JIT handler state
+    // JIT handler state.
+    //   handler_state: current state-machine index; handler reads this at
+    //     entry and dispatches. On yield the runtime stores next_state here.
+    //   handler_ctx:   reserved for future frame / slot storage (SlicePool
+    //     slice or arena-allocated HandlerCtx). Slice 0 (wait only) keeps
+    //     this null and uses a stack-local HandlerCtx.
+    //   pending_handler_fn: non-null while the handler has yielded and is
+    //     waiting for its timer/io completion. The tick callback uses this
+    //     to distinguish "resume JIT handler" from "keepalive expired,
+    //     close connection". Reset to null on terminal outcome.
     u16 handler_state;
     void* handler_ctx;
+    jit::HandlerFn pending_handler_fn;
+
+    // Per-request generation counter. Incremented on every new request
+    // (in on_header_received) so the epoll YieldHeap can filter out
+    // stale entries left behind by a close+reuse that lands in the same
+    // microsecond as the new request — req_start_us alone is not
+    // strictly unique at μs granularity under close-during-yield churn.
+    //
+    // Default-initialized and deliberately NOT reset in reset(): the
+    // counter must persist across slot reuse so every generation on a
+    // given slot is distinct (first use: 0 → 1; reuse: N → N+1; …).
+    u32 handler_gen = 0;
+
+    // Route config pinned for the lifetime of the current request. Set
+    // in on_header_received from the loop's config pointer; referenced
+    // by handle_jit_outcome (e.g., Forward upstream resolution) so a
+    // config hot-swap during wait(ms) can't resolve an upstream_id
+    // against the post-swap config. Cleared by reset().
+    const RouteConfig* request_config;
+
+    // Per-connection timespec storage for IORING_OP_TIMEOUT yields. The
+    // kernel reads this asynchronously after SQE submission, so it must
+    // outlive the submit call — on-connection storage is the simplest
+    // stable lifetime. Unused by the epoll backend (which uses a shared
+    // yield_timer_fd + min-heap).
+    __kernel_timespec yield_timespec;
 
     bool keep_alive;
     bool tls_active;
@@ -104,6 +143,12 @@ struct ConnectionBase {
     bool send_armed;
     bool upstream_recv_armed;
     bool upstream_send_armed;
+    // True between schedule_yield_timer (io_uring: IORING_OP_TIMEOUT SQE
+    // submitted) and the matching HandlerTimer CQE. Mirrors the other
+    // *_armed flags so close_conn_impl can submit a cancel SQE, keeping
+    // the slot pinned until the timer CQE is harvested — otherwise a
+    // late-arriving stale CQE could resume a handler on a reused slot.
+    bool yield_armed;
 
     // Response status (set by handler/proxy, used by access log)
     u16 resp_status;
@@ -173,6 +218,14 @@ struct ConnectionBase {
         upstream_idx = 0;
         handler_state = 0;
         handler_ctx = nullptr;
+        // Deliberately NOT reset here: handler_gen persists across
+        // reset() so a stale YieldHeap entry whose target slot was
+        // recycled reliably fails the generation match. It's
+        // initialized at accept-time via EventLoop::alloc_conn_impl.
+        request_config = nullptr;
+        pending_handler_fn = nullptr;
+        yield_timespec.tv_sec = 0;
+        yield_timespec.tv_nsec = 0;
         keep_alive = false;
         tls_active = false;
         tls_handshake_complete = false;
@@ -195,6 +248,7 @@ struct ConnectionBase {
         send_armed = false;
         upstream_recv_armed = false;
         upstream_send_armed = false;
+        yield_armed = false;
         resp_status = 0;
         req_method = 0;
         req_size = 0;

@@ -12,7 +12,13 @@ enum class IoEventType : u8 {
     UpstreamConnect,
     UpstreamRecv,
     UpstreamSend,
-    Timeout,
+    Timeout,       // 1-second TimerWheel tick (keepalive driver)
+    HandlerTimer,  // JIT handler yield timer expired. Precise to ms.
+                   // io_uring: IORING_OP_TIMEOUT — conn_id identifies the
+                   //   target connection whose pending_handler_fn resumes.
+                   // epoll:   shared one-shot timerfd — event is a global
+                   //   notification; conn_id is unused, the event loop
+                   //   drains its min-heap to find which conns to resume.
 };
 
 // Unified completion event — field order optimized for minimal padding.

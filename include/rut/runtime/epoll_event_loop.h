@@ -556,6 +556,16 @@ public:
             if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
+            } else if (conn.pending_handler_fn) {
+                // Mid-yield (all callback slots null while the yield timer
+                // owns the wakeup). Close on terminal recv (peer FIN / RST /
+                // hang-up) so a client disconnect during wait(ms) can't
+                // keep the slot allocated until the deadline fires.
+                // close_conn takes the yield timer down via yield_heap
+                // remove_by_conn in close_conn_impl.
+                if (ev.type == IoEventType::Recv && ev.result <= 0) {
+                    this->close_conn(conn);
+                }
             }
         }
     }

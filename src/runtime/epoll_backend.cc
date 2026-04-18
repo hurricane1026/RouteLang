@@ -491,7 +491,15 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         u32 conn_id;
         IoEventType type;
         decode_data(ep_events[i].data.u64, conn_id, type);
-        bool has_read = (ep_events[i].events & EPOLLIN) != 0;
+        // EPOLLHUP/EPOLLERR always fire regardless of the interest mask
+        // (per epoll_ctl(2)), so pause_recv(events=0) can't prevent them.
+        // Fold them into has_read so peer-close / hard-error routes
+        // through handle_epollin → recv() returns 0 or -errno → emits a
+        // terminal Recv event the dispatcher can close on. Without this,
+        // a HUP during yield would silently drop every iteration and
+        // the kernel would re-deliver it forever (busy loop + slot leak).
+        bool has_read =
+            (ep_events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != 0;
         bool has_write = (ep_events[i].events & EPOLLOUT) != 0;
 
         if (conn_id == kListenConnId) {

@@ -322,13 +322,52 @@ void handle_jit_outcome(Loop* loop,
             loop->schedule_yield_timer(conn, outcome.timer_ms);
             return;
         }
-        case JitDispatchOutcome::Kind::Forward:
+        case JitDispatchOutcome::Kind::Forward: {
+            conn.pending_handler_fn = nullptr;
+            // Resolve upstream by id. The handler ABI's upstream_id slot
+            // is u16, and upstream tables are small, so a direct index
+            // into config->upstreams matches the RouteAction::Proxy path.
+            const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
+            if (!config || outcome.upstream_id >= config->upstream_count) {
+                // Unresolvable upstream id — handler returned a value
+                // the config doesn't know. Fail closed with 502 rather
+                // than hanging or silently discarding the request.
+                conn.state = ConnState::Sending;
+                conn.resp_status = kStatusBadGateway;
+                format_static_response(conn, 502, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
+            conn.state = ConnState::Proxying;
+            auto& target = config->upstreams[outcome.upstream_id];
+            for (u32 i = 0; i < sizeof(conn.upstream_name) && i < target.name_len; i++)
+                conn.upstream_name[i] = target.name[i];
+            if (target.name_len < sizeof(conn.upstream_name))
+                conn.upstream_name[target.name_len] = '\0';
+            else
+                conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
+            const i32 kUpstreamFd = UpstreamPool::create_socket();
+            if (kUpstreamFd < 0) {
+                conn.state = ConnState::Sending;
+                conn.resp_status = kStatusBadGateway;
+                format_static_response(conn, 502, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
+            conn.upstream_fd = kUpstreamFd;
+            conn.upstream_start_us = monotonic_us();
+            conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+            loop->submit_connect(conn, &target.addr, sizeof(target.addr));
+            return;
+        }
         case JitDispatchOutcome::Kind::Error:
         default:
-            // Forward from JIT path not yet wired end-to-end; fall through
-            // to 500 for safety so the client never hangs. Proper Forward
-            // integration rides the existing Proxy path once the upstream
-            // id resolution is connected — future slice.
+            // Handler returned an unsupported action kind (or nullptr fn);
+            // fail closed with 500 rather than hang.
             conn.pending_handler_fn = nullptr;
             conn.state = ConnState::Sending;
             conn.resp_status = 500;

@@ -2341,6 +2341,127 @@ TEST(route, wait_longer_than_keepalive_not_resumed_by_wheel) {
     rir.destroy();
 }
 
+// Minimal hand-written handler that returns a Forward action. Matches the
+// jit::HandlerFn ABI so callbacks_impl.h's handle_jit_outcome can dispatch
+// it the same way it would a real JIT-compiled handler.
+static u64 forward_upstream_0_handler(void* /*conn*/,
+                                      rut::jit::HandlerCtx* /*ctx*/,
+                                      const u8* /*req*/,
+                                      u32 /*len*/,
+                                      void* /*arena*/) {
+    auto r = rut::jit::HandlerResult::make_forward(0);
+    return r.pack();
+}
+
+// End-to-end: a JIT handler returning Forward must kick off the same
+// proxy flow as a RouteAction::Proxy match. Before the JIT forward wire-up,
+// handle_jit_outcome::Forward returned 500; this test guards against that
+// regression. Mirrors replay_gap::proxy_route_enters_proxy_state but with
+// the JitHandler route action.
+TEST(route, forward_jit_handler_enters_proxy_state) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    auto up = cfg.add_upstream("backend", 0x7F000001, 9999);
+    REQUIRE(up.has_value());
+    REQUIRE_EQ(up.value(), 0u);  // first upstream → id 0 in cfg
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_upstream_0_handler));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /api HTTP/1.1\r\nHost: x\r\n\r\n", 30);
+
+    // The request triggers the JIT handler → Forward → submit_connect
+    // to 127.0.0.1:9999. No upstream is listening, so the connect will
+    // fail with ECONNREFUSED and the loop will send a 502 (or close).
+    // The assertion we care about is that a 502 came back — proving
+    // Forward routed through the proxy path instead of the pre-fix
+    // 500 response.
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    bool found_502 = false;
+    for (i32 i = 0; i + 2 < n; i++) {
+        if (buf[i] == '5' && buf[i + 1] == '0' && buf[i + 2] == '2') {
+            found_502 = true;
+            break;
+        }
+    }
+    CHECK(found_502);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+// Bad upstream_id (out of bounds) → handle_jit_outcome must return 502
+// rather than crash or hang. Guards the defensive bound check in the
+// Forward branch.
+static u64 forward_upstream_99_handler(void* /*conn*/,
+                                       rut::jit::HandlerCtx* /*ctx*/,
+                                       const u8* /*req*/,
+                                       u32 /*len*/,
+                                       void* /*arena*/) {
+    auto r = rut::jit::HandlerResult::make_forward(99);
+    return r.pack();
+}
+
+TEST(route, forward_jit_handler_rejects_unknown_upstream_id) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    // Only one upstream at id 0; handler returns 99.
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9999));
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_upstream_99_handler));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /api HTTP/1.1\r\nHost: x\r\n\r\n", 30);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    bool found_502 = false;
+    for (i32 i = 0; i + 2 < n; i++) {
+        if (buf[i] == '5' && buf[i + 1] == '0' && buf[i + 2] == '2') {
+            found_502 = true;
+            break;
+        }
+    }
+    CHECK(found_502);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

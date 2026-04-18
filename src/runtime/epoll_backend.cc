@@ -498,8 +498,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         // terminal Recv event the dispatcher can close on. Without this,
         // a HUP during yield would silently drop every iteration and
         // the kernel would re-deliver it forever (busy loop + slot leak).
-        bool has_read =
-            (ep_events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != 0;
+        bool has_read = (ep_events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != 0;
         bool has_write = (ep_events[i].events & EPOLLOUT) != 0;
 
         if (conn_id == kListenConnId) {

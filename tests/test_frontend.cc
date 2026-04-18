@@ -241,6 +241,40 @@ TEST(frontend, analyze_accepts_wait_as_prefix_with_return) {
     REQUIRE_EQ(hir->routes[0].waits.len, 2u);
 }
 
+TEST(frontend, analyze_rejects_wait_zero) {
+    // wait(0) has no meaning for a sleep primitive and would stall
+    // ~1s under the wheel fallback path. Reject until the DSL grows
+    // a legitimate "yield control" semantic.
+    const char* src = "route GET \"/x\" { wait(0) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_rejects_wait_in_decorated_route) {
+    // The codegen state-machine prologue routes states 0..yield_count-1
+    // to yield blocks before the entry block. Once decorators are wired
+    // from HIR to codegen, they'd run AFTER all waits — unauthorized
+    // requests would sleep before rejecting. Reject the combination
+    // until decorators land with a proper pre-yield placement.
+    const char* src = R"rut(
+func auth(_ req: i32) -> i32 => 0
+route {
+    @auth "*"
+    GET "/x" { wait(50) return 204 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
 TEST(frontend, rir_function_carries_yield_payload_for_waits) {
     const char* src = "route GET \"/x\" { wait(500) wait(1000) return 200 }\n";
     auto lexed = lex(lit(src));

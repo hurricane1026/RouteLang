@@ -414,8 +414,9 @@ TEST(simulate_engine, let_before_wait_drives_to_terminal) {
 TEST(simulate_engine, let_used_after_wait_in_if) {
     // The real test of slice 1: the let's value has to survive the
     // yield and actually drive the branch in the terminal block.
-    // With pure-constant initializer + re-materialize-in-terminal, this
-    // works without explicit slot spilling.
+    // The pure-constant initializer is re-materialized fresh in the
+    // terminal block, so the branch compares against the correct
+    // value without any HandlerCtx slot storage.
     const char* src =
         "route GET \"/x\" { let code = 201 wait(50) if code == 201 { return 201 } else { return "
         "500 } }\n";

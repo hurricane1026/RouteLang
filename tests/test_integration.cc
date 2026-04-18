@@ -2299,7 +2299,8 @@ TEST(route, let_across_wait_drives_return_real_socket) {
 
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    send_all(c, "GET /let HTTP/1.1\r\nHost: x\r\n\r\n", 30);
+    const char kLetReq[] = "GET /let HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kLetReq, sizeof(kLetReq) - 1);
     char buf[1024];
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     CHECK_GT(n, 0);

@@ -9406,16 +9406,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // — zero or more `let`s, zero or more `wait`s, then the rest
         // (guard / if / match / return / forward).
         //
-        // Mechanism (for slice 1's pure-expression surface): codegen
-        // routes states 0..N-1 to dead-end yield blocks that emit the
-        // packed Yield; state N (terminal) runs the original entry
-        // block, which re-materializes every local fresh via
+        // Mechanism (slice 1, pure-expression surface): codegen routes
+        // states 0..N-1 to dead-end yield blocks that emit the packed
+        // Yield; state N (terminal) runs the original entry block,
+        // which re-materializes every local fresh via
         // materialize_local_init. For pure initializers that's
         // idempotent, so pre-wait locals reach the post-wait terminal
-        // with the right value — no spill/reload of HandlerCtx slots
-        // is needed. Once initializers gain side effects (I/O calls
-        // in later slices) this becomes incorrect and spill/reload
-        // must be wired.
+        // with the right value. The HandlerCtx slot helpers
+        // (load_slot/store_slot in include/rut/jit/handler_abi.h) are
+        // NOT used today — they stay parked until impure initializers
+        // (I/O expressions) arrive and re-materialization becomes
+        // incorrect.
         //
         // `let` after the first `wait` is rejected: it would still
         // execute in the terminal block (so pure inits would work in

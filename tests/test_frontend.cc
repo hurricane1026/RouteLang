@@ -256,9 +256,9 @@ TEST(frontend, analyze_rejects_wait_zero) {
 
 TEST(frontend, analyze_accepts_let_before_wait) {
     // Slice 1: lets can appear before waits. Codegen re-materializes
-    // the value in the terminal/entry block across the yield boundary;
-    // for the pure initializers slice 0 supports, this is idempotent
-    // so no HandlerCtx spill/reload machinery is needed yet.
+    // the value in the terminal/entry block across the yield boundary
+    // (idempotent for pure initializers). The HandlerCtx slot helpers
+    // in handler_abi.h are not wired.
     const char* src = "route GET \"/x\" { let k = 42 wait(50) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);

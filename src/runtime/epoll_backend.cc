@@ -219,9 +219,14 @@ void EpollBackend::pause_recv(u32 conn_id) {
     if (conn_id >= kMaxFdMap) return;
     i32 fd = downstream_fd_map[conn_id];
     if (fd < 0) return;
-    // events=0 keeps the fd registered but the kernel won't deliver
-    // EPOLLIN/EPOLLOUT until the next EPOLL_CTL_MOD rearms it.
-    set_fd_interest(epoll_fd, fd, conn_id, IoEventType::Recv, 0);
+    // Mask EPOLLIN so client data bytes during wait(ms) don't wake us on
+    // a level-triggered ready socket with no handler to consume them
+    // (busy-loop risk on a full recv_buf). KEEP EPOLLRDHUP so a clean
+    // peer FIN still surfaces — the kernel only sets EPOLLHUP when BOTH
+    // directions are closed, and without RDHUP interest a half-close
+    // would go undetected and the slot would sit until the yield
+    // deadline. EPOLLERR is always delivered regardless of mask.
+    set_fd_interest(epoll_fd, fd, conn_id, IoEventType::Recv, EPOLLRDHUP);
 }
 
 bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {

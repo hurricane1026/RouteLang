@@ -172,6 +172,11 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         // behave like the production loops.
         if (secs >= TimerWheel::kSlots) return false;
         if (secs == 0) secs = 1;
+        // timer.add doesn't detach an existing entry — calling it twice
+        // on the same connection would double-insert and corrupt the
+        // intrusive list. Production loops remove first; mirror that
+        // so keepalive-armed conns can yield safely.
+        timer.remove(&c);
         timer.add(&c, secs);
         return true;
     }
@@ -543,6 +548,11 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         // behave like the production loops.
         if (secs >= TimerWheel::kSlots) return false;
         if (secs == 0) secs = 1;
+        // timer.add doesn't detach an existing entry — calling it twice
+        // on the same connection would double-insert and corrupt the
+        // intrusive list. Production loops remove first; mirror that
+        // so keepalive-armed conns can yield safely.
+        timer.remove(&c);
         timer.add(&c, secs);
         return true;
     }
@@ -791,6 +801,11 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         // behave like the production loops.
         if (secs >= TimerWheel::kSlots) return false;
         if (secs == 0) secs = 1;
+        // timer.add doesn't detach an existing entry — calling it twice
+        // on the same connection would double-insert and corrupt the
+        // intrusive list. Production loops remove first; mirror that
+        // so keepalive-armed conns can yield safely.
+        timer.remove(&c);
         timer.add(&c, secs);
         return true;
     }

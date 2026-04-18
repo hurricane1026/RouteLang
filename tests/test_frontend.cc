@@ -190,7 +190,55 @@ TEST(frontend, analyze_accepts_wait_larger_than_u16_max) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
-    CHECK_EQ(hir->routes[0].waits[0].ms, 100000);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 100000u);
+}
+
+TEST(frontend, analyze_accepts_wait_near_u32_max) {
+    // UINT32_MAX-1 is the largest wait representable through the parser's
+    // u64 accumulator + UINT32_MAX cap. Round-trips through to HIR as-is.
+    const char* src = "route GET \"/x\" { wait(4294967294) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 4294967294u);
+}
+
+TEST(frontend, parser_rejects_wait_above_u32_max) {
+    // 2^32 overflows the u32 cap even with the u64 accumulator.
+    const char* src = "route GET \"/x\" { wait(4294967296) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    CHECK(!ast);
+}
+
+TEST(frontend, analyze_rejects_wait_after_non_wait_statement) {
+    // Slice 0 codegen dispatches yields before the entry block, so waits
+    // must be a contiguous prefix. `guard ...; wait(50); return 204`
+    // would otherwise run the wait before the guard check.
+    const char* src = "route GET \"/x\" { guard true else { return 500 } wait(50) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_accepts_wait_as_prefix_with_return) {
+    // Two waits then a return is the canonical slice-0 shape.
+    const char* src = "route GET \"/x\" { wait(10) wait(20) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 2u);
 }
 
 TEST(frontend, rir_function_carries_yield_payload_for_waits) {

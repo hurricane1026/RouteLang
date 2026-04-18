@@ -425,22 +425,24 @@ public:
             return;
         }
         if (ev.type == IoEventType::HandlerTimer) {
-            // JIT handler yield timer expired (or was cancelled — same
+            // JIT handler yield timer fired (or was cancelled — same
             // resume path; any error bubbles through the handler).
-            // ev.more is never set for IORING_OP_TIMEOUT, so this CQE
-            // always concludes a yield_armed window: decrement the op
-            // accounting so close-during-yield can reclaim the slot.
+            //
+            // Decrement pending_ops unconditionally: IORING_OP_TIMEOUT
+            // never sets CQE_F_MORE, and the cancel SQE submitted in
+            // close_conn_impl shares this user_data — both CQEs route
+            // here and must each decrement. yield_armed can't gate this
+            // because free_conn_impl::reset() clears the flag when a
+            // close lands while the timer is in flight.
             if (ev.conn_id < kMaxConns) {
                 auto& c = conns[ev.conn_id];
-                if (c.yield_armed) {
-                    c.yield_armed = false;
-                    if (c.pending_ops > 0) c.pending_ops--;
-                }
+                if (c.pending_ops > 0) c.pending_ops--;
+                c.yield_armed = false;
                 if (c.pending_handler_fn) {
                     resume_jit_handler<IoUringEventLoop>(this, c);
                 } else if (c.pending_ops == 0) {
-                    // Stale CQE for a slot that was already closed; nothing
-                    // else left in flight, safe to reclaim now.
+                    // Stale CQE for an already-closed slot; safe to
+                    // reclaim now that the last in-flight op has drained.
                     reclaim_slot(ev.conn_id);
                 }
             }

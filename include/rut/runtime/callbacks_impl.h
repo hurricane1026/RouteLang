@@ -167,6 +167,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 
     capture_request_metadata(conn);
 
+    // Tag the request with a fresh generation so the yield-heap stale
+    // filter can reliably reject entries left by a close+reuse even if
+    // the new request's req_start_us lands in the same microsecond.
+    conn.handler_gen++;
     conn.req_start_us = monotonic_us();
     if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();

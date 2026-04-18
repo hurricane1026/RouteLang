@@ -85,6 +85,13 @@ struct ConnectionBase {
     void* handler_ctx;
     jit::HandlerFn pending_handler_fn;
 
+    // Per-request generation counter. Incremented on every new request
+    // (in on_header_received) so the epoll YieldHeap can filter out
+    // stale entries left behind by a close+reuse that lands in the same
+    // microsecond as the new request — req_start_us alone is not
+    // strictly unique at μs granularity under close-during-yield churn.
+    u32 handler_gen;
+
     // Per-connection timespec storage for IORING_OP_TIMEOUT yields. The
     // kernel reads this asynchronously after SQE submission, so it must
     // outlive the submit call — on-connection storage is the simplest
@@ -198,6 +205,10 @@ struct ConnectionBase {
         upstream_idx = 0;
         handler_state = 0;
         handler_ctx = nullptr;
+        // Deliberately NOT reset here: handler_gen persists across
+        // reset() so a stale YieldHeap entry whose target slot was
+        // recycled reliably fails the generation match. It's
+        // initialized at accept-time via EventLoop::alloc_conn_impl.
         pending_handler_fn = nullptr;
         yield_timespec.tv_sec = 0;
         yield_timespec.tv_nsec = 0;

@@ -1,6 +1,7 @@
 #include "rut/jit/codegen.h"
 
 #include "rut/compiler/rir.h"
+#include "rut/jit/handler_abi.h"
 
 #include <llvm-c/Core.h>
 
@@ -872,7 +873,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
         // Use function-specific yield kind. v1: all yields are Timer; later
         // layers will branch on per-yield metadata.
-        constexpr u8 kYieldKindTimer = 3;
+        constexpr u8 kYieldKindTimer = static_cast<u8>(YieldKind::Timer);
         for (u32 si = 0; si < fn.yield_count; si++) {
             char ylabel[24];
             u32 lpos = 0;

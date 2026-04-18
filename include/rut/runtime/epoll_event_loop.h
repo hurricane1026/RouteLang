@@ -37,8 +37,10 @@ inline u64 monotonic_ns() {
 
 // Min-heap of pending JIT yield deadlines. The heap's top entry determines
 // when backend.yield_timer_fd must fire next. Entries are tagged with the
-// connection's req_start_us so stale entries (connection closed and
-// reassigned to a different request) can be filtered on pop.
+// connection's handler_gen so stale entries (connection closed and
+// reassigned to a different request) are filtered on pop. handler_gen is
+// a monotonic per-connection counter — strictly unique across reuse even
+// under μs-granularity close/reuse churn that could alias req_start_us.
 //
 // Capacity: one live entry per connection at most; handler chains (yield →
 // resume → yield) push a new entry each time, but the prior entry has
@@ -46,7 +48,7 @@ inline u64 monotonic_ns() {
 struct YieldHeap {
     struct Entry {
         u64 deadline_ns;
-        u64 req_start_us;
+        u32 handler_gen;
         u32 conn_id;
     };
     static constexpr u32 kCap = 16384 + 256;
@@ -57,10 +59,10 @@ struct YieldHeap {
     bool empty() const { return size == 0; }
     const Entry& top() const { return entries[0]; }
 
-    bool push(u64 deadline_ns, u64 req_start_us, u32 conn_id) {
+    bool push(u64 deadline_ns, u32 handler_gen, u32 conn_id) {
         if (size >= kCap) return false;
         u32 i = size++;
-        entries[i] = {deadline_ns, req_start_us, conn_id};
+        entries[i] = {deadline_ns, handler_gen, conn_id};
         while (i > 0) {
             u32 parent = (i - 1) / 2;
             if (entries[parent].deadline_ns <= entries[i].deadline_ns) break;
@@ -389,7 +391,7 @@ public:
         timer.remove(&conn);
         u64 now = epoll_yield::monotonic_ns();
         u64 deadline = now + static_cast<u64>(ms) * 1'000'000ull;
-        if (!yield_heap.push(deadline, conn.req_start_us, conn.id)) {
+        if (!yield_heap.push(deadline, conn.handler_gen, conn.id)) {
             // Heap full — fall back to 1-second timer wheel. Degrades
             // precision but preserves liveness via the wheel tick's
             // pending_handler_fn branch.
@@ -418,7 +420,7 @@ public:
 
     // Drain all heap entries whose deadline has passed. Resume each
     // connection's pending JIT handler (skipping stale entries whose
-    // req_start_us no longer matches — indicating the slot was closed
+    // handler_gen no longer matches — indicating the slot was closed
     // and reused before the timer fired).
     void drain_yield_heap() {
         u64 now = epoll_yield::monotonic_ns();
@@ -428,7 +430,7 @@ public:
             if (entry.conn_id >= kMaxConns) continue;
             auto& c = conns[entry.conn_id];
             if (!c.pending_handler_fn) continue;
-            if (c.req_start_us != entry.req_start_us) continue;  // stale
+            if (c.handler_gen != entry.handler_gen) continue;  // stale
             resume_jit_handler<EpollEventLoop>(this, c);
         }
         rearm_yield_timerfd();

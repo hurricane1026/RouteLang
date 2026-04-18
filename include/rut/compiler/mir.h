@@ -196,7 +196,7 @@ struct MirBlock {
 struct MirFunction {
     struct Wait {
         Span span{};
-        i32 ms = 0;
+        u32 ms = 0;
     };
 
     Span span{};

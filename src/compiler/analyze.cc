@@ -9401,36 +9401,56 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (route.method == 0)
             return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
 
-        // Slice-0 constraint: all waits must appear as a contiguous prefix
-        // of the route body (possibly empty, followed by non-wait code).
-        // The current codegen dispatches the state-machine prologue BEFORE
-        // the entry block, so a wait placed after other statements would
-        // run those statements only after the final yield — source order
-        // would not match execution order for interleaved guard/let/wait.
-        // Proper mid-body yields land with the submit/any/all slices.
+        // Slice-1 constraint: a route body has the shape
+        //   let* ; wait* ; guard* ; terminal_control
+        // — zero or more `let`s, zero or more `wait`s, zero or more
+        // top-level `guard`s (each guard requires a following
+        // statement), then one top-level terminal control statement
+        // (return / forward / if / match / block containing that
+        // terminal region). Guards gate subsequent waits the same
+        // way any other non-let non-wait does, but are called out
+        // separately because they're common pre-terminal filters.
         //
-        // Decorators are also routed through the entry block (once wired
-        // from HIR to codegen), so mixing waits with decorators would
-        // sleep before running the decorator — a route like
-        // `@auth GET "/x" { wait(50) return 204 }` would let an
-        // unauthorized request sleep before rejecting. Reject that
-        // combination here until decorators land in codegen with a
-        // proper pre-yield placement.
+        // Mechanism (slice 1, pure-expression surface): codegen routes
+        // states 0..N-1 to dead-end yield blocks that emit the packed
+        // Yield; state N (terminal) runs the original entry block,
+        // which re-materializes every local fresh via
+        // materialize_local_init. For pure initializers that's
+        // idempotent, so pre-wait locals reach the post-wait terminal
+        // with the right value. The HandlerCtx slot helpers
+        // (load_slot/store_slot in include/rut/jit/handler_abi.h) are
+        // NOT used today — they stay parked until impure initializers
+        // (I/O expressions) arrive and re-materialization becomes
+        // incorrect.
+        //
+        // `let` after the first `wait` is rejected: it would still
+        // execute in the terminal block (so pure inits would work in
+        // principle), but the source order would misrepresent when
+        // the initializer actually runs, and the mechanism extends
+        // awkwardly once impure inits land. Deferring until the
+        // state-machine has real per-state code gen.
+        //
+        // Decorators are routed through the entry block, so mixing
+        // waits with decorators would sleep before running the
+        // decorator — `@auth GET "/x" { wait(50) return 204 }` would
+        // let an unauthorized request sleep before rejecting. Reject
+        // that combination here until decorators gain pre-yield
+        // placement.
         //
         // wait(0) is rejected: it has no meaning for a sleep primitive
-        // and would stall 1s under the wheel fallback. If concurrent-I/O
-        // primitives grow a legitimate "yield control" use-case, this
-        // check can be lifted.
-        bool seen_non_wait = false;
+        // and would stall 1s under the wheel fallback.
+        bool seen_wait = false;
+        bool seen_non_let_non_wait = false;
         for (u32 si = 0; si < item.route.statements.len; si++) {
             const auto& stmt = item.route.statements[si];
             if (stmt.kind == AstStmtKind::Wait) {
-                if (seen_non_wait)
+                if (seen_non_let_non_wait)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 if (stmt.status_code == 0)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 if (!item.route.decorators.empty())
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                seen_wait = true;
                 // ms payload is the 32-bit Yield slot (status_code +
                 // upstream_id co-opted); the parser already caps at
                 // UINT32_MAX. Duration literals (`1s`, `500ms`) are future
@@ -9442,7 +9462,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     return frontend_error(FrontendError::TooManyItems, stmt.span);
                 continue;
             }
-            seen_non_wait = true;
+            // Pre-wait lets are allowed; post-wait lets are not. Any
+            // other statement (guard/if/match/return/forward/...) counts
+            // as the terminal region and gates further waits.
+            if (stmt.kind != AstStmtKind::Let) {
+                seen_non_let_non_wait = true;
+            } else if (seen_wait) {
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            }
             if (stmt.kind == AstStmtKind::Let) {
                 HirLocal local{};
                 local.span = stmt.span;

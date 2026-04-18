@@ -392,6 +392,46 @@ TEST(simulate_engine, wait_handler_drives_state_machine_to_terminal_status) {
     rir.destroy();
 }
 
+TEST(simulate_engine, let_before_wait_drives_to_terminal) {
+    // Slice 1 acceptance: a let before a wait runs when the terminal
+    // state reaches the entry block, and the yield chain still drives
+    // to the terminal status cleanly. The let's value doesn't
+    // participate in the return here — that's covered by
+    // let_used_after_wait_in_if below.
+    const char* src = "route GET \"/x\" { let k = 200 wait(50) return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 200));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 200u);
+    CHECK_EQ(result.yield_count, 1u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, let_used_after_wait_in_if) {
+    // The real test of slice 1: the let's value has to survive the
+    // yield and actually drive the branch in the terminal block.
+    // The pure-constant initializer is re-materialized fresh in the
+    // terminal block, so the branch compares against the correct
+    // value without any HandlerCtx slot storage.
+    const char* src =
+        "route GET \"/x\" { let code = 201 wait(50) if code == 201 { return 201 } else { return "
+        "500 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 201));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 201u);
+    CHECK_EQ(result.yield_count, 1u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, multiple_waits_all_drive_then_return) {
     const char* src = "route GET \"/multi\" { wait(100) wait(200) wait(300) return 201 }\n";
     FrontendRirModule rir{};

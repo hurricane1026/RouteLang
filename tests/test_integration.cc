@@ -2248,6 +2248,94 @@ TEST(route, wait_ms_precision_sub_second) {
     rir.destroy();
 }
 
+// Slice 1: a let initializer whose value drives the terminal return
+// must survive across a wait. The current codegen re-materializes the
+// local inside the terminal block, which works for pure initializers.
+// End-to-end check via a real JIT + epoll loop that `let code = 201;
+// wait(100); if code == 201 { return 201 } else { return 500 }` returns
+// 201, proving the local's value reaches the branch post-yield.
+TEST(route, let_across_wait_drives_return_real_socket) {
+    using namespace rut;
+
+    const char* src =
+        "route GET \"/let\" { let code = 201 wait(100) if code == 201 { return 201 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/let", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kLetReq[] = "GET /let HTTP/1.1\r\nHost: x\r\n\r\n";
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    send_all(c, kLetReq, sizeof(kLetReq) - 1);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
+                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ms = elapsed_ns / 1'000'000LL;
+
+    CHECK_GT(n, 0);
+    bool found_201 = false;
+    for (i32 i = 0; i + 2 < n; i++) {
+        if (buf[i] == '2' && buf[i + 1] == '0' && buf[i + 2] == '1') {
+            found_201 = true;
+            break;
+        }
+    }
+    CHECK(found_201);
+    // wait(100) must actually fire — otherwise this test could pass
+    // even if the yield path was bypassed and state 0 fell through
+    // to state N immediately. Floor at 80ms for scheduler jitter on
+    // slow CI; ceiling at 500ms to flag anything unusually slow.
+    CHECK_GT(elapsed_ms, 80);
+    CHECK_LT(elapsed_ms, 500);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
 // Regression: a wait(ms) longer than keepalive_timeout must NOT be woken
 // early by the 1-second TimerWheel tick. Before the fix, yielded conns
 // remained on the keepalive wheel and the tick callback resumed them via

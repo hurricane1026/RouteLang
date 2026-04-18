@@ -411,6 +411,15 @@ public:
     // HandlerTimer can't resume a handler on a reused slot.
     void schedule_yield_timer(Connection& conn, u32 ms) {
         timer.remove(&conn);
+        // Cancel multishot recv so client bytes during wait(ms) don't
+        // pile up: with on_recv null, dispatch would drop CQEs and
+        // never return provided buffers, leaking the ring. The cancel
+        // SQE's own CQE + the final -ECANCELED recv CQE both route
+        // through dispatch's pending_handler_fn branch (pending_ops
+        // decrements there).
+        if (conn.recv_armed && backend.cancel_recv(conn.id)) {
+            conn.pending_ops++;
+        }
         if (backend.add_yield_timeout(conn.id, conn, ms)) {
             conn.yield_armed = true;
             conn.pending_ops++;
@@ -498,12 +507,16 @@ public:
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
             } else if (conn.pending_handler_fn) {
-                // Stray CQE for a conn that's mid-yield (all slots null while
-                // the timer owns the wakeup). Don't touch pending_ops beyond
-                // the accounting already done above, and DO NOT reclaim —
-                // the handler is still waiting to resume. Particularly
-                // important in the SQ-full wheel-fallback path, which
-                // doesn't pin the slot via pending_ops.
+                // Stray CQE for a conn that's mid-yield (all slots null
+                // while the timer owns the wakeup). Return any provided
+                // buffer to the ring so an in-flight multishot recv
+                // racing with cancel_recv doesn't leak buffers. Don't
+                // touch pending_ops beyond the accounting already done
+                // above, and DO NOT reclaim — the handler is still
+                // waiting to resume. Particularly important in the
+                // SQ-full wheel-fallback path, which doesn't pin the
+                // slot via pending_ops.
+                if (ev.has_buf) backend.return_buffer(ev.buf_id);
             } else if (conn.pending_ops == 0) {
                 // Stale CQE for a genuinely closed connection.
                 reclaim_slot(ev.conn_id);

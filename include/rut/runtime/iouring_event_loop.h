@@ -416,16 +416,22 @@ public:
     // wheel fallback can represent (~63s). Caller fails the request.
     [[nodiscard]] bool schedule_yield_timer(Connection& conn, u32 ms) {
         timer.remove(&conn);
+        // Ensure a recv is in flight so peer disconnect during wait(ms)
+        // produces a CQE the mid-yield dispatch branch can close on.
+        // submit_recv is idempotent (checks recv_armed), so this is a
+        // no-op when multishot is still running. It matters when the
+        // prior multishot terminated with !ev.more before this yield
+        // (e.g., buffer-ring edge case) and would otherwise leave no
+        // in-flight recv to surface a silent client FIN.
+        this->submit_recv(conn);
         // NOTE: we deliberately do NOT cancel the multishot recv here.
         // A cancel SQE would make the canceled target's -ECANCELED CQE
         // arrive after the handler resumes and re-sets on_recv, where
         // it would be interpreted as a peer close and kill the
         // connection (or break keep-alive). The dispatch-level
-        // pending_handler_fn branch returns provided buffers to the
-        // ring for any multishot CQE arriving mid-yield, so an
-        // adversarial peer can keep the multishot alive but can't
-        // exhaust the buffer ring. CPU spent per dropped CQE is
-        // bounded by TCP flow control + buffer pool size.
+        // pending_handler_fn branch closes on any mid-yield recv CQE,
+        // so an adversarial peer can't exhaust buffers or silently
+        // inject data.
         if (backend.add_yield_timeout(conn.id, conn, ms)) {
             conn.yield_armed = true;
             conn.pending_ops++;

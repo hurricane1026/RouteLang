@@ -409,7 +409,12 @@ public:
     // close_conn_impl will submit a cancel SQE — keeping the slot
     // pinned until the timer's CQE is harvested, so a late stale
     // HandlerTimer can't resume a handler on a reused slot.
-    void schedule_yield_timer(Connection& conn, u32 ms) {
+    //
+    // Returns false if no timer could be scheduled faithfully: under
+    // catastrophic SQ pressure (IORING_OP_TIMEOUT fails even after
+    // flush+retry) AND the requested wait exceeds what the 1-second
+    // wheel fallback can represent (~63s). Caller fails the request.
+    [[nodiscard]] bool schedule_yield_timer(Connection& conn, u32 ms) {
         timer.remove(&conn);
         // NOTE: we deliberately do NOT cancel the multishot recv here.
         // A cancel SQE would make the canceled target's -ECANCELED CQE
@@ -424,17 +429,21 @@ public:
         if (backend.add_yield_timeout(conn.id, conn, ms)) {
             conn.yield_armed = true;
             conn.pending_ops++;
-            return;
+            return true;
         }
         // Catastrophic SQ pressure — add_yield_timeout already did one
-        // flush+retry. Fall back to the 1-second wheel. The wheel has
-        // only 64 slots (kSlots), so seconds > 63 would wrap mod 64 and
-        // could fire immediately. Clamp to 63s so the handler resumes
-        // too early rather than too early-AND-wrong. In practice this
-        // branch is only reachable if the kernel refuses to drain SQEs.
+        // flush+retry. Fall back to the 1-second wheel, but only if the
+        // wait actually fits: the wheel has 64 slots at 1s each, so
+        // anything >= 63s would wrap mod-64 and fire far too early.
+        // Fail the request rather than silently shorten the wait.
+        if (ms >= static_cast<u32>(TimerWheel::kSlots - 1) * 1000u) return false;
+        // Minimum 1 second: wait(0) on the wheel would land in the
+        // current slot, which the ongoing tick has already drained —
+        // the entry would then sit idle until the wheel wraps (~64s).
         u32 secs = timer_seconds_from_ms(ms);
-        if (secs >= TimerWheel::kSlots) secs = TimerWheel::kSlots - 1;
+        if (secs == 0) secs = 1;
         timer.add(&conn, secs);
+        return true;
     }
 
     void dispatch(const IoEvent& ev) {

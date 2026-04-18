@@ -324,7 +324,18 @@ void handle_jit_outcome(Loop* loop,
             conn.handler_state = outcome.next_state;
             conn.state = ConnState::ExecHandler;
             conn.set_slots(nullptr, nullptr, nullptr, nullptr);
-            loop->schedule_yield_timer(conn, outcome.timer_ms);
+            if (loop->schedule_yield_timer(conn, outcome.timer_ms)) return;
+            // Couldn't schedule faithfully (SQ / heap catastrophically
+            // pressured AND wait too long for the wheel fallback). Fail
+            // the request rather than resume early and silently violate
+            // wait(ms) semantics.
+            conn.pending_handler_fn = nullptr;
+            conn.state = ConnState::Sending;
+            conn.resp_status = 500;
+            format_static_response(conn, 500, /*keep_alive=*/false);
+            conn.keep_alive = false;
+            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
         case JitDispatchOutcome::Kind::Forward: {

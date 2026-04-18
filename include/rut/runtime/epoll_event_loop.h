@@ -441,7 +441,11 @@ public:
     // get resumed early by the wheel's 1-second tick. Keepalive gets
     // re-armed automatically by dispatch()'s timer.refresh when the
     // handler resumes and submits its next I/O.
-    void schedule_yield_timer(Connection& conn, u32 ms) {
+    //
+    // Returns false if the request can't be scheduled faithfully —
+    // yield_heap is full AND the wait exceeds what the 1-second wheel
+    // fallback can represent (~63s). Caller fails the request.
+    [[nodiscard]] bool schedule_yield_timer(Connection& conn, u32 ms) {
         timer.remove(&conn);
         // Epoll is level-triggered: with all callback slots null during
         // yield, an adversarial peer sending bytes while recv_buf is
@@ -450,17 +454,22 @@ public:
         backend.pause_recv(conn.id);
         u64 now = epoll_yield::monotonic_ns();
         u64 deadline = now + static_cast<u64>(ms) * 1'000'000ull;
-        if (!yield_heap.push(deadline, conn.handler_gen, conn.id)) {
-            // Heap full — fall back to 1-second timer wheel. Degrades
-            // precision but preserves liveness via the wheel tick's
-            // pending_handler_fn branch. Clamp to 63s so seconds > 63
-            // don't wrap mod-kSlots and fire immediately.
-            u32 secs = timer_seconds_from_ms(ms);
-            if (secs >= TimerWheel::kSlots) secs = TimerWheel::kSlots - 1;
-            timer.add(&conn, secs);
-            return;
+        if (yield_heap.push(deadline, conn.handler_gen, conn.id)) {
+            rearm_yield_timerfd();
+            return true;
         }
-        rearm_yield_timerfd();
+        // Heap full — fall back to 1-second timer wheel, but only if
+        // the wait fits. The wheel has 64 slots, 1s each; ms >= 63000
+        // would wrap mod-64 and fire immediately. Fail the request
+        // rather than silently shorten the wait.
+        if (ms >= static_cast<u32>(TimerWheel::kSlots - 1) * 1000u) return false;
+        // Minimum 1 second: wait(0) on the wheel would land in the
+        // current slot, which the ongoing tick has already drained —
+        // the entry would then sit idle until the wheel wraps (~64s).
+        u32 secs = timer_seconds_from_ms(ms);
+        if (secs == 0) secs = 1;
+        timer.add(&conn, secs);
+        return true;
     }
 
     // (Re-)arm backend.yield_timer_fd for the current heap top. Called after

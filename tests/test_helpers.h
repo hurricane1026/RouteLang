@@ -163,9 +163,12 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     // Test shim: record the ms for assertions, fall back to 1s wheel so
     // pending_handler_fn is still re-entered when the test ticks.
     u32 last_yield_ms = 0;
-    void schedule_yield_timer(Connection& c, u32 ms) {
+    [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
         last_yield_ms = ms;
-        timer.add(&c, timer_seconds_from_ms(ms));
+        u32 secs = timer_seconds_from_ms(ms);
+        if (secs == 0) secs = 1;
+        timer.add(&c, secs);
+        return true;
     }
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
@@ -515,9 +518,12 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     // Test shim matching SmallLoop's: drive the legacy wheel so existing
     // 1-second tick tests continue to resume the handler.
     u32 last_yield_ms = 0;
-    void schedule_yield_timer(Connection& c, u32 ms) {
+    [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
         last_yield_ms = ms;
-        timer.add(&c, timer_seconds_from_ms(ms));
+        u32 secs = timer_seconds_from_ms(ms);
+        if (secs == 0) secs = 1;
+        timer.add(&c, secs);
+        return true;
     }
 
     void close_conn_impl(Connection& c) {
@@ -747,9 +753,12 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) c.pending_ops++;
     }
     u32 last_yield_ms = 0;
-    void schedule_yield_timer(Connection& c, u32 ms) {
+    [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
         last_yield_ms = ms;
-        timer.add(&c, timer_seconds_from_ms(ms));
+        u32 secs = timer_seconds_from_ms(ms);
+        if (secs == 0) secs = 1;
+        timer.add(&c, secs);
+        return true;
     }
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();

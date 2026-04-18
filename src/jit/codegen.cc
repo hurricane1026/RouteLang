@@ -274,17 +274,17 @@ struct Ctx {
     // [5-6]=next_state [7]=yield_kind
 
     LLVMValueRef make_result_status(u16 code) {
-        // Pack: action=0 (ReturnStatus), status_code=code, rest=0
+        // Pack: action=ReturnStatus, status_code=code, rest=0
         u64 packed = 0;
-        packed |= static_cast<u64>(0);          // action = ReturnStatus
-        packed |= static_cast<u64>(code) << 8;  // status_code
+        packed |= static_cast<u64>(HandlerAction::ReturnStatus);  // action
+        packed |= static_cast<u64>(code) << 8;                    // status_code
         return LLVMConstInt(i64_ty, packed, 0);
     }
 
     LLVMValueRef make_result_forward(u16 upstream) {
         u64 packed = 0;
-        packed |= static_cast<u64>(1);               // action = Forward
-        packed |= static_cast<u64>(upstream) << 24;  // upstream_id
+        packed |= static_cast<u64>(HandlerAction::Forward);  // action
+        packed |= static_cast<u64>(upstream) << 24;          // upstream_id
         return LLVMConstInt(i64_ty, packed, 0);
     }
 
@@ -293,10 +293,10 @@ struct Ctx {
     // where ms can exceed u16. See HandlerResult::make_yield_payload.
     LLVMValueRef make_result_yield(u16 next_state, u8 yield_kind, u32 payload) {
         u64 packed = 0;
-        packed |= static_cast<u64>(2);                 // action = Yield
-        packed |= static_cast<u64>(payload) << 8;      // status + upstream slots
-        packed |= static_cast<u64>(next_state) << 40;  // next_state
-        packed |= static_cast<u64>(yield_kind) << 56;  // yield_kind
+        packed |= static_cast<u64>(HandlerAction::Yield);  // action
+        packed |= static_cast<u64>(payload) << 8;          // status + upstream slots
+        packed |= static_cast<u64>(next_state) << 40;      // next_state
+        packed |= static_cast<u64>(yield_kind) << 56;      // yield_kind
         return LLVMConstInt(i64_ty, packed, 0);
     }
 
@@ -767,7 +767,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::RetForward: {
-            // Pack: action=1 (Forward), upstream_id from operand or immediate.
+            // Pack: action=Forward, upstream_id from operand or immediate.
             LLVMValueRef upstream;
             if (inst.operand_count > 0) {
                 upstream = c.get_value(inst.operands[0]);
@@ -777,7 +777,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             } else {
                 upstream = LLVMConstInt(c.i32_ty, 0, 0);
             }
-            LLVMValueRef action = LLVMConstInt(c.i64_ty, 1, 0);  // Forward
+            LLVMValueRef action =
+                LLVMConstInt(c.i64_ty, static_cast<u64>(HandlerAction::Forward), 0);
             LLVMValueRef up_ext = LLVMBuildZExt(c.builder, upstream, c.i64_ty, "up.e");
             LLVMValueRef shifted =
                 LLVMBuildShl(c.builder, up_ext, LLVMConstInt(c.i64_ty, 24, 0), "up.shl");

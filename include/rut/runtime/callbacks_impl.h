@@ -180,7 +180,12 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.keep_alive = kKeepAlive;
 
     // Route matching: config_ptr → active RouteConfig (may be null in tests).
+    // Pin on the connection so handle_jit_outcome resumes (post-wait) see
+    // the same config the route was matched against — hot-swap during a
+    // long wait(ms) could otherwise resolve upstream_id against a
+    // different upstream table.
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    conn.request_config = config;
     const RouteEntry* route = nullptr;
     if (config) {
         // Map LogHttpMethod back to RouteConfig's method_char format.
@@ -324,10 +329,11 @@ void handle_jit_outcome(Loop* loop,
         }
         case JitDispatchOutcome::Kind::Forward: {
             conn.pending_handler_fn = nullptr;
-            // Resolve upstream by id. The handler ABI's upstream_id slot
-            // is u16, and upstream tables are small, so a direct index
-            // into config->upstreams matches the RouteAction::Proxy path.
-            const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
+            // Resolve upstream by id against the config pinned at
+            // on_header_received. Reading loop->config_ptr here would
+            // pick up a post-swap config whose upstream table doesn't
+            // match the indexing the handler compiled against.
+            const RouteConfig* config = conn.request_config;
             if (!config || outcome.upstream_id >= config->upstream_count) {
                 // Unresolvable upstream id — handler returned a value
                 // the config doesn't know. Fail closed with 502 rather

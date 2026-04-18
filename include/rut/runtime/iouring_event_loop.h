@@ -511,13 +511,18 @@ public:
                 // Stray CQE for a conn that's mid-yield (all slots null
                 // while the timer owns the wakeup). Return any provided
                 // buffer to the ring so an in-flight multishot recv
-                // racing with cancel_recv doesn't leak buffers. Don't
-                // touch pending_ops beyond the accounting already done
-                // above, and DO NOT reclaim — the handler is still
-                // waiting to resume. Particularly important in the
-                // SQ-full wheel-fallback path, which doesn't pin the
-                // slot via pending_ops.
+                // doesn't leak buffers.
                 if (ev.has_buf) backend.return_buffer(ev.buf_id);
+                // Peer-close during wait(ms): client disconnects while
+                // the handler is sleeping. Without this, the slot stays
+                // allocated until the yield deadline fires — long waits
+                // + early disconnects would exhaust slots under load.
+                // close_conn cancels the yield timer via yield_armed.
+                const bool kPeerClosed = (ev.type == IoEventType::Recv && !ev.more &&
+                                          ev.result <= 0 && ev.result != -ECANCELED);
+                if (kPeerClosed) {
+                    this->close_conn(conn);
+                }
             } else if (conn.pending_ops == 0) {
                 // Stale CQE for a genuinely closed connection.
                 reclaim_slot(ev.conn_id);

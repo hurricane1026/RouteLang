@@ -11,6 +11,8 @@
 
 namespace rut {
 
+struct RouteConfig;  // forward for per-request config pin below
+
 enum class BodyMode : u8 {
     None,           // No body
     ContentLength,  // Known size via Content-Length
@@ -95,6 +97,13 @@ struct ConnectionBase {
     // counter must persist across slot reuse so every generation on a
     // given slot is distinct (first use: 0 → 1; reuse: N → N+1; …).
     u32 handler_gen = 0;
+
+    // Route config pinned for the lifetime of the current request. Set
+    // in on_header_received from the loop's config pointer; referenced
+    // by handle_jit_outcome (e.g., Forward upstream resolution) so a
+    // config hot-swap during wait(ms) can't resolve an upstream_id
+    // against the post-swap config. Cleared by reset().
+    const RouteConfig* request_config;
 
     // Per-connection timespec storage for IORING_OP_TIMEOUT yields. The
     // kernel reads this asynchronously after SQE submission, so it must
@@ -213,6 +222,7 @@ struct ConnectionBase {
         // reset() so a stale YieldHeap entry whose target slot was
         // recycled reliably fails the generation match. It's
         // initialized at accept-time via EventLoop::alloc_conn_impl.
+        request_config = nullptr;
         pending_handler_fn = nullptr;
         yield_timespec.tv_sec = 0;
         yield_timespec.tv_nsec = 0;

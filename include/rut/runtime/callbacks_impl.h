@@ -335,6 +335,12 @@ void handle_jit_outcome(Loop* loop,
             format_static_response(conn, 500, /*keep_alive=*/false);
             conn.keep_alive = false;
             conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            // schedule_yield_timer already called timer.remove(&conn);
+            // re-arm keepalive before the send so a stalled response
+            // (client backpressure) can't leak the slot indefinitely.
+            // on_response_sent's normal dispatch refresh would eventually
+            // cover it, but only if the Send CQE arrives.
+            loop->timer.add(&conn, loop->keepalive_timeout);
             loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }

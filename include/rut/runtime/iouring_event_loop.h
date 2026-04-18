@@ -411,15 +411,16 @@ public:
     // HandlerTimer can't resume a handler on a reused slot.
     void schedule_yield_timer(Connection& conn, u32 ms) {
         timer.remove(&conn);
-        // Cancel multishot recv so client bytes during wait(ms) don't
-        // pile up: with on_recv null, dispatch would drop CQEs and
-        // never return provided buffers, leaking the ring. The cancel
-        // SQE's own CQE + the final -ECANCELED recv CQE both route
-        // through dispatch's pending_handler_fn branch (pending_ops
-        // decrements there).
-        if (conn.recv_armed && backend.cancel_recv(conn.id)) {
-            conn.pending_ops++;
-        }
+        // NOTE: we deliberately do NOT cancel the multishot recv here.
+        // A cancel SQE would make the canceled target's -ECANCELED CQE
+        // arrive after the handler resumes and re-sets on_recv, where
+        // it would be interpreted as a peer close and kill the
+        // connection (or break keep-alive). The dispatch-level
+        // pending_handler_fn branch returns provided buffers to the
+        // ring for any multishot CQE arriving mid-yield, so an
+        // adversarial peer can keep the multishot alive but can't
+        // exhaust the buffer ring. CPU spent per dropped CQE is
+        // bounded by TCP flow control + buffer pool size.
         if (backend.add_yield_timeout(conn.id, conn, ms)) {
             conn.yield_armed = true;
             conn.pending_ops++;

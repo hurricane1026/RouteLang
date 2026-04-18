@@ -312,11 +312,6 @@ bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
     return true;
 }
 
-bool IoUringBackend::cancel_recv(u32 conn_id) {
-    return cancel_by_user_data(
-        encode_user_data(conn_id, IoEventType::Recv), conn_id, IoEventType::Recv);
-}
-
 bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id) {
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;

@@ -103,14 +103,6 @@ struct IoUringBackend {
     // can distinguish upstream vs client recv CQEs.
     bool add_recv_upstream(i32 fd, u32 conn_id);
 
-    // Cancel the in-flight multishot recv for conn_id so client bytes
-    // arriving during a JIT handler yield don't drain provided buffers
-    // (which our dispatch can't return while handler slots are null).
-    // Returns true if a cancel SQE was submitted. Caller must account
-    // for the cancel op in pending_ops; the subsequent Recv CQE
-    // (-ECANCELED, !ev.more) will clear recv_armed the normal way.
-    bool cancel_recv(u32 conn_id);
-
     // Submit a send (or zero-copy send).
     // Returns false if SQ is full (no SQE submitted).
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);

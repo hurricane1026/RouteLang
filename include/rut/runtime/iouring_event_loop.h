@@ -443,15 +443,16 @@ public:
             return true;
         }
         // Catastrophic SQ pressure — add_yield_timeout already did one
-        // flush+retry. Fall back to the 1-second wheel, but only if the
-        // wait actually fits: the wheel has 64 slots at 1s each, so
-        // anything >= 63s would wrap mod-64 and fire far too early.
-        // Fail the request rather than silently shorten the wait.
-        if (ms >= static_cast<u32>(TimerWheel::kSlots - 1) * 1000u) return false;
+        // flush+retry. Fall back to the 1-second wheel, but only if
+        // the wait actually fits: 64 slots × 1s, so seconds in
+        // [1, 63] land faithfully; seconds 64+ would wrap mod-64 and
+        // fire far too early. Fail the request rather than shorten.
+        u32 secs = timer_seconds_from_ms(ms);
+        if (secs >= TimerWheel::kSlots) return false;
         // Minimum 1 second: wait(0) on the wheel would land in the
         // current slot, which the ongoing tick has already drained —
         // the entry would then sit idle until the wheel wraps (~64s).
-        u32 secs = timer_seconds_from_ms(ms);
+        // analyze rejects wait(0) upstream, so this is defence-in-depth.
         if (secs == 0) secs = 1;
         timer.add(&conn, secs);
         return true;
@@ -529,23 +530,31 @@ public:
                 this->dispatch_event(conn, ev);
             } else if (conn.pending_handler_fn) {
                 // Stray CQE for a conn that's mid-yield (all slots null
-                // while the timer owns the wakeup). Return any provided
-                // buffer to the ring so an in-flight multishot recv
-                // doesn't leak buffers.
-                if (ev.has_buf) backend.return_buffer(ev.buf_id);
-                // Close only on terminal recv (peer FIN / error). The
-                // multishot may deliver positive-length CQEs for bytes
-                // the peer sends during wait(ms) — e.g., a segmented
-                // POST body, or a pipelined next request. Slice 0's
-                // analyze rejects routes that would interact with
-                // either case (non-wait-before-wait, decorators, etc.),
-                // so the bytes are contractually noise; dropping the
-                // buffer is safe. Closing on positive reads would kill
-                // otherwise-legitimate clients that happened to send
-                // anything during the wait.
-                const bool kTerminal = (ev.type == IoEventType::Recv && !ev.more &&
-                                        ev.result <= 0 && ev.result != -ECANCELED);
-                if (kTerminal) {
+                // while the timer owns the wakeup). Provided-buffer
+                // lifetime is already handled inside
+                // IoUringBackend::wait(); this branch only decides
+                // whether the stray completion should terminate the
+                // connection.
+                //
+                // Rules:
+                //   - ev.result > 0                 → keep alive. Bytes
+                //     the peer sends during wait(ms) — segmented body,
+                //     pipelined next request — are contractually noise
+                //     for slice 0 (analyze rejects the patterns where
+                //     they'd be meaningful). Killing here would punish
+                //     legitimate clients.
+                //   - ev.result == 0 && !ev.more    → peer FIN. Close.
+                //   - ev.result < 0 (non-CANCEL)    → recv error,
+                //     including -ENOBUFS when recv_buf fills. On older
+                //     kernels -ENOBUFS can arrive with ev.more still set,
+                //     so relying on !ev.more here would let the loop
+                //     hot-spin on repeated error CQEs until the yield
+                //     timer fires. Close unconditionally.
+                const bool kRecvError =
+                    (ev.type == IoEventType::Recv && ev.result < 0 && ev.result != -ECANCELED);
+                const bool kPeerClose =
+                    (ev.type == IoEventType::Recv && !ev.more && ev.result == 0);
+                if (kRecvError || kPeerClose) {
                     this->close_conn(conn);
                 }
             } else if (conn.pending_ops == 0) {

@@ -2217,8 +2217,12 @@ TEST(route, wait_ms_precision_sub_second) {
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    u64 elapsed_ms = static_cast<u64>(t1.tv_sec - t0.tv_sec) * 1000ull +
-                     static_cast<u64>(t1.tv_nsec - t0.tv_nsec) / 1'000'000ull;
+    // Compute delta in signed nanoseconds so tv_nsec underflow (t1.tv_nsec
+    // < t0.tv_nsec) doesn't wrap to a huge u64 when the tv_sec carry should
+    // handle it.
+    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
+                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ms = elapsed_ns / 1'000'000LL;
 
     CHECK_GT(n, 0);
     bool found_204 = false;
@@ -2233,8 +2237,8 @@ TEST(route, wait_ms_precision_sub_second) {
     // TimerWheel rounds to 1000ms; a 500ms ceiling proves we're using
     // the yield_timer_fd / IORING_OP_TIMEOUT path. Floor at 40ms
     // protects against any accidental zero-wait regression.
-    CHECK_GT(static_cast<i32>(elapsed_ms), 40);
-    CHECK_LT(static_cast<i32>(elapsed_ms), 500);
+    CHECK_GT(elapsed_ms, 40);
+    CHECK_LT(elapsed_ms, 500);
 
     close(c);
     lt.stop();
@@ -2306,8 +2310,12 @@ TEST(route, wait_longer_than_keepalive_not_resumed_by_wheel) {
     i32 n = recv_timeout(c, buf, sizeof(buf), 4000);
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    u64 elapsed_ms = static_cast<u64>(t1.tv_sec - t0.tv_sec) * 1000ull +
-                     static_cast<u64>(t1.tv_nsec - t0.tv_nsec) / 1'000'000ull;
+    // Compute delta in signed nanoseconds so tv_nsec underflow (t1.tv_nsec
+    // < t0.tv_nsec) doesn't wrap to a huge u64 when the tv_sec carry should
+    // handle it.
+    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
+                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ms = elapsed_ns / 1'000'000LL;
 
     CHECK_GT(n, 0);
     bool found_204 = false;
@@ -2321,8 +2329,8 @@ TEST(route, wait_longer_than_keepalive_not_resumed_by_wheel) {
     // Must not have been woken by the 1s wheel tick. 1700ms floor leaves
     // comfortable margin above the tick; 3000ms ceiling catches stuck
     // timers. wait(2000) on an unloaded loop lands near 2000ms.
-    CHECK_GT(static_cast<i32>(elapsed_ms), 1700);
-    CHECK_LT(static_cast<i32>(elapsed_ms), 3000);
+    CHECK_GT(elapsed_ms, 1700);
+    CHECK_LT(elapsed_ms, 3000);
 
     close(c);
     lt.stop();

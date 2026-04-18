@@ -130,7 +130,8 @@ struct IoUringBackend {
                bool send_armed,
                bool upstream_recv_armed,
                bool upstream_send_armed,
-               bool has_upstream);
+               bool has_upstream,
+               bool yield_armed = false);
 
     // Cancel the multishot accept request. Must be called before closing
     // listen_fd during drain to stop io_uring from accepting new connections.

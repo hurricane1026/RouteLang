@@ -21,7 +21,9 @@ enum class YieldKind : u8 {
     HttpGet = 0,
     HttpPost = 1,
     Forward = 2,
-    Timer = 3,  // sleep for N ms; payload stored in status_code slot (v1: u16 max)
+    Timer = 3,  // sleep for N ms; payload packed across status_code +
+                // upstream_id as a u32 (~49 days). See make_yield_payload /
+                // yield_payload_u32.
 };
 
 // ── Handler Result ─────────────────────────────────────────────────
@@ -33,6 +35,10 @@ enum class YieldKind : u8 {
 //   byte 3-4: upstream_id  (u16, for Forward)
 //   byte 5-6: next_state   (u16, for Yield)
 //   byte 7:   yield_kind   (YieldKind)
+//
+// For Yield actions, the status_code + upstream_id slots are unused by
+// their named role and instead carry a 32-bit payload (e.g. Timer ms).
+// See make_yield_payload / yield_payload_u32 for the u32 view.
 //
 // IMPORTANT: We use u64 as the function return type (not a struct)
 // because clang uses sret (hidden pointer) for packed structs even

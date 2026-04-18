@@ -338,6 +338,13 @@ void handle_jit_outcome(Loop* loop,
 
 template <typename Loop>
 void resume_jit_handler(Loop* loop, Connection& conn) {
+    // schedule_yield_timer took the conn off the keepalive wheel while
+    // the precise timer owned its wakeup. Restore it before running the
+    // handler: non-TimerYield outcomes submit I/O whose completion will
+    // call timer.refresh via dispatch_event, but until that happens a
+    // silent peer has no backstop. A chained wait removes again via
+    // schedule_yield_timer, so this is harmless when yielding again.
+    loop->timer.add(&conn, loop->keepalive_timeout);
     auto* fn = conn.pending_handler_fn;
     jit::HandlerCtx ctx{};
     ctx.state = conn.handler_state;

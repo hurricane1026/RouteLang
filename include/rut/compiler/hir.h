@@ -625,7 +625,9 @@ struct HirRoute {
     };
     struct Wait {
         Span span{};
-        i32 ms = 0;  // duration in milliseconds (u16 fits in HandlerResult yield payload)
+        i32 ms = 0;  // duration in milliseconds; packed into the u32 yield
+                     // payload (status_code + upstream_id) at codegen time.
+                     // Parser currently caps at INT_MAX (~24.8 days).
     };
 
     Span span{};

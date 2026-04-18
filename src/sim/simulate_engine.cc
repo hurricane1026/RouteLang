@@ -619,7 +619,7 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     // per spec (submit + wait batches, not loops).
     static constexpr u32 kMaxHandlerYields = 32;
     jit::HandlerResult kUnpacked{};
-    for (u32 iter = 0; iter <= kMaxHandlerYields; iter++) {
+    for (u32 iter = 0; iter < kMaxHandlerYields; iter++) {
         const u64 kPacked =
             route->fn(&conn, &ctx, entry.raw_headers, entry.raw_header_len, nullptr);
         kUnpacked = jit::HandlerResult::unpack(kPacked);

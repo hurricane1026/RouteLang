@@ -123,6 +123,12 @@ struct ConnectionBase {
     bool send_armed;
     bool upstream_recv_armed;
     bool upstream_send_armed;
+    // True between schedule_yield_timer (io_uring: IORING_OP_TIMEOUT SQE
+    // submitted) and the matching HandlerTimer CQE. Mirrors the other
+    // *_armed flags so close_conn_impl can submit a cancel SQE, keeping
+    // the slot pinned until the timer CQE is harvested — otherwise a
+    // late-arriving stale CQE could resume a handler on a reused slot.
+    bool yield_armed;
 
     // Response status (set by handler/proxy, used by access log)
     u16 resp_status;
@@ -217,6 +223,7 @@ struct ConnectionBase {
         send_armed = false;
         upstream_recv_armed = false;
         upstream_send_armed = false;
+        yield_armed = false;
         resp_status = 0;
         req_method = 0;
         req_size = 0;

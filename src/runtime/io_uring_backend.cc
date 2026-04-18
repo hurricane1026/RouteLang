@@ -469,7 +469,8 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
                            bool send_armed,
                            bool upstream_recv_armed,
                            bool upstream_send_armed,
-                           bool has_upstream) {
+                           bool has_upstream,
+                           bool yield_armed) {
     // Only cancel op types that are actually in flight to avoid wasting
     // SQ/CQ capacity with no-op cancels that produce -ENOENT completions.
     u32 submitted = 0;
@@ -501,6 +502,15 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
         if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::UpstreamConnect),
                                 conn_id,
                                 IoEventType::UpstreamConnect))
+            submitted++;
+    }
+    // JIT handler yield timer (IORING_OP_TIMEOUT) — cancel pins the slot
+    // until the target CQE arrives, preventing stale HandlerTimer events
+    // from resuming a handler on a reused slot.
+    if (yield_armed) {
+        if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::HandlerTimer),
+                                conn_id,
+                                IoEventType::HandlerTimer))
             submitted++;
     }
 

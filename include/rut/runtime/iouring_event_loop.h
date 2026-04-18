@@ -370,7 +370,8 @@ public:
                                             c.send_armed,
                                             c.upstream_recv_armed,
                                             c.upstream_send_armed,
-                                            c.upstream_fd >= 0);
+                                            c.upstream_fd >= 0,
+                                            c.yield_armed);
         }
         if (c.fd >= 0) {
             ::close(c.fd);
@@ -403,9 +404,18 @@ public:
     // Falls back to the 1-second wheel if the SQ is full; the wheel
     // tick callback checks pending_handler_fn and resumes from there,
     // degrading precision but preserving liveness.
+    //
+    // On success, increments pending_ops and sets yield_armed so
+    // close_conn_impl will submit a cancel SQE — keeping the slot
+    // pinned until the timer's CQE is harvested, so a late stale
+    // HandlerTimer can't resume a handler on a reused slot.
     void schedule_yield_timer(Connection& conn, u32 ms) {
         timer.remove(&conn);
-        if (backend.add_yield_timeout(conn.id, conn, ms)) return;
+        if (backend.add_yield_timeout(conn.id, conn, ms)) {
+            conn.yield_armed = true;
+            conn.pending_ops++;
+            return;
+        }
         timer.add(&conn, timer_seconds_from_ms(ms));
     }
 
@@ -415,15 +425,23 @@ public:
             return;
         }
         if (ev.type == IoEventType::HandlerTimer) {
-            // JIT handler yield timer expired. conn_id identifies the
-            // connection whose pending_handler_fn should resume. The
-            // ETIME result from IORING_OP_TIMEOUT is expected; any other
-            // CQE result is still treated as "resume now" — the handler
-            // outcome will bubble up the error.
+            // JIT handler yield timer expired (or was cancelled — same
+            // resume path; any error bubbles through the handler).
+            // ev.more is never set for IORING_OP_TIMEOUT, so this CQE
+            // always concludes a yield_armed window: decrement the op
+            // accounting so close-during-yield can reclaim the slot.
             if (ev.conn_id < kMaxConns) {
                 auto& c = conns[ev.conn_id];
+                if (c.yield_armed) {
+                    c.yield_armed = false;
+                    if (c.pending_ops > 0) c.pending_ops--;
+                }
                 if (c.pending_handler_fn) {
                     resume_jit_handler<IoUringEventLoop>(this, c);
+                } else if (c.pending_ops == 0) {
+                    // Stale CQE for a slot that was already closed; nothing
+                    // else left in flight, safe to reclaim now.
+                    reclaim_slot(ev.conn_id);
                 }
             }
             return;

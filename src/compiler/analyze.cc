@@ -9402,10 +9402,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
 
         // Slice-1 constraint: a route body has the shape
-        //   let* ; wait* ; terminal
-        // — zero or more `let`s, zero or more `wait`s, then one
-        // top-level terminal statement (return / forward / guard /
-        // if / match / block containing that terminal region).
+        //   let* ; wait* ; guard* ; terminal_control
+        // — zero or more `let`s, zero or more `wait`s, zero or more
+        // top-level `guard`s (each guard requires a following
+        // statement), then one top-level terminal control statement
+        // (return / forward / if / match / block containing that
+        // terminal region). Guards gate subsequent waits the same
+        // way any other non-let non-wait does, but are called out
+        // separately because they're common pre-terminal filters.
         //
         // Mechanism (slice 1, pure-expression surface): codegen routes
         // states 0..N-1 to dead-end yield blocks that emit the packed

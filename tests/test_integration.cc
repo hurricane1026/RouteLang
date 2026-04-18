@@ -2300,9 +2300,17 @@ TEST(route, let_across_wait_drives_return_real_socket) {
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
     const char kLetReq[] = "GET /let HTTP/1.1\r\nHost: x\r\n\r\n";
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     send_all(c, kLetReq, sizeof(kLetReq) - 1);
     char buf[1024];
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
+                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ms = elapsed_ns / 1'000'000LL;
+
     CHECK_GT(n, 0);
     bool found_201 = false;
     for (i32 i = 0; i + 2 < n; i++) {
@@ -2312,6 +2320,12 @@ TEST(route, let_across_wait_drives_return_real_socket) {
         }
     }
     CHECK(found_201);
+    // wait(100) must actually fire — otherwise this test could pass
+    // even if the yield path was bypassed and state 0 fell through
+    // to state N immediately. Floor at 80ms for scheduler jitter on
+    // slow CI; ceiling at 500ms to flag anything unusually slow.
+    CHECK_GT(elapsed_ms, 80);
+    CHECK_LT(elapsed_ms, 500);
 
     close(c);
     lt.stop();

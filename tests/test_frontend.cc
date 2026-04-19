@@ -137,6 +137,50 @@ TEST(frontend, lex_recognizes_wait_keyword) {
     CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwWait));
 }
 
+TEST(frontend, parse_return_response_status_only) {
+    // `return response(200)` is the builder entry point. With no body
+    // kwarg it's semantically identical to `return 200`; the HIR
+    // terminator produces the same ReturnStatus instruction.
+    const char* src = "route GET \"/x\" { return response(200) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 1u);
+    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(route.statements[0].status_code, 200u);
+    CHECK_EQ(route.statements[0].response_body.len, 0u);
+    // Analyze accepts, producing the same HIR shape as `return 200`.
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, parse_return_response_with_body) {
+    // Parser recognises the body: "..." kwarg and stores the literal;
+    // analyze rejects it for now because the runtime body-render path
+    // hasn't landed (tracked for follow-up slice).
+    const char* src = "route GET \"/x\" { return response(200, body: \"Hello\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(stmt.status_code, 200u);
+    REQUIRE_EQ(stmt.response_body.len, 5u);
+    CHECK(stmt.response_body.eq(lit("Hello")));
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, parse_return_response_rejects_unknown_kwarg) {
+    const char* src = "route GET \"/x\" { return response(200, header: \"foo\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    CHECK(!ast);
+}
+
 TEST(frontend, lex_duration_suffix_boundary) {
     // `5ms` is one DurLit; the suffix must sit at a token boundary so
     // `5mystery` stays `5` (IntLit) + `mystery` (Ident). Similarly

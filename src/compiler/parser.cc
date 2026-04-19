@@ -709,6 +709,69 @@ struct Parser {
             return stmt;
         }
         if (take(TokenType::KwReturn)) {
+            // Two forms:
+            //   return <IntLit>                          (legacy)
+            //   return response(<IntLit>[, body: "..."]) (response builder)
+            // The body variant lets the handler supply a custom payload
+            // that the runtime writes verbatim with an auto Content-Length.
+            AstStatement stmt{};
+            stmt.kind = AstStmtKind::ReturnStatus;
+
+            // Peek for the builder form. We recognise `response` by the
+            // literal identifier text; no dedicated keyword yet because
+            // `response` is also a valid identifier in other contexts.
+            const Token& peek = cur();
+            const bool kIsBuilder = peek.type == TokenType::Ident && peek.text.len == 8 &&
+                                    peek.text.ptr[0] == 'r' && peek.text.ptr[1] == 'e' &&
+                                    peek.text.ptr[2] == 's' && peek.text.ptr[3] == 'p' &&
+                                    peek.text.ptr[4] == 'o' && peek.text.ptr[5] == 'n' &&
+                                    peek.text.ptr[6] == 's' && peek.text.ptr[7] == 'e';
+            if (kIsBuilder) {
+                pos++;  // consume `response`
+                auto lparen = expect(TokenType::LParen);
+                if (!lparen) return core::make_unexpected(lparen.error());
+                auto status = expect(TokenType::IntLit);
+                if (!status) return core::make_unexpected(status.error());
+                i32 value = 0;
+                for (u32 i = 0; i < status.value()->text.len; i++) {
+                    const u32 digit = static_cast<u32>(status.value()->text.ptr[i] - '0');
+                    if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
+                        return frontend_error(FrontendError::InvalidInteger,
+                                              span_from(*status.value()),
+                                              status.value()->text);
+                    value = value * 10 + static_cast<i32>(digit);
+                }
+                stmt.status_code = value;
+                // Optional `, body: "<StringLit>"` — no other kwargs yet.
+                if (take(TokenType::Comma)) {
+                    auto kw = expect(TokenType::Ident);
+                    if (!kw) return core::make_unexpected(kw.error());
+                    if (!(kw.value()->text.len == 4 && kw.value()->text.ptr[0] == 'b' &&
+                          kw.value()->text.ptr[1] == 'o' && kw.value()->text.ptr[2] == 'd' &&
+                          kw.value()->text.ptr[3] == 'y')) {
+                        return frontend_error(FrontendError::UnexpectedToken,
+                                              span_from(*kw.value()),
+                                              kw.value()->text);
+                    }
+                    auto colon = expect(TokenType::Colon);
+                    if (!colon) return core::make_unexpected(colon.error());
+                    auto body_tok = expect(TokenType::StringLit);
+                    if (!body_tok) return core::make_unexpected(body_tok.error());
+                    // Strip the surrounding quotes. Lexer keeps them in text.
+                    const Str raw = body_tok.value()->text;
+                    if (raw.len >= 2 && raw.ptr[0] == '"' && raw.ptr[raw.len - 1] == '"') {
+                        stmt.response_body = Str{raw.ptr + 1, raw.len - 2};
+                    } else {
+                        stmt.response_body = raw;
+                    }
+                }
+                auto rparen = expect(TokenType::RParen);
+                if (!rparen) return core::make_unexpected(rparen.error());
+                stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
+                return stmt;
+            }
+
+            // Legacy `return <IntLit>`.
             auto status = expect(TokenType::IntLit);
             if (!status) return core::make_unexpected(status.error());
             i32 value = 0;
@@ -720,8 +783,6 @@ struct Parser {
                                           status.value()->text);
                 value = value * 10 + static_cast<i32>(digit);
             }
-            AstStatement stmt{};
-            stmt.kind = AstStmtKind::ReturnStatus;
             stmt.status_code = value;
             stmt.span = Span{start.start, status.value()->end, start.line, start.col};
             return stmt;

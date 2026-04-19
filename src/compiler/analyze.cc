@@ -5243,6 +5243,12 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     if (stmt.kind == AstStmtKind::ReturnStatus) {
         if (stmt.status_code < 100 || stmt.status_code > 999)
             return frontend_error(FrontendError::InvalidStatusCode, stmt.span);
+        // `response(N, body: "...")` syntax is parsed but custom body
+        // rendering isn't wired to the runtime yet. Reject at analyze
+        // to avoid silently dropping the payload. Follow-up slice will
+        // plumb bodies through HIR → MIR → RIR → codegen → format_*.
+        if (stmt.response_body.len > 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
         term.kind = HirTerminatorKind::ReturnStatus;
         // Validated to 100..999 above; fits in HirTerminator::status_code.
         term.status_code = static_cast<i32>(stmt.status_code);

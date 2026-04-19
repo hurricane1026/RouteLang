@@ -166,9 +166,11 @@ TEST(frontend, parse_return_response_status_only) {
 }
 
 TEST(frontend, parse_return_response_with_body) {
-    // Parser recognises the body: "..." kwarg and stores the literal;
-    // analyze rejects it with UnsupportedSyntax because the runtime
-    // body-render path hasn't landed (tracked for follow-up slice).
+    // Covers the body: "..." kwarg through the compile-side pipeline:
+    // parser → AST.response_body, analyze → HirTerminator.response_body,
+    // lower_rir → rir::Module::response_bodies (non-empty entry interned,
+    // body_idx = 1). Codegen and runtime behavior are exercised by
+    // tests/test_integration.cc::dsl_response_body_real_socket.
     const char* src = "route GET \"/x\" { return response(200, body: \"Hello\") }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -182,14 +184,31 @@ TEST(frontend, parse_return_response_with_body) {
     CHECK(stmt.response_body.eq(lit("Hello")));
     CHECK(stmt.has_response_body);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
-    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK_EQ(static_cast<u8>(term.kind), static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(term.status_code, 200);
+    REQUIRE_EQ(term.response_body.len, 5u);
+    CHECK(term.response_body.eq(lit("Hello")));
+    // Lower through MIR → RIR and verify a single body was interned at
+    // slot 0 (body_idx 1) with the exact bytes.
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    REQUIRE_EQ(rir.module.response_bodies[0].len, 5u);
+    CHECK(rir.module.response_bodies[0].eq(lit("Hello")));
+    rir.destroy();
 }
 
-TEST(frontend, parse_return_response_rejects_empty_body) {
-    // `body: ""` is an explicit empty string; has_response_body
-    // distinguishes it from the no-kwarg case so analyze still
-    // rejects, not silently treating it as a plain `return`.
+TEST(frontend, parse_return_response_empty_body_is_noop) {
+    // `body: ""` has the explicit-empty flag but zero bytes; HIR
+    // preserves the kwarg (ptr != nullptr, len == 0 — the documented
+    // sentinel), and lower_rir treats it as "no custom body" so no
+    // entry is interned into the module table.
     const char* src = "route GET \"/x\" { return response(200, body: \"\") }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -199,8 +218,23 @@ TEST(frontend, parse_return_response_rejects_empty_body) {
     REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
     CHECK(ast->items[0].route.statements[0].has_response_body);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
-    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(hir);
+    // HIR preserves the explicit kwarg via ptr-based sentinel: ptr
+    // non-null distinguishes `body: ""` from the no-kwarg case even
+    // though len == 0 in both. Asserting ptr != nullptr catches
+    // regressions that would silently drop the kwarg.
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK(term.response_body.ptr != nullptr);
+    CHECK_EQ(term.response_body.len, 0u);
+    // Lower through MIR → RIR and verify the module table stays empty:
+    // zero-length bodies should not produce an intern entry.
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    CHECK_EQ(rir.module.response_body_count, 0u);
+    rir.destroy();
 }
 
 TEST(frontend, parse_return_response_rejects_unknown_kwarg) {

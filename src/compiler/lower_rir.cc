@@ -2366,12 +2366,33 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         if (term.source_kind == MirTerminatorSourceKind::LocalRef) {
             if (term.local_ref_index >= local_count)
                 return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            // Runtime-value status doesn't carry a body literal today
+            // (source syntax is `return <local>`, no response()
+            // builder form on this path). Body plumbing on that path
+            // can follow when response(localVar) becomes valid.
             const auto code_id = locals[term.local_ref_index];
             if (!b.emit_ret_status(code_id, {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             return {};
         }
-        if (!b.emit_ret_status(term.status_code, {term.span.line, term.span.col}))
+        // Literal form: intern the body (if any) into the module table
+        // and pack the 1-based idx into RetStatus's immediate. Empty /
+        // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
+        u16 body_idx = 0;
+        if (term.response_body.ptr != nullptr && term.response_body.len > 0) {
+            body_idx = b.intern_response_body(term.response_body);
+            if (body_idx == 0) {
+                // intern returns 0 for both "table full" and "arena
+                // OOM for the body-bytes copy". Distinguish here so
+                // the diagnostic isn't misleading: if the count is
+                // still under the cap, the arena must have failed.
+                const auto err = b.mod->response_body_count < rir::Module::kMaxResponseBodies
+                                     ? FrontendError::OutOfMemory
+                                     : FrontendError::TooManyItems;
+                return frontend_error(err, term.span);
+            }
+        }
+        if (!b.emit_ret_status(term.status_code, {term.span.line, term.span.col}, body_idx))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }

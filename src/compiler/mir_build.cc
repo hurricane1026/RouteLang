@@ -799,6 +799,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                    ? MirTerminatorSourceKind::LocalRef
                                    : MirTerminatorSourceKind::Literal;
             out->local_ref_index = term.local_ref_index;
+            out->response_body = term.response_body;
         };
         auto guard_fail_block_count = [&](const HirGuard& guard) -> u32 {
             if (guard.fail_kind == HirGuard::FailKind::Term) return 1;

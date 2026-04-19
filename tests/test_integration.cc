@@ -2712,32 +2712,101 @@ TEST(route, jit_handler_unknown_body_idx_falls_back) {
     // bytes), and format_static_response does NOT emit Content-Type,
     // so the response shape is distinct from the custom-body path.
     const Str response{buf, static_cast<u32>(n)};
-    auto contains = [&](const char* needle, u32 nlen) {
-        for (u32 i = 0; i + nlen <= response.len; i++) {
-            bool match = true;
-            for (u32 j = 0; j < nlen; j++) {
-                if (response.ptr[i + j] != static_cast<u8>(needle[j])) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) return true;
-        }
-        return false;
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
     };
-    CHECK(contains("200 OK", 6));
-    CHECK(contains("Content-Length: 2\r\n", 19));
+    CHECK(has("200 OK", 6));
+    CHECK(has("Content-Length: 2\r\n", 19));
     // Default formatter must NOT emit Content-Type — that would mean
     // the custom-body path ran despite the out-of-range index.
-    CHECK(!contains("Content-Type:", 13));
+    CHECK(!has("Content-Type:", 13));
     // Body bytes at end of response: "...\r\n\r\nOK".
-    CHECK(contains("\r\n\r\nOK", 6));
+    CHECK(has("\r\n\r\nOK", 6));
 
     close(c);
     lt.stop();
     loop->shutdown();
     close(lfd);
     destroy_real_loop(loop);
+}
+
+// End-to-end: compile `route GET "/x" { return response(200, body: "Hi!") }`
+// from source, populate RouteConfig.response_bodies from the compiled
+// rir::Module, and verify a real client receives the exact body.
+TEST(route, dsl_response_body_real_socket) {
+    using namespace rut;
+
+    const char* src = "route GET \"/x\" { return response(200, body: \"Hi!\") }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    // Mirror the module's body table (1-based) into cfg. This loop is
+    // what a future compile→RouteConfig helper will do in production.
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    for (u32 i = 0; i < rir.module.response_body_count; i++) {
+        const auto& body = rir.module.response_bodies[i];
+        const u16 idx = cfg.add_response_body(body.ptr, body.len);
+        REQUIRE_EQ(idx, static_cast<u16>(i + 1));
+    }
+    REQUIRE(cfg.add_jit_handler("/x", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[2048];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n, 0);
+    const Str response{buf, static_cast<u32>(n)};
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
+    };
+    CHECK(has("200 OK", 6));
+    CHECK(has("Content-Length: 3\r\n", 19));
+    CHECK(has("Content-Type: text/plain", 24));
+    CHECK(has("\r\n\r\nHi!", 7));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
 }
 
 int main(int argc, char** argv) {

@@ -884,6 +884,24 @@ inline bool has_200(const char* buf, i32 n) {
     return false;
 }
 
+// Byte-literal substring search over a fixed-length buffer. Returns true
+// iff `[needle, needle+nlen)` appears anywhere in `[hay, hay+hlen)`.
+// Handles nlen == 0 (always true) and nlen > hlen (always false).
+inline bool buf_contains(const char* hay, u32 hlen, const char* needle, u32 nlen) {
+    if (nlen > hlen) return false;
+    for (u32 i = 0; i + nlen <= hlen; i++) {
+        bool match = true;
+        for (u32 j = 0; j < nlen; j++) {
+            if (hay[i + j] != needle[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 struct LoopThread {
     RealLoop* loop;
     pthread_t thread;

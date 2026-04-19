@@ -186,6 +186,10 @@ struct MirTerminator {
     MirValue rhs{};
     u32 then_block = 0;
     u32 else_block = 0;
+    // Optional response body literal — carried verbatim from HIR for
+    // ReturnStatus terminators. lower_rir maps identical literals to a
+    // shared body_idx that codegen packs into HandlerResult.upstream_id.
+    Str response_body{};
 };
 
 struct MirBlock {

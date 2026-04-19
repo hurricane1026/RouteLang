@@ -206,7 +206,19 @@ enum class Opcode : u8 {
     // ── Terminators ── (must be last instruction in a block)
     Br,          // br %cond, then_block, else_block
     Jmp,         // jmp target_block
-    RetStatus,   // ret.status code [, headers/body]
+    RetStatus,   // ret.status — two encodings, disambiguated by operand_count:
+                 //   operand_count == 0 (literal form): imm.i32_val holds
+                 //     a packed (status | body_idx<<16):
+                 //       low  16 bits: HTTP status code (0..65535)
+                 //       high 16 bits: 1-based response_bodies index,
+                 //                     0 = no body
+                 //   operand_count >  0 (value form):   operands[0] is an
+                 //     SSA i32 status code; imm is unused and body_idx is
+                 //     implicitly 0 (no custom body today).
+                 //   Printers/decoders MUST branch on operand_count before
+                 //   reading imm.i32_val — doing otherwise will print
+                 //   garbage for the value form and miss body_idx in the
+                 //   literal form.
     RetForward,  // ret.forward upstream [, options]
 
     // ── Yield (I/O suspend → state machine boundary) ──
@@ -238,7 +250,9 @@ struct Instruction {
     // Instruction-specific immediate data (tagged by opcode).
     union Immediate {
         Str str_val;               // ConstStr, ReqHeader, ReqParam, ReqCookie, etc.
-        i32 i32_val;               // ConstI32, ConstStatus, RetStatus
+        i32 i32_val;               // ConstI32, ConstStatus; RetStatus packs
+                                   // (status | body_idx<<16) — decode before
+                                   // display (see RetStatus opcode comment).
         i64 i64_val;               // ConstI64, ConstDuration, ConstByteSize
         bool bool_val;             // ConstBool
         u8 method_val;             // ConstMethod (HTTP method enum)
@@ -359,6 +373,19 @@ struct Module {
     Function* functions;
     u32 func_count;
     u32 func_cap;
+
+    // Response-body literals collected from RetStatus terminators.
+    // The array is 0-based, but the emit_ret_status body_idx and the
+    // handler ABI use 1-based indices (0 reserved as "no custom
+    // body"), so `body_idx = i + 1` maps to `response_bodies[i]`.
+    // Identical literals are deduplicated during lowering so the
+    // table stays small. Populated at lower_to_rir time; the table is
+    // then consumed by whatever populates RouteConfig (tests / future
+    // compile→config helper) — codegen itself only packs the index
+    // into the handler's return value, it doesn't read the bytes.
+    static constexpr u32 kMaxResponseBodies = 128;
+    Str response_bodies[kMaxResponseBodies];
+    u32 response_body_count = 0;
 
     // Arena that owns all IR memory (mmap-backed, compiler use).
     MmapArena* arena;

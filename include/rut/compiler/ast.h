@@ -100,6 +100,12 @@ struct AstStatement {
     // `wait(N)`. u32 fits both the HTTP range and the full u32 yield
     // payload range (~49 days); semantic validation is in analyze.
     u32 status_code = 0;
+    // Response body literal, populated when `return` uses the
+    // `response(N, body: "...")` form. `has_response_body` distinguishes
+    // an omitted kwarg from an explicit empty string — the latter must
+    // still be rejected while body plumbing is not wired end-to-end.
+    Str response_body{};
+    bool has_response_body = false;
     AstStatement* then_stmt = nullptr;
     AstStatement* else_stmt = nullptr;
     static constexpr u32 kMaxBlockStatements = 8;

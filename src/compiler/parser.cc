@@ -709,20 +709,74 @@ struct Parser {
             return stmt;
         }
         if (take(TokenType::KwReturn)) {
-            auto status = expect(TokenType::IntLit);
-            if (!status) return core::make_unexpected(status.error());
-            i32 value = 0;
-            for (u32 i = 0; i < status.value()->text.len; i++) {
-                const u32 digit = static_cast<u32>(status.value()->text.ptr[i] - '0');
-                if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
-                    return frontend_error(FrontendError::InvalidInteger,
-                                          span_from(*status.value()),
-                                          status.value()->text);
-                value = value * 10 + static_cast<i32>(digit);
-            }
+            // Two forms:
+            //   return <IntLit>                          (legacy)
+            //   return response(<IntLit>[, body: "..."]) (response builder)
+            // The builder form is the syntactic entry point for richer
+            // responses (body / headers / content-type). Today only
+            // response(<IntLit>) is semantically identical to `return
+            // <IntLit>`; analyze rejects the `body:` kwarg until the
+            // runtime body-render path lands.
             AstStatement stmt{};
             stmt.kind = AstStmtKind::ReturnStatus;
-            stmt.status_code = value;
+
+            // Expect an IntLit and parse it as a signed i32 with the
+            // INT_MAX overflow check that both branches share.
+            auto parse_status_i32 = [&](const Token& tok) -> FrontendResult<i32> {
+                i32 value = 0;
+                for (u32 i = 0; i < tok.text.len; i++) {
+                    const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
+                    if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
+                        return frontend_error(
+                            FrontendError::InvalidInteger, span_from(tok), tok.text);
+                    value = value * 10 + static_cast<i32>(digit);
+                }
+                return value;
+            };
+
+            // Peek for the builder form. We recognise `response` by the
+            // literal identifier text; no dedicated keyword yet because
+            // `response` is also a valid identifier in other contexts.
+            const Token& peek = cur();
+            const bool is_builder = peek.type == TokenType::Ident && peek.text.eq({"response", 8});
+            if (is_builder) {
+                pos++;  // consume `response`
+                auto lparen = expect(TokenType::LParen);
+                if (!lparen) return core::make_unexpected(lparen.error());
+                auto status = expect(TokenType::IntLit);
+                if (!status) return core::make_unexpected(status.error());
+                auto parsed = parse_status_i32(*status.value());
+                if (!parsed) return core::make_unexpected(parsed.error());
+                stmt.status_code = parsed.value();
+                // Optional `, body: "<StringLit>"` — no other kwargs yet.
+                if (take(TokenType::Comma)) {
+                    auto kw = expect(TokenType::Ident);
+                    if (!kw) return core::make_unexpected(kw.error());
+                    if (!kw.value()->text.eq({"body", 4})) {
+                        return frontend_error(FrontendError::UnexpectedToken,
+                                              span_from(*kw.value()),
+                                              kw.value()->text);
+                    }
+                    auto colon = expect(TokenType::Colon);
+                    if (!colon) return core::make_unexpected(colon.error());
+                    auto body_tok = expect(TokenType::StringLit);
+                    if (!body_tok) return core::make_unexpected(body_tok.error());
+                    // Lexer strips the surrounding quotes already.
+                    stmt.response_body = body_tok.value()->text;
+                    stmt.has_response_body = true;
+                }
+                auto rparen = expect(TokenType::RParen);
+                if (!rparen) return core::make_unexpected(rparen.error());
+                stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
+                return stmt;
+            }
+
+            // Legacy `return <IntLit>`.
+            auto status = expect(TokenType::IntLit);
+            if (!status) return core::make_unexpected(status.error());
+            auto parsed = parse_status_i32(*status.value());
+            if (!parsed) return core::make_unexpected(parsed.error());
+            stmt.status_code = parsed.value();
             stmt.span = Span{start.start, status.value()->end, start.line, start.col};
             return stmt;
         }

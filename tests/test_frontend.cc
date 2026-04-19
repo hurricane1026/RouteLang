@@ -137,6 +137,82 @@ TEST(frontend, lex_recognizes_wait_keyword) {
     CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwWait));
 }
 
+TEST(frontend, parse_return_response_status_only) {
+    // `return response(200)` is the builder entry point. With no body
+    // kwarg it's semantically identical to `return 200`; the HIR
+    // terminator produces the same ReturnStatus instruction.
+    const char* src = "route GET \"/x\" { return response(200) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 1u);
+    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(route.statements[0].status_code, 200u);
+    CHECK_EQ(route.statements[0].response_body.len, 0u);
+    CHECK(!route.statements[0].has_response_body);
+    // Analyze accepts; HIR terminator matches the plain `return 200`
+    // shape (Direct control flow, ReturnStatus with status 200).
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& hir_route = hir->routes[0];
+    CHECK_EQ(static_cast<u8>(hir_route.control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(static_cast<u8>(hir_route.control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(hir_route.control.direct_term.status_code, 200);
+}
+
+TEST(frontend, parse_return_response_with_body) {
+    // Parser recognises the body: "..." kwarg and stores the literal;
+    // analyze rejects it with UnsupportedSyntax because the runtime
+    // body-render path hasn't landed (tracked for follow-up slice).
+    const char* src = "route GET \"/x\" { return response(200, body: \"Hello\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
+    const auto& stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(stmt.status_code, 200u);
+    REQUIRE_EQ(stmt.response_body.len, 5u);
+    CHECK(stmt.response_body.eq(lit("Hello")));
+    CHECK(stmt.has_response_body);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_rejects_empty_body) {
+    // `body: ""` is an explicit empty string; has_response_body
+    // distinguishes it from the no-kwarg case so analyze still
+    // rejects, not silently treating it as a plain `return`.
+    const char* src = "route GET \"/x\" { return response(200, body: \"\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
+    CHECK(ast->items[0].route.statements[0].has_response_body);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_rejects_unknown_kwarg) {
+    const char* src = "route GET \"/x\" { return response(200, header: \"foo\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("header")));
+}
+
 TEST(frontend, lex_duration_suffix_boundary) {
     // `5ms` is one DurLit; the suffix must sit at a token boundary so
     // `5mystery` stays `5` (IntLit) + `mystery` (Ident). Similarly

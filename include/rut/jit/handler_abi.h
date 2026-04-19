@@ -32,7 +32,7 @@ enum class YieldKind : u8 {
 //
 //   byte 0:   action       (HandlerAction)
 //   byte 1-2: status_code  (u16, for ReturnStatus)
-//   byte 3-4: upstream_id  (u16, for Forward)
+//   byte 3-4: upstream_id  (u16, for Forward / body-index on ReturnStatus)
 //   byte 5-6: next_state   (u16, for Yield)
 //   byte 7:   yield_kind   (YieldKind)
 //

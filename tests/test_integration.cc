@@ -2707,14 +2707,31 @@ TEST(route, jit_handler_unknown_body_idx_falls_back) {
     char buf[1024];
     i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
     CHECK_GT(n, 0);
-    bool has_200 = false;
-    for (i32 i = 0; i + 2 < n; i++) {
-        if (buf[i] == '2' && buf[i + 1] == '0' && buf[i + 2] == '0') {
-            has_200 = true;
-            break;
+    // Assert the default reason-phrase body — not just that 200 is
+    // anywhere in the response. For 200 the default body is "OK" (2
+    // bytes), and format_static_response does NOT emit Content-Type,
+    // so the response shape is distinct from the custom-body path.
+    const Str response{buf, static_cast<u32>(n)};
+    auto contains = [&](const char* needle, u32 nlen) {
+        for (u32 i = 0; i + nlen <= response.len; i++) {
+            bool match = true;
+            for (u32 j = 0; j < nlen; j++) {
+                if (response.ptr[i + j] != static_cast<u8>(needle[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
         }
-    }
-    CHECK(has_200);
+        return false;
+    };
+    CHECK(contains("200 OK", 6));
+    CHECK(contains("Content-Length: 2\r\n", 19));
+    // Default formatter must NOT emit Content-Type — that would mean
+    // the custom-body path ran despite the out-of-range index.
+    CHECK(!contains("Content-Type:", 13));
+    // Body bytes at end of response: "...\r\n\r\nOK".
+    CHECK(contains("\r\n\r\nOK", 6));
 
     close(c);
     lt.stop();

@@ -164,10 +164,15 @@ struct RouteConfig {
     // caller doesn't need to keep the source alive. Returns a 1-based
     // index (0 is reserved as "no body") that JIT handlers can encode
     // in the HandlerResult upstream_id slot for ReturnStatus.
-    // Returns 0 if the body table or pool is full.
+    // Returns 0 if the body table or pool is full, or if the arguments
+    // are nonsensical (null data with non-zero len).
     u16 add_response_body(const char* data, u32 len) {
         if (response_body_count >= kMaxResponseBodies) return 0;
-        if (body_pool_used + len > kResponseBodyPoolBytes) return 0;
+        if (len > 0 && data == nullptr) return 0;
+        // Subtraction-based capacity check: `body_pool_used + len`
+        // would wrap on a large u32 `len` and silently pass, leading
+        // to an out-of-bounds write into body_pool.
+        if (len > kResponseBodyPoolBytes - body_pool_used) return 0;
         char* dst = body_pool + body_pool_used;
         for (u32 i = 0; i < len; i++) dst[i] = data[i];
         body_pool_used += len;

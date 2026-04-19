@@ -720,6 +720,20 @@ struct Parser {
             AstStatement stmt{};
             stmt.kind = AstStmtKind::ReturnStatus;
 
+            // Expect an IntLit and parse it as a signed i32 with the
+            // INT_MAX overflow check that both branches share.
+            auto parse_status_i32 = [&](const Token& tok) -> FrontendResult<i32> {
+                i32 value = 0;
+                for (u32 i = 0; i < tok.text.len; i++) {
+                    const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
+                    if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
+                        return frontend_error(
+                            FrontendError::InvalidInteger, span_from(tok), tok.text);
+                    value = value * 10 + static_cast<i32>(digit);
+                }
+                return value;
+            };
+
             // Peek for the builder form. We recognise `response` by the
             // literal identifier text; no dedicated keyword yet because
             // `response` is also a valid identifier in other contexts.
@@ -731,16 +745,9 @@ struct Parser {
                 if (!lparen) return core::make_unexpected(lparen.error());
                 auto status = expect(TokenType::IntLit);
                 if (!status) return core::make_unexpected(status.error());
-                i32 value = 0;
-                for (u32 i = 0; i < status.value()->text.len; i++) {
-                    const u32 digit = static_cast<u32>(status.value()->text.ptr[i] - '0');
-                    if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
-                        return frontend_error(FrontendError::InvalidInteger,
-                                              span_from(*status.value()),
-                                              status.value()->text);
-                    value = value * 10 + static_cast<i32>(digit);
-                }
-                stmt.status_code = value;
+                auto parsed = parse_status_i32(*status.value());
+                if (!parsed) return core::make_unexpected(parsed.error());
+                stmt.status_code = parsed.value();
                 // Optional `, body: "<StringLit>"` — no other kwargs yet.
                 if (take(TokenType::Comma)) {
                     auto kw = expect(TokenType::Ident);
@@ -767,16 +774,9 @@ struct Parser {
             // Legacy `return <IntLit>`.
             auto status = expect(TokenType::IntLit);
             if (!status) return core::make_unexpected(status.error());
-            i32 value = 0;
-            for (u32 i = 0; i < status.value()->text.len; i++) {
-                const u32 digit = static_cast<u32>(status.value()->text.ptr[i] - '0');
-                if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
-                    return frontend_error(FrontendError::InvalidInteger,
-                                          span_from(*status.value()),
-                                          status.value()->text);
-                value = value * 10 + static_cast<i32>(digit);
-            }
-            stmt.status_code = value;
+            auto parsed = parse_status_i32(*status.value());
+            if (!parsed) return core::make_unexpected(parsed.error());
+            stmt.status_code = parsed.value();
             stmt.span = Span{start.start, status.value()->end, start.line, start.col};
             return stmt;
         }

@@ -146,6 +146,7 @@ TEST(frontend, parse_return_response_status_only) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
     const auto& route = ast->items[0].route;
     REQUIRE_EQ(route.statements.len, 1u);
     CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::ReturnStatus));
@@ -173,6 +174,8 @@ TEST(frontend, parse_return_response_with_body) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
     const auto& stmt = ast->items[0].route.statements[0];
     CHECK_EQ(stmt.status_code, 200u);
     REQUIRE_EQ(stmt.response_body.len, 5u);
@@ -192,6 +195,8 @@ TEST(frontend, parse_return_response_rejects_empty_body) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
     CHECK(ast->items[0].route.statements[0].has_response_body);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(!hir);

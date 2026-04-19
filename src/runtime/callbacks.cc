@@ -306,16 +306,16 @@ const char* status_reason(u16 code) {
 // Shared writer: status line + Content-Length + Connection header,
 // used by both the default (reason-phrase) body path and the custom
 // body path. Leaves the builder positioned just past "\r\n" so the
-// caller can write the body bytes (if any).
+// caller can write the body bytes (if any). Callers pre-compute the
+// reason string so status_reason/strlen only runs once per response.
 static void write_response_headers(Connection& conn,
                                    u16 code,
+                                   const char* reason,
+                                   u32 reason_len,
                                    u32 body_len,
                                    bool keep_alive,
                                    const char* content_type,
                                    u32 content_type_len) {
-    const char* reason = status_reason(code);
-    u32 reason_len = 0;
-    while (reason[reason_len]) reason_len++;
     conn.send_buf.reset();
     conn.send_buf.write(reinterpret_cast<const u8*>("HTTP/1.1 "), 9);
     char code_buf[3];
@@ -385,7 +385,7 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive) {
     while (reason[reason_len]) reason_len++;
     const bool kNoBody = (code < 200 || code == 204 || code == 304);
     const u32 kBodyLen = kNoBody ? 0 : reason_len;
-    write_response_headers(conn, code, kBodyLen, keep_alive, nullptr, 0);
+    write_response_headers(conn, code, reason, reason_len, kBodyLen, keep_alive, nullptr, 0);
     if (kBodyLen > 0) conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
 }
 
@@ -398,9 +398,18 @@ void format_response_with_body(
         format_static_response(conn, code, keep_alive);
         return;
     }
+    const char* reason = status_reason(code);
+    u32 reason_len = 0;
+    while (reason[reason_len]) reason_len++;
     static const char kDefaultContentType[] = "text/plain; charset=utf-8";
-    write_response_headers(
-        conn, code, body_len, keep_alive, kDefaultContentType, sizeof(kDefaultContentType) - 1);
+    write_response_headers(conn,
+                           code,
+                           reason,
+                           reason_len,
+                           body_len,
+                           keep_alive,
+                           kDefaultContentType,
+                           sizeof(kDefaultContentType) - 1);
     if (body_len > 0) conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
 }
 

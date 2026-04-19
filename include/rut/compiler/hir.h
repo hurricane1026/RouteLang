@@ -534,8 +534,13 @@ struct HirTerminator {
     u32 local_ref_index = 0xffffffffu;
     u32 upstream_index = 0;
     // Optional response body literal (populated when the source was
-    // `return response(N, body: "...")`). Empty Str means no custom
-    // body — runtime uses the default status-reason phrase.
+    // `return response(N, body: "...")`). Sentinel by ptr, not len:
+    //   ptr == nullptr   → no body kwarg, use default status-reason.
+    //   ptr != nullptr   → explicit body (including `body: ""` which
+    //                      keeps ptr non-null with len == 0).
+    // lower_rir.cc::analyze_term only copies this when the Ast source
+    // had `has_response_body == true`, so the sentinel is preserved
+    // end-to-end.
     Str response_body{};
 };
 

@@ -721,10 +721,19 @@ struct Builder {
 
     // Intern a response body literal into the module's table. Returns
     // a 1-based index suitable for emit_ret_status. Deduplicates
-    // byte-identical literals. Returns 0 if the table is full, which
-    // caller should treat as "no custom body" + flag an error.
+    // byte-identical literals. Returns 0 ONLY on failure (table full
+    // or arena OOM) — callers should surface this as a hard error;
+    // 0 does NOT mean "no custom body" (that's the absence of a
+    // terminator's response_body in the first place).
+    //
+    // Body bytes are copied into the module's arena so entries survive
+    // after the caller's source buffer (e.g. transient file-read
+    // storage) goes away. Downstream consumers (RouteConfig::
+    // add_response_body) still make their own copy into config-owned
+    // storage, but the module is self-contained between lowering and
+    // config population.
     u16 intern_response_body(Str body) {
-        if (!mod) return 0;
+        if (!mod || !mod->arena) return 0;
         for (u32 i = 0; i < mod->response_body_count; i++) {
             const Str& existing = mod->response_bodies[i];
             if (existing.len == body.len) {
@@ -739,8 +748,14 @@ struct Builder {
             }
         }
         if (mod->response_body_count >= Module::kMaxResponseBodies) return 0;
+        char* buf = nullptr;
+        if (body.len > 0) {
+            buf = mod->arena->alloc_array<char>(body.len);
+            if (!buf) return 0;
+            for (u32 i = 0; i < body.len; i++) buf[i] = body.ptr[i];
+        }
         const u32 idx = mod->response_body_count++;
-        mod->response_bodies[idx] = body;
+        mod->response_bodies[idx] = {buf, body.len};
         return static_cast<u16>(idx + 1);
     }
 

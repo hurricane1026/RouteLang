@@ -361,11 +361,14 @@ struct Module {
     u32 func_cap;
 
     // Response-body literals collected from RetStatus terminators.
-    // Entry 0 is reserved as "no custom body"; real literals start at
-    // index 1 (matching the 1-based body_idx the JIT handler packs
-    // into HandlerResult.upstream_id). Identical literals are
-    // deduplicated during lowering so the table stays small.
-    // Populated at lower_to_rir time; codegen references it by index.
+    // The array is 0-based, but the emit_ret_status body_idx and the
+    // handler ABI use 1-based indices (0 reserved as "no custom
+    // body"), so `body_idx = i + 1` maps to `response_bodies[i]`.
+    // Identical literals are deduplicated during lowering so the
+    // table stays small. Populated at lower_to_rir time; the table is
+    // then consumed by whatever populates RouteConfig (tests / future
+    // compile→config helper) — codegen itself only packs the index
+    // into the handler's return value, it doesn't read the bytes.
     static constexpr u32 kMaxResponseBodies = 128;
     Str response_bodies[kMaxResponseBodies];
     u32 response_body_count = 0;

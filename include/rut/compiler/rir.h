@@ -206,7 +206,12 @@ enum class Opcode : u8 {
     // ── Terminators ── (must be last instruction in a block)
     Br,          // br %cond, then_block, else_block
     Jmp,         // jmp target_block
-    RetStatus,   // ret.status code [, headers/body]
+    RetStatus,   // ret.status packed-imm (imm.i32_val = status | body_idx<<16)
+                 //   low  16 bits: HTTP status code (0..65535)
+                 //   high 16 bits: 1-based response_bodies index, 0 = no body
+                 //   Any printer/decoder MUST decode both fields — printing
+                 //   imm.i32_val as a raw status will be misleading when
+                 //   body_idx > 0.
     RetForward,  // ret.forward upstream [, options]
 
     // ── Yield (I/O suspend → state machine boundary) ──
@@ -238,7 +243,9 @@ struct Instruction {
     // Instruction-specific immediate data (tagged by opcode).
     union Immediate {
         Str str_val;               // ConstStr, ReqHeader, ReqParam, ReqCookie, etc.
-        i32 i32_val;               // ConstI32, ConstStatus, RetStatus
+        i32 i32_val;               // ConstI32, ConstStatus; RetStatus packs
+                                   // (status | body_idx<<16) — decode before
+                                   // display (see RetStatus opcode comment).
         i64 i64_val;               // ConstI64, ConstDuration, ConstByteSize
         bool bool_val;             // ConstBool
         u8 method_val;             // ConstMethod (HTTP method enum)

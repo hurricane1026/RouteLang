@@ -759,6 +759,13 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 if (LLVMTypeOf(status) != c.i32_ty) {
                     status = LLVMBuildZExt(c.builder, status, c.i32_ty, "code.ext");
                 }
+                // Mask to 16 bits so a runtime-produced status value
+                // above 0xffff can't spill into the upstream_id slot
+                // (which carries the body_idx for ReturnStatus). The
+                // operand form doesn't carry a body_idx today, so
+                // body_idx_imm stays 0.
+                status = LLVMBuildAnd(
+                    c.builder, status, LLVMConstInt(c.i32_ty, 0xffffu, 0), "code.mask");
             } else {
                 const u32 packed = static_cast<u32>(inst.imm.i32_val);
                 const u32 status_u = packed & 0xffffu;

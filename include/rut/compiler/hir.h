@@ -538,7 +538,7 @@ struct HirTerminator {
     //   ptr == nullptr   → no body kwarg, use default status-reason.
     //   ptr != nullptr   → explicit body (including `body: ""` which
     //                      keeps ptr non-null with len == 0).
-    // lower_rir.cc::analyze_term only copies this when the Ast source
+    // analyze.cc::analyze_term only copies this when the Ast source
     // had `has_response_body == true`, so the sentinel is preserved
     // end-to-end.
     Str response_body{};

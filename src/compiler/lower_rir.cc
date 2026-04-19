@@ -2381,7 +2381,16 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         u16 body_idx = 0;
         if (term.response_body.ptr != nullptr && term.response_body.len > 0) {
             body_idx = b.intern_response_body(term.response_body);
-            if (body_idx == 0) return frontend_error(FrontendError::TooManyItems, term.span);
+            if (body_idx == 0) {
+                // intern returns 0 for both "table full" and "arena
+                // OOM for the body-bytes copy". Distinguish here so
+                // the diagnostic isn't misleading: if the count is
+                // still under the cap, the arena must have failed.
+                const auto err = b.mod->response_body_count < rir::Module::kMaxResponseBodies
+                                     ? FrontendError::OutOfMemory
+                                     : FrontendError::TooManyItems;
+                return frontend_error(err, term.span);
+            }
         }
         if (!b.emit_ret_status(term.status_code, {term.span.line, term.span.col}, body_idx))
             return frontend_error(FrontendError::OutOfMemory, term.span);

@@ -518,8 +518,13 @@ void format_response_with_body_and_headers(Connection& conn,
     if (needed > conn.send_buf.capacity()) {
         // Fail closed: force connection close and emit a small 500.
         // format_static_response uses the reason-phrase body which is
-        // guaranteed to fit, and the caller's keep_alive is overridden
-        // to false so the client disconnects after reading.
+        // guaranteed to fit. Update conn state too — resp_status and
+        // keep_alive were set upstream assuming the happy path; if we
+        // leave them, on_response_sent would reuse the socket despite
+        // the wire saying "Connection: close" and metrics would log
+        // the original status rather than the 500 we actually sent.
+        conn.resp_status = 500;
+        conn.keep_alive = false;
         format_static_response(conn, 500, /*keep_alive=*/false);
         return;
     }

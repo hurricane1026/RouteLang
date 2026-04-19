@@ -493,8 +493,11 @@ void format_response_with_body_and_headers(Connection& conn,
     conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
     write_content_length_digits(conn, body_len_emit);
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
-    // Default Content-Type only if the user didn't supply one.
-    if (!user_has_content_type) {
+    // Default Content-Type only if the user didn't supply one AND
+    // we're actually going to send a body. No-body responses (1xx /
+    // 204 / 304 and redirect-style header-only responses) shouldn't
+    // advertise a Content-Type — matches format_static_response.
+    if (!user_has_content_type && body_len_emit > 0) {
         static const char kDefaultContentType[] = "Content-Type: text/plain; charset=utf-8\r\n";
         conn.send_buf.write(reinterpret_cast<const u8*>(kDefaultContentType),
                             sizeof(kDefaultContentType) - 1);

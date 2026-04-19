@@ -2993,11 +2993,15 @@ TEST(route, dsl_response_headers_only_real_socket) {
     CHECK(has("301 ", 4));
     CHECK(has("Content-Length: 0\r\n", 19));
     CHECK(has("Location: /new\r\n", 16));
-    // Response must terminate at the blank line — no body bytes follow.
-    // We can check this by looking for "\r\n\r\n" then end-of-response.
-    // The total response length should match up-to-and-including the
-    // blank line (no trailing payload).
-    CHECK(has("\r\n\r\n", 4));
+    // Response must terminate exactly at the blank line — the last
+    // four bytes must be "\r\n\r\n" and nothing else should follow.
+    // Substring-containment alone wouldn't catch a stray body payload
+    // appended after the terminator.
+    REQUIRE_GE(response.len, 4u);
+    CHECK_EQ(response.ptr[response.len - 4], '\r');
+    CHECK_EQ(response.ptr[response.len - 3], '\n');
+    CHECK_EQ(response.ptr[response.len - 2], '\r');
+    CHECK_EQ(response.ptr[response.len - 1], '\n');
 
     close(c);
     lt.stop();

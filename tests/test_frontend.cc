@@ -360,6 +360,47 @@ TEST(frontend, parse_return_response_rejects_empty_headers_dict) {
     CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
 }
 
+TEST(frontend, parse_return_response_rejects_crlf_in_header_value) {
+    // Header values must not contain CR/LF — would let a source author
+    // inject a second header (response-splitting) or break the wire
+    // framing. `\r` is within the lexer's allowed string bytes, so the
+    // parser has to enforce this.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X-Bad\": \"a\rInjected: 1\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_rejects_colon_in_header_key) {
+    // `:` in a key would be ambiguous once serialized ("Foo:Bar: v"
+    // parses as key "Foo" value "Bar: v" at the wire level). Reject
+    // at parse time to keep keys unambiguous.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X:Bad\": \"1\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_rejects_empty_header_key) {
+    // Empty header name is invalid per HTTP.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"\": \"1\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+}
+
 TEST(frontend, parse_return_response_body_and_headers_order_independent) {
     // Kwargs can appear in either order; both propagate.
     const char* src_a =

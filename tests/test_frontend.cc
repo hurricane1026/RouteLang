@@ -166,9 +166,10 @@ TEST(frontend, parse_return_response_status_only) {
 }
 
 TEST(frontend, parse_return_response_with_body) {
-    // Parser recognises the body: "..." kwarg and stores the literal;
-    // analyze rejects it with UnsupportedSyntax because the runtime
-    // body-render path hasn't landed (tracked for follow-up slice).
+    // Parser recognises the body: "..." kwarg; analyze propagates the
+    // literal into HirTerminator.response_body; lower_rir interns it
+    // into rir::Module::response_bodies and emits body_idx on
+    // RetStatus; codegen packs body_idx into HandlerResult.upstream_id.
     const char* src = "route GET \"/x\" { return response(200, body: \"Hello\") }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -182,14 +183,19 @@ TEST(frontend, parse_return_response_with_body) {
     CHECK(stmt.response_body.eq(lit("Hello")));
     CHECK(stmt.has_response_body);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
-    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK_EQ(static_cast<u8>(term.kind), static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(term.status_code, 200);
+    REQUIRE_EQ(term.response_body.len, 5u);
+    CHECK(term.response_body.eq(lit("Hello")));
 }
 
-TEST(frontend, parse_return_response_rejects_empty_body) {
-    // `body: ""` is an explicit empty string; has_response_body
-    // distinguishes it from the no-kwarg case so analyze still
-    // rejects, not silently treating it as a plain `return`.
+TEST(frontend, parse_return_response_empty_body_is_noop) {
+    // `body: ""` has the explicit-empty flag but zero bytes; lower_rir
+    // treats it as "no custom body" (same as if the kwarg had been
+    // omitted), so no entry is interned into the module table.
     const char* src = "route GET \"/x\" { return response(200, body: \"\") }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -199,8 +205,10 @@ TEST(frontend, parse_return_response_rejects_empty_body) {
     REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
     CHECK(ast->items[0].route.statements[0].has_response_body);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
-    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(hir);
+    // HIR preserves the empty string so downstream passes can see the
+    // explicit kwarg; the interning step later skips zero-length bodies.
+    CHECK_EQ(hir->routes[0].control.direct_term.response_body.len, 0u);
 }
 
 TEST(frontend, parse_return_response_rejects_unknown_kwarg) {

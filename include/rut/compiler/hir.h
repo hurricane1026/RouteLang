@@ -533,6 +533,10 @@ struct HirTerminator {
     i32 status_code = 0;
     u32 local_ref_index = 0xffffffffu;
     u32 upstream_index = 0;
+    // Optional response body literal (populated when the source was
+    // `return response(N, body: "...")`). Empty Str means no custom
+    // body — runtime uses the default status-reason phrase.
+    Str response_body{};
 };
 
 struct HirGuardBody {

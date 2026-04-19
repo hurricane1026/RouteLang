@@ -741,28 +741,41 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::RetStatus: {
-            // Pack HandlerResult as i64: action=0 (ReturnStatus), status_code from operand or
-            // immediate.
-            LLVMValueRef code;
+            // Pack HandlerResult as i64: action=ReturnStatus,
+            // status_code in bytes 1-2 (low 16 of status slot),
+            // body_idx in bytes 3-4 (the "upstream_id" slot repurposed
+            // per handler ABI — 1-based index into RouteConfig's
+            // response_bodies; 0 = default status-reason body).
+            //
+            // For the operand form (runtime-value status), body_idx is
+            // always 0 because that source path doesn't yet support
+            // custom bodies. For the literal form, RIR packs status
+            // and body_idx into imm.i32_val: low 16 = status, high 16
+            // = body_idx — decode both here.
+            LLVMValueRef status;
+            u32 body_idx_imm = 0;
             if (inst.operand_count > 0) {
-                code = c.get_value(inst.operands[0]);
-                // Ensure it's i32
-                if (LLVMTypeOf(code) != c.i32_ty) {
-                    code = LLVMBuildZExt(c.builder, code, c.i32_ty, "code.ext");
+                status = c.get_value(inst.operands[0]);
+                if (LLVMTypeOf(status) != c.i32_ty) {
+                    status = LLVMBuildZExt(c.builder, status, c.i32_ty, "code.ext");
                 }
             } else {
-                code = LLVMConstInt(c.i32_ty, static_cast<u32>(inst.imm.i32_val), 0);
+                const u32 packed = static_cast<u32>(inst.imm.i32_val);
+                const u32 status_u = packed & 0xffffu;
+                body_idx_imm = (packed >> 16) & 0xffffu;
+                status = LLVMConstInt(c.i32_ty, status_u, 0);
             }
-            // Build packed i64: action(8) | status(16) | upstream(16) | next_state(16) |
-            // yield_kind(8) Byte layout (packed struct, little-endian):
-            //   byte 0: action = 0 (ReturnStatus)
-            //   byte 1-2: status_code (u16)
-            //   byte 3-7: zeros
-            LLVMValueRef action = LLVMConstInt(c.i64_ty, 0, 0);  // ReturnStatus
-            LLVMValueRef status_ext = LLVMBuildZExt(c.builder, code, c.i64_ty, "st.ext");
-            LLVMValueRef shifted =
+            LLVMValueRef action =
+                LLVMConstInt(c.i64_ty, static_cast<u64>(HandlerAction::ReturnStatus), 0);
+            LLVMValueRef status_ext = LLVMBuildZExt(c.builder, status, c.i64_ty, "st.ext");
+            LLVMValueRef status_shifted =
                 LLVMBuildShl(c.builder, status_ext, LLVMConstInt(c.i64_ty, 8, 0), "st.shl");
-            LLVMValueRef result = LLVMBuildOr(c.builder, action, shifted, "result");
+            LLVMValueRef result = LLVMBuildOr(c.builder, action, status_shifted, "result.st");
+            if (body_idx_imm != 0) {
+                LLVMValueRef body_slot =
+                    LLVMConstInt(c.i64_ty, static_cast<u64>(body_idx_imm) << 24, 0);
+                result = LLVMBuildOr(c.builder, result, body_slot, "result.body");
+            }
             LLVMBuildRet(c.builder, result);
             break;
         }

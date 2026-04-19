@@ -707,10 +707,41 @@ struct Builder {
         return {};
     }
 
-    VoidResult emit_ret_status(i32 code, SourceLoc loc = {}) {
+    // Literal status form. body_idx is a 1-based index into the
+    // module's response_bodies table (0 = no custom body, runtime
+    // renders the default status-reason phrase). Status fits in
+    // 16 bits (100..999); body_idx fits in 16 bits. Both pack
+    // into the immediate slot: low 16 = status, high 16 = body_idx.
+    VoidResult emit_ret_status(i32 code, SourceLoc loc = {}, u16 body_idx = 0) {
         auto r = TRY(emit(Opcode::RetStatus, nullptr, loc));
-        r.inst->imm.i32_val = code;
+        r.inst->imm.i32_val = static_cast<i32>((static_cast<u32>(body_idx) << 16) |
+                                               (static_cast<u32>(code) & 0xffffu));
         return {};
+    }
+
+    // Intern a response body literal into the module's table. Returns
+    // a 1-based index suitable for emit_ret_status. Deduplicates
+    // byte-identical literals. Returns 0 if the table is full, which
+    // caller should treat as "no custom body" + flag an error.
+    u16 intern_response_body(Str body) {
+        if (!mod) return 0;
+        for (u32 i = 0; i < mod->response_body_count; i++) {
+            const Str& existing = mod->response_bodies[i];
+            if (existing.len == body.len) {
+                bool match = true;
+                for (u32 j = 0; j < body.len; j++) {
+                    if (existing.ptr[j] != body.ptr[j]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) return static_cast<u16>(i + 1);
+            }
+        }
+        if (mod->response_body_count >= Module::kMaxResponseBodies) return 0;
+        const u32 idx = mod->response_body_count++;
+        mod->response_bodies[idx] = body;
+        return static_cast<u16>(idx + 1);
     }
 
     // Runtime-value form: status code is read from a SSA value (e.g. result

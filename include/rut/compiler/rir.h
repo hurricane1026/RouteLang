@@ -360,6 +360,16 @@ struct Module {
     u32 func_count;
     u32 func_cap;
 
+    // Response-body literals collected from RetStatus terminators.
+    // Entry 0 is reserved as "no custom body"; real literals start at
+    // index 1 (matching the 1-based body_idx the JIT handler packs
+    // into HandlerResult.upstream_id). Identical literals are
+    // deduplicated during lowering so the table stays small.
+    // Populated at lower_to_rir time; codegen references it by index.
+    static constexpr u32 kMaxResponseBodies = 128;
+    Str response_bodies[kMaxResponseBodies];
+    u32 response_body_count = 0;
+
     // Arena that owns all IR memory (mmap-backed, compiler use).
     MmapArena* arena;
 };

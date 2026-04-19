@@ -2712,26 +2712,17 @@ TEST(route, jit_handler_unknown_body_idx_falls_back) {
     // bytes), and format_static_response does NOT emit Content-Type,
     // so the response shape is distinct from the custom-body path.
     const Str response{buf, static_cast<u32>(n)};
-    auto contains = [&](const char* needle, u32 nlen) {
-        for (u32 i = 0; i + nlen <= response.len; i++) {
-            bool match = true;
-            for (u32 j = 0; j < nlen; j++) {
-                if (response.ptr[i + j] != static_cast<u8>(needle[j])) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) return true;
-        }
-        return false;
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
     };
-    CHECK(contains("200 OK", 6));
-    CHECK(contains("Content-Length: 2\r\n", 19));
+    CHECK(has("200 OK", 6));
+    CHECK(has("Content-Length: 2\r\n", 19));
     // Default formatter must NOT emit Content-Type — that would mean
     // the custom-body path ran despite the out-of-range index.
-    CHECK(!contains("Content-Type:", 13));
+    CHECK(!has("Content-Type:", 13));
     // Body bytes at end of response: "...\r\n\r\nOK".
-    CHECK(contains("\r\n\r\nOK", 6));
+    CHECK(has("\r\n\r\nOK", 6));
 
     close(c);
     lt.stop();
@@ -2800,23 +2791,14 @@ TEST(route, dsl_response_body_real_socket) {
     i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
     CHECK_GT(n, 0);
     const Str response{buf, static_cast<u32>(n)};
-    auto contains = [&](const char* needle, u32 nlen) {
-        for (u32 i = 0; i + nlen <= response.len; i++) {
-            bool match = true;
-            for (u32 j = 0; j < nlen; j++) {
-                if (response.ptr[i + j] != static_cast<u8>(needle[j])) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) return true;
-        }
-        return false;
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
     };
-    CHECK(contains("200 OK", 6));
-    CHECK(contains("Content-Length: 3\r\n", 19));
-    CHECK(contains("Content-Type: text/plain", 24));
-    CHECK(contains("\r\n\r\nHi!", 7));
+    CHECK(has("200 OK", 6));
+    CHECK(has("Content-Length: 3\r\n", 19));
+    CHECK(has("Content-Type: text/plain", 24));
+    CHECK(has("\r\n\r\nHi!", 7));
 
     close(c);
     lt.stop();

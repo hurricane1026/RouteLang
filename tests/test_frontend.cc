@@ -193,9 +193,10 @@ TEST(frontend, parse_return_response_with_body) {
 }
 
 TEST(frontend, parse_return_response_empty_body_is_noop) {
-    // `body: ""` has the explicit-empty flag but zero bytes; lower_rir
-    // treats it as "no custom body" (same as if the kwarg had been
-    // omitted), so no entry is interned into the module table.
+    // `body: ""` has the explicit-empty flag but zero bytes; HIR
+    // preserves the kwarg (ptr != nullptr, len == 0 — the documented
+    // sentinel), and lower_rir treats it as "no custom body" so no
+    // entry is interned into the module table.
     const char* src = "route GET \"/x\" { return response(200, body: \"\") }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -206,9 +207,21 @@ TEST(frontend, parse_return_response_empty_body_is_noop) {
     CHECK(ast->items[0].route.statements[0].has_response_body);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    // HIR preserves the empty string so downstream passes can see the
-    // explicit kwarg; the interning step later skips zero-length bodies.
-    CHECK_EQ(hir->routes[0].control.direct_term.response_body.len, 0u);
+    // HIR preserves the explicit kwarg via ptr-based sentinel: ptr
+    // non-null distinguishes `body: ""` from the no-kwarg case even
+    // though len == 0 in both. Asserting ptr != nullptr catches
+    // regressions that would silently drop the kwarg.
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK(term.response_body.ptr != nullptr);
+    CHECK_EQ(term.response_body.len, 0u);
+    // Lower through MIR → RIR and verify the module table stays empty:
+    // zero-length bodies should not produce an intern entry.
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    CHECK_EQ(rir.module.response_body_count, 0u);
 }
 
 TEST(frontend, parse_return_response_rejects_unknown_kwarg) {

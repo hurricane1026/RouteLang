@@ -206,12 +206,19 @@ enum class Opcode : u8 {
     // ── Terminators ── (must be last instruction in a block)
     Br,          // br %cond, then_block, else_block
     Jmp,         // jmp target_block
-    RetStatus,   // ret.status packed-imm (imm.i32_val = status | body_idx<<16)
-                 //   low  16 bits: HTTP status code (0..65535)
-                 //   high 16 bits: 1-based response_bodies index, 0 = no body
-                 //   Any printer/decoder MUST decode both fields — printing
-                 //   imm.i32_val as a raw status will be misleading when
-                 //   body_idx > 0.
+    RetStatus,   // ret.status — two encodings, disambiguated by operand_count:
+                 //   operand_count == 0 (literal form): imm.i32_val holds
+                 //     a packed (status | body_idx<<16):
+                 //       low  16 bits: HTTP status code (0..65535)
+                 //       high 16 bits: 1-based response_bodies index,
+                 //                     0 = no body
+                 //   operand_count >  0 (value form):   operands[0] is an
+                 //     SSA i32 status code; imm is unused and body_idx is
+                 //     implicitly 0 (no custom body today).
+                 //   Printers/decoders MUST branch on operand_count before
+                 //   reading imm.i32_val — doing otherwise will print
+                 //   garbage for the value form and miss body_idx in the
+                 //   literal form.
     RetForward,  // ret.forward upstream [, options]
 
     // ── Yield (I/O suspend → state machine boundary) ──

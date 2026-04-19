@@ -201,6 +201,7 @@ TEST(frontend, parse_return_response_with_body) {
     REQUIRE_EQ(rir.module.response_body_count, 1u);
     REQUIRE_EQ(rir.module.response_bodies[0].len, 5u);
     CHECK(rir.module.response_bodies[0].eq(lit("Hello")));
+    rir.destroy();
 }
 
 TEST(frontend, parse_return_response_empty_body_is_noop) {
@@ -233,6 +234,7 @@ TEST(frontend, parse_return_response_empty_body_is_noop) {
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
     CHECK_EQ(rir.module.response_body_count, 0u);
+    rir.destroy();
 }
 
 TEST(frontend, parse_return_response_rejects_unknown_kwarg) {

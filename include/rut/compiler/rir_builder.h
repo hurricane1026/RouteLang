@@ -735,17 +735,7 @@ struct Builder {
     u16 intern_response_body(Str body) {
         if (!mod || !mod->arena) return 0;
         for (u32 i = 0; i < mod->response_body_count; i++) {
-            const Str& existing = mod->response_bodies[i];
-            if (existing.len == body.len) {
-                bool match = true;
-                for (u32 j = 0; j < body.len; j++) {
-                    if (existing.ptr[j] != body.ptr[j]) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) return static_cast<u16>(i + 1);
-            }
+            if (mod->response_bodies[i].eq(body)) return static_cast<u16>(i + 1);
         }
         if (mod->response_body_count >= Module::kMaxResponseBodies) return 0;
         char* buf = nullptr;

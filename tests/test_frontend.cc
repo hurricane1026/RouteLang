@@ -158,8 +158,8 @@ TEST(frontend, parse_return_response_status_only) {
 
 TEST(frontend, parse_return_response_with_body) {
     // Parser recognises the body: "..." kwarg and stores the literal;
-    // analyze rejects it for now because the runtime body-render path
-    // hasn't landed (tracked for follow-up slice).
+    // analyze rejects it with UnsupportedSyntax because the runtime
+    // body-render path hasn't landed (tracked for follow-up slice).
     const char* src = "route GET \"/x\" { return response(200, body: \"Hello\") }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -169,8 +169,25 @@ TEST(frontend, parse_return_response_with_body) {
     CHECK_EQ(stmt.status_code, 200u);
     REQUIRE_EQ(stmt.response_body.len, 5u);
     CHECK(stmt.response_body.eq(lit("Hello")));
+    CHECK(stmt.has_response_body);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_rejects_empty_body) {
+    // `body: ""` is an explicit empty string; has_response_body
+    // distinguishes it from the no-kwarg case so analyze still
+    // rejects, not silently treating it as a plain `return`.
+    const char* src = "route GET \"/x\" { return response(200, body: \"\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK(ast->items[0].route.statements[0].has_response_body);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, parse_return_response_rejects_unknown_kwarg) {
@@ -178,7 +195,9 @@ TEST(frontend, parse_return_response_rejects_unknown_kwarg) {
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    CHECK(!ast);
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("header")));
 }
 
 TEST(frontend, lex_duration_suffix_boundary) {

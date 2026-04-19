@@ -101,9 +101,11 @@ struct AstStatement {
     // payload range (~49 days); semantic validation is in analyze.
     u32 status_code = 0;
     // Response body literal, populated when `return` uses the
-    // `response(N, body: "...")` form. Empty `Str` means no custom
-    // body — runtime falls back to the default (status reason phrase).
+    // `response(N, body: "...")` form. `has_response_body` distinguishes
+    // an omitted kwarg from an explicit empty string — the latter must
+    // still be rejected while body plumbing is not wired end-to-end.
     Str response_body{};
+    bool has_response_body = false;
     AstStatement* then_stmt = nullptr;
     AstStatement* else_stmt = nullptr;
     static constexpr u32 kMaxBlockStatements = 8;

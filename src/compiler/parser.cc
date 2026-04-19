@@ -712,8 +712,11 @@ struct Parser {
             // Two forms:
             //   return <IntLit>                          (legacy)
             //   return response(<IntLit>[, body: "..."]) (response builder)
-            // The body variant lets the handler supply a custom payload
-            // that the runtime writes verbatim with an auto Content-Length.
+            // The builder form is the syntactic entry point for richer
+            // responses (body / headers / content-type). Today only
+            // response(<IntLit>) is semantically identical to `return
+            // <IntLit>`; analyze rejects the `body:` kwarg until the
+            // runtime body-render path lands.
             AstStatement stmt{};
             stmt.kind = AstStmtKind::ReturnStatus;
 
@@ -721,12 +724,8 @@ struct Parser {
             // literal identifier text; no dedicated keyword yet because
             // `response` is also a valid identifier in other contexts.
             const Token& peek = cur();
-            const bool kIsBuilder = peek.type == TokenType::Ident && peek.text.len == 8 &&
-                                    peek.text.ptr[0] == 'r' && peek.text.ptr[1] == 'e' &&
-                                    peek.text.ptr[2] == 's' && peek.text.ptr[3] == 'p' &&
-                                    peek.text.ptr[4] == 'o' && peek.text.ptr[5] == 'n' &&
-                                    peek.text.ptr[6] == 's' && peek.text.ptr[7] == 'e';
-            if (kIsBuilder) {
+            const bool is_builder = peek.type == TokenType::Ident && peek.text.eq({"response", 8});
+            if (is_builder) {
                 pos++;  // consume `response`
                 auto lparen = expect(TokenType::LParen);
                 if (!lparen) return core::make_unexpected(lparen.error());
@@ -746,9 +745,7 @@ struct Parser {
                 if (take(TokenType::Comma)) {
                     auto kw = expect(TokenType::Ident);
                     if (!kw) return core::make_unexpected(kw.error());
-                    if (!(kw.value()->text.len == 4 && kw.value()->text.ptr[0] == 'b' &&
-                          kw.value()->text.ptr[1] == 'o' && kw.value()->text.ptr[2] == 'd' &&
-                          kw.value()->text.ptr[3] == 'y')) {
+                    if (!kw.value()->text.eq({"body", 4})) {
                         return frontend_error(FrontendError::UnexpectedToken,
                                               span_from(*kw.value()),
                                               kw.value()->text);
@@ -757,13 +754,9 @@ struct Parser {
                     if (!colon) return core::make_unexpected(colon.error());
                     auto body_tok = expect(TokenType::StringLit);
                     if (!body_tok) return core::make_unexpected(body_tok.error());
-                    // Strip the surrounding quotes. Lexer keeps them in text.
-                    const Str raw = body_tok.value()->text;
-                    if (raw.len >= 2 && raw.ptr[0] == '"' && raw.ptr[raw.len - 1] == '"') {
-                        stmt.response_body = Str{raw.ptr + 1, raw.len - 2};
-                    } else {
-                        stmt.response_body = raw;
-                    }
+                    // Lexer strips the surrounding quotes already.
+                    stmt.response_body = body_tok.value()->text;
+                    stmt.has_response_body = true;
                 }
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());

@@ -801,11 +801,21 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->local_ref_index = term.local_ref_index;
             out->response_body = term.response_body;
             out->response_headers.len = 0;
+            // Both HIR and MIR cap at 16 headers per terminator, so a
+            // straight copy cannot truncate. Static-assert the cap
+            // equality here so a future tweak on either side trips
+            // the build instead of silently dropping headers.
+            static_assert(HirTerminator::kMaxHeaders == MirTerminator::kMaxHeaders,
+                          "HIR/MIR header cap must stay in lockstep or a different "
+                          "copy strategy (returning an error) is required.");
             for (u32 i = 0; i < term.response_headers.len; i++) {
                 const auto& p = term.response_headers[i];
-                // Capacity matches (both sides use 16); push can fail
-                // only if MIR's cap is smaller, which we don't expect.
-                out->response_headers.push({p.key, p.value});
+                const bool ok = out->response_headers.push({p.key, p.value});
+                // Unreachable given the static_assert above; use a
+                // builtin trap in debug/release rather than `(void)ok`
+                // so a regression surfaces immediately instead of
+                // silently shipping a truncated header set.
+                if (!ok) __builtin_trap();
             }
         };
         auto guard_fail_block_count = [&](const HirGuard& guard) -> u32 {

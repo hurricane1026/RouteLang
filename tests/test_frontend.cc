@@ -401,6 +401,56 @@ TEST(frontend, parse_return_response_rejects_empty_header_key) {
     CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
 }
 
+TEST(frontend, parse_return_response_rejects_space_in_header_key) {
+    // Spaces aren't in the HTTP tchar grammar — reject `"X Foo"` so
+    // sloppy names don't slip through and later fail to match the
+    // case-insensitive Content-Type suppression check.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X Foo\": \"1\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_rejects_case_insensitive_duplicate_key) {
+    // HTTP field names are case-insensitive — `"X-Foo"` and `"x-foo"`
+    // are the same header and must be rejected as duplicates.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X-Foo\": \"1\", \"x-foo\": \"2\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("x-foo")));
+}
+
+TEST(frontend, parse_return_response_rejects_reserved_header_names) {
+    // Content-Length / Transfer-Encoding / Connection are
+    // runtime-managed; user attempts to set them would create CL/TE
+    // smuggling-style inconsistencies or conflict with the keep-alive
+    // decision. Rejected at parse time regardless of case.
+    const char* kContentLength =
+        "route GET \"/x\" { return response(200, headers: { \"Content-Length\": \"0\" }) }\n";
+    const char* kTransferEncoding =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"transfer-encoding\": \"chunked\" }) }\n";
+    const char* kConnection =
+        "route GET \"/x\" { return response(200, headers: { \"CONNECTION\": \"close\" }) }\n";
+    const char* kCases[] = {kContentLength, kTransferEncoding, kConnection};
+    for (const char* src : kCases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(!ast);
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
 TEST(frontend, parse_return_response_body_and_headers_order_independent) {
     // Kwargs can appear in either order; both propagate.
     const char* src_a =

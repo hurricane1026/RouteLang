@@ -453,6 +453,16 @@ static void write_content_length_digits(Connection& conn, u32 body_len) {
     }
 }
 
+// Count ASCII digits needed to represent `v` in base 10 (at least 1).
+static u32 decimal_digit_count(u32 v) {
+    u32 n = 1;
+    while (v >= 10u) {
+        v /= 10u;
+        n++;
+    }
+    return n;
+}
+
 void format_response_with_body_and_headers(Connection& conn,
                                            u16 code,
                                            const char* body_data,
@@ -476,6 +486,42 @@ void format_response_with_body_and_headers(Connection& conn,
             user_has_content_type = true;
             break;
         }
+    }
+
+    // Precompute the exact number of bytes we're about to write.
+    // Buffer::write() silently truncates on capacity — if we ran past
+    // the send_buf we'd ship a response with a Content-Length that
+    // doesn't match the bytes actually on the wire, which hangs or
+    // poisons clients. Instead, if the full response doesn't fit, we
+    // fail closed: emit a 500 + Connection: close via the fallback
+    // formatter. The cap is per-connection (send_buf is a 16KB
+    // slice), so this only trips on pathological hand-built configs.
+    constexpr u32 kStatusLineFixed =
+        9 /* "HTTP/1.1 " */ + 3 /* code */ + 1 /* " " */ + 2 /* "\r\n" */;
+    constexpr u32 kContentLengthPrefix = 16;  // "Content-Length: "
+    constexpr u32 kDefaultContentTypeLine =
+        sizeof("Content-Type: text/plain; charset=utf-8\r\n") - 1;
+    constexpr u32 kConnKeepAliveLine = 24;  // "Connection: keep-alive\r\n"
+    constexpr u32 kConnCloseLine = 19;      // "Connection: close\r\n"
+    u64 needed = kStatusLineFixed + reason_len + kContentLengthPrefix +
+                 decimal_digit_count(body_len_emit) + 2;
+    if (!user_has_content_type && body_len_emit > 0) needed += kDefaultContentTypeLine;
+    for (u32 i = 0; i < header_count; i++) {
+        if (header_name_eq_ascii_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
+            continue;
+        }
+        needed += headers[i].key_len + 2 /* ": " */ + headers[i].value_len + 2 /* "\r\n" */;
+    }
+    needed += (keep_alive ? kConnKeepAliveLine : kConnCloseLine);
+    needed += 2;  // blank line terminator
+    needed += body_len_emit;
+    if (needed > conn.send_buf.capacity()) {
+        // Fail closed: force connection close and emit a small 500.
+        // format_static_response uses the reason-phrase body which is
+        // guaranteed to fit, and the caller's keep_alive is overridden
+        // to false so the client disconnects after reading.
+        format_static_response(conn, 500, /*keep_alive=*/false);
+        return;
     }
 
     conn.send_buf.reset();

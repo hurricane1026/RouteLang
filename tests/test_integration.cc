@@ -2824,6 +2824,50 @@ TEST(route, add_response_header_set_rejects_count_over_per_set_cap) {
         1u);
 }
 
+TEST(route, add_response_header_set_rejects_malformed_headers) {
+    using namespace rut;
+    // The runtime API must reject the same things the DSL parser does:
+    // CR in a value (response splitting), invalid key chars (space),
+    // and reserved framing names. Manual JIT-handler setups would
+    // otherwise bypass the parser-level validation.
+    RouteConfig cfg{};
+    const char* ok_key = "X-Ok";
+    u32 ok_key_len = 4;
+    const char* ok_val = "ok";
+    u32 ok_val_len = 2;
+
+    // CR in value → rejected.
+    const char* crlf_key = "X-Bad";
+    u32 crlf_key_len = 5;
+    const char* crlf_val = "a\r\nInjected: 1";
+    u32 crlf_val_len = 14;
+    CHECK_EQ(cfg.add_response_header_set(&crlf_key, &crlf_key_len, &crlf_val, &crlf_val_len, 1),
+             0u);
+
+    // Space in key → rejected.
+    const char* space_key = "X Bad";
+    u32 space_key_len = 5;
+    CHECK_EQ(cfg.add_response_header_set(&space_key, &space_key_len, &ok_val, &ok_val_len, 1), 0u);
+
+    // Reserved framing names → rejected.
+    const char* cl_key = "Content-Length";
+    u32 cl_key_len = 14;
+    CHECK_EQ(cfg.add_response_header_set(&cl_key, &cl_key_len, &ok_val, &ok_val_len, 1), 0u);
+    const char* te_key = "transfer-encoding";
+    u32 te_key_len = 17;
+    CHECK_EQ(cfg.add_response_header_set(&te_key, &te_key_len, &ok_val, &ok_val_len, 1), 0u);
+    const char* conn_key = "connection";
+    u32 conn_key_len = 10;
+    CHECK_EQ(cfg.add_response_header_set(&conn_key, &conn_key_len, &ok_val, &ok_val_len, 1), 0u);
+
+    // Confirm no partial state leaked: set count still zero after all
+    // the rejected attempts.
+    CHECK_EQ(cfg.response_header_set_count, 0u);
+
+    // Valid pair still works afterwards.
+    CHECK_EQ(cfg.add_response_header_set(&ok_key, &ok_key_len, &ok_val, &ok_val_len, 1), 1u);
+}
+
 // End-to-end: compile `route GET "/x" { return response(200, body: "Hi!") }`
 // from source, populate RouteConfig.response_bodies from the compiled
 // rir::Module, and verify a real client receives the exact body.
@@ -2902,19 +2946,19 @@ TEST(route, dsl_response_body_real_socket) {
     rir.destroy();
 }
 
-// End-to-end: compile a route with custom headers (including a
-// user-supplied Content-Type that must suppress the default, and a
-// user-supplied Content-Length that the formatter must ignore), run
-// through the full pipeline, and assert the real-socket response
-// contains exactly what we expect.
+// End-to-end: compile a route with custom headers (user-supplied
+// Content-Type must suppress the default text/plain) and assert the
+// real-socket response contains exactly what we expect. Reserved
+// framing headers (Content-Length / Transfer-Encoding / Connection)
+// are rejected at parse time — see parse_return_response_rejects_
+// reserved_header_names in test_frontend.cc.
 TEST(route, dsl_response_headers_real_socket) {
     using namespace rut;
 
     const char* src =
         "route GET \"/x\" { return response(200, body: \"hello-json\", headers: "
         "{ \"Content-Type\": \"application/json\", "
-        "\"X-Service\": \"auth\", "
-        "\"Content-Length\": \"9999\" }) }\n";
+        "\"X-Service\": \"auth\" }) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -2989,11 +3033,10 @@ TEST(route, dsl_response_headers_real_socket) {
         return buf_contains(
             reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
     };
-    // Body is exactly 10 bytes (`hello-json`). The formatter ignores
-    // the user's "9999" Content-Length and writes 10.
+    // Body is exactly 10 bytes (`hello-json`), and the formatter
+    // recomputes Content-Length from that.
     CHECK(has("200 OK", 6));
     CHECK(has("Content-Length: 10\r\n", 20));
-    CHECK(!has("Content-Length: 9999", 20));
     // User's Content-Type wins; default text/plain is suppressed.
     CHECK(has("Content-Type: application/json\r\n", 32));
     CHECK(!has("text/plain", 10));

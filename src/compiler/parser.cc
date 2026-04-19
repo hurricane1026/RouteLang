@@ -1,5 +1,6 @@
 #include "rut/compiler/parser.h"
 
+#include "rut/common/http_header_validation.h"
 #include <memory>
 
 namespace rut {
@@ -783,33 +784,6 @@ struct Parser {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(cur()));
                         }
-                        // Reject any ASCII control char (< 0x20 or == 0x7f)
-                        // in header bytes. CR/LF are the security-critical
-                        // ones — they'd let a source author inject a
-                        // second header or split the response. TAB could
-                        // be argued for values but HTTP strongly
-                        // discourages it, and a uniform reject keeps the
-                        // surface small. Keys additionally forbid ':'
-                        // (the serialized delimiter) and must be non-empty.
-                        auto reject_if_bad =
-                            [&](Str s, bool is_key, const Token& where) -> FrontendResult<void> {
-                            if (is_key && s.len == 0) {
-                                return frontend_error(
-                                    FrontendError::UnsupportedSyntax, span_from(where), s);
-                            }
-                            for (u32 i = 0; i < s.len; i++) {
-                                const u8 c = static_cast<u8>(s.ptr[i]);
-                                if (c < 0x20 || c == 0x7f) {
-                                    return frontend_error(
-                                        FrontendError::UnsupportedSyntax, span_from(where), s);
-                                }
-                                if (is_key && c == ':') {
-                                    return frontend_error(
-                                        FrontendError::UnsupportedSyntax, span_from(where), s);
-                                }
-                            }
-                            return {};
-                        };
                         while (true) {
                             auto key_tok = expect(TokenType::StringLit);
                             if (!key_tok) return core::make_unexpected(key_tok.error());
@@ -818,13 +792,29 @@ struct Parser {
                             auto val_tok = expect(TokenType::StringLit);
                             if (!val_tok) return core::make_unexpected(val_tok.error());
                             AstHeaderKV pair{key_tok.value()->text, val_tok.value()->text};
-                            if (auto v = reject_if_bad(pair.key, true, *key_tok.value()); !v)
-                                return core::make_unexpected(v.error());
-                            if (auto v = reject_if_bad(pair.value, false, *val_tok.value()); !v)
-                                return core::make_unexpected(v.error());
-                            // Reject duplicate keys within the same set.
+                            // Delegate byte-level validation to the
+                            // shared HTTP header validator so the
+                            // compiler and the runtime's public
+                            // add_response_header_set apply identical
+                            // rules (HTTP tchar grammar on keys,
+                            // control-char reject on values,
+                            // framing/hop-by-hop names reserved).
+                            const auto result = validate_response_header(
+                                pair.key.ptr, pair.key.len, pair.value.ptr, pair.value.len);
+                            if (result != HttpHeaderValidation::Ok) {
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*key_tok.value()),
+                                                      pair.key);
+                            }
+                            // Reject duplicate keys (case-insensitive
+                            // per HTTP) so { "X": "1", "x": "2" } is a
+                            // parse error instead of emitting two
+                            // contradictory singletons.
                             for (u32 i = 0; i < stmt.response_headers.len; i++) {
-                                if (stmt.response_headers[i].key.eq(pair.key)) {
+                                if (http_header_name_eq_ci(stmt.response_headers[i].key.ptr,
+                                                           stmt.response_headers[i].key.len,
+                                                           pair.key.ptr,
+                                                           pair.key.len)) {
                                     return frontend_error(FrontendError::UnexpectedToken,
                                                           span_from(*key_tok.value()),
                                                           pair.key);

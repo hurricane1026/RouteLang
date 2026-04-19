@@ -36,15 +36,16 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive);
 void format_response_with_body(
     Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive);
 
-// Custom-headers variant: emits all (key, value) pairs from `keys[]` /
-// `values[]` (indexed [0, header_count)) before the blank line. If any
-// user-supplied key case-insensitively matches "Content-Type", the
-// default text/plain Content-Type is suppressed so the user's value
-// wins. User-supplied "Content-Length" is always dropped — the
-// formatter recomputes it from `body_len` to keep the framing honest.
-// For codes that must have no body (1xx / 204 / 304), headers are
-// still emitted (they can be meaningful on 204/304, e.g. Cache-Control)
-// but the body is omitted per spec.
+// Custom-headers variant: emits each `headers[i]` pair (indexed
+// [0, header_count)) before the blank line. If any user-supplied key
+// case-insensitively matches "Content-Type", the default text/plain
+// Content-Type is suppressed so the user's value wins. User-supplied
+// "Content-Length" is skipped — the formatter recomputes it from
+// `body_len` to keep the framing honest. For codes that must have no
+// body (1xx / 204 / 304), headers are still emitted (they can be
+// meaningful on 204/304, e.g. Cache-Control) but the body is omitted
+// per spec. If the precomputed response size won't fit in the
+// connection's send_buf, fails closed with a 500 + Connection: close.
 struct ResponseHeaderKV {
     const char* key_data;
     u32 key_len;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
@@ -246,12 +247,20 @@ struct RouteConfig {
         // Subtraction-based capacity check on the (key, value) arrays.
         if (count > kMaxHeaderPoolEntries - header_pool_used) return 0;
         // Tally total bytes we're about to write; reject if the bytes
-        // pool can't fit them. Summing up-front avoids a partial copy
-        // aborting mid-way with half-written state.
+        // pool can't fit them. Also validate each (key, value) pair
+        // via the shared HTTP header validator — parity with the DSL
+        // parser — so manual callers can't accidentally emit malformed
+        // or smuggling-prone responses (CR/LF injection, CL/TE
+        // conflicts, etc.). Doing the scan up front avoids a partial
+        // copy aborting mid-way with half-written state.
         u32 total_bytes = 0;
         for (u32 i = 0; i < count; i++) {
             if ((key_lens[i] > 0 && keys[i] == nullptr) ||
                 (value_lens[i] > 0 && values[i] == nullptr)) {
+                return 0;
+            }
+            if (validate_response_header(keys[i], key_lens[i], values[i], value_lens[i]) !=
+                HttpHeaderValidation::Ok) {
                 return 0;
             }
             // Guard each add individually against u32 overflow.

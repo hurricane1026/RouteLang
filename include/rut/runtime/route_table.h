@@ -86,6 +86,13 @@ struct RouteConfig {
     static constexpr u32 kMaxResponseHeaderSets = 128;
     static constexpr u32 kMaxHeaderPoolEntries = 512;
     static constexpr u32 kResponseHeaderBytesPoolBytes = 8 * 1024;
+    // Per-response cap for header count. Bigger than what the AST
+    // permits (16) so hand-built RouteConfigs — tests, future
+    // compile→config helper — have headroom, but small enough that the
+    // dispatch code can materialise a stack-local KV array without
+    // any risk of silent truncation. Must match the buffer size used
+    // by handle_jit_outcome in callbacks_impl.h.
+    static constexpr u32 kMaxHeadersPerSet = 32;
 
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
@@ -232,6 +239,10 @@ struct RouteConfig {
             return 0;
         }
         if (response_header_set_count >= kMaxResponseHeaderSets) return 0;
+        // Per-set cap is enforced here so the dispatch formatter (which
+        // uses a fixed stack buffer sized to kMaxHeadersPerSet) can
+        // never silently drop trailing pairs.
+        if (count > kMaxHeadersPerSet) return 0;
         // Subtraction-based capacity check on the (key, value) arrays.
         if (count > kMaxHeaderPoolEntries - header_pool_used) return 0;
         // Tally total bytes we're about to write; reject if the bytes

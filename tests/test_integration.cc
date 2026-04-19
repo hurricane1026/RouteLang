@@ -2731,6 +2731,99 @@ TEST(route, jit_handler_unknown_body_idx_falls_back) {
     destroy_real_loop(loop);
 }
 
+// Handler returns ReturnStatus with a valid headers_idx but an
+// out-of-range body_idx. The dispatch path must still render the
+// default reason-phrase body so the response isn't silently empty —
+// matches the no-headers fallback behavior of format_static_response.
+static u64 return_200_body_99_headers_1_handler(void* /*conn*/,
+                                                rut::jit::HandlerCtx* /*ctx*/,
+                                                const u8* /*req*/,
+                                                u32 /*len*/,
+                                                void* /*arena*/) {
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
+                              200,
+                              /*upstream_id=*/99,  // body_idx: out of range
+                              /*next_state=*/1,    // headers_idx: valid
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
+TEST(route, jit_handler_unknown_body_idx_with_headers_falls_back) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    // Register one header set (idx 1) but no bodies — body_idx=99
+    // is out of range.
+    const char* keys[] = {"X-Service"};
+    u32 key_lens[] = {9};
+    const char* vals[] = {"auth"};
+    u32 val_lens[] = {4};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/hello", 'G', &return_200_body_99_headers_1_handler));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n, 0);
+    const Str response{buf, static_cast<u32>(n)};
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
+    };
+    CHECK(has("200 OK", 6));
+    // Body fell back to the default reason phrase "OK" (2 bytes) even
+    // though headers were present.
+    CHECK(has("Content-Length: 2\r\n", 19));
+    CHECK(has("\r\n\r\nOK", 6));
+    // Custom header still emitted alongside the fallback body.
+    CHECK(has("X-Service: auth\r\n", 17));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(route, add_response_header_set_rejects_count_over_per_set_cap) {
+    using namespace rut;
+    // Above the per-set cap: registration must refuse the set rather
+    // than accept it and let the dispatch formatter silently truncate.
+    RouteConfig cfg{};
+    constexpr u32 kOver = RouteConfig::kMaxHeadersPerSet + 1;
+    const char* keys[kOver];
+    u32 key_lens[kOver];
+    const char* vals[kOver];
+    u32 val_lens[kOver];
+    for (u32 i = 0; i < kOver; i++) {
+        keys[i] = "K";
+        key_lens[i] = 1;
+        vals[i] = "V";
+        val_lens[i] = 1;
+    }
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, kOver), 0u);
+    CHECK_EQ(cfg.response_header_set_count, 0u);
+    // At the cap it still succeeds.
+    CHECK_EQ(
+        cfg.add_response_header_set(keys, key_lens, vals, val_lens, RouteConfig::kMaxHeadersPerSet),
+        1u);
+}
+
 // End-to-end: compile `route GET "/x" { return response(200, body: "Hi!") }`
 // from source, populate RouteConfig.response_bodies from the compiled
 // rir::Module, and verify a real client receives the exact body.

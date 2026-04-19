@@ -347,20 +347,22 @@ void handle_jit_outcome(Loop* loop,
                                   outcome.response_body_idx <= cfg->response_body_count;
             const bool has_headers = outcome.response_headers_idx != 0 && cfg != nullptr &&
                                      outcome.response_headers_idx <= cfg->response_header_set_count;
+            // Distinguish "user didn't supply a body" (body_idx == 0)
+            // from "user supplied one but it's out of range" (a config
+            // mismatch). The latter falls back to the reason-phrase
+            // default so the response still has a representative body
+            // — matches the no-headers path's documented behavior of
+            // falling back rather than rendering garbage.
+            const bool body_idx_invalid = outcome.response_body_idx != 0 && !has_body;
             if (has_headers) {
                 // Materialise the header set into a stack-local KV
-                // array so the formatter takes a uniform view. The
-                // per-response cap is set at the AST layer
-                // (AstStatement::kMaxResponseHeaders = 16) and carries
-                // through to RIR interning, so 32 here is comfortably
-                // above any single-response count and keeps the stack
-                // footprint small.
-                constexpr u32 kMaxPerResponse = 32;
+                // array so the formatter takes a uniform view.
+                // RouteConfig::kMaxHeadersPerSet is enforced at
+                // add_response_header_set time, so ref.count can
+                // never exceed our buffer size — no silent truncation.
                 const auto& ref = cfg->response_header_sets[outcome.response_headers_idx - 1];
-                ResponseHeaderKV kvs[kMaxPerResponse];
-                const u16 n =
-                    ref.count > kMaxPerResponse ? static_cast<u16>(kMaxPerResponse) : ref.count;
-                for (u16 i = 0; i < n; i++) {
+                ResponseHeaderKV kvs[RouteConfig::kMaxHeadersPerSet];
+                for (u16 i = 0; i < ref.count; i++) {
                     kvs[i].key_data = cfg->header_keys[ref.offset + i].data;
                     kvs[i].key_len = cfg->header_keys[ref.offset + i].len;
                     kvs[i].value_data = cfg->header_values[ref.offset + i].data;
@@ -372,9 +374,19 @@ void handle_jit_outcome(Loop* loop,
                     const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                     body_data = body.data;
                     body_len = body.len;
+                } else if (body_idx_invalid) {
+                    // Out-of-range body_idx + headers present: render
+                    // the default reason-phrase as body so the
+                    // fallback matches the no-headers path's
+                    // "fall back rather than render garbage" rule.
+                    const char* reason = status_reason(outcome.status_code);
+                    u32 reason_len = 0;
+                    while (reason[reason_len]) reason_len++;
+                    body_data = reason;
+                    body_len = reason_len;
                 }
                 format_response_with_body_and_headers(
-                    conn, outcome.status_code, body_data, body_len, kvs, n, keep_alive);
+                    conn, outcome.status_code, body_data, body_len, kvs, ref.count, keep_alive);
             } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 format_response_with_body(

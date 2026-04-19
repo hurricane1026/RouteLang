@@ -29,6 +29,12 @@ bool pipeline_recover(Connection& conn);
 void capture_stage_headers(Connection& conn);
 const char* status_reason(u16 code);
 void format_static_response(Connection& conn, u16 code, bool keep_alive);
+// Custom-body variant: writes status line + Content-Length matching
+// body_len + default Content-Type (text/plain; charset=utf-8) + body
+// bytes. For codes that must have no body (1xx / 204 / 304) falls
+// back to format_static_response.
+void format_response_with_body(
+    Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -305,14 +311,27 @@ void handle_jit_outcome(Loop* loop,
                         jit::HandlerFn fn,
                         bool keep_alive) {
     switch (outcome.kind) {
-        case JitDispatchOutcome::Kind::ReturnStatus:
+        case JitDispatchOutcome::Kind::ReturnStatus: {
             conn.pending_handler_fn = nullptr;
             conn.state = ConnState::Sending;
             conn.resp_status = outcome.status_code;
-            format_static_response(conn, outcome.status_code, keep_alive);
+            // ABI: upstream_id is a 1-based index into the pinned
+            // route config's response_bodies table (0 = use default
+            // status-reason body). Out-of-range indices fall back to
+            // the default rather than rendering garbage.
+            const RouteConfig* cfg = conn.request_config;
+            if (outcome.response_body_idx != 0 && cfg != nullptr &&
+                outcome.response_body_idx <= cfg->response_body_count) {
+                const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+                format_response_with_body(
+                    conn, outcome.status_code, body.data, body.len, keep_alive);
+            } else {
+                format_static_response(conn, outcome.status_code, keep_alive);
+            }
             conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
             loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             return;
+        }
         case JitDispatchOutcome::Kind::TimerYield: {
             // Stash fn + next_state so the resume path can re-enter the
             // handler with ctx.state = handler_state. Slots stay clear —

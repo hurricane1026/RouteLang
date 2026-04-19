@@ -2310,6 +2310,45 @@ TEST(route, add_upstream_at_capacity) {
     CHECK(!cfg.add_upstream("overflow", 0x7F000001, 9999).has_value());  // full
 }
 
+TEST(route, add_response_body_basic) {
+    RouteConfig cfg;
+    const u16 idx = cfg.add_response_body("Hello", 5);
+    REQUIRE_EQ(idx, 1u);
+    REQUIRE_EQ(cfg.response_body_count, 1u);
+    CHECK_EQ(cfg.response_bodies[0].len, 5u);
+    CHECK_EQ(cfg.response_bodies[0].data[0], 'H');
+    CHECK_EQ(cfg.response_bodies[0].data[4], 'o');
+    // Second body gets a distinct index.
+    const u16 idx2 = cfg.add_response_body("World", 5);
+    CHECK_EQ(idx2, 2u);
+}
+
+TEST(route, add_response_body_rejects_overflowing_len) {
+    // Subtraction-based capacity check: `body_pool_used + len` would
+    // wrap when len is near u32 max. The guarded code rejects the
+    // request cleanly rather than writing out of bounds.
+    RouteConfig cfg;
+    // Body table + pool start empty. Try a len that would overflow
+    // kResponseBodyPoolBytes - body_pool_used = kResponseBodyPoolBytes.
+    CHECK_EQ(cfg.add_response_body("x", 0xFFFFFFFFu), 0u);
+    // After a small successful add, a len near u32 max still overflows.
+    const u16 ok = cfg.add_response_body("Hi", 2);
+    REQUIRE_EQ(ok, 1u);
+    CHECK_EQ(cfg.add_response_body("x", 0xFFFFFFFEu), 0u);
+    // Null data with non-zero len is also rejected.
+    CHECK_EQ(cfg.add_response_body(nullptr, 1), 0u);
+    // Null data with zero len is a valid (empty) body.
+    CHECK_EQ(cfg.add_response_body(nullptr, 0), 2u);
+}
+
+TEST(route, add_response_body_rejects_at_capacity) {
+    RouteConfig cfg;
+    for (u32 i = 0; i < RouteConfig::kMaxResponseBodies; i++) {
+        CHECK_EQ(cfg.add_response_body("", 0), static_cast<u16>(i + 1));
+    }
+    CHECK_EQ(cfg.add_response_body("x", 1), 0u);  // table full
+}
+
 TEST(route, add_route_at_capacity) {
     RouteConfig cfg;
     (void)cfg.add_upstream("x", 0x7F000001, 80);

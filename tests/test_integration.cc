@@ -2549,6 +2549,197 @@ TEST(route, forward_jit_handler_rejects_unknown_upstream_id) {
     destroy_real_loop(loop);
 }
 
+// Minimal hand-written JIT handler that returns ReturnStatus(200)
+// with upstream_id = 1 — the ABI slot for a 1-based response-body
+// index. Used to validate the runtime body-render path without
+// needing the (not-yet-wired) compiler pipeline for bodies.
+static u64 return_200_with_body_1_handler(void* /*conn*/,
+                                          rut::jit::HandlerCtx* /*ctx*/,
+                                          const u8* /*req*/,
+                                          u32 /*len*/,
+                                          void* /*arena*/) {
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
+                              200,
+                              /*upstream_id=*/1,
+                              0,
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
+// End-to-end: handler returns ReturnStatus with body_idx=1;
+// RouteConfig has a body pre-registered; runtime formats response
+// with the body bytes + matching Content-Length + default Content-Type.
+TEST(route, jit_handler_custom_body_real_socket) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    const char kBody[] = "Hello, world";
+    const u16 body_idx = cfg.add_response_body(kBody, sizeof(kBody) - 1);
+    REQUIRE_EQ(body_idx, 1u);
+    REQUIRE(cfg.add_jit_handler("/hello", 'G', &return_200_with_body_1_handler));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[2048];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n, 0);
+    buf[n < static_cast<i32>(sizeof(buf)) ? n : static_cast<i32>(sizeof(buf)) - 1] = '\0';
+
+    // Response must contain "200", "Content-Length: 12", default
+    // Content-Type, and the body bytes literal.
+    const Str response{buf, static_cast<u32>(n)};
+    bool has_200 = false;
+    bool has_cl = false;
+    bool has_ct = false;
+    bool has_body = false;
+    for (u32 i = 0; i + 2 < response.len; i++) {
+        if (response.ptr[i] == '2' && response.ptr[i + 1] == '0' && response.ptr[i + 2] == '0') {
+            has_200 = true;
+            break;
+        }
+    }
+    static const char kCL[] = "Content-Length: 12";
+    for (u32 i = 0; i + sizeof(kCL) - 1 <= response.len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kCL) - 1; j++) {
+            if (response.ptr[i + j] != static_cast<u8>(kCL[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            has_cl = true;
+            break;
+        }
+    }
+    static const char kCT[] = "Content-Type: text/plain";
+    for (u32 i = 0; i + sizeof(kCT) - 1 <= response.len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kCT) - 1; j++) {
+            if (response.ptr[i + j] != static_cast<u8>(kCT[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            has_ct = true;
+            break;
+        }
+    }
+    for (u32 i = 0; i + sizeof(kBody) - 1 <= response.len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kBody) - 1; j++) {
+            if (response.ptr[i + j] != static_cast<u8>(kBody[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            has_body = true;
+            break;
+        }
+    }
+    CHECK(has_200);
+    CHECK(has_cl);
+    CHECK(has_ct);
+    CHECK(has_body);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+// Handler returns ReturnStatus with an out-of-range body_idx (e.g. no
+// body was registered). Runtime must fall back to the default status-
+// reason body rather than rendering garbage or hanging.
+static u64 return_200_with_body_99_handler(void* /*conn*/,
+                                           rut::jit::HandlerCtx* /*ctx*/,
+                                           const u8* /*req*/,
+                                           u32 /*len*/,
+                                           void* /*arena*/) {
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
+                              200,
+                              /*upstream_id=*/99,
+                              0,
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
+TEST(route, jit_handler_unknown_body_idx_falls_back) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    // No response bodies registered. upstream_id=99 is out of range.
+    REQUIRE(cfg.add_jit_handler("/hello", 'G', &return_200_with_body_99_handler));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n, 0);
+    // Assert the default reason-phrase body — not just that 200 is
+    // anywhere in the response. For 200 the default body is "OK" (2
+    // bytes), and format_static_response does NOT emit Content-Type,
+    // so the response shape is distinct from the custom-body path.
+    const Str response{buf, static_cast<u32>(n)};
+    auto contains = [&](const char* needle, u32 nlen) {
+        for (u32 i = 0; i + nlen <= response.len; i++) {
+            bool match = true;
+            for (u32 j = 0; j < nlen; j++) {
+                if (response.ptr[i + j] != static_cast<u8>(needle[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+        return false;
+    };
+    CHECK(contains("200 OK", 6));
+    CHECK(contains("Content-Length: 2\r\n", 19));
+    // Default formatter must NOT emit Content-Type — that would mean
+    // the custom-body path ran despite the out-of-range index.
+    CHECK(!contains("Content-Type:", 13));
+    // Body bytes at end of response: "...\r\n\r\nOK".
+    CHECK(contains("\r\n\r\nOK", 6));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

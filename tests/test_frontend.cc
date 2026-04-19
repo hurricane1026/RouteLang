@@ -166,10 +166,11 @@ TEST(frontend, parse_return_response_status_only) {
 }
 
 TEST(frontend, parse_return_response_with_body) {
-    // Parser recognises the body: "..." kwarg; analyze propagates the
-    // literal into HirTerminator.response_body; lower_rir interns it
-    // into rir::Module::response_bodies and emits body_idx on
-    // RetStatus; codegen packs body_idx into HandlerResult.upstream_id.
+    // Covers the body: "..." kwarg through the compile-side pipeline:
+    // parser → AST.response_body, analyze → HirTerminator.response_body,
+    // lower_rir → rir::Module::response_bodies (non-empty entry interned,
+    // body_idx = 1). Codegen and runtime behavior are exercised by
+    // tests/test_integration.cc::dsl_response_body_real_socket.
     const char* src = "route GET \"/x\" { return response(200, body: \"Hello\") }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -190,6 +191,16 @@ TEST(frontend, parse_return_response_with_body) {
     CHECK_EQ(term.status_code, 200);
     REQUIRE_EQ(term.response_body.len, 5u);
     CHECK(term.response_body.eq(lit("Hello")));
+    // Lower through MIR → RIR and verify a single body was interned at
+    // slot 0 (body_idx 1) with the exact bytes.
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    REQUIRE_EQ(rir.module.response_bodies[0].len, 5u);
+    CHECK(rir.module.response_bodies[0].eq(lit("Hello")));
 }
 
 TEST(frontend, parse_return_response_empty_body_is_noop) {

@@ -2731,7 +2731,7 @@ TEST(route, jit_handler_unknown_body_idx_falls_back) {
     destroy_real_loop(loop);
 }
 
-// End-to-end: compile `route GET "/x" { return response(200, body: "Hi") }`
+// End-to-end: compile `route GET "/x" { return response(200, body: "Hi!") }`
 // from source, populate RouteConfig.response_bodies from the compiled
 // rir::Module, and verify a real client receives the exact body.
 TEST(route, dsl_response_body_real_socket) {

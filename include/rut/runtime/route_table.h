@@ -76,6 +76,16 @@ struct RouteConfig {
     // use the default status reason phrase).
     static constexpr u32 kMaxResponseBodies = 128;
     static constexpr u32 kResponseBodyPoolBytes = 8 * 1024;
+    // Response-headers tables. Parallel to response_bodies but
+    // independently indexed (JIT handlers pack a separate `headers_idx`
+    // into HandlerResult.next_state for ReturnStatus, 0 = no custom
+    // headers). All (key, value) pairs across every set share one flat
+    // pool; each set is an (offset, count) slice into it. Header bytes
+    // live in a single char pool so they outlive the RouteConfig's
+    // RCU lifetime the same way body_pool does.
+    static constexpr u32 kMaxResponseHeaderSets = 128;
+    static constexpr u32 kMaxHeaderPoolEntries = 512;
+    static constexpr u32 kResponseHeaderBytesPoolBytes = 8 * 1024;
 
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
@@ -94,6 +104,27 @@ struct RouteConfig {
     u32 response_body_count = 0;
     char body_pool[kResponseBodyPoolBytes];
     u32 body_pool_used = 0;
+
+    // Header entries point into header_bytes_pool; the pool is a
+    // bump-allocated char buffer shared by all keys and values. Each
+    // pair-entry lives in header_keys[] / header_values[] with pointers
+    // into the bytes pool; each response's header set is a slice of
+    // those arrays described by HeaderSetRef.
+    struct HeaderEntry {
+        const char* data;
+        u32 len;
+    };
+    struct HeaderSetRef {
+        u16 offset;  // into header_keys / header_values
+        u16 count;
+    };
+    HeaderEntry header_keys[kMaxHeaderPoolEntries];
+    HeaderEntry header_values[kMaxHeaderPoolEntries];
+    u32 header_pool_used = 0;
+    HeaderSetRef response_header_sets[kMaxResponseHeaderSets];
+    u32 response_header_set_count = 0;
+    char header_bytes_pool[kResponseHeaderBytesPoolBytes];
+    u32 header_bytes_pool_used = 0;
 
     // Add a proxy route: path prefix → upstream target.
     // Returns false if table full, upstream_id invalid, or path too long.
@@ -178,6 +209,61 @@ struct RouteConfig {
         body_pool_used += len;
         const u32 idx = response_body_count++;
         response_bodies[idx] = {dst, len};
+        return static_cast<u16>(idx + 1);  // 1-based; 0 reserved
+    }
+
+    // Register a response header set. `keys[i]` / `key_lens[i]` and
+    // `values[i]` / `value_lens[i]` describe the i-th pair (i in
+    // [0, count)). Bytes are copied into header_bytes_pool so callers
+    // don't need to keep the source alive. Returns a 1-based index
+    // (0 reserved as "no custom headers") that JIT handlers encode in
+    // HandlerResult.next_state for ReturnStatus.
+    //
+    // Returns 0 on any capacity failure (sets table, key/value array,
+    // or bytes pool) or if arguments are nonsensical (count > 0 with
+    // null pointer table, or null data + non-zero len for a pair).
+    u16 add_response_header_set(const char* const* keys,
+                                const u32* key_lens,
+                                const char* const* values,
+                                const u32* value_lens,
+                                u32 count) {
+        if (count == 0) return 0;
+        if (keys == nullptr || values == nullptr || key_lens == nullptr || value_lens == nullptr) {
+            return 0;
+        }
+        if (response_header_set_count >= kMaxResponseHeaderSets) return 0;
+        // Subtraction-based capacity check on the (key, value) arrays.
+        if (count > kMaxHeaderPoolEntries - header_pool_used) return 0;
+        // Tally total bytes we're about to write; reject if the bytes
+        // pool can't fit them. Summing up-front avoids a partial copy
+        // aborting mid-way with half-written state.
+        u32 total_bytes = 0;
+        for (u32 i = 0; i < count; i++) {
+            if ((key_lens[i] > 0 && keys[i] == nullptr) ||
+                (value_lens[i] > 0 && values[i] == nullptr)) {
+                return 0;
+            }
+            // Guard each add individually against u32 overflow.
+            if (key_lens[i] > 0xffffffffu - total_bytes) return 0;
+            total_bytes += key_lens[i];
+            if (value_lens[i] > 0xffffffffu - total_bytes) return 0;
+            total_bytes += value_lens[i];
+        }
+        if (total_bytes > kResponseHeaderBytesPoolBytes - header_bytes_pool_used) return 0;
+        const u16 offset = static_cast<u16>(header_pool_used);
+        for (u32 i = 0; i < count; i++) {
+            char* key_dst = header_bytes_pool + header_bytes_pool_used;
+            for (u32 j = 0; j < key_lens[i]; j++) key_dst[j] = keys[i][j];
+            header_bytes_pool_used += key_lens[i];
+            char* val_dst = header_bytes_pool + header_bytes_pool_used;
+            for (u32 j = 0; j < value_lens[i]; j++) val_dst[j] = values[i][j];
+            header_bytes_pool_used += value_lens[i];
+            header_keys[offset + i] = {key_dst, key_lens[i]};
+            header_values[offset + i] = {val_dst, value_lens[i]};
+        }
+        header_pool_used += count;
+        const u32 idx = response_header_set_count++;
+        response_header_sets[idx] = {offset, static_cast<u16>(count)};
         return static_cast<u16>(idx + 1);  // 1-based; 0 reserved
     }
 

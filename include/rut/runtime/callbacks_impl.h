@@ -35,6 +35,29 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive);
 // back to format_static_response.
 void format_response_with_body(
     Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive);
+
+// Custom-headers variant: emits all (key, value) pairs from `keys[]` /
+// `values[]` (indexed [0, header_count)) before the blank line. If any
+// user-supplied key case-insensitively matches "Content-Type", the
+// default text/plain Content-Type is suppressed so the user's value
+// wins. User-supplied "Content-Length" is always dropped — the
+// formatter recomputes it from `body_len` to keep the framing honest.
+// For codes that must have no body (1xx / 204 / 304), headers are
+// still emitted (they can be meaningful on 204/304, e.g. Cache-Control)
+// but the body is omitted per spec.
+struct ResponseHeaderKV {
+    const char* key_data;
+    u32 key_len;
+    const char* value_data;
+    u32 value_len;
+};
+void format_response_with_body_and_headers(Connection& conn,
+                                           u16 code,
+                                           const char* body_data,
+                                           u32 body_len,
+                                           const ResponseHeaderKV* headers,
+                                           u32 header_count,
+                                           bool keep_alive);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -320,8 +343,39 @@ void handle_jit_outcome(Loop* loop,
             // status-reason body). Out-of-range indices fall back to
             // the default rather than rendering garbage.
             const RouteConfig* cfg = conn.request_config;
-            if (outcome.response_body_idx != 0 && cfg != nullptr &&
-                outcome.response_body_idx <= cfg->response_body_count) {
+            const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
+                                  outcome.response_body_idx <= cfg->response_body_count;
+            const bool has_headers = outcome.response_headers_idx != 0 && cfg != nullptr &&
+                                     outcome.response_headers_idx <= cfg->response_header_set_count;
+            if (has_headers) {
+                // Materialise the header set into a stack-local KV
+                // array so the formatter takes a uniform view. The
+                // per-response cap is set at the AST layer
+                // (AstStatement::kMaxResponseHeaders = 16) and carries
+                // through to RIR interning, so 32 here is comfortably
+                // above any single-response count and keeps the stack
+                // footprint small.
+                constexpr u32 kMaxPerResponse = 32;
+                const auto& ref = cfg->response_header_sets[outcome.response_headers_idx - 1];
+                ResponseHeaderKV kvs[kMaxPerResponse];
+                const u16 n =
+                    ref.count > kMaxPerResponse ? static_cast<u16>(kMaxPerResponse) : ref.count;
+                for (u16 i = 0; i < n; i++) {
+                    kvs[i].key_data = cfg->header_keys[ref.offset + i].data;
+                    kvs[i].key_len = cfg->header_keys[ref.offset + i].len;
+                    kvs[i].value_data = cfg->header_values[ref.offset + i].data;
+                    kvs[i].value_len = cfg->header_values[ref.offset + i].len;
+                }
+                const char* body_data = nullptr;
+                u32 body_len = 0;
+                if (has_body) {
+                    const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+                    body_data = body.data;
+                    body_len = body.len;
+                }
+                format_response_with_body_and_headers(
+                    conn, outcome.status_code, body_data, body_len, kvs, n, keep_alive);
+            } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 format_response_with_body(
                     conn, outcome.status_code, body.data, body.len, keep_alive);

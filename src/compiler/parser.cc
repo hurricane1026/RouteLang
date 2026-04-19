@@ -748,22 +748,71 @@ struct Parser {
                 auto parsed = parse_status_i32(*status.value());
                 if (!parsed) return core::make_unexpected(parsed.error());
                 stmt.status_code = parsed.value();
-                // Optional `, body: "<StringLit>"` — no other kwargs yet.
-                if (take(TokenType::Comma)) {
+                // Optional kwargs: `body: "<StringLit>"` and/or
+                // `headers: { "K": "V", ... }`. Any order, each at
+                // most once. An explicit empty dict (`headers: {}`) is
+                // a parse error — write no kwarg instead.
+                bool seen_headers = false;
+                while (take(TokenType::Comma)) {
                     auto kw = expect(TokenType::Ident);
                     if (!kw) return core::make_unexpected(kw.error());
-                    if (!kw.value()->text.eq({"body", 4})) {
-                        return frontend_error(FrontendError::UnexpectedToken,
-                                              span_from(*kw.value()),
-                                              kw.value()->text);
-                    }
+                    const Str kw_text = kw.value()->text;
                     auto colon = expect(TokenType::Colon);
                     if (!colon) return core::make_unexpected(colon.error());
-                    auto body_tok = expect(TokenType::StringLit);
-                    if (!body_tok) return core::make_unexpected(body_tok.error());
-                    // Lexer strips the surrounding quotes already.
-                    stmt.response_body = body_tok.value()->text;
-                    stmt.has_response_body = true;
+                    if (kw_text.eq({"body", 4})) {
+                        if (stmt.has_response_body) {
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        }
+                        auto body_tok = expect(TokenType::StringLit);
+                        if (!body_tok) return core::make_unexpected(body_tok.error());
+                        // Lexer strips the surrounding quotes already.
+                        stmt.response_body = body_tok.value()->text;
+                        stmt.has_response_body = true;
+                    } else if (kw_text.eq({"headers", 7})) {
+                        if (seen_headers) {
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        }
+                        seen_headers = true;
+                        auto lbrace = expect(TokenType::LBrace);
+                        if (!lbrace) return core::make_unexpected(lbrace.error());
+                        // Empty dict is rejected — omit the kwarg
+                        // instead to express "no custom headers".
+                        if (cur().type == TokenType::RBrace) {
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(cur()));
+                        }
+                        while (true) {
+                            auto key_tok = expect(TokenType::StringLit);
+                            if (!key_tok) return core::make_unexpected(key_tok.error());
+                            auto kcolon = expect(TokenType::Colon);
+                            if (!kcolon) return core::make_unexpected(kcolon.error());
+                            auto val_tok = expect(TokenType::StringLit);
+                            if (!val_tok) return core::make_unexpected(val_tok.error());
+                            AstHeaderKV pair{key_tok.value()->text, val_tok.value()->text};
+                            // Reject duplicate keys within the same set.
+                            for (u32 i = 0; i < stmt.response_headers.len; i++) {
+                                if (stmt.response_headers[i].key.eq(pair.key)) {
+                                    return frontend_error(FrontendError::UnexpectedToken,
+                                                          span_from(*key_tok.value()),
+                                                          pair.key);
+                                }
+                            }
+                            if (!stmt.response_headers.push(pair)) {
+                                return frontend_error(FrontendError::TooManyItems,
+                                                      span_from(*key_tok.value()));
+                            }
+                            if (!take(TokenType::Comma)) break;
+                            // Trailing comma before `}` is allowed.
+                            if (cur().type == TokenType::RBrace) break;
+                        }
+                        auto rbrace = expect(TokenType::RBrace);
+                        if (!rbrace) return core::make_unexpected(rbrace.error());
+                    } else {
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                    }
                 }
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());

@@ -247,6 +247,140 @@ TEST(frontend, parse_return_response_rejects_unknown_kwarg) {
     CHECK(ast.error().detail.eq(lit("header")));
 }
 
+TEST(frontend, parse_return_response_with_headers) {
+    // Headers dict carries through parser → HIR → MIR → RIR:
+    // intern_response_headers writes one set into rir::Module's flat
+    // pool and the emit_ret_status imm packs headers_idx=1 alongside
+    // body_idx. Codegen and runtime behaviour are covered by
+    // tests/test_integration.cc::dsl_response_headers_real_socket.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X-Service\": \"auth\", \"Cache-Control\": \"no-store\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
+    const auto& stmt = ast->items[0].route.statements[0];
+    REQUIRE_EQ(stmt.response_headers.len, 2u);
+    CHECK(stmt.response_headers[0].key.eq(lit("X-Service")));
+    CHECK(stmt.response_headers[0].value.eq(lit("auth")));
+    CHECK(stmt.response_headers[1].key.eq(lit("Cache-Control")));
+    CHECK(stmt.response_headers[1].value.eq(lit("no-store")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    REQUIRE_EQ(term.response_headers.len, 2u);
+    CHECK(term.response_headers[0].key.eq(lit("X-Service")));
+    CHECK(term.response_headers[1].value.eq(lit("no-store")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
+    REQUIRE_EQ(rir.module.header_sets[0].count, 2u);
+    REQUIRE_EQ(rir.module.header_sets[0].offset, 0u);
+    CHECK(rir.module.header_keys[0].eq(lit("X-Service")));
+    CHECK(rir.module.header_values[0].eq(lit("auth")));
+    CHECK(rir.module.header_keys[1].eq(lit("Cache-Control")));
+    CHECK(rir.module.header_values[1].eq(lit("no-store")));
+    rir.destroy();
+}
+
+TEST(frontend, parse_return_response_headers_only) {
+    // Redirect-style response: headers without a body. Verify
+    // response_body_count stays 0 and header_set_count rises to 1.
+    const char* src =
+        "route GET \"/old\" { return response(301, headers: "
+        "{ \"Location\": \"/new\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    CHECK_EQ(rir.module.response_body_count, 0u);
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
+    REQUIRE_EQ(rir.module.header_sets[0].count, 1u);
+    CHECK(rir.module.header_keys[0].eq(lit("Location")));
+    CHECK(rir.module.header_values[0].eq(lit("/new")));
+    rir.destroy();
+}
+
+TEST(frontend, parse_return_response_headers_dedup_across_routes) {
+    // Two routes emit the same header set → intern returns the same
+    // 1-based idx; header_set_count stays at 1.
+    const char* src =
+        "route GET \"/a\" { return response(200, headers: { \"X-Cached\": \"1\" }) }\n"
+        "route GET \"/b\" { return response(200, headers: { \"X-Cached\": \"1\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    // Only one set interned despite two sources.
+    CHECK_EQ(rir.module.header_set_count, 1u);
+    CHECK_EQ(rir.module.header_pool_used, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, parse_return_response_rejects_duplicate_header_key) {
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X-Foo\": \"1\", \"X-Foo\": \"2\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("X-Foo")));
+}
+
+TEST(frontend, parse_return_response_rejects_empty_headers_dict) {
+    // `headers: {}` is explicitly rejected; omit the kwarg to mean
+    // "no custom headers".
+    const char* src = "route GET \"/x\" { return response(200, headers: {}) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_body_and_headers_order_independent) {
+    // Kwargs can appear in either order; both propagate.
+    const char* src_a =
+        "route GET \"/a\" { return response(200, body: \"hi\", "
+        "headers: { \"X-A\": \"1\" }) }\n";
+    const char* src_b =
+        "route GET \"/a\" { return response(200, headers: { \"X-A\": \"1\" }, "
+        "body: \"hi\") }\n";
+    for (const char* src : {src_a, src_b}) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        const auto& stmt = ast->items[0].route.statements[0];
+        CHECK(stmt.has_response_body);
+        CHECK(stmt.response_body.eq(lit("hi")));
+        REQUIRE_EQ(stmt.response_headers.len, 1u);
+        CHECK(stmt.response_headers[0].key.eq(lit("X-A")));
+    }
+}
+
 TEST(frontend, lex_duration_suffix_boundary) {
     // `5ms` is one DurLit; the suffix must sit at a token boundary so
     // `5mystery` stays `5` (IntLit) + `mystery` (Ident). Similarly

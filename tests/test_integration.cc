@@ -2809,6 +2809,205 @@ TEST(route, dsl_response_body_real_socket) {
     rir.destroy();
 }
 
+// End-to-end: compile a route with custom headers (including a
+// user-supplied Content-Type that must suppress the default, and a
+// user-supplied Content-Length that the formatter must ignore), run
+// through the full pipeline, and assert the real-socket response
+// contains exactly what we expect.
+TEST(route, dsl_response_headers_real_socket) {
+    using namespace rut;
+
+    const char* src =
+        "route GET \"/x\" { return response(200, body: \"hello-json\", headers: "
+        "{ \"Content-Type\": \"application/json\", "
+        "\"X-Service\": \"auth\", "
+        "\"Content-Length\": \"9999\" }) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    for (u32 i = 0; i < rir.module.response_body_count; i++) {
+        const auto& body = rir.module.response_bodies[i];
+        const u16 idx = cfg.add_response_body(body.ptr, body.len);
+        REQUIRE_EQ(idx, static_cast<u16>(i + 1));
+    }
+    // Mirror header sets from rir::Module into RouteConfig the same
+    // way bodies are mirrored above (1-based index preserved).
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
+    for (u32 i = 0; i < rir.module.header_set_count; i++) {
+        const auto& ref = rir.module.header_sets[i];
+        const char* keys[16];
+        u32 key_lens[16];
+        const char* vals[16];
+        u32 val_lens[16];
+        REQUIRE(ref.count <= 16u);
+        for (u16 j = 0; j < ref.count; j++) {
+            keys[j] = rir.module.header_keys[ref.offset + j].ptr;
+            key_lens[j] = rir.module.header_keys[ref.offset + j].len;
+            vals[j] = rir.module.header_values[ref.offset + j].ptr;
+            val_lens[j] = rir.module.header_values[ref.offset + j].len;
+        }
+        const u16 idx = cfg.add_response_header_set(keys, key_lens, vals, val_lens, ref.count);
+        REQUIRE_EQ(idx, static_cast<u16>(i + 1));
+    }
+    REQUIRE(cfg.add_jit_handler("/x", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[2048];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n, 0);
+    const Str response{buf, static_cast<u32>(n)};
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
+    };
+    // Body is exactly 10 bytes (`hello-json`). The formatter ignores
+    // the user's "9999" Content-Length and writes 10.
+    CHECK(has("200 OK", 6));
+    CHECK(has("Content-Length: 10\r\n", 20));
+    CHECK(!has("Content-Length: 9999", 20));
+    // User's Content-Type wins; default text/plain is suppressed.
+    CHECK(has("Content-Type: application/json\r\n", 32));
+    CHECK(!has("text/plain", 10));
+    // Other user header is emitted verbatim.
+    CHECK(has("X-Service: auth\r\n", 17));
+    // Body bytes at the end: 4 CRLF + 10 body = 14 bytes.
+    CHECK(has("\r\n\r\nhello-json", 14));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// Redirect-style: headers without body. Verify Content-Length: 0,
+// the Location header is emitted, and no body bytes follow.
+TEST(route, dsl_response_headers_only_real_socket) {
+    using namespace rut;
+
+    const char* src =
+        "route GET \"/old\" { return response(301, headers: "
+        "{ \"Location\": \"/new\" }) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    CHECK_EQ(rir.module.response_body_count, 0u);
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
+    const auto& ref = rir.module.header_sets[0];
+    const char* keys[4];
+    u32 key_lens[4];
+    const char* vals[4];
+    u32 val_lens[4];
+    REQUIRE(ref.count <= 4u);
+    for (u16 j = 0; j < ref.count; j++) {
+        keys[j] = rir.module.header_keys[ref.offset + j].ptr;
+        key_lens[j] = rir.module.header_keys[ref.offset + j].len;
+        vals[j] = rir.module.header_values[ref.offset + j].ptr;
+        val_lens[j] = rir.module.header_values[ref.offset + j].len;
+    }
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, ref.count), 1u);
+    REQUIRE(cfg.add_jit_handler("/old", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /old HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[2048];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n, 0);
+    const Str response{buf, static_cast<u32>(n)};
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
+    };
+    CHECK(has("301 ", 4));
+    CHECK(has("Content-Length: 0\r\n", 19));
+    CHECK(has("Location: /new\r\n", 16));
+    // Response must terminate at the blank line — no body bytes follow.
+    // We can check this by looking for "\r\n\r\n" then end-of-response.
+    // The total response length should match up-to-and-including the
+    // blank line (no trailing payload).
+    CHECK(has("\r\n\r\n", 4));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

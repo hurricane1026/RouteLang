@@ -526,6 +526,11 @@ enum class HirTerminatorSourceKind : u8 {
     LocalRef,
 };
 
+struct HirHeaderKV {
+    Str key{};
+    Str value{};
+};
+
 struct HirTerminator {
     HirTerminatorKind kind = HirTerminatorKind::ReturnStatus;
     Span span{};
@@ -542,6 +547,12 @@ struct HirTerminator {
     // had `has_response_body == true`, so the sentinel is preserved
     // end-to-end.
     Str response_body{};
+    // Optional response headers from `response(N, headers: {...})`.
+    // Inline-stored so analyze doesn't need the AstFile handle, and
+    // downstream passes don't need a module-level pool. len == 0
+    // means "no kwarg" (parser rejects explicit empty dicts).
+    static constexpr u32 kMaxHeaders = 16;
+    FixedVec<HirHeaderKV, kMaxHeaders> response_headers;
 };
 
 struct HirGuardBody {

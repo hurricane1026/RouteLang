@@ -707,15 +707,23 @@ struct Builder {
         return {};
     }
 
-    // Literal status form. body_idx is a 1-based index into the
-    // module's response_bodies table (0 = no custom body, runtime
-    // renders the default status-reason phrase). Status fits in
-    // 16 bits (100..999); body_idx fits in 16 bits. Both pack
-    // into the immediate slot: low 16 = status, high 16 = body_idx.
-    VoidResult emit_ret_status(i32 code, SourceLoc loc = {}, u16 body_idx = 0) {
+    // Literal status form. body_idx / headers_idx are 1-based indices
+    // into the module's response_bodies / header_sets tables (0 = no
+    // custom body / no custom headers). Status fits in 16 bits
+    // (100..999), each idx fits in 16 bits. All three pack into the
+    // immediate i64 slot:
+    //   bits [ 0:16): status
+    //   bits [16:32): body_idx
+    //   bits [32:48): headers_idx
+    //   bits [48:64): reserved (0)
+    VoidResult emit_ret_status(i32 code,
+                               SourceLoc loc = {},
+                               u16 body_idx = 0,
+                               u16 headers_idx = 0) {
         auto r = TRY(emit(Opcode::RetStatus, nullptr, loc));
-        r.inst->imm.i32_val = static_cast<i32>((static_cast<u32>(body_idx) << 16) |
-                                               (static_cast<u32>(code) & 0xffffu));
+        const u64 packed = (static_cast<u64>(code) & 0xffffu) | (static_cast<u64>(body_idx) << 16) |
+                           (static_cast<u64>(headers_idx) << 32);
+        r.inst->imm.i64_val = static_cast<i64>(packed);
         return {};
     }
 
@@ -746,6 +754,57 @@ struct Builder {
         }
         const u32 idx = mod->response_body_count++;
         mod->response_bodies[idx] = {buf, body.len};
+        return static_cast<u16>(idx + 1);
+    }
+
+    // Intern a response header set (array of {key, value} pairs) into
+    // the module's flat pool. Returns a 1-based index suitable for
+    // emit_ret_status; 0 means failure (sets table full, pool full,
+    // or arena OOM). Dedup is by full ordered sequence — two sets
+    // with the same pairs in a different order are NOT dedup'd.
+    //
+    // Key and value bytes are copied into the module's arena so
+    // entries outlive the caller's source buffer.
+    template <typename Pair>
+    u16 intern_response_headers(const Pair* pairs, u32 count) {
+        if (!mod || !mod->arena) return 0;
+        if (count == 0) return 0;
+        // Dedup: scan existing sets for an exact-sequence match.
+        for (u32 i = 0; i < mod->header_set_count; i++) {
+            const auto& ref = mod->header_sets[i];
+            if (ref.count != count) continue;
+            bool match = true;
+            for (u32 j = 0; j < count; j++) {
+                if (!mod->header_keys[ref.offset + j].eq(pairs[j].key) ||
+                    !mod->header_values[ref.offset + j].eq(pairs[j].value)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return static_cast<u16>(i + 1);
+        }
+        if (mod->header_set_count >= Module::kMaxHeaderSets) return 0;
+        // Subtraction-safe capacity check for the flat pool.
+        if (count > Module::kMaxHeaderPoolEntries - mod->header_pool_used) return 0;
+        const u16 offset = static_cast<u16>(mod->header_pool_used);
+        for (u32 j = 0; j < count; j++) {
+            auto copy_into_arena = [&](Str s) -> Str {
+                if (s.len == 0) return {nullptr, 0};
+                char* buf = mod->arena->template alloc_array<char>(s.len);
+                if (!buf) return {nullptr, 0xffffffffu};  // sentinel for failure
+                for (u32 k = 0; k < s.len; k++) buf[k] = s.ptr[k];
+                return {buf, s.len};
+            };
+            const Str k = copy_into_arena(pairs[j].key);
+            if (k.len == 0xffffffffu) return 0;
+            const Str v = copy_into_arena(pairs[j].value);
+            if (v.len == 0xffffffffu) return 0;
+            mod->header_keys[offset + j] = k;
+            mod->header_values[offset + j] = v;
+        }
+        mod->header_pool_used += count;
+        const u32 idx = mod->header_set_count++;
+        mod->header_sets[idx] = {offset, static_cast<u16>(count)};
         return static_cast<u16>(idx + 1);
     }
 

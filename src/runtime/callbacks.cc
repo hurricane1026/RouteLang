@@ -413,6 +413,115 @@ void format_response_with_body(
     if (body_len > 0) conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
 }
 
+// Case-insensitive ASCII byte compare against a literal C string.
+// Only compares bytes in the ASCII range; sufficient for HTTP header
+// names which are defined as ASCII token characters.
+static bool header_name_eq_ascii_ci(const char* data, u32 len, const char* literal) {
+    u32 lit_len = 0;
+    while (literal[lit_len]) lit_len++;
+    if (len != lit_len) return false;
+    for (u32 i = 0; i < len; i++) {
+        char a = data[i];
+        char b = literal[i];
+        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + ('a' - 'A'));
+        if (a != b) return false;
+    }
+    return true;
+}
+
+// Write a decimal body_len (Content-Length) to the send_buf as ASCII
+// digits, leading zeros suppressed. Emits at least one digit even for
+// body_len == 0, so "Content-Length: 0\r\n" comes out whole.
+static void write_content_length_digits(Connection& conn, u32 body_len) {
+    // Walk down the power-of-ten ladder; start emitting once we hit
+    // the highest populated digit so we don't prefix with zeros.
+    bool any = false;
+    constexpr u32 kDivs[] = {
+        1000000000u, 100000000u, 10000000u, 1000000u, 100000u, 10000u, 1000u, 100u, 10u, 1u};
+    for (u32 d : kDivs) {
+        u32 digit = (body_len / d) % 10u;
+        if (digit != 0) any = true;
+        if (any) {
+            char c = static_cast<char>('0' + digit);
+            conn.send_buf.write(reinterpret_cast<const u8*>(&c), 1);
+        }
+    }
+    if (!any) {
+        char c = '0';
+        conn.send_buf.write(reinterpret_cast<const u8*>(&c), 1);
+    }
+}
+
+void format_response_with_body_and_headers(Connection& conn,
+                                           u16 code,
+                                           const char* body_data,
+                                           u32 body_len,
+                                           const ResponseHeaderKV* headers,
+                                           u32 header_count,
+                                           bool keep_alive) {
+    const bool kNoBody = (code < 200 || code == 204 || code == 304);
+    const u32 body_len_emit = kNoBody ? 0 : body_len;
+    const char* reason = status_reason(code);
+    u32 reason_len = 0;
+    while (reason[reason_len]) reason_len++;
+
+    // Scan user headers once: is there a user-supplied Content-Type?
+    // (If so, skip the default "text/plain".) Content-Length is
+    // always dropped — we recompute from body_len_emit to keep framing
+    // honest regardless of what the user writes.
+    bool user_has_content_type = false;
+    for (u32 i = 0; i < header_count; i++) {
+        if (header_name_eq_ascii_ci(headers[i].key_data, headers[i].key_len, "Content-Type")) {
+            user_has_content_type = true;
+            break;
+        }
+    }
+
+    conn.send_buf.reset();
+    // Status line: "HTTP/1.1 <3-digit code> <reason>\r\n"
+    conn.send_buf.write(reinterpret_cast<const u8*>("HTTP/1.1 "), 9);
+    char code_buf[3];
+    code_buf[0] = static_cast<char>('0' + (code / 100) % 10);
+    code_buf[1] = static_cast<char>('0' + (code / 10) % 10);
+    code_buf[2] = static_cast<char>('0' + code % 10);
+    conn.send_buf.write(reinterpret_cast<const u8*>(code_buf), 3);
+    conn.send_buf.write(reinterpret_cast<const u8*>(" "), 1);
+    conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
+    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    // Content-Length (from body_len_emit, not the user's headers).
+    conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
+    write_content_length_digits(conn, body_len_emit);
+    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    // Default Content-Type only if the user didn't supply one.
+    if (!user_has_content_type) {
+        static const char kDefaultContentType[] = "Content-Type: text/plain; charset=utf-8\r\n";
+        conn.send_buf.write(reinterpret_cast<const u8*>(kDefaultContentType),
+                            sizeof(kDefaultContentType) - 1);
+    }
+    // User-supplied headers, skipping Content-Length.
+    for (u32 i = 0; i < header_count; i++) {
+        if (header_name_eq_ascii_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
+            continue;
+        }
+        conn.send_buf.write(reinterpret_cast<const u8*>(headers[i].key_data), headers[i].key_len);
+        conn.send_buf.write(reinterpret_cast<const u8*>(": "), 2);
+        conn.send_buf.write(reinterpret_cast<const u8*>(headers[i].value_data),
+                            headers[i].value_len);
+        conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    }
+    // Connection + blank line.
+    if (keep_alive)
+        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
+    else
+        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
+    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+
+    if (body_len_emit > 0) {
+        conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len_emit);
+    }
+}
+
 void prepare_early_response_state(Connection& conn) {
     const bool kHasRemainingBody =
         (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||

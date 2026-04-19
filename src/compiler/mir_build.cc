@@ -800,6 +800,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                    : MirTerminatorSourceKind::Literal;
             out->local_ref_index = term.local_ref_index;
             out->response_body = term.response_body;
+            out->response_headers.len = 0;
+            for (u32 i = 0; i < term.response_headers.len; i++) {
+                const auto& p = term.response_headers[i];
+                // Capacity matches (both sides use 16); push can fail
+                // only if MIR's cap is smaller, which we don't expect.
+                out->response_headers.push({p.key, p.value});
+            }
         };
         auto guard_fail_block_count = [&](const HirGuard& guard) -> u32 {
             if (guard.fail_kind == HirGuard::FailKind::Term) return 1;

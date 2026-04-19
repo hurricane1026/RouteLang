@@ -29,6 +29,13 @@ enum class AstStmtKind : u8 {
     Wait,  // `wait(N)` — suspend handler for N milliseconds (v1: IntLit only)
 };
 
+// Single response header key/value pair, used by `response(N, headers: {...})`.
+// Both fields are non-owning views into the lexer's source buffer.
+struct AstHeaderKV {
+    Str key{};
+    Str value{};
+};
+
 enum class AstExprKind : u8 {
     BoolLit,
     IntLit,
@@ -106,6 +113,13 @@ struct AstStatement {
     // still be rejected while body plumbing is not wired end-to-end.
     Str response_body{};
     bool has_response_body = false;
+    // Response headers from `response(N, headers: { "K": "V", ... })`.
+    // Inline-stored (no external pool) so analyze/lowering don't need
+    // the AstFile handle. `response_headers.len == 0` means "no kwarg";
+    // the parser rejects the explicit-empty `headers: {}` form so the
+    // length uniquely distinguishes "absent" from "present".
+    static constexpr u32 kMaxResponseHeaders = 16;
+    FixedVec<AstHeaderKV, kMaxResponseHeaders> response_headers;
     AstStatement* then_stmt = nullptr;
     AstStatement* else_stmt = nullptr;
     static constexpr u32 kMaxBlockStatements = 8;

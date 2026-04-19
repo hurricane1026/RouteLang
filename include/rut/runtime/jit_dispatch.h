@@ -41,6 +41,11 @@ struct JitDispatchOutcome {
     // Kind::ReturnStatus; 0 = no custom body (use the default status
     // reason phrase). Decoded from the upstream_id slot per handler ABI.
     u16 response_body_idx = 0;
+    // 1-based index into RouteConfig::response_header_sets for
+    // Kind::ReturnStatus; 0 = no custom headers. Decoded from the
+    // next_state slot per handler ABI (reused while action is
+    // ReturnStatus — next_state has no resumption meaning there).
+    u16 response_headers_idx = 0;
 };
 
 // Round-up conversion from ms to seconds. Callers using a 1-second
@@ -79,8 +84,10 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             out.kind = JitDispatchOutcome::Kind::ReturnStatus;
             out.status_code = r.status_code;
             // ABI: upstream_id carries a 1-based response-body index
-            // for ReturnStatus (0 = default body).
+            // and next_state a 1-based response-header-set index for
+            // ReturnStatus (0 = default body / no custom headers).
             out.response_body_idx = r.upstream_id;
+            out.response_headers_idx = r.next_state;
             return out;
         case jit::HandlerAction::Forward:
             out.kind = JitDispatchOutcome::Kind::Forward;

@@ -303,12 +303,19 @@ const char* status_reason(u16 code) {
     }
 }
 
-void format_static_response(Connection& conn, u16 code, bool keep_alive) {
+// Shared writer: status line + Content-Length + Connection header,
+// used by both the default (reason-phrase) body path and the custom
+// body path. Leaves the builder positioned just past "\r\n" so the
+// caller can write the body bytes (if any).
+static void write_response_headers(Connection& conn,
+                                   u16 code,
+                                   u32 body_len,
+                                   bool keep_alive,
+                                   const char* content_type,
+                                   u32 content_type_len) {
     const char* reason = status_reason(code);
     u32 reason_len = 0;
     while (reason[reason_len]) reason_len++;
-    const bool kNoBody = (code < 200 || code == 204 || code == 304);
-    const u32 kBodyLen = kNoBody ? 0 : reason_len;
     conn.send_buf.reset();
     conn.send_buf.write(reinterpret_cast<const u8*>("HTTP/1.1 "), 9);
     char code_buf[3];
@@ -319,24 +326,82 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive) {
     conn.send_buf.write(reinterpret_cast<const u8*>(" "), 1);
     conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    // Content-Length: decimal digits, always emitted (even for 0).
     conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
-    if (kBodyLen >= 100) {
-        char d = static_cast<char>('0' + kBodyLen / 100);
+    if (body_len >= 1000000000u) {
+        char d = static_cast<char>('0' + (body_len / 1000000000u) % 10);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
-    if (kBodyLen >= 10) {
-        char d = static_cast<char>('0' + (kBodyLen / 10) % 10);
+    if (body_len >= 100000000u) {
+        char d = static_cast<char>('0' + (body_len / 100000000u) % 10);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
-    char d = static_cast<char>('0' + kBodyLen % 10);
+    if (body_len >= 10000000u) {
+        char d = static_cast<char>('0' + (body_len / 10000000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 1000000u) {
+        char d = static_cast<char>('0' + (body_len / 1000000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 100000u) {
+        char d = static_cast<char>('0' + (body_len / 100000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 10000u) {
+        char d = static_cast<char>('0' + (body_len / 10000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 1000u) {
+        char d = static_cast<char>('0' + (body_len / 1000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 100u) {
+        char d = static_cast<char>('0' + (body_len / 100u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 10u) {
+        char d = static_cast<char>('0' + (body_len / 10u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    char d = static_cast<char>('0' + body_len % 10);
     conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    if (content_type_len > 0) {
+        conn.send_buf.write(reinterpret_cast<const u8*>("Content-Type: "), 14);
+        conn.send_buf.write(reinterpret_cast<const u8*>(content_type), content_type_len);
+        conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    }
     if (keep_alive)
         conn.send_buf.write(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
     else
         conn.send_buf.write(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+}
+
+void format_static_response(Connection& conn, u16 code, bool keep_alive) {
+    const char* reason = status_reason(code);
+    u32 reason_len = 0;
+    while (reason[reason_len]) reason_len++;
+    const bool kNoBody = (code < 200 || code == 204 || code == 304);
+    const u32 kBodyLen = kNoBody ? 0 : reason_len;
+    write_response_headers(conn, code, kBodyLen, keep_alive, nullptr, 0);
     if (kBodyLen > 0) conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
+}
+
+void format_response_with_body(
+    Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive) {
+    // 204 / 304 / 1xx carry no body per HTTP spec; fall back to the
+    // default formatter for those codes even if a body was supplied.
+    const bool kNoBody = (code < 200 || code == 204 || code == 304);
+    if (kNoBody) {
+        format_static_response(conn, code, keep_alive);
+        return;
+    }
+    static const char kDefaultContentType[] = "text/plain; charset=utf-8";
+    write_response_headers(
+        conn, code, body_len, keep_alive, kDefaultContentType, sizeof(kDefaultContentType) - 1);
+    if (body_len > 0) conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
 }
 
 void prepare_early_response_state(Connection& conn) {

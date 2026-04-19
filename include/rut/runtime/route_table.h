@@ -70,12 +70,30 @@ struct RouteEntry {
 struct RouteConfig {
     static constexpr u32 kMaxRoutes = 128;
     static constexpr u32 kMaxUpstreams = 64;
+    // Response-body table. Populated at compile/config time; referenced
+    // by JIT handlers via a 1-based index packed into
+    // HandlerResult.upstream_id for ReturnStatus (0 = no custom body,
+    // use the default status reason phrase).
+    static constexpr u32 kMaxResponseBodies = 128;
+    static constexpr u32 kResponseBodyPoolBytes = 8 * 1024;
 
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
 
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
+
+    // Body entries point into body_pool; pool is a bump-allocated char
+    // buffer so body bytes live alongside the config and get reclaimed
+    // with it during RCU swap.
+    struct ResponseBody {
+        const char* data;
+        u32 len;
+    };
+    ResponseBody response_bodies[kMaxResponseBodies];
+    u32 response_body_count = 0;
+    char body_pool[kResponseBodyPoolBytes];
+    u32 body_pool_used = 0;
 
     // Add a proxy route: path prefix → upstream target.
     // Returns false if table full, upstream_id invalid, or path too long.
@@ -140,6 +158,22 @@ struct RouteConfig {
         r.fn = fn;
         route_count++;
         return true;
+    }
+
+    // Register a response body. Copies the bytes into body_pool so the
+    // caller doesn't need to keep the source alive. Returns a 1-based
+    // index (0 is reserved as "no body") that JIT handlers can encode
+    // in the HandlerResult upstream_id slot for ReturnStatus.
+    // Returns 0 if the body table or pool is full.
+    u16 add_response_body(const char* data, u32 len) {
+        if (response_body_count >= kMaxResponseBodies) return 0;
+        if (body_pool_used + len > kResponseBodyPoolBytes) return 0;
+        char* dst = body_pool + body_pool_used;
+        for (u32 i = 0; i < len; i++) dst[i] = data[i];
+        body_pool_used += len;
+        const u32 idx = response_body_count++;
+        response_bodies[idx] = {dst, len};
+        return static_cast<u16>(idx + 1);  // 1-based; 0 reserved
     }
 
     // Add an upstream target. Returns its index, or error if at capacity.

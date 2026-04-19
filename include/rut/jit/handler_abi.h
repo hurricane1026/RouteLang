@@ -36,9 +36,14 @@ enum class YieldKind : u8 {
 //   byte 5-6: next_state   (u16, for Yield)
 //   byte 7:   yield_kind   (YieldKind)
 //
-// For Yield actions, the status_code + upstream_id slots are unused by
-// their named role and instead carry a 32-bit payload (e.g. Timer ms).
-// See make_yield_payload / yield_payload_u32 for the u32 view.
+// Slot reuse by action:
+//   - Yield:        status_code + upstream_id carry a packed u32
+//                   payload (e.g. Timer ms). See make_yield_payload
+//                   / yield_payload_u32.
+//   - ReturnStatus: upstream_id carries a 1-based index into
+//                   RouteConfig::response_bodies (0 = no custom body,
+//                   runtime uses default status-reason phrase).
+//   - Forward:      upstream_id is the real upstream index.
 //
 // IMPORTANT: We use u64 as the function return type (not a struct)
 // because clang uses sret (hidden pointer) for packed structs even

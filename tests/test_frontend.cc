@@ -151,9 +151,17 @@ TEST(frontend, parse_return_response_status_only) {
     CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::ReturnStatus));
     CHECK_EQ(route.statements[0].status_code, 200u);
     CHECK_EQ(route.statements[0].response_body.len, 0u);
-    // Analyze accepts, producing the same HIR shape as `return 200`.
+    CHECK(!route.statements[0].has_response_body);
+    // Analyze accepts; HIR terminator matches the plain `return 200`
+    // shape (Direct control flow, ReturnStatus with status 200).
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& hir_route = hir->routes[0];
+    CHECK_EQ(static_cast<u8>(hir_route.control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(static_cast<u8>(hir_route.control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(hir_route.control.direct_term.status_code, 200);
 }
 
 TEST(frontend, parse_return_response_with_body) {

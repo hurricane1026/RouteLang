@@ -273,6 +273,8 @@ TEST(frontend, parse_return_response_with_headers) {
     const auto& term = hir->routes[0].control.direct_term;
     REQUIRE_EQ(term.response_headers.len, 2u);
     CHECK(term.response_headers[0].key.eq(lit("X-Service")));
+    CHECK(term.response_headers[0].value.eq(lit("auth")));
+    CHECK(term.response_headers[1].key.eq(lit("Cache-Control")));
     CHECK(term.response_headers[1].value.eq(lit("no-store")));
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -364,7 +366,9 @@ TEST(frontend, parse_return_response_rejects_crlf_in_header_value) {
     // Header values must not contain CR/LF — would let a source author
     // inject a second header (response-splitting) or break the wire
     // framing. `\r` is within the lexer's allowed string bytes, so the
-    // parser has to enforce this.
+    // parser has to enforce this. The error detail must point at the
+    // value bytes (not the key) so the diagnostic highlights the
+    // offending string rather than a well-formed key.
     const char* src =
         "route GET \"/x\" { return response(200, headers: "
         "{ \"X-Bad\": \"a\rInjected: 1\" }) }\n";
@@ -373,6 +377,9 @@ TEST(frontend, parse_return_response_rejects_crlf_in_header_value) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(!ast);
     CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    // Error detail carries the value bytes, proving the span was
+    // taken from val_tok, not key_tok.
+    CHECK(ast.error().detail.eq(lit("a\rInjected: 1")));
 }
 
 TEST(frontend, parse_return_response_rejects_colon_in_header_key) {

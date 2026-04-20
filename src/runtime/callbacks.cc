@@ -414,37 +414,61 @@ void format_response_with_body(
     if (body_len > 0) conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
 }
 
-// Case-insensitive compare against a C-string literal. Thin adapter
-// over the shared http_header_name_eq_ci so the formatter's local
-// special-case checks (Content-Type, Content-Length) share the same
-// comparison semantics as the parser's validator.
-static bool header_name_eq_literal_ci(const char* data, u32 len, const char* literal) {
-    u32 lit_len = 0;
-    while (literal[lit_len]) lit_len++;
-    return http_header_name_eq_ci(data, len, literal, lit_len);
+// Case-insensitive compare against a string literal. Templated on the
+// array size so the literal length is resolved at compile time — the
+// per-header-pair loop in format_response_with_body_and_headers calls
+// this on every entry, and we don't want a strlen-equivalent scan
+// baked into that loop. `N` includes the trailing NUL, so we subtract
+// one to get the byte length.
+template <u32 N>
+static bool header_name_eq_literal_ci(const char* data, u32 len, const char (&literal)[N]) {
+    return http_header_name_eq_ci(data, len, literal, N - 1);
 }
 
 // Write a decimal body_len (Content-Length) to the send_buf as ASCII
 // digits, leading zeros suppressed. Emits at least one digit even for
-// body_len == 0, so "Content-Length: 0\r\n" comes out whole.
+// body_len == 0, so "Content-Length: 0\r\n" comes out whole. Mirrors
+// the cascading-threshold pattern in write_response_headers so small
+// body_len values (the common case) don't pay for ten divisions.
 static void write_content_length_digits(Connection& conn, u32 body_len) {
-    // Walk down the power-of-ten ladder; start emitting once we hit
-    // the highest populated digit so we don't prefix with zeros.
-    bool any = false;
-    constexpr u32 kDivs[] = {
-        1000000000u, 100000000u, 10000000u, 1000000u, 100000u, 10000u, 1000u, 100u, 10u, 1u};
-    for (u32 d : kDivs) {
-        u32 digit = (body_len / d) % 10u;
-        if (digit != 0) any = true;
-        if (any) {
-            char c = static_cast<char>('0' + digit);
-            conn.send_buf.write(reinterpret_cast<const u8*>(&c), 1);
-        }
+    if (body_len >= 1000000000u) {
+        char d = static_cast<char>('0' + (body_len / 1000000000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
-    if (!any) {
-        char c = '0';
-        conn.send_buf.write(reinterpret_cast<const u8*>(&c), 1);
+    if (body_len >= 100000000u) {
+        char d = static_cast<char>('0' + (body_len / 100000000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
+    if (body_len >= 10000000u) {
+        char d = static_cast<char>('0' + (body_len / 10000000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 1000000u) {
+        char d = static_cast<char>('0' + (body_len / 1000000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 100000u) {
+        char d = static_cast<char>('0' + (body_len / 100000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 10000u) {
+        char d = static_cast<char>('0' + (body_len / 10000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 1000u) {
+        char d = static_cast<char>('0' + (body_len / 1000u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 100u) {
+        char d = static_cast<char>('0' + (body_len / 100u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    if (body_len >= 10u) {
+        char d = static_cast<char>('0' + (body_len / 10u) % 10);
+        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    }
+    char d = static_cast<char>('0' + body_len % 10);
+    conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
 }
 
 // Count ASCII digits needed to represent `v` in base 10 (at least 1).

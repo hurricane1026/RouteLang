@@ -802,9 +802,20 @@ struct Parser {
                             const auto result = validate_response_header(
                                 pair.key.ptr, pair.key.len, pair.value.ptr, pair.value.len);
                             if (result != HttpHeaderValidation::Ok) {
-                                return frontend_error(FrontendError::UnsupportedSyntax,
-                                                      span_from(*key_tok.value()),
-                                                      pair.key);
+                                // Point the span at the offending
+                                // token: value-specific failures go
+                                // to val_tok so the error message
+                                // highlights the bad value, not the
+                                // key. Key-side failures (empty,
+                                // invalid char, reserved name) keep
+                                // the key-token span and detail.
+                                const bool is_value_err =
+                                    result == HttpHeaderValidation::InvalidValueChar;
+                                const Token& where =
+                                    is_value_err ? *val_tok.value() : *key_tok.value();
+                                const Str detail = is_value_err ? pair.value : pair.key;
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax, span_from(where), detail);
                             }
                             // Reject duplicate keys (case-insensitive
                             // per HTTP) so { "X": "1", "x": "2" } is a

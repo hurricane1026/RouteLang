@@ -263,6 +263,15 @@ struct RouteConfig {
                 HttpHeaderValidation::Ok) {
                 return 0;
             }
+            // Case-insensitive duplicate-key check — parity with the
+            // DSL parser. Two singletons with the same field name
+            // (any case) would make the wire response ambiguous, so
+            // we reject before allocating.
+            for (u32 j = 0; j < i; j++) {
+                if (http_header_name_eq_ci(keys[i], key_lens[i], keys[j], key_lens[j])) {
+                    return 0;
+                }
+            }
             // Guard each add individually against u32 overflow.
             if (key_lens[i] > 0xffffffffu - total_bytes) return 0;
             total_bytes += key_lens[i];

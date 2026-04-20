@@ -38,8 +38,19 @@ struct JitDispatchOutcome {
     u16 next_state = 0;
     u32 timer_ms = 0;  // raw ms payload; callers pick their own precision
     // 1-based index into RouteConfig::response_bodies for
-    // Kind::ReturnStatus; 0 = no custom body (use the default status
-    // reason phrase). Decoded from the upstream_id slot per handler ABI.
+    // Kind::ReturnStatus; 0 = no custom body. Decoded from the
+    // upstream_id slot per handler ABI.
+    //
+    // Meaning of body_idx == 0 depends on response_headers_idx:
+    //   body_idx == 0, headers_idx == 0: "no custom body" → dispatch
+    //       falls back to format_static_response, emitting the default
+    //       status reason-phrase as body.
+    //   body_idx == 0, headers_idx != 0: "headers-only response" (the
+    //       user wrote `response(301, headers: {...})`) → empty body,
+    //       Content-Length: 0, custom headers emitted on the wire.
+    //   body_idx > 0 but out-of-range: config mismatch; dispatch falls
+    //       back to the reason-phrase body — preserved in both the
+    //       no-headers and headers paths.
     u16 response_body_idx = 0;
     // 1-based index into RouteConfig::response_header_sets for
     // Kind::ReturnStatus; 0 = no custom headers. Decoded from the

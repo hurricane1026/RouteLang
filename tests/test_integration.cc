@@ -2804,15 +2804,33 @@ TEST(route, add_response_header_set_rejects_count_over_per_set_cap) {
     using namespace rut;
     // Above the per-set cap: registration must refuse the set rather
     // than accept it and let the dispatch formatter silently truncate.
+    // Use unique key names per slot so we stress the capacity check
+    // rather than the duplicate-key check.
     RouteConfig cfg{};
     constexpr u32 kOver = RouteConfig::kMaxHeadersPerSet + 1;
+    char key_bufs[kOver][8];
     const char* keys[kOver];
     u32 key_lens[kOver];
     const char* vals[kOver];
     u32 val_lens[kOver];
     for (u32 i = 0; i < kOver; i++) {
-        keys[i] = "K";
-        key_lens[i] = 1;
+        // Format as "K<number>" by hand (no stdlib allowed on hot path).
+        key_bufs[i][0] = 'K';
+        u32 pos = 1;
+        u32 v = i;
+        if (v == 0) {
+            key_bufs[i][pos++] = '0';
+        } else {
+            char digits[4];
+            u32 d = 0;
+            while (v > 0) {
+                digits[d++] = static_cast<char>('0' + (v % 10));
+                v /= 10;
+            }
+            for (u32 k = 0; k < d; k++) key_bufs[i][pos++] = digits[d - 1 - k];
+        }
+        keys[i] = key_bufs[i];
+        key_lens[i] = pos;
         vals[i] = "V";
         val_lens[i] = 1;
     }
@@ -2822,6 +2840,21 @@ TEST(route, add_response_header_set_rejects_count_over_per_set_cap) {
     CHECK_EQ(
         cfg.add_response_header_set(keys, key_lens, vals, val_lens, RouteConfig::kMaxHeadersPerSet),
         1u);
+}
+
+TEST(route, add_response_header_set_rejects_case_insensitive_duplicate) {
+    using namespace rut;
+    // Manual RouteConfig path must reject duplicate names the same
+    // way the DSL parser does, case-insensitively. Two entries with
+    // "X-Foo" / "x-foo" would produce ambiguous singleton headers on
+    // the wire, so registration fails up front.
+    RouteConfig cfg{};
+    const char* keys[2] = {"X-Foo", "x-foo"};
+    u32 key_lens[2] = {5, 5};
+    const char* vals[2] = {"1", "2"};
+    u32 val_lens[2] = {1, 1};
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 2), 0u);
+    CHECK_EQ(cfg.response_header_set_count, 0u);
 }
 
 TEST(route, add_response_header_set_rejects_malformed_headers) {

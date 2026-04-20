@@ -1,3 +1,4 @@
+#include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/callbacks_impl.h"  // IWYU pragma: keep
@@ -413,21 +414,14 @@ void format_response_with_body(
     if (body_len > 0) conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
 }
 
-// Case-insensitive ASCII byte compare against a literal C string.
-// Only compares bytes in the ASCII range; sufficient for HTTP header
-// names which are defined as ASCII token characters.
-static bool header_name_eq_ascii_ci(const char* data, u32 len, const char* literal) {
+// Case-insensitive compare against a C-string literal. Thin adapter
+// over the shared http_header_name_eq_ci so the formatter's local
+// special-case checks (Content-Type, Content-Length) share the same
+// comparison semantics as the parser's validator.
+static bool header_name_eq_literal_ci(const char* data, u32 len, const char* literal) {
     u32 lit_len = 0;
     while (literal[lit_len]) lit_len++;
-    if (len != lit_len) return false;
-    for (u32 i = 0; i < len; i++) {
-        char a = data[i];
-        char b = literal[i];
-        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
-        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + ('a' - 'A'));
-        if (a != b) return false;
-    }
-    return true;
+    return http_header_name_eq_ci(data, len, literal, lit_len);
 }
 
 // Write a decimal body_len (Content-Length) to the send_buf as ASCII
@@ -482,7 +476,7 @@ void format_response_with_body_and_headers(Connection& conn,
     // honest regardless of what the user writes.
     bool user_has_content_type = false;
     for (u32 i = 0; i < header_count; i++) {
-        if (header_name_eq_ascii_ci(headers[i].key_data, headers[i].key_len, "Content-Type")) {
+        if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Type")) {
             user_has_content_type = true;
             break;
         }
@@ -507,7 +501,7 @@ void format_response_with_body_and_headers(Connection& conn,
                  decimal_digit_count(body_len_emit) + 2;
     if (!user_has_content_type && body_len_emit > 0) needed += kDefaultContentTypeLine;
     for (u32 i = 0; i < header_count; i++) {
-        if (header_name_eq_ascii_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
+        if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
             continue;
         }
         needed += headers[i].key_len + 2 /* ": " */ + headers[i].value_len + 2 /* "\r\n" */;
@@ -555,7 +549,7 @@ void format_response_with_body_and_headers(Connection& conn,
     }
     // User-supplied headers, skipping Content-Length.
     for (u32 i = 0; i < header_count; i++) {
-        if (header_name_eq_ascii_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
+        if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
             continue;
         }
         conn.send_buf.write(reinterpret_cast<const u8*>(headers[i].key_data), headers[i].key_len);

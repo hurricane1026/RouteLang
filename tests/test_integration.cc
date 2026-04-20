@@ -2906,6 +2906,183 @@ TEST(route, add_response_header_set_rejects_malformed_headers) {
     CHECK_EQ(cfg.add_response_header_set(&ok_key, &ok_key_len, &ok_val, &ok_val_len, 1), 1u);
 }
 
+TEST(route, add_response_header_set_rejects_null_arguments) {
+    using namespace rut;
+    // Null-pointer-table guards: any of the four input tables being
+    // null with count > 0 returns 0 without touching state. Same for
+    // a null data pointer paired with a non-zero length.
+    RouteConfig cfg{};
+    const char* keys[1] = {"X-Ok"};
+    u32 key_lens[1] = {4};
+    const char* vals[1] = {"v"};
+    u32 val_lens[1] = {1};
+
+    // count == 0 → 0 (explicit short-circuit; no pointers touched).
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 0), 0u);
+
+    // Each of the four tables being null individually rejects.
+    CHECK_EQ(cfg.add_response_header_set(nullptr, key_lens, vals, val_lens, 1), 0u);
+    CHECK_EQ(cfg.add_response_header_set(keys, nullptr, vals, val_lens, 1), 0u);
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, nullptr, val_lens, 1), 0u);
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, nullptr, 1), 0u);
+
+    // Null data pointer with non-zero length for a pair → 0.
+    const char* null_key[1] = {nullptr};
+    CHECK_EQ(cfg.add_response_header_set(null_key, key_lens, vals, val_lens, 1), 0u);
+    const char* null_val[1] = {nullptr};
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, null_val, val_lens, 1), 0u);
+
+    CHECK_EQ(cfg.response_header_set_count, 0u);
+
+    // Zero-length key with null pointer still fails the empty-key
+    // validator (caught by validate_response_header before the null
+    // check hits, but either way rejection is consistent).
+    const char* empty_key[1] = {nullptr};
+    u32 empty_key_len[1] = {0};
+    CHECK_EQ(cfg.add_response_header_set(empty_key, empty_key_len, vals, val_lens, 1), 0u);
+}
+
+TEST(route, add_response_header_set_rejects_when_bytes_pool_full) {
+    using namespace rut;
+    // The bytes pool (header_bytes_pool) is 8 KB. A single pair with
+    // key_len + value_len exceeding that cap must be rejected; we
+    // can't split header bytes across multiple allocations. The
+    // rejection path is the `total_bytes > pool available` guard
+    // that runs after validation succeeds.
+    RouteConfig cfg{};
+    constexpr u32 kHugeVal = 9 * 1024;  // > 8 KB header_bytes_pool
+    char big_val_buf[kHugeVal];
+    for (u32 i = 0; i < kHugeVal; i++) big_val_buf[i] = 'a';
+    const char* keys[1] = {"X-Big"};
+    u32 key_lens[1] = {5};
+    const char* vals[1] = {big_val_buf};
+    u32 val_lens[1] = {kHugeVal};
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 1), 0u);
+    CHECK_EQ(cfg.response_header_set_count, 0u);
+    // Modest pair still accepted after the rejected one.
+    const char* ok_vals[1] = {"ok"};
+    u32 ok_val_lens[1] = {2};
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, ok_vals, ok_val_lens, 1), 1u);
+}
+
+TEST(route, add_response_header_set_rejects_when_kv_array_full) {
+    using namespace rut;
+    // The (key, value) arrays cap at kMaxHeaderPoolEntries = 512
+    // pairs across all sets. If a new set's count would push us past
+    // that total, the subtraction-safe check rejects it before any
+    // per-pair work.
+    RouteConfig cfg{};
+    // Fill the pool almost full: 32-pair sets up to kMaxHeaderPoolEntries
+    // (512). 512 / 32 = 16 sets of 32, but we also need to stay
+    // under kMaxHeaderSets=128 (no risk here). After 15 sets = 480
+    // pairs used, a 32-pair set would need 32 more and fit; a 33-pair
+    // set would overflow — but per-set cap is already 32, so we'd
+    // hit that first. Use unique 1-byte keys so each 32-pair set fits
+    // in the bytes pool (~64 bytes per set, well under 8KB).
+    constexpr u32 kPerSet = 32;
+    for (u32 s = 0; s < 15; s++) {
+        char key_bufs[kPerSet][8];
+        const char* keys[kPerSet];
+        u32 key_lens[kPerSet];
+        const char* vals[kPerSet];
+        u32 val_lens[kPerSet];
+        for (u32 i = 0; i < kPerSet; i++) {
+            // Unique across all sets: "K<set>_<i>" encoded as digits.
+            u32 pos = 0;
+            key_bufs[i][pos++] = 'K';
+            // Simple encoding: avoid duplicates by mixing set & index.
+            u32 code = s * 32 + i;  // 0..479
+            char digits[4];
+            u32 d = 0;
+            if (code == 0) {
+                digits[d++] = '0';
+            } else {
+                while (code > 0) {
+                    digits[d++] = static_cast<char>('0' + (code % 10));
+                    code /= 10;
+                }
+            }
+            for (u32 k = 0; k < d; k++) key_bufs[i][pos++] = digits[d - 1 - k];
+            keys[i] = key_bufs[i];
+            key_lens[i] = pos;
+            vals[i] = "v";
+            val_lens[i] = 1;
+        }
+        const u16 idx = cfg.add_response_header_set(keys, key_lens, vals, val_lens, kPerSet);
+        REQUIRE_EQ(idx, static_cast<u16>(s + 1));
+    }
+    // After 15×32 = 480 pairs consumed, a 32-pair set would bring the
+    // total to 512 (== kMaxHeaderPoolEntries) — exactly the cap, still
+    // accepted. A 33-pair set would overflow but the per-set cap
+    // already rejects that earlier. To force the kv-array-full branch
+    // without the per-set check catching it first, we submit a 32-pair
+    // set after filling to 481+, which we engineer via a 1-pair set.
+    const char* one_key[1] = {"Single"};
+    u32 one_key_len[1] = {6};
+    const char* one_val[1] = {"v"};
+    u32 one_val_len[1] = {1};
+    REQUIRE_EQ(cfg.add_response_header_set(one_key, one_key_len, one_val, one_val_len, 1), 16u);
+    // Pool used = 481. A 32-pair set needs 32 more → 513 > 512.
+    // Build a 32-pair set; we expect the kv-array-full branch to fire.
+    char overflow_bufs[32][8];
+    const char* over_keys[32];
+    u32 over_key_lens[32];
+    const char* over_vals[32];
+    u32 over_val_lens[32];
+    for (u32 i = 0; i < 32; i++) {
+        overflow_bufs[i][0] = 'Z';
+        overflow_bufs[i][1] = static_cast<char>('A' + (i / 10));
+        overflow_bufs[i][2] = static_cast<char>('0' + (i % 10));
+        over_keys[i] = overflow_bufs[i];
+        over_key_lens[i] = 3;
+        over_vals[i] = "v";
+        over_val_lens[i] = 1;
+    }
+    CHECK_EQ(cfg.add_response_header_set(over_keys, over_key_lens, over_vals, over_val_lens, 32),
+             0u);
+    CHECK_EQ(cfg.response_header_set_count, 16u);  // unchanged
+}
+
+TEST(http_header_validation, is_http_tchar_covers_all_special_chars) {
+    using namespace rut;
+    // The tchar grammar accepts alphanum plus 15 special chars. Each
+    // case in the switch needs a live hit for full branch coverage;
+    // miss any and a future grammar-tightening change could silently
+    // drop a character without flagging a test.
+    static const u8 kAccepted[] = {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~'};
+    for (u8 c : kAccepted) {
+        CHECK(is_http_tchar(c));
+    }
+    // Spot-check the default branch: anything outside tchar is
+    // rejected. Cover a control char, space, and the separators the
+    // HTTP grammar explicitly excludes.
+    static const u8 kRejected[] = {0x00, 0x1f, ' ', '(', ')', '<', '>', '@', ',', ';', ':',
+                                   '\\', '"',  '/', '[', ']', '?', '=', '{', '}', 0x7f};
+    for (u8 c : kRejected) {
+        CHECK(!is_http_tchar(c));
+    }
+}
+
+TEST(http_header_validation, validate_response_header_accepts_tab_in_value) {
+    using namespace rut;
+    // Horizontal tab is permitted inside header values per RFC 7230.
+    // No other test hits this branch directly; without this the
+    // "c == '\t' continue" line stays uncovered.
+    const char* key = "X-Traced";
+    const char* val = "a\tb";
+    CHECK_EQ(validate_response_header(key, 8, val, 3), HttpHeaderValidation::Ok);
+}
+
+TEST(http_header_validation, http_header_name_eq_ci_length_mismatch) {
+    using namespace rut;
+    // Early-out on length mismatch is its own branch — cover it so a
+    // future refactor that replaces the early-out can't silently drop
+    // safety.
+    CHECK(!http_header_name_eq_ci("Host", 4, "Hostname", 8));
+    CHECK(!http_header_name_eq_ci("X", 1, "", 0));
+}
+
 // End-to-end: compile `route GET "/x" { return response(200, body: "Hi!") }`
 // from source, populate RouteConfig.response_bodies from the compiled
 // rir::Module, and verify a real client receives the exact body.

@@ -143,49 +143,37 @@ jobs:
         run: |
           llvm-profdata merge build/*.profraw -o build/merged.profdata
 
-          # Report for runtime code (exclude test framework and unused utility headers).
-          # io_uring_backend is excluded: requires kernel 6.0+ and io_uring permissions,
-          # which are unreliable in CI. It is tested via conditional integration tests.
-          llvm-cov report \
-            --instr-profile=build/merged.profdata \
-            --object build/tests/test_buffer \
-            --object build/tests/test_types \
-            --object build/tests/test_network \
-            --object build/tests/test_integration \
-            --object build/tests/test_arena \
-            --object build/tests/test_http_parser \
-            --object build/tests/test_expected \
-            --object build/tests/test_drain \
-            --object build/tests/test_access_log \
-            --object build/tests/test_metrics \
-            --object build/tests/test_chunked_parser \
-            --object build/tests/test_rir \
-            --sources include/rut/common/ include/rut/runtime/ src/runtime/ \
-            --ignore-filename-regex='io_uring_backend|epoll_backend|socket\.cc|access_log\.cc|shard\.h|epoll_event_loop\.h|iouring_event_loop\.h' | tee build/coverage.txt
-          # Note: test_traffic_capture, test_traffic_replay, test_sim, and
-          # test_shard_control are excluded from the coverage report because
-          # they instantiate callbacks_impl.h templates for test-only loop types
-          # in additional binaries. The production EpollEventLoop/IoUringEventLoop
-          # callbacks now live in callbacks.cc via explicit instantiation, so
-          # test_network is the primary binary for template coverage accounting.
-          # The excluded tests still run above for correctness validation.
-
-          cat build/coverage.txt
-
-          # Extract line coverage from TOTAL row.
-          # llvm-cov output has 4 percentage columns: Regions, Functions, Lines, Branches.
-          # We want the 3rd one (Lines Cover).
-          LINE_COV=$(grep '^TOTAL' build/coverage.txt | awk '{
-            n=0; for(i=1;i<=NF;i++) if($i ~ /%/) { n++; if(n==3) { gsub(/%/,"",$i); print $i; exit } }
-          }')
-          echo "Line coverage: ${LINE_COV}%"
-          if [ -z "$LINE_COV" ]; then
-            echo "ERROR: Could not parse line coverage"
-            exit 1
-          fi
-          # awk exit 0 = success (pass), exit 1 = fail
-          if ! awk "BEGIN { exit ($LINE_COV < 92) }"; then
-            echo "ERROR: Line coverage ${LINE_COV}% is below 92% threshold"
-            exit 1
-          fi
-          echo "Coverage OK: ${LINE_COV}% >= 92%"
+          # Report runtime coverage as the UNION across test binaries:
+          # a line counts as covered if any binary hits it. `llvm-cov
+          # report` alone picks one binary's instantiation per line for
+          # inline/template functions in headers, which undercounts
+          # coverage dramatically (e.g. handle_jit_outcome<Loop> has
+          # different instantiations in test_network vs test_integration
+          # — whichever comes first wins the reporting slot). The helper
+          # walks per-binary JSON exports and max-merges per line.
+          #
+          # io_uring_backend / epoll_backend are excluded: require
+          # kernel features / permissions that are unreliable in CI.
+          # They are tested via conditional integration tests.
+          #
+          # test_traffic_capture / test_traffic_replay / test_sim /
+          # test_shard_control are not passed as --object because they
+          # instantiate callbacks_impl.h templates for test-only loop
+          # types; the union merge would incorrectly count those as
+          # real production paths. They still run above for correctness
+          # validation.
+          python3 scripts/coverage_report.py \
+            --profile build/merged.profdata \
+            --threshold 97 \
+            build/tests/test_buffer \
+            build/tests/test_types \
+            build/tests/test_network \
+            build/tests/test_integration \
+            build/tests/test_arena \
+            build/tests/test_http_parser \
+            build/tests/test_expected \
+            build/tests/test_drain \
+            build/tests/test_access_log \
+            build/tests/test_metrics \
+            build/tests/test_chunked_parser \
+            build/tests/test_rir

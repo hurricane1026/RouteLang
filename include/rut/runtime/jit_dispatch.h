@@ -100,7 +100,10 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             out.status_code = r.status_code;
             // ABI: upstream_id carries a 1-based response-body index
             // and next_state a 1-based response-header-set index for
-            // ReturnStatus (0 = default body / no custom headers).
+            // ReturnStatus (0 = no custom body / no custom headers;
+            // dispatch behaviour when idx == 0 — reason-phrase fallback
+            // vs. headers-only empty body — is documented on the
+            // response_body_idx field above).
             out.response_body_idx = r.upstream_id;
             out.response_headers_idx = r.next_state;
             return out;

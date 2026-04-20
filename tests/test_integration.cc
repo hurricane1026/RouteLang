@@ -3423,10 +3423,21 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
     REQUIRE(c >= 0);
     const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
     send_all(c, kReq, sizeof(kReq) - 1);
+    // Read until the status line is complete. Loopback typically
+    // returns everything in one recv, but TCP is free to fragment,
+    // so loop until we see the "\r\n" that terminates the status
+    // line (or the buffer fills / timeout). That makes the
+    // "HTTP/1.1 502" assertion below robust against split-recv.
     char buf[1024];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
-    CHECK_GT(n, 0);
-    const Str response{buf, static_cast<u32>(n)};
+    i32 total = 0;
+    while (total < static_cast<i32>(sizeof(buf))) {
+        i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
+        if (n <= 0) break;
+        total += n;
+        if (buf_contains(buf, static_cast<u32>(total), "\r\n", 2)) break;
+    }
+    CHECK_GT(total, 0);
+    const Str response{buf, static_cast<u32>(total)};
     auto has = [&](const char* needle, u32 nlen) {
         return buf_contains(
             reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);

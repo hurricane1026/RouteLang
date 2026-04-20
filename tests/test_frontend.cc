@@ -247,6 +247,238 @@ TEST(frontend, parse_return_response_rejects_unknown_kwarg) {
     CHECK(ast.error().detail.eq(lit("header")));
 }
 
+TEST(frontend, parse_return_response_with_headers) {
+    // Headers dict carries through parser → HIR → MIR → RIR:
+    // intern_response_headers writes one set into rir::Module's flat
+    // pool and the emit_ret_status imm packs headers_idx=1 alongside
+    // body_idx. Codegen and runtime behaviour are covered by
+    // tests/test_integration.cc::dsl_response_headers_real_socket.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X-Service\": \"auth\", \"Cache-Control\": \"no-store\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
+    const auto& stmt = ast->items[0].route.statements[0];
+    REQUIRE_EQ(stmt.response_headers.len, 2u);
+    CHECK(stmt.response_headers[0].key.eq(lit("X-Service")));
+    CHECK(stmt.response_headers[0].value.eq(lit("auth")));
+    CHECK(stmt.response_headers[1].key.eq(lit("Cache-Control")));
+    CHECK(stmt.response_headers[1].value.eq(lit("no-store")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    REQUIRE_EQ(term.response_headers.len, 2u);
+    CHECK(term.response_headers[0].key.eq(lit("X-Service")));
+    CHECK(term.response_headers[0].value.eq(lit("auth")));
+    CHECK(term.response_headers[1].key.eq(lit("Cache-Control")));
+    CHECK(term.response_headers[1].value.eq(lit("no-store")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
+    REQUIRE_EQ(rir.module.header_sets[0].count, 2u);
+    REQUIRE_EQ(rir.module.header_sets[0].offset, 0u);
+    CHECK(rir.module.header_keys[0].eq(lit("X-Service")));
+    CHECK(rir.module.header_values[0].eq(lit("auth")));
+    CHECK(rir.module.header_keys[1].eq(lit("Cache-Control")));
+    CHECK(rir.module.header_values[1].eq(lit("no-store")));
+    rir.destroy();
+}
+
+TEST(frontend, parse_return_response_headers_only) {
+    // Redirect-style response: headers without a body. Verify
+    // response_body_count stays 0 and header_set_count rises to 1.
+    const char* src =
+        "route GET \"/old\" { return response(301, headers: "
+        "{ \"Location\": \"/new\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    CHECK_EQ(rir.module.response_body_count, 0u);
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
+    REQUIRE_EQ(rir.module.header_sets[0].count, 1u);
+    CHECK(rir.module.header_keys[0].eq(lit("Location")));
+    CHECK(rir.module.header_values[0].eq(lit("/new")));
+    rir.destroy();
+}
+
+TEST(frontend, parse_return_response_headers_dedup_across_routes) {
+    // Two routes emit the same header set → intern returns the same
+    // 1-based idx; header_set_count stays at 1.
+    const char* src =
+        "route GET \"/a\" { return response(200, headers: { \"X-Cached\": \"1\" }) }\n"
+        "route GET \"/b\" { return response(200, headers: { \"X-Cached\": \"1\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    // Only one set interned despite two sources.
+    CHECK_EQ(rir.module.header_set_count, 1u);
+    CHECK_EQ(rir.module.header_pool_used, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, parse_return_response_rejects_duplicate_header_key) {
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X-Foo\": \"1\", \"X-Foo\": \"2\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("X-Foo")));
+}
+
+TEST(frontend, parse_return_response_rejects_empty_headers_dict) {
+    // `headers: {}` is explicitly rejected; omit the kwarg to mean
+    // "no custom headers".
+    const char* src = "route GET \"/x\" { return response(200, headers: {}) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_rejects_crlf_in_header_value) {
+    // Header values must not contain CR/LF — would let a source author
+    // inject a second header (response-splitting) or break the wire
+    // framing. `\r` is within the lexer's allowed string bytes, so the
+    // parser has to enforce this. The error detail must point at the
+    // value bytes (not the key) so the diagnostic highlights the
+    // offending string rather than a well-formed key.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X-Bad\": \"a\rInjected: 1\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    // Error detail carries the value bytes, proving the span was
+    // taken from val_tok, not key_tok.
+    CHECK(ast.error().detail.eq(lit("a\rInjected: 1")));
+}
+
+TEST(frontend, parse_return_response_rejects_colon_in_header_key) {
+    // `:` in a key would be ambiguous once serialized ("Foo:Bar: v"
+    // parses as key "Foo" value "Bar: v" at the wire level). Reject
+    // at parse time to keep keys unambiguous.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X:Bad\": \"1\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_rejects_empty_header_key) {
+    // Empty header name is invalid per HTTP.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"\": \"1\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_rejects_space_in_header_key) {
+    // Spaces aren't in the HTTP tchar grammar — reject `"X Foo"` so
+    // sloppy names don't slip through and later fail to match the
+    // case-insensitive Content-Type suppression check.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X Foo\": \"1\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_return_response_rejects_case_insensitive_duplicate_key) {
+    // HTTP field names are case-insensitive — `"X-Foo"` and `"x-foo"`
+    // are the same header and must be rejected as duplicates.
+    const char* src =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"X-Foo\": \"1\", \"x-foo\": \"2\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("x-foo")));
+}
+
+TEST(frontend, parse_return_response_rejects_reserved_header_names) {
+    // Content-Length / Transfer-Encoding / Connection are
+    // runtime-managed; user attempts to set them would create CL/TE
+    // smuggling-style inconsistencies or conflict with the keep-alive
+    // decision. Rejected at parse time regardless of case.
+    const char* kContentLength =
+        "route GET \"/x\" { return response(200, headers: { \"Content-Length\": \"0\" }) }\n";
+    const char* kTransferEncoding =
+        "route GET \"/x\" { return response(200, headers: "
+        "{ \"transfer-encoding\": \"chunked\" }) }\n";
+    const char* kConnection =
+        "route GET \"/x\" { return response(200, headers: { \"CONNECTION\": \"close\" }) }\n";
+    const char* kCases[] = {kContentLength, kTransferEncoding, kConnection};
+    for (const char* src : kCases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(!ast);
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, parse_return_response_body_and_headers_order_independent) {
+    // Kwargs can appear in either order; both propagate.
+    const char* src_a =
+        "route GET \"/a\" { return response(200, body: \"hi\", "
+        "headers: { \"X-A\": \"1\" }) }\n";
+    const char* src_b =
+        "route GET \"/a\" { return response(200, headers: { \"X-A\": \"1\" }, "
+        "body: \"hi\") }\n";
+    for (const char* src : {src_a, src_b}) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        const auto& stmt = ast->items[0].route.statements[0];
+        CHECK(stmt.has_response_body);
+        CHECK(stmt.response_body.eq(lit("hi")));
+        REQUIRE_EQ(stmt.response_headers.len, 1u);
+        CHECK(stmt.response_headers[0].key.eq(lit("X-A")));
+    }
+}
+
 TEST(frontend, lex_duration_suffix_boundary) {
     // `5ms` is one DurLit; the suffix must sit at a token boundary so
     // `5mystery` stays `5` (IntLit) + `mystery` (Ident). Similarly

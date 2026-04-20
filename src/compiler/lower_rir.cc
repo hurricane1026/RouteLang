@@ -2392,7 +2392,27 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 return frontend_error(err, term.span);
             }
         }
-        if (!b.emit_ret_status(term.status_code, {term.span.line, term.span.col}, body_idx))
+        // Intern the header set (if any) into the module's flat pool
+        // and pack its 1-based idx into the same RetStatus imm slot.
+        // Missing kwarg ⇒ idx = 0 ⇒ runtime emits no custom headers.
+        u16 headers_idx = 0;
+        if (term.response_headers.len > 0) {
+            headers_idx =
+                b.intern_response_headers(&term.response_headers[0], term.response_headers.len);
+            if (headers_idx == 0) {
+                // Same failure disambiguation as intern_response_body:
+                // distinguish "sets table full" or "pool full" from
+                // "arena OOM mid-copy".
+                const bool sets_full = b.mod->header_set_count >= rir::Module::kMaxHeaderSets;
+                const bool pool_full = term.response_headers.len >
+                                       rir::Module::kMaxHeaderPoolEntries - b.mod->header_pool_used;
+                const auto err = (sets_full || pool_full) ? FrontendError::TooManyItems
+                                                          : FrontendError::OutOfMemory;
+                return frontend_error(err, term.span);
+            }
+        }
+        if (!b.emit_ret_status(
+                term.status_code, {term.span.line, term.span.col}, body_idx, headers_idx))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }

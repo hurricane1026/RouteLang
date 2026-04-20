@@ -745,15 +745,21 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             // status_code in bytes 1-2 (low 16 of status slot),
             // body_idx in bytes 3-4 (the "upstream_id" slot repurposed
             // per handler ABI — 1-based index into RouteConfig's
-            // response_bodies; 0 = default status-reason body).
+            // response_bodies; 0 = default status-reason body),
+            // headers_idx in bytes 5-6 (the "next_state" slot repurposed
+            // for ReturnStatus — 1-based index into RouteConfig's
+            // response_header_sets; 0 = no custom headers).
             //
-            // For the operand form (runtime-value status), body_idx is
-            // always 0 because that source path doesn't yet support
-            // custom bodies. For the literal form, RIR packs status
-            // and body_idx into imm.i32_val: low 16 = status, high 16
-            // = body_idx — decode both here.
+            // For the operand form (runtime-value status), both idx
+            // fields are always 0 because that source path doesn't
+            // support custom bodies/headers today. For the literal
+            // form, RIR packs all three into imm.i64_val:
+            //   bits [ 0:16): status
+            //   bits [16:32): body_idx
+            //   bits [32:48): headers_idx — decode all three here.
             LLVMValueRef status;
             u32 body_idx_imm = 0;
+            u32 headers_idx_imm = 0;
             if (inst.operand_count > 0) {
                 status = c.get_value(inst.operands[0]);
                 if (LLVMTypeOf(status) != c.i32_ty) {
@@ -762,14 +768,14 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 // Mask to 16 bits so a runtime-produced status value
                 // above 0xffff can't spill into the upstream_id slot
                 // (which carries the body_idx for ReturnStatus). The
-                // operand form doesn't carry a body_idx today, so
-                // body_idx_imm stays 0.
+                // operand form doesn't carry idx fields today.
                 status = LLVMBuildAnd(
                     c.builder, status, LLVMConstInt(c.i32_ty, 0xffffu, 0), "code.mask");
             } else {
-                const u32 packed = static_cast<u32>(inst.imm.i32_val);
-                const u32 status_u = packed & 0xffffu;
-                body_idx_imm = (packed >> 16) & 0xffffu;
+                const u64 packed = static_cast<u64>(inst.imm.i64_val);
+                const u32 status_u = static_cast<u32>(packed & 0xffffu);
+                body_idx_imm = static_cast<u32>((packed >> 16) & 0xffffu);
+                headers_idx_imm = static_cast<u32>((packed >> 32) & 0xffffu);
                 status = LLVMConstInt(c.i32_ty, status_u, 0);
             }
             LLVMValueRef action =
@@ -782,6 +788,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 LLVMValueRef body_slot =
                     LLVMConstInt(c.i64_ty, static_cast<u64>(body_idx_imm) << 24, 0);
                 result = LLVMBuildOr(c.builder, result, body_slot, "result.body");
+            }
+            if (headers_idx_imm != 0) {
+                LLVMValueRef headers_slot =
+                    LLVMConstInt(c.i64_ty, static_cast<u64>(headers_idx_imm) << 40, 0);
+                result = LLVMBuildOr(c.builder, result, headers_slot, "result.headers");
             }
             LLVMBuildRet(c.builder, result);
             break;

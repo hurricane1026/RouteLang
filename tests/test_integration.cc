@@ -2731,6 +2731,358 @@ TEST(route, jit_handler_unknown_body_idx_falls_back) {
     destroy_real_loop(loop);
 }
 
+// Handler returns ReturnStatus with a valid headers_idx but an
+// out-of-range body_idx. The dispatch path must still render the
+// default reason-phrase body so the response isn't silently empty —
+// matches the no-headers fallback behavior of format_static_response.
+static u64 return_200_body_99_headers_1_handler(void* /*conn*/,
+                                                rut::jit::HandlerCtx* /*ctx*/,
+                                                const u8* /*req*/,
+                                                u32 /*len*/,
+                                                void* /*arena*/) {
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
+                              200,
+                              /*upstream_id=*/99,  // body_idx: out of range
+                              /*next_state=*/1,    // headers_idx: valid
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
+TEST(route, jit_handler_unknown_body_idx_with_headers_falls_back) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    // Register one header set (idx 1) but no bodies — body_idx=99
+    // is out of range.
+    const char* keys[] = {"X-Service"};
+    u32 key_lens[] = {9};
+    const char* vals[] = {"auth"};
+    u32 val_lens[] = {4};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/hello", 'G', &return_200_body_99_headers_1_handler));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n, 0);
+    const Str response{buf, static_cast<u32>(n)};
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
+    };
+    CHECK(has("200 OK", 6));
+    // Body fell back to the default reason phrase "OK" (2 bytes) even
+    // though headers were present.
+    CHECK(has("Content-Length: 2\r\n", 19));
+    CHECK(has("\r\n\r\nOK", 6));
+    // Custom header still emitted alongside the fallback body.
+    CHECK(has("X-Service: auth\r\n", 17));
+    // Fallback-reason-phrase body must NOT carry the default
+    // Content-Type — matches format_static_response's wire shape so
+    // the two fallback paths (with / without headers) are
+    // byte-compatible modulo the extra user headers.
+    CHECK(!has("Content-Type:", 13));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(route, add_response_header_set_rejects_count_over_per_set_cap) {
+    using namespace rut;
+    // Above the per-set cap: registration must refuse the set rather
+    // than accept it and let the dispatch formatter silently truncate.
+    // Use unique key names per slot so we stress the capacity check
+    // rather than the duplicate-key check.
+    RouteConfig cfg{};
+    constexpr u32 kOver = RouteConfig::kMaxHeadersPerSet + 1;
+    char key_bufs[kOver][8];
+    const char* keys[kOver];
+    u32 key_lens[kOver];
+    const char* vals[kOver];
+    u32 val_lens[kOver];
+    for (u32 i = 0; i < kOver; i++) {
+        // Format as "K<number>" by hand (no stdlib allowed on hot path).
+        key_bufs[i][0] = 'K';
+        u32 pos = 1;
+        u32 v = i;
+        if (v == 0) {
+            key_bufs[i][pos++] = '0';
+        } else {
+            char digits[4];
+            u32 d = 0;
+            while (v > 0) {
+                digits[d++] = static_cast<char>('0' + (v % 10));
+                v /= 10;
+            }
+            for (u32 k = 0; k < d; k++) key_bufs[i][pos++] = digits[d - 1 - k];
+        }
+        keys[i] = key_bufs[i];
+        key_lens[i] = pos;
+        vals[i] = "V";
+        val_lens[i] = 1;
+    }
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, kOver), 0u);
+    CHECK_EQ(cfg.response_header_set_count, 0u);
+    // At the cap it still succeeds.
+    CHECK_EQ(
+        cfg.add_response_header_set(keys, key_lens, vals, val_lens, RouteConfig::kMaxHeadersPerSet),
+        1u);
+}
+
+TEST(route, add_response_header_set_rejects_case_insensitive_duplicate) {
+    using namespace rut;
+    // Manual RouteConfig path must reject duplicate names the same
+    // way the DSL parser does, case-insensitively. Two entries with
+    // "X-Foo" / "x-foo" would produce ambiguous singleton headers on
+    // the wire, so registration fails up front.
+    RouteConfig cfg{};
+    const char* keys[2] = {"X-Foo", "x-foo"};
+    u32 key_lens[2] = {5, 5};
+    const char* vals[2] = {"1", "2"};
+    u32 val_lens[2] = {1, 1};
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 2), 0u);
+    CHECK_EQ(cfg.response_header_set_count, 0u);
+}
+
+TEST(route, add_response_header_set_rejects_malformed_headers) {
+    using namespace rut;
+    // The runtime API must reject the same things the DSL parser does:
+    // CR in a value (response splitting), invalid key chars (space),
+    // and reserved framing names. Manual JIT-handler setups would
+    // otherwise bypass the parser-level validation.
+    RouteConfig cfg{};
+    const char* ok_key = "X-Ok";
+    u32 ok_key_len = 4;
+    const char* ok_val = "ok";
+    u32 ok_val_len = 2;
+
+    // CR in value → rejected.
+    const char* crlf_key = "X-Bad";
+    u32 crlf_key_len = 5;
+    const char* crlf_val = "a\r\nInjected: 1";
+    u32 crlf_val_len = 14;
+    CHECK_EQ(cfg.add_response_header_set(&crlf_key, &crlf_key_len, &crlf_val, &crlf_val_len, 1),
+             0u);
+
+    // Space in key → rejected.
+    const char* space_key = "X Bad";
+    u32 space_key_len = 5;
+    CHECK_EQ(cfg.add_response_header_set(&space_key, &space_key_len, &ok_val, &ok_val_len, 1), 0u);
+
+    // Reserved framing names → rejected.
+    const char* cl_key = "Content-Length";
+    u32 cl_key_len = 14;
+    CHECK_EQ(cfg.add_response_header_set(&cl_key, &cl_key_len, &ok_val, &ok_val_len, 1), 0u);
+    const char* te_key = "transfer-encoding";
+    u32 te_key_len = 17;
+    CHECK_EQ(cfg.add_response_header_set(&te_key, &te_key_len, &ok_val, &ok_val_len, 1), 0u);
+    const char* conn_key = "connection";
+    u32 conn_key_len = 10;
+    CHECK_EQ(cfg.add_response_header_set(&conn_key, &conn_key_len, &ok_val, &ok_val_len, 1), 0u);
+
+    // Confirm no partial state leaked: set count still zero after all
+    // the rejected attempts.
+    CHECK_EQ(cfg.response_header_set_count, 0u);
+
+    // Valid pair still works afterwards.
+    CHECK_EQ(cfg.add_response_header_set(&ok_key, &ok_key_len, &ok_val, &ok_val_len, 1), 1u);
+}
+
+TEST(route, add_response_header_set_rejects_null_arguments) {
+    using namespace rut;
+    // Null-pointer-table guards: any of the four input tables being
+    // null with count > 0 returns 0 without touching state. Same for
+    // a null data pointer paired with a non-zero length.
+    RouteConfig cfg{};
+    const char* keys[1] = {"X-Ok"};
+    u32 key_lens[1] = {4};
+    const char* vals[1] = {"v"};
+    u32 val_lens[1] = {1};
+
+    // count == 0 → 0 (explicit short-circuit; no pointers touched).
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 0), 0u);
+
+    // Each of the four tables being null individually rejects.
+    CHECK_EQ(cfg.add_response_header_set(nullptr, key_lens, vals, val_lens, 1), 0u);
+    CHECK_EQ(cfg.add_response_header_set(keys, nullptr, vals, val_lens, 1), 0u);
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, nullptr, val_lens, 1), 0u);
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, nullptr, 1), 0u);
+
+    // Null data pointer with non-zero length for a pair → 0.
+    const char* null_key[1] = {nullptr};
+    CHECK_EQ(cfg.add_response_header_set(null_key, key_lens, vals, val_lens, 1), 0u);
+    const char* null_val[1] = {nullptr};
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, null_val, val_lens, 1), 0u);
+
+    CHECK_EQ(cfg.response_header_set_count, 0u);
+
+    // Zero-length key with null pointer still fails the empty-key
+    // validator (caught by validate_response_header before the null
+    // check hits, but either way rejection is consistent).
+    const char* empty_key[1] = {nullptr};
+    u32 empty_key_len[1] = {0};
+    CHECK_EQ(cfg.add_response_header_set(empty_key, empty_key_len, vals, val_lens, 1), 0u);
+}
+
+TEST(route, add_response_header_set_rejects_when_bytes_pool_full) {
+    using namespace rut;
+    // The bytes pool (header_bytes_pool) is 8 KB. A single pair with
+    // key_len + value_len exceeding that cap must be rejected; we
+    // can't split header bytes across multiple allocations. The
+    // rejection path is the `total_bytes > pool available` guard
+    // that runs after validation succeeds.
+    RouteConfig cfg{};
+    constexpr u32 kHugeVal = 9 * 1024;  // > 8 KB header_bytes_pool
+    char big_val_buf[kHugeVal];
+    for (u32 i = 0; i < kHugeVal; i++) big_val_buf[i] = 'a';
+    const char* keys[1] = {"X-Big"};
+    u32 key_lens[1] = {5};
+    const char* vals[1] = {big_val_buf};
+    u32 val_lens[1] = {kHugeVal};
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 1), 0u);
+    CHECK_EQ(cfg.response_header_set_count, 0u);
+    // Modest pair still accepted after the rejected one.
+    const char* ok_vals[1] = {"ok"};
+    u32 ok_val_lens[1] = {2};
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, ok_vals, ok_val_lens, 1), 1u);
+}
+
+TEST(route, add_response_header_set_rejects_when_kv_array_full) {
+    using namespace rut;
+    // The (key, value) arrays cap at kMaxHeaderPoolEntries = 512
+    // pairs across all sets. If a new set's count would push us past
+    // that total, the subtraction-safe check rejects it before any
+    // per-pair work.
+    RouteConfig cfg{};
+    // Fill the pool almost full: 32-pair sets up to kMaxHeaderPoolEntries
+    // (512). 512 / 32 = 16 sets of 32, but we also need to stay
+    // under kMaxHeaderSets=128 (no risk here). After 15 sets = 480
+    // pairs used, a 32-pair set would need 32 more and fit; a 33-pair
+    // set would overflow — but per-set cap is already 32, so we'd
+    // hit that first. Use unique 1-byte keys so each 32-pair set fits
+    // in the bytes pool (~64 bytes per set, well under 8KB).
+    constexpr u32 kPerSet = 32;
+    for (u32 s = 0; s < 15; s++) {
+        char key_bufs[kPerSet][8];
+        const char* keys[kPerSet];
+        u32 key_lens[kPerSet];
+        const char* vals[kPerSet];
+        u32 val_lens[kPerSet];
+        for (u32 i = 0; i < kPerSet; i++) {
+            // Unique across all sets: "K<set>_<i>" encoded as digits.
+            u32 pos = 0;
+            key_bufs[i][pos++] = 'K';
+            // Simple encoding: avoid duplicates by mixing set & index.
+            u32 code = s * 32 + i;  // 0..479
+            char digits[4];
+            u32 d = 0;
+            if (code == 0) {
+                digits[d++] = '0';
+            } else {
+                while (code > 0) {
+                    digits[d++] = static_cast<char>('0' + (code % 10));
+                    code /= 10;
+                }
+            }
+            for (u32 k = 0; k < d; k++) key_bufs[i][pos++] = digits[d - 1 - k];
+            keys[i] = key_bufs[i];
+            key_lens[i] = pos;
+            vals[i] = "v";
+            val_lens[i] = 1;
+        }
+        const u16 idx = cfg.add_response_header_set(keys, key_lens, vals, val_lens, kPerSet);
+        REQUIRE_EQ(idx, static_cast<u16>(s + 1));
+    }
+    // After 15×32 = 480 pairs consumed, a 32-pair set would bring the
+    // total to 512 (== kMaxHeaderPoolEntries) — exactly the cap, still
+    // accepted. A 33-pair set would overflow but the per-set cap
+    // already rejects that earlier. To force the kv-array-full branch
+    // without the per-set check catching it first, we submit a 32-pair
+    // set after filling to 481+, which we engineer via a 1-pair set.
+    const char* one_key[1] = {"Single"};
+    u32 one_key_len[1] = {6};
+    const char* one_val[1] = {"v"};
+    u32 one_val_len[1] = {1};
+    REQUIRE_EQ(cfg.add_response_header_set(one_key, one_key_len, one_val, one_val_len, 1), 16u);
+    // Pool used = 481. A 32-pair set needs 32 more → 513 > 512.
+    // Build a 32-pair set; we expect the kv-array-full branch to fire.
+    char overflow_bufs[32][8];
+    const char* over_keys[32];
+    u32 over_key_lens[32];
+    const char* over_vals[32];
+    u32 over_val_lens[32];
+    for (u32 i = 0; i < 32; i++) {
+        overflow_bufs[i][0] = 'Z';
+        overflow_bufs[i][1] = static_cast<char>('A' + (i / 10));
+        overflow_bufs[i][2] = static_cast<char>('0' + (i % 10));
+        over_keys[i] = overflow_bufs[i];
+        over_key_lens[i] = 3;
+        over_vals[i] = "v";
+        over_val_lens[i] = 1;
+    }
+    CHECK_EQ(cfg.add_response_header_set(over_keys, over_key_lens, over_vals, over_val_lens, 32),
+             0u);
+    CHECK_EQ(cfg.response_header_set_count, 16u);  // unchanged
+}
+
+TEST(http_header_validation, is_http_tchar_covers_all_special_chars) {
+    using namespace rut;
+    // The tchar grammar accepts alphanum plus 15 special chars. Each
+    // case in the switch needs a live hit for full branch coverage;
+    // miss any and a future grammar-tightening change could silently
+    // drop a character without flagging a test.
+    static const u8 kAccepted[] = {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~'};
+    for (u8 c : kAccepted) {
+        CHECK(is_http_tchar(c));
+    }
+    // Spot-check the default branch: anything outside tchar is
+    // rejected. Cover a control char, space, and the separators the
+    // HTTP grammar explicitly excludes.
+    static const u8 kRejected[] = {0x00, 0x1f, ' ', '(', ')', '<', '>', '@', ',', ';', ':',
+                                   '\\', '"',  '/', '[', ']', '?', '=', '{', '}', 0x7f};
+    for (u8 c : kRejected) {
+        CHECK(!is_http_tchar(c));
+    }
+}
+
+TEST(http_header_validation, validate_response_header_accepts_tab_in_value) {
+    using namespace rut;
+    // Horizontal tab is permitted inside header values per RFC 7230.
+    // No other test hits this branch directly; without this the
+    // "c == '\t' continue" line stays uncovered.
+    const char* key = "X-Traced";
+    const char* val = "a\tb";
+    CHECK_EQ(validate_response_header(key, 8, val, 3), HttpHeaderValidation::Ok);
+}
+
+TEST(http_header_validation, http_header_name_eq_ci_length_mismatch) {
+    using namespace rut;
+    // Early-out on length mismatch is its own branch — cover it so a
+    // future refactor that replaces the early-out can't silently drop
+    // safety.
+    CHECK(!http_header_name_eq_ci("Host", 4, "Hostname", 8));
+    CHECK(!http_header_name_eq_ci("X", 1, "", 0));
+}
+
 // End-to-end: compile `route GET "/x" { return response(200, body: "Hi!") }`
 // from source, populate RouteConfig.response_bodies from the compiled
 // rir::Module, and verify a real client receives the exact body.
@@ -2799,6 +3151,208 @@ TEST(route, dsl_response_body_real_socket) {
     CHECK(has("Content-Length: 3\r\n", 19));
     CHECK(has("Content-Type: text/plain", 24));
     CHECK(has("\r\n\r\nHi!", 7));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// End-to-end: compile a route with custom headers (user-supplied
+// Content-Type must suppress the default text/plain) and assert the
+// real-socket response contains exactly what we expect. Reserved
+// framing headers (Content-Length / Transfer-Encoding / Connection)
+// are rejected at parse time — see parse_return_response_rejects_
+// reserved_header_names in test_frontend.cc.
+TEST(route, dsl_response_headers_real_socket) {
+    using namespace rut;
+
+    const char* src =
+        "route GET \"/x\" { return response(200, body: \"hello-json\", headers: "
+        "{ \"Content-Type\": \"application/json\", "
+        "\"X-Service\": \"auth\" }) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    for (u32 i = 0; i < rir.module.response_body_count; i++) {
+        const auto& body = rir.module.response_bodies[i];
+        const u16 idx = cfg.add_response_body(body.ptr, body.len);
+        REQUIRE_EQ(idx, static_cast<u16>(i + 1));
+    }
+    // Mirror header sets from rir::Module into RouteConfig the same
+    // way bodies are mirrored above (1-based index preserved).
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
+    for (u32 i = 0; i < rir.module.header_set_count; i++) {
+        const auto& ref = rir.module.header_sets[i];
+        const char* keys[16];
+        u32 key_lens[16];
+        const char* vals[16];
+        u32 val_lens[16];
+        REQUIRE(ref.count <= 16u);
+        for (u16 j = 0; j < ref.count; j++) {
+            keys[j] = rir.module.header_keys[ref.offset + j].ptr;
+            key_lens[j] = rir.module.header_keys[ref.offset + j].len;
+            vals[j] = rir.module.header_values[ref.offset + j].ptr;
+            val_lens[j] = rir.module.header_values[ref.offset + j].len;
+        }
+        const u16 idx = cfg.add_response_header_set(keys, key_lens, vals, val_lens, ref.count);
+        REQUIRE_EQ(idx, static_cast<u16>(i + 1));
+    }
+    REQUIRE(cfg.add_jit_handler("/x", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[2048];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n, 0);
+    const Str response{buf, static_cast<u32>(n)};
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
+    };
+    // Body is exactly 10 bytes (`hello-json`), and the formatter
+    // recomputes Content-Length from that.
+    CHECK(has("200 OK", 6));
+    CHECK(has("Content-Length: 10\r\n", 20));
+    // User's Content-Type wins; default text/plain is suppressed.
+    CHECK(has("Content-Type: application/json\r\n", 32));
+    CHECK(!has("text/plain", 10));
+    // Other user header is emitted verbatim.
+    CHECK(has("X-Service: auth\r\n", 17));
+    // Body bytes at the end: 4 CRLF + 10 body = 14 bytes.
+    CHECK(has("\r\n\r\nhello-json", 14));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// Redirect-style: headers without body. Verify Content-Length: 0,
+// the Location header is emitted, and no body bytes follow.
+TEST(route, dsl_response_headers_only_real_socket) {
+    using namespace rut;
+
+    const char* src =
+        "route GET \"/old\" { return response(301, headers: "
+        "{ \"Location\": \"/new\" }) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    CHECK_EQ(rir.module.response_body_count, 0u);
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
+    const auto& ref = rir.module.header_sets[0];
+    const char* keys[4];
+    u32 key_lens[4];
+    const char* vals[4];
+    u32 val_lens[4];
+    REQUIRE(ref.count <= 4u);
+    for (u16 j = 0; j < ref.count; j++) {
+        keys[j] = rir.module.header_keys[ref.offset + j].ptr;
+        key_lens[j] = rir.module.header_keys[ref.offset + j].len;
+        vals[j] = rir.module.header_values[ref.offset + j].ptr;
+        val_lens[j] = rir.module.header_values[ref.offset + j].len;
+    }
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, ref.count), 1u);
+    REQUIRE(cfg.add_jit_handler("/old", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /old HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[2048];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n, 0);
+    const Str response{buf, static_cast<u32>(n)};
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
+    };
+    CHECK(has("301 ", 4));
+    CHECK(has("Content-Length: 0\r\n", 19));
+    CHECK(has("Location: /new\r\n", 16));
+    // Response must terminate exactly at the blank line — the last
+    // four bytes must be "\r\n\r\n" and nothing else should follow.
+    // Substring-containment alone wouldn't catch a stray body payload
+    // appended after the terminator.
+    REQUIRE_GE(response.len, 4u);
+    CHECK_EQ(response.ptr[response.len - 4], '\r');
+    CHECK_EQ(response.ptr[response.len - 3], '\n');
+    CHECK_EQ(response.ptr[response.len - 2], '\r');
+    CHECK_EQ(response.ptr[response.len - 1], '\n');
 
     close(c);
     lt.stop();

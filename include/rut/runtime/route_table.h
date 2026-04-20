@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
@@ -76,6 +77,23 @@ struct RouteConfig {
     // use the default status reason phrase).
     static constexpr u32 kMaxResponseBodies = 128;
     static constexpr u32 kResponseBodyPoolBytes = 8 * 1024;
+    // Response-headers tables. Parallel to response_bodies but
+    // independently indexed (JIT handlers pack a separate `headers_idx`
+    // into HandlerResult.next_state for ReturnStatus, 0 = no custom
+    // headers). All (key, value) pairs across every set share one flat
+    // pool; each set is an (offset, count) slice into it. Header bytes
+    // live in a single char pool so they outlive the RouteConfig's
+    // RCU lifetime the same way body_pool does.
+    static constexpr u32 kMaxResponseHeaderSets = 128;
+    static constexpr u32 kMaxHeaderPoolEntries = 512;
+    static constexpr u32 kResponseHeaderBytesPoolBytes = 8 * 1024;
+    // Per-response cap for header count. Bigger than what the AST
+    // permits (16) so hand-built RouteConfigs — tests, future
+    // compile→config helper — have headroom, but small enough that the
+    // dispatch code can materialise a stack-local KV array without
+    // any risk of silent truncation. Must match the buffer size used
+    // by handle_jit_outcome in callbacks_impl.h.
+    static constexpr u32 kMaxHeadersPerSet = 32;
 
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
@@ -94,6 +112,27 @@ struct RouteConfig {
     u32 response_body_count = 0;
     char body_pool[kResponseBodyPoolBytes];
     u32 body_pool_used = 0;
+
+    // Header entries point into header_bytes_pool; the pool is a
+    // bump-allocated char buffer shared by all keys and values. Each
+    // pair-entry lives in header_keys[] / header_values[] with pointers
+    // into the bytes pool; each response's header set is a slice of
+    // those arrays described by HeaderSetRef.
+    struct HeaderEntry {
+        const char* data;
+        u32 len;
+    };
+    struct HeaderSetRef {
+        u16 offset;  // into header_keys / header_values
+        u16 count;
+    };
+    HeaderEntry header_keys[kMaxHeaderPoolEntries];
+    HeaderEntry header_values[kMaxHeaderPoolEntries];
+    u32 header_pool_used = 0;
+    HeaderSetRef response_header_sets[kMaxResponseHeaderSets];
+    u32 response_header_set_count = 0;
+    char header_bytes_pool[kResponseHeaderBytesPoolBytes];
+    u32 header_bytes_pool_used = 0;
 
     // Add a proxy route: path prefix → upstream target.
     // Returns false if table full, upstream_id invalid, or path too long.
@@ -178,6 +217,89 @@ struct RouteConfig {
         body_pool_used += len;
         const u32 idx = response_body_count++;
         response_bodies[idx] = {dst, len};
+        return static_cast<u16>(idx + 1);  // 1-based; 0 reserved
+    }
+
+    // Register a response header set. `keys[i]` / `key_lens[i]` and
+    // `values[i]` / `value_lens[i]` describe the i-th pair (i in
+    // [0, count)). Bytes are copied into header_bytes_pool so callers
+    // don't need to keep the source alive. Returns a 1-based index
+    // (0 reserved as "no custom headers") that JIT handlers encode in
+    // HandlerResult.next_state for ReturnStatus.
+    //
+    // Returns 0 on any of:
+    //   - count == 0 or null pointer tables
+    //   - null data + non-zero len for any pair
+    //   - capacity failure: sets table, (key, value) arrays (per-set
+    //     cap = kMaxHeadersPerSet), or bytes pool
+    //   - validation failure: key fails the HTTP tchar grammar, value
+    //     contains control chars, or key names a reserved framing
+    //     header (Content-Length / Transfer-Encoding / Connection)
+    //   - duplicate: two keys in the set compare equal under ASCII
+    //     case folding (parity with the DSL parser's dup-reject)
+    u16 add_response_header_set(const char* const* keys,
+                                const u32* key_lens,
+                                const char* const* values,
+                                const u32* value_lens,
+                                u32 count) {
+        if (count == 0) return 0;
+        if (keys == nullptr || values == nullptr || key_lens == nullptr || value_lens == nullptr) {
+            return 0;
+        }
+        if (response_header_set_count >= kMaxResponseHeaderSets) return 0;
+        // Per-set cap is enforced here so the dispatch formatter (which
+        // uses a fixed stack buffer sized to kMaxHeadersPerSet) can
+        // never silently drop trailing pairs.
+        if (count > kMaxHeadersPerSet) return 0;
+        // Subtraction-based capacity check on the (key, value) arrays.
+        if (count > kMaxHeaderPoolEntries - header_pool_used) return 0;
+        // Tally total bytes we're about to write; reject if the bytes
+        // pool can't fit them. Also validate each (key, value) pair
+        // via the shared HTTP header validator — parity with the DSL
+        // parser — so manual callers can't accidentally emit malformed
+        // or smuggling-prone responses (CR/LF injection, CL/TE
+        // conflicts, etc.). Doing the scan up front avoids a partial
+        // copy aborting mid-way with half-written state.
+        u32 total_bytes = 0;
+        for (u32 i = 0; i < count; i++) {
+            if ((key_lens[i] > 0 && keys[i] == nullptr) ||
+                (value_lens[i] > 0 && values[i] == nullptr)) {
+                return 0;
+            }
+            if (validate_response_header(keys[i], key_lens[i], values[i], value_lens[i]) !=
+                HttpHeaderValidation::Ok) {
+                return 0;
+            }
+            // Case-insensitive duplicate-key check — parity with the
+            // DSL parser. Two singletons with the same field name
+            // (any case) would make the wire response ambiguous, so
+            // we reject before allocating.
+            for (u32 j = 0; j < i; j++) {
+                if (http_header_name_eq_ci(keys[i], key_lens[i], keys[j], key_lens[j])) {
+                    return 0;
+                }
+            }
+            // Guard each add individually against u32 overflow.
+            if (key_lens[i] > 0xffffffffu - total_bytes) return 0;
+            total_bytes += key_lens[i];
+            if (value_lens[i] > 0xffffffffu - total_bytes) return 0;
+            total_bytes += value_lens[i];
+        }
+        if (total_bytes > kResponseHeaderBytesPoolBytes - header_bytes_pool_used) return 0;
+        const u16 offset = static_cast<u16>(header_pool_used);
+        for (u32 i = 0; i < count; i++) {
+            char* key_dst = header_bytes_pool + header_bytes_pool_used;
+            for (u32 j = 0; j < key_lens[i]; j++) key_dst[j] = keys[i][j];
+            header_bytes_pool_used += key_lens[i];
+            char* val_dst = header_bytes_pool + header_bytes_pool_used;
+            for (u32 j = 0; j < value_lens[i]; j++) val_dst[j] = values[i][j];
+            header_bytes_pool_used += value_lens[i];
+            header_keys[offset + i] = {key_dst, key_lens[i]};
+            header_values[offset + i] = {val_dst, value_lens[i]};
+        }
+        header_pool_used += count;
+        const u32 idx = response_header_set_count++;
+        response_header_sets[idx] = {offset, static_cast<u16>(count)};
         return static_cast<u16>(idx + 1);  // 1-based; 0 reserved
     }
 

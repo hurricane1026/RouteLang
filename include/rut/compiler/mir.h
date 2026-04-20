@@ -173,6 +173,11 @@ enum class MirTerminatorSourceKind : u8 {
     LocalRef,
 };
 
+struct MirHeaderKV {
+    Str key{};
+    Str value{};
+};
+
 struct MirTerminator {
     MirTerminatorKind kind = MirTerminatorKind::ReturnStatus;
     Span span{};
@@ -190,6 +195,11 @@ struct MirTerminator {
     // ReturnStatus terminators. lower_rir maps identical literals to a
     // shared body_idx that codegen packs into HandlerResult.upstream_id.
     Str response_body{};
+    // Optional response headers carried from HIR. Inline-stored.
+    // len == 0 means "no kwarg". lower_rir interns these into the
+    // RIR module's shared header pool.
+    static constexpr u32 kMaxHeaders = 16;
+    FixedVec<MirHeaderKV, kMaxHeaders> response_headers;
 };
 
 struct MirBlock {

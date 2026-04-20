@@ -207,18 +207,21 @@ enum class Opcode : u8 {
     Br,          // br %cond, then_block, else_block
     Jmp,         // jmp target_block
     RetStatus,   // ret.status — two encodings, disambiguated by operand_count:
-                 //   operand_count == 0 (literal form): imm.i32_val holds
-                 //     a packed (status | body_idx<<16):
-                 //       low  16 bits: HTTP status code (0..65535)
-                 //       high 16 bits: 1-based response_bodies index,
-                 //                     0 = no body
+                 //   operand_count == 0 (literal form): imm.i64_val holds
+                 //     a packed (status | body_idx<<16 | headers_idx<<32):
+                 //       bits [ 0:16): HTTP status code (0..65535)
+                 //       bits [16:32): 1-based response_bodies index,
+                 //                     0 = no custom body
+                 //       bits [32:48): 1-based response header_sets index,
+                 //                     0 = no custom headers
+                 //       bits [48:64): reserved (must be 0)
                  //   operand_count >  0 (value form):   operands[0] is an
-                 //     SSA i32 status code; imm is unused and body_idx is
-                 //     implicitly 0 (no custom body today).
+                 //     SSA i32 status code; imm is unused and both
+                 //     body_idx and headers_idx are implicitly 0.
                  //   Printers/decoders MUST branch on operand_count before
-                 //   reading imm.i32_val — doing otherwise will print
-                 //   garbage for the value form and miss body_idx in the
-                 //   literal form.
+                 //   reading imm.i64_val — doing otherwise will print
+                 //   garbage for the value form and miss body/header idx
+                 //   in the literal form.
     RetForward,  // ret.forward upstream [, options]
 
     // ── Yield (I/O suspend → state machine boundary) ──
@@ -250,10 +253,12 @@ struct Instruction {
     // Instruction-specific immediate data (tagged by opcode).
     union Immediate {
         Str str_val;               // ConstStr, ReqHeader, ReqParam, ReqCookie, etc.
-        i32 i32_val;               // ConstI32, ConstStatus; RetStatus packs
-                                   // (status | body_idx<<16) — decode before
-                                   // display (see RetStatus opcode comment).
-        i64 i64_val;               // ConstI64, ConstDuration, ConstByteSize
+        i32 i32_val;               // ConstI32, ConstStatus.
+        i64 i64_val;               // ConstI64, ConstDuration, ConstByteSize;
+                                   // RetStatus literal form packs
+                                   // (status | body_idx<<16 | headers_idx<<32)
+                                   // — decode before display (see RetStatus
+                                   // opcode comment).
         bool bool_val;             // ConstBool
         u8 method_val;             // ConstMethod (HTTP method enum)
         BlockId block_targets[2];  // Br: [then, else]; Jmp: [target, _]
@@ -386,6 +391,25 @@ struct Module {
     static constexpr u32 kMaxResponseBodies = 128;
     Str response_bodies[kMaxResponseBodies];
     u32 response_body_count = 0;
+
+    // Response header sets collected from RetStatus terminators. Shape
+    // is the flat-pool design (decision B2): all (key, value) pairs
+    // across the module live in header_keys[] / header_values[]; each
+    // set is a (offset, count) slice into those arrays. Entries are
+    // deduplicated by full (ordered) pair-sequence equality during
+    // lowering. Indexed 1-based from the handler ABI (0 = no custom
+    // headers), so `headers_idx = i + 1` maps to `header_sets[i]`.
+    struct HeaderSetRef {
+        u16 offset;  // into header_keys / header_values
+        u16 count;
+    };
+    static constexpr u32 kMaxHeaderSets = 128;
+    static constexpr u32 kMaxHeaderPoolEntries = 512;
+    Str header_keys[kMaxHeaderPoolEntries];
+    Str header_values[kMaxHeaderPoolEntries];
+    u32 header_pool_used = 0;
+    HeaderSetRef header_sets[kMaxHeaderSets];
+    u32 header_set_count = 0;
 
     // Arena that owns all IR memory (mmap-backed, compiler use).
     MmapArena* arena;

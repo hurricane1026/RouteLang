@@ -5251,6 +5251,13 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         // analyze stores an explicit zero-length non-null Str when the
         // user wrote `body: ""`; lower_rir de-dupes on content.
         if (stmt.has_response_body) term.response_body = stmt.response_body;
+        // Carry response headers verbatim (parser already rejected
+        // explicit empty dicts and duplicate keys).
+        for (u32 i = 0; i < stmt.response_headers.len; i++) {
+            const auto& p = stmt.response_headers[i];
+            if (!term.response_headers.push({p.key, p.value}))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+        }
         return term;
     }
 

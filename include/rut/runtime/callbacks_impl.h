@@ -35,6 +35,39 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive);
 // back to format_static_response.
 void format_response_with_body(
     Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive);
+
+// Custom-headers variant: emits each `headers[i]` pair (indexed
+// [0, header_count)) before the blank line. If any user-supplied key
+// case-insensitively matches "Content-Type", the default text/plain
+// Content-Type is suppressed so the user's value wins. User-supplied
+// "Content-Length" is skipped — the formatter recomputes it from
+// `body_len` to keep the framing honest. For codes that must have no
+// body (1xx / 204 / 304), headers are still emitted (they can be
+// meaningful on 204/304, e.g. Cache-Control) but the body is omitted
+// per spec. If the precomputed response size won't fit in the
+// connection's send_buf, fails closed with a 500 + Connection: close.
+//
+// `body_is_fallback_reason_phrase` tells the formatter the body bytes
+// are a system-generated status-reason phrase (e.g. "OK" after an
+// invalid body_idx config mismatch), not user content. In that case
+// the default Content-Type is suppressed even when body_len > 0 —
+// matches format_static_response's wire shape so the "fallback"
+// semantic is consistent regardless of whether custom headers were
+// present.
+struct ResponseHeaderKV {
+    const char* key_data;
+    u32 key_len;
+    const char* value_data;
+    u32 value_len;
+};
+void format_response_with_body_and_headers(Connection& conn,
+                                           u16 code,
+                                           const char* body_data,
+                                           u32 body_len,
+                                           const ResponseHeaderKV* headers,
+                                           u32 header_count,
+                                           bool keep_alive,
+                                           bool body_is_fallback_reason_phrase = false);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -320,8 +353,62 @@ void handle_jit_outcome(Loop* loop,
             // status-reason body). Out-of-range indices fall back to
             // the default rather than rendering garbage.
             const RouteConfig* cfg = conn.request_config;
-            if (outcome.response_body_idx != 0 && cfg != nullptr &&
-                outcome.response_body_idx <= cfg->response_body_count) {
+            const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
+                                  outcome.response_body_idx <= cfg->response_body_count;
+            const bool has_headers = outcome.response_headers_idx != 0 && cfg != nullptr &&
+                                     outcome.response_headers_idx <= cfg->response_header_set_count;
+            // Distinguish "user didn't supply a body" (body_idx == 0)
+            // from "user supplied one but it's out of range" (a config
+            // mismatch). The latter falls back to the reason-phrase
+            // default so the response still has a representative body
+            // — matches the no-headers path's documented behavior of
+            // falling back rather than rendering garbage.
+            const bool body_idx_invalid = outcome.response_body_idx != 0 && !has_body;
+            if (has_headers) {
+                // Materialise the header set into a stack-local KV
+                // array so the formatter takes a uniform view.
+                // RouteConfig::kMaxHeadersPerSet is enforced at
+                // add_response_header_set time, so ref.count can
+                // never exceed our buffer size — no silent truncation.
+                const auto& ref = cfg->response_header_sets[outcome.response_headers_idx - 1];
+                ResponseHeaderKV kvs[RouteConfig::kMaxHeadersPerSet];
+                for (u16 i = 0; i < ref.count; i++) {
+                    kvs[i].key_data = cfg->header_keys[ref.offset + i].data;
+                    kvs[i].key_len = cfg->header_keys[ref.offset + i].len;
+                    kvs[i].value_data = cfg->header_values[ref.offset + i].data;
+                    kvs[i].value_len = cfg->header_values[ref.offset + i].len;
+                }
+                const char* body_data = nullptr;
+                u32 body_len = 0;
+                bool body_is_fallback = false;
+                if (has_body) {
+                    const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+                    body_data = body.data;
+                    body_len = body.len;
+                } else if (body_idx_invalid) {
+                    // Out-of-range body_idx + headers present: render
+                    // the default reason-phrase as body so the
+                    // fallback matches the no-headers path's "fall
+                    // back rather than render garbage" rule. Flag it
+                    // so the formatter suppresses the default
+                    // Content-Type (format_static_response doesn't
+                    // advertise one for reason-phrase bodies either).
+                    const char* reason = status_reason(outcome.status_code);
+                    u32 reason_len = 0;
+                    while (reason[reason_len]) reason_len++;
+                    body_data = reason;
+                    body_len = reason_len;
+                    body_is_fallback = true;
+                }
+                format_response_with_body_and_headers(conn,
+                                                      outcome.status_code,
+                                                      body_data,
+                                                      body_len,
+                                                      kvs,
+                                                      ref.count,
+                                                      keep_alive,
+                                                      body_is_fallback);
+            } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 format_response_with_body(
                     conn, outcome.status_code, body.data, body.len, keep_alive);

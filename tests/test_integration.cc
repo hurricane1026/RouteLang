@@ -3421,7 +3421,8 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
 
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    send_all(c, "GET /api HTTP/1.1\r\nHost: x\r\n\r\n", 30);
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
     char buf[1024];
     i32 n = recv_timeout(c, buf, sizeof(buf), 500);
     CHECK_GT(n, 0);
@@ -3430,7 +3431,10 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
         return buf_contains(
             reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
     };
-    CHECK(has("502", 3));
+    // Match the full status line — "502" alone could hit a timestamp,
+    // a header value, or a body byte pattern. Locking in "HTTP/1.1 502"
+    // makes the assertion about the status line specifically.
+    CHECK(has("HTTP/1.1 502", 12));
 
     close(c);
     lt.stop();

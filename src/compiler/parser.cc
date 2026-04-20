@@ -712,7 +712,10 @@ struct Parser {
         if (take(TokenType::KwReturn)) {
             // Three forms:
             //   return <IntLit>                           (legacy)
-            //   return response(<IntLit>[, body: "..."])  (response builder)
+            //   return response(<IntLit>
+            //                   [, body: "..."]
+            //                   [, headers: { "K": "V", ... }])
+            //                                             (response builder)
             //   return forward(<Ident>)                   (forward to upstream)
             // The builder forms are the syntactic entry points for
             // richer responses / proxying. Bare `forward <name>` is

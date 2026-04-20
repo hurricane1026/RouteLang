@@ -1,0 +1,86 @@
+#pragma once
+
+// Bridge header: copy the RIR module's declarative content (upstreams
+// with addresses, response bodies, response header sets) into a
+// RouteConfig so the runtime can serve the compiled handlers.
+//
+// This helper intentionally does NOT register route entries — those
+// require the JitEngine to have compiled and looked up each handler
+// function, which is orthogonal to the declarative content here.
+// Callers typically:
+//   1. jit::codegen(rir.module) → LLVM IR module
+//   2. engine.compile(...); engine.lookup("handler_route_N") for each
+//   3. populate_route_config(cfg, rir.module) for upstreams / bodies /
+//      header sets
+//   4. cfg.add_jit_handler(path, method, fn) per route
+//
+// Returns true on full success. On any partial failure (capacity
+// exceeded, validation rejected) the function stops and returns false;
+// `cfg` may have been partially populated, so callers should discard
+// it rather than try to reuse it.
+
+#include "rut/compiler/rir.h"
+#include "rut/runtime/route_table.h"
+
+namespace rut {
+
+inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
+    // Upstreams: skip entries without an address (those are declared
+    // name-only in the DSL and bound by the runtime via an explicit
+    // add_upstream() from a config file / env / CLI flag). Entries
+    // with an address go straight in.
+    for (u32 i = 0; i < mod.upstream_count; i++) {
+        const auto& up = mod.upstreams[i];
+        if (!up.has_address) continue;
+        // add_upstream's name parameter is a NUL-terminated C string;
+        // rir::Module stores Str (ptr + len) where the bytes may not
+        // be NUL-terminated (arena-allocated slices). Copy into a
+        // small fixed buffer matching UpstreamTarget::kMaxUpstreamNameLen
+        // so the underlying strncpy-equivalent sees a terminator.
+        char name_buf[UpstreamTarget::kMaxUpstreamNameLen];
+        if (up.name.len + 1 > sizeof(name_buf)) return false;  // name too long
+        for (u32 j = 0; j < up.name.len; j++) name_buf[j] = up.name.ptr[j];
+        name_buf[up.name.len] = '\0';
+        auto r = cfg.add_upstream(name_buf, up.ip, up.port);
+        if (!r.has_value()) return false;
+    }
+
+    // Response bodies (1-based index preserved). Empty bodies don't
+    // appear in the module table (lower_rir skips them), so we can
+    // feed the bytes straight through.
+    for (u32 i = 0; i < mod.response_body_count; i++) {
+        const auto& body = mod.response_bodies[i];
+        u16 idx = cfg.add_response_body(body.ptr, body.len);
+        if (idx == 0) return false;
+        // Belt-and-suspenders: the 1-based index must match i+1 so
+        // callers that packed body_idx at compile time still resolve
+        // correctly. add_response_body assigns sequentially, so this
+        // invariant holds iff we start from an empty cfg.
+        if (idx != i + 1) return false;
+    }
+
+    // Response header sets (1-based index preserved). Materialise the
+    // (key, value) pointer tables add_response_header_set expects.
+    for (u32 i = 0; i < mod.header_set_count; i++) {
+        const auto& ref = mod.header_sets[i];
+        const char* keys[RouteConfig::kMaxHeadersPerSet];
+        u32 key_lens[RouteConfig::kMaxHeadersPerSet];
+        const char* vals[RouteConfig::kMaxHeadersPerSet];
+        u32 val_lens[RouteConfig::kMaxHeadersPerSet];
+        if (ref.count > RouteConfig::kMaxHeadersPerSet) return false;
+        for (u16 j = 0; j < ref.count; j++) {
+            const auto& k = mod.header_keys[ref.offset + j];
+            const auto& v = mod.header_values[ref.offset + j];
+            keys[j] = k.ptr;
+            key_lens[j] = k.len;
+            vals[j] = v.ptr;
+            val_lens[j] = v.len;
+        }
+        u16 idx = cfg.add_response_header_set(keys, key_lens, vals, val_lens, ref.count);
+        if (idx == 0) return false;
+        if (idx != i + 1) return false;
+    }
+    return true;
+}
+
+}  // namespace rut

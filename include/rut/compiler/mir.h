@@ -317,6 +317,13 @@ struct MirUpstream {
     Span span{};
     Str name{};
     u16 id = 0;
+    // Address copied from HIR. has_address == false → the runtime
+    // must bind this upstream via add_upstream(); addresses declared
+    // in the DSL live here in host byte order (matching
+    // RouteConfig::add_upstream's expected layout).
+    bool has_address = false;
+    u32 ip = 0;
+    u16 port = 0;
 };
 
 struct MirModule {

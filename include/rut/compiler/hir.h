@@ -18,6 +18,16 @@ struct HirUpstream {
     Span span{};
     Str name{};
     u16 id = 0;
+    // Address declared in the DSL via `upstream X at "..."` or
+    // `upstream X { host: "...", port: N }`. `has_address == false`
+    // means the runtime must bind this upstream via add_upstream();
+    // analyze doesn't force an address on every upstream, to stay
+    // compatible with test configs that register upstreams manually.
+    // ip is in host byte order (RouteConfig::add_upstream expects
+    // the same).
+    bool has_address = false;
+    u32 ip = 0;
+    u16 port = 0;
 };
 struct HirImport {
     Span span{};

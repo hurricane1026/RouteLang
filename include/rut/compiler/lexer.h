@@ -38,6 +38,7 @@ enum class TokenType : u8 {
     KwIn,
     KwReturn,
     KwUpstream,
+    KwAt,
     KwListen,
     KwTls,
     KwDefaults,

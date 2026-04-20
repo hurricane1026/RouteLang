@@ -411,6 +411,21 @@ struct Module {
     HeaderSetRef header_sets[kMaxHeaderSets];
     u32 header_set_count = 0;
 
+    // Upstream declarations carried verbatim from the DSL so a
+    // compile→config helper can translate them into
+    // RouteConfig::add_upstream calls without re-parsing addresses.
+    // has_address == false means the DSL declared the name only; the
+    // runtime must bind it separately. ip is host byte order.
+    struct Upstream {
+        Str name;
+        bool has_address;
+        u32 ip;
+        u16 port;
+    };
+    static constexpr u32 kMaxUpstreams = 32;
+    Upstream upstreams[kMaxUpstreams];
+    u32 upstream_count = 0;
+
     // Arena that owns all IR memory (mmap-backed, compiler use).
     MmapArena* arena;
 };

@@ -7058,6 +7058,36 @@ static FrontendResult<HirModule*> analyze_file_internal(
         import_stack.push_back(normalized_source);
     }
 
+    // Parse an IPv4 dotted-quad into a u32 in host byte order. Returns
+    // false on any malformed input (non-digit, octet > 255, missing
+    // dot, empty octet). `len` is the number of bytes at `s` to
+    // consider (does NOT need to be NUL-terminated).
+    auto parse_ipv4 = [](const char* s, u32 len, u32& out_ip) -> bool {
+        u32 octets[4] = {0, 0, 0, 0};
+        u32 octet_idx = 0;
+        u32 digit_count = 0;
+        u32 cur = 0;
+        for (u32 i = 0; i < len; i++) {
+            const char c = s[i];
+            if (c == '.') {
+                if (digit_count == 0 || octet_idx >= 3) return false;
+                octets[octet_idx++] = cur;
+                cur = 0;
+                digit_count = 0;
+                continue;
+            }
+            if (c < '0' || c > '9') return false;
+            cur = cur * 10 + static_cast<u32>(c - '0');
+            if (cur > 255) return false;
+            digit_count++;
+            if (digit_count > 3) return false;
+        }
+        if (digit_count == 0 || octet_idx != 3) return false;
+        octets[3] = cur;
+        out_ip = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
+        return true;
+    };
+
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Upstream) continue;
@@ -7070,6 +7100,53 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.span = item.upstream.span;
         up.name = item.upstream.name;
         up.id = static_cast<u16>(mod.upstreams.len + 1);
+        // Resolve the parsed address (if any) into concrete (ip, port).
+        // Two AST shapes produce this: `at "host:port"` packs both
+        // into host_lit; dict form separates host_lit and port_lit.
+        if (item.upstream.has_address) {
+            const Str lit = item.upstream.host_lit;
+            Str host_part = lit;
+            u32 port_value = item.upstream.port_lit;
+            if (!item.upstream.port_is_set) {
+                // `at "host:port"` form — split on the LAST colon so a
+                // future IPv6 literal (`[::1]:8080`) can replace this
+                // without refactoring the field layout.
+                u32 colon_idx = 0xffffffffu;
+                for (u32 k = 0; k < lit.len; k++) {
+                    if (lit.ptr[k] == ':') colon_idx = k;
+                }
+                if (colon_idx == 0xffffffffu || colon_idx + 1 == lit.len) {
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, item.upstream.addr_span, lit);
+                }
+                host_part = {lit.ptr, colon_idx};
+                port_value = 0;
+                for (u32 k = colon_idx + 1; k < lit.len; k++) {
+                    const char c = lit.ptr[k];
+                    if (c < '0' || c > '9') {
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, item.upstream.addr_span, lit);
+                    }
+                    port_value = port_value * 10 + static_cast<u32>(c - '0');
+                    if (port_value > 0xffffu) {
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, item.upstream.addr_span, lit);
+                    }
+                }
+            }
+            if (port_value == 0 || port_value > 0xffffu) {
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, lit);
+            }
+            u32 ip = 0;
+            if (!parse_ipv4(host_part.ptr, host_part.len, ip)) {
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, host_part);
+            }
+            up.has_address = true;
+            up.ip = ip;
+            up.port = static_cast<u16>(port_value);
+        }
         if (!mod.upstreams.push(up))
             return frontend_error(FrontendError::TooManyItems, item.upstream.span);
     }

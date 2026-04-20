@@ -296,6 +296,159 @@ TEST(frontend, parse_return_forward_rejects_missing_parens) {
     CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
 }
 
+TEST(frontend, parse_upstream_at_form) {
+    // `upstream NAME at "host:port"` packs both into a single string
+    // that analyze splits at the last colon. Result: HirUpstream has
+    // has_address=true and host-byte-order ip + port.
+    const char* src = "upstream api at \"127.0.0.1:8080\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    const auto& up = ast->items[0].upstream;
+    CHECK(up.has_address);
+    CHECK(up.host_lit.eq(lit("127.0.0.1:8080")));
+    CHECK(!up.port_is_set);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    const auto& u = hir->upstreams[0];
+    CHECK(u.has_address);
+    CHECK_EQ(u.ip, 0x7F000001u);
+    CHECK_EQ(u.port, 8080u);
+}
+
+TEST(frontend, parse_upstream_dict_form) {
+    // Dict form `{ host: "...", port: N }` — same analyze output,
+    // order-independent, both fields required.
+    const char* src_host_first =
+        "upstream api { host: \"10.0.0.1\", port: 9090 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    const char* src_port_first =
+        "upstream api { port: 9090, host: \"10.0.0.1\" }\n"
+        "route GET \"/u\" { return 200 }\n";
+    for (const char* src : {src_host_first, src_port_first}) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->upstreams.len, 1u);
+        const auto& u = hir->upstreams[0];
+        CHECK(u.has_address);
+        CHECK_EQ(u.ip, 0x0A000001u);
+        CHECK_EQ(u.port, 9090u);
+    }
+}
+
+TEST(frontend, parse_upstream_no_address_still_works) {
+    // Backwards-compat: `upstream NAME` (no address) stays legal.
+    // HirUpstream.has_address == false means the runtime must bind
+    // this upstream via add_upstream() itself.
+    const char* src = "upstream api\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    CHECK(!hir->upstreams[0].has_address);
+}
+
+TEST(frontend, parse_upstream_rejects_malformed_ip) {
+    // IPv4 dotted-quad with an out-of-range octet → analyze rejects.
+    const char* src = "upstream api at \"256.0.0.1:8080\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_upstream_rejects_hostname) {
+    // DNS names aren't supported yet — only IPv4 dotted-quad literals.
+    const char* src = "upstream api at \"example.com:8080\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_upstream_rejects_missing_port) {
+    // `at "127.0.0.1"` without `:port` is rejected at analyze.
+    const char* src = "upstream api at \"127.0.0.1\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_upstream_rejects_port_zero_and_overflow) {
+    // Port must be 1..65535 — 0 is reserved, and anything > 65535 is
+    // rejected at parse time (IntLit overflow) or at analyze.
+    for (const char* src : {
+             "upstream api at \"127.0.0.1:0\"\nroute GET \"/u\" { return 200 }\n",
+             "upstream api at \"127.0.0.1:65536\"\nroute GET \"/u\" { return 200 }\n",
+         }) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, parse_upstream_dict_rejects_missing_field) {
+    // Both host and port are required in dict form.
+    for (const char* src : {
+             "upstream api { host: \"127.0.0.1\" }\nroute GET \"/u\" { return 200 }\n",
+             "upstream api { port: 8080 }\nroute GET \"/u\" { return 200 }\n",
+             "upstream api {}\nroute GET \"/u\" { return 200 }\n",
+         }) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(!ast);
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, parse_upstream_dict_rejects_duplicate_field) {
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", host: \"10.0.0.1\", port: 80 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_upstream_dict_rejects_unknown_field) {
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", port: 80, weight: 3 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("weight")));
+}
+
 TEST(frontend, parse_return_response_with_headers) {
     // Headers dict carries through parser → HIR → MIR → RIR:
     // intern_response_headers writes one set into rir::Module's flat

@@ -7,6 +7,7 @@
 #include "rut/compiler/parser.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/shard.h"
@@ -3446,6 +3447,101 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
     // a header value, or a body byte pattern. Locking in "HTTP/1.1 502"
     // makes the assertion about the status line specifically.
     CHECK(has("HTTP/1.1 502", 12));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// End-to-end: compile DSL with an address-carrying `upstream` decl and
+// let populate_route_config bind the RouteConfig. Since no real backend
+// is listening on the compiled port, the forward will ECONNREFUSED and
+// the client will get 502 — which proves:
+//   1. `upstream X at "127.0.0.1:NNN"` parses + validates + lowers.
+//   2. populate_route_config called add_upstream with the compiled
+//      (ip, port) — otherwise the runtime would have had no upstream
+//      entry and returned some other error.
+TEST(route, populate_route_config_binds_upstream_from_dsl) {
+    using namespace rut;
+
+    const char* src =
+        "upstream backend at \"127.0.0.1:9999\"\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    // RIR module carries the declared upstream with its address.
+    REQUIRE_EQ(rir.module.upstream_count, 1u);
+    CHECK(rir.module.upstreams[0].has_address);
+    CHECK_EQ(rir.module.upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(rir.module.upstreams[0].port, 9999u);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    // The helper walks mod.upstreams / response_bodies / header_sets
+    // and calls the corresponding cfg.add_* methods. For this test
+    // only the upstream gets populated; routes still need to be
+    // registered explicitly (they depend on the JIT-compiled fn).
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK_EQ(cfg.upstream_count, 1u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[1024];
+    i32 total = 0;
+    while (total < static_cast<i32>(sizeof(buf))) {
+        i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
+        if (n <= 0) break;
+        total += n;
+        if (buf_contains(buf, static_cast<u32>(total), "\r\n", 2)) break;
+    }
+    CHECK_GT(total, 0);
+    const Str response{buf, static_cast<u32>(total)};
+    // The connect to 127.0.0.1:9999 fails (nothing listening) → 502.
+    // If populate_route_config had NOT populated the upstream, the
+    // runtime's upstream_id lookup would have failed earlier and the
+    // error shape would differ (still 502 today, but the branch is
+    // different). We rely on upstream_count == 1 above as the
+    // strong evidence that the DSL-compiled address reached cfg.
+    CHECK(buf_contains(
+        reinterpret_cast<const char*>(response.ptr), response.len, "HTTP/1.1 502", 12));
 
     close(c);
     lt.stop();

@@ -2466,6 +2466,21 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     rir::Builder b;
     b.init(&out.module);
 
+    // Carry upstream declarations (name + optional address) verbatim
+    // into the RIR module so a compile→config helper can translate
+    // them into RouteConfig::add_upstream calls without re-parsing.
+    if (mir.upstreams.len > rir::Module::kMaxUpstreams) {
+        return frontend_error(FrontendError::TooManyItems,
+                              mir.upstreams.len > 0 ? mir.upstreams[0].span : Span{});
+    }
+    for (u32 i = 0; i < mir.upstreams.len; i++) {
+        out.module.upstreams[i].name = mir.upstreams[i].name;
+        out.module.upstreams[i].has_address = mir.upstreams[i].has_address;
+        out.module.upstreams[i].ip = mir.upstreams[i].ip;
+        out.module.upstreams[i].port = mir.upstreams[i].port;
+    }
+    out.module.upstream_count = mir.upstreams.len;
+
     VariantLoweringInfo variant_infos[MirModule::kMaxVariants]{};
     TupleLoweringInfo tuple_infos[64]{};
     u32 tuple_info_count = 0;

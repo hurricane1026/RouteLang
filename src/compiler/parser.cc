@@ -1027,9 +1027,82 @@ struct Parser {
         if (!name) return core::make_unexpected(name.error());
         AstItem item{};
         item.kind = AstItemKind::Upstream;
-        item.span = Span{kw.value()->start, name.value()->end, kw.value()->line, kw.value()->col};
-        item.upstream.span = item.span;
         item.upstream.name = name.value()->text;
+        u32 end_off = name.value()->end;
+        // Optional address after the name. Two forms:
+        //   `at "<host>:<port>"`          — single string literal
+        //   `{ host: "...", port: N }`    — dict form; order-independent,
+        //                                    both fields required
+        if (take(TokenType::KwAt)) {
+            auto lit = expect(TokenType::StringLit);
+            if (!lit) return core::make_unexpected(lit.error());
+            item.upstream.has_address = true;
+            item.upstream.host_lit = lit.value()->text;
+            item.upstream.addr_span = span_from(*lit.value());
+            // port_is_set stays false — analyze splits host_lit into
+            // (ip, port) for the `at "..."` form.
+            end_off = lit.value()->end;
+        } else if (take(TokenType::LBrace)) {
+            item.upstream.has_address = true;
+            item.upstream.addr_span =
+                Span{name.value()->end, name.value()->end, name.value()->line, name.value()->col};
+            bool seen_host = false;
+            bool seen_port = false;
+            // Empty dict (`upstream foo {}`) is a parse error — omit
+            // the braces entirely if no address is being declared.
+            if (cur().type == TokenType::RBrace) {
+                return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()));
+            }
+            while (true) {
+                auto field = expect(TokenType::Ident);
+                if (!field) return core::make_unexpected(field.error());
+                const Str field_name = field.value()->text;
+                auto colon = expect(TokenType::Colon);
+                if (!colon) return core::make_unexpected(colon.error());
+                if (field_name.eq({"host", 4})) {
+                    if (seen_host)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    auto lit = expect(TokenType::StringLit);
+                    if (!lit) return core::make_unexpected(lit.error());
+                    item.upstream.host_lit = lit.value()->text;
+                    seen_host = true;
+                } else if (field_name.eq({"port", 4})) {
+                    if (seen_port)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    auto lit = expect(TokenType::IntLit);
+                    if (!lit) return core::make_unexpected(lit.error());
+                    // Parse digits into u32; analyze range-checks to
+                    // 1..65535 with a friendlier diagnostic.
+                    u64 v = 0;
+                    for (u32 i = 0; i < lit.value()->text.len; i++) {
+                        v = v * 10 + static_cast<u64>(lit.value()->text.ptr[i] - '0');
+                        if (v > 0xffffffffu) {
+                            return frontend_error(FrontendError::InvalidInteger,
+                                                  span_from(*lit.value()),
+                                                  lit.value()->text);
+                        }
+                    }
+                    item.upstream.port_lit = static_cast<u32>(v);
+                    item.upstream.port_is_set = true;
+                    seen_port = true;
+                } else {
+                    return frontend_error(
+                        FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                }
+                if (!take(TokenType::Comma)) break;
+                if (cur().type == TokenType::RBrace) break;  // trailing comma
+            }
+            auto rbrace = expect(TokenType::RBrace);
+            if (!rbrace) return core::make_unexpected(rbrace.error());
+            if (!seen_host || !seen_port) {
+                return frontend_error(FrontendError::UnsupportedSyntax, span_from(*rbrace.value()));
+            }
+            end_off = rbrace.value()->end;
+        }
+        item.span = Span{kw.value()->start, end_off, kw.value()->line, kw.value()->col};
+        item.upstream.span = item.span;
         return item;
     }
 

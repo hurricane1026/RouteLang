@@ -137,6 +137,22 @@ struct AstStatement {
 struct AstUpstreamDecl {
     Span span{};
     Str name{};
+    // Optional backend address. Two syntactic forms produce the same
+    // fields, distinguished only by what the parser saw after the name:
+    //   A. `upstream backend at "127.0.0.1:8080"`
+    //      → host_lit = "127.0.0.1:8080", port_is_set = false.
+    //   C. `upstream backend { host: "127.0.0.1", port: 8080 }`
+    //      → host_lit = "127.0.0.1", port_lit = 8080, port_is_set = true.
+    // Analyze parses host_lit + port_lit into (ip u32, port u16) and
+    // stores the result on HirUpstream. has_address == false means no
+    // address was declared in the DSL (runtime must supply one via
+    // add_upstream()). Both forms require an IPv4 literal today;
+    // DNS/IPv6 are future work.
+    bool has_address = false;
+    Str host_lit{};    // raw string from `at "..."` or `host: "..."`
+    Span addr_span{};  // points at the address site for diagnostics
+    bool port_is_set = false;
+    u32 port_lit = 0;  // u32 to fit any parsed IntLit before range check
 };
 
 struct AstFunctionDecl {

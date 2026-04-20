@@ -3363,6 +3363,99 @@ TEST(route, dsl_response_headers_only_real_socket) {
     rir.destroy();
 }
 
+// End-to-end DSL forward: compile `upstream backend route GET "/api"
+// { return forward(backend) }`, register the upstream in RouteConfig
+// pointing at 127.0.0.1:9999 (nothing listening → ECONNREFUSED),
+// and assert the client sees a 502. This proves the full compile
+// pipeline wired `return forward(<ident>)` through HIR/MIR/RIR/codegen
+// into HandlerAction::Forward, and the runtime dispatched it onto the
+// proxy connect path (mirrors forward_jit_handler_enters_proxy_state
+// but starts from DSL source instead of a hand-written handler).
+TEST(route, dsl_return_forward_enters_proxy_state) {
+    using namespace rut;
+
+    const char* src = "upstream backend\nroute GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    // Register the upstream at index 0 so it matches the DSL's
+    // compile-time upstream_index. 9999 has nothing listening; the
+    // connect will ECONNREFUSED and the proxy path will 502. The
+    // assertion we care about is "502 came back", which proves the
+    // DSL-compiled handler really returned Forward rather than
+    // accidentally falling through to 200 or 500.
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9999).has_value());
+    REQUIRE(cfg.add_jit_handler("/api", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    // Read until the status line is complete. Loopback typically
+    // returns everything in one recv, but TCP is free to fragment,
+    // so loop until we see the "\r\n" that terminates the status
+    // line (or the buffer fills / timeout). That makes the
+    // "HTTP/1.1 502" assertion below robust against split-recv.
+    char buf[1024];
+    i32 total = 0;
+    while (total < static_cast<i32>(sizeof(buf))) {
+        i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
+        if (n <= 0) break;
+        total += n;
+        if (buf_contains(buf, static_cast<u32>(total), "\r\n", 2)) break;
+    }
+    CHECK_GT(total, 0);
+    const Str response{buf, static_cast<u32>(total)};
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
+    };
+    // Match the full status line — "502" alone could hit a timestamp,
+    // a header value, or a body byte pattern. Locking in "HTTP/1.1 502"
+    // makes the assertion about the status line specifically.
+    CHECK(has("HTTP/1.1 502", 12));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

@@ -710,14 +710,18 @@ struct Parser {
             return stmt;
         }
         if (take(TokenType::KwReturn)) {
-            // Two forms:
-            //   return <IntLit>                          (legacy)
-            //   return response(<IntLit>[, body: "..."]) (response builder)
-            // The builder form is the syntactic entry point for richer
-            // responses (body / headers / content-type). Today only
-            // response(<IntLit>) is semantically identical to `return
-            // <IntLit>`; analyze rejects the `body:` kwarg until the
-            // runtime body-render path lands.
+            // Three forms:
+            //   return <IntLit>                           (legacy)
+            //   return response(<IntLit>
+            //                   [, body: "..."]
+            //                   [, headers: { "K": "V", ... }])
+            //                                             (response builder)
+            //   return forward(<Ident>)                   (forward to upstream)
+            // The builder forms are the syntactic entry points for
+            // richer responses / proxying. Bare `forward <name>` is
+            // intentionally not accepted — the only way to hand off
+            // to an upstream is via `return forward(name)` so the
+            // control-flow terminator is always explicit.
             AstStatement stmt{};
             stmt.kind = AstStmtKind::ReturnStatus;
 
@@ -735,9 +739,27 @@ struct Parser {
                 return value;
             };
 
-            // Peek for the builder form. We recognise `response` by the
-            // literal identifier text; no dedicated keyword yet because
-            // `response` is also a valid identifier in other contexts.
+            // Peek for the forward builder. `forward` is a keyword, so
+            // `return forward(<name>)` is unambiguous. Analyze later
+            // resolves the ident to an upstream_index; the RIR layer
+            // already has RetForward wired, so we just populate the
+            // AstStatement here with ForwardUpstream kind + name.
+            if (take(TokenType::KwForward)) {
+                auto lparen = expect(TokenType::LParen);
+                if (!lparen) return core::make_unexpected(lparen.error());
+                auto name = expect(TokenType::Ident);
+                if (!name) return core::make_unexpected(name.error());
+                auto rparen = expect(TokenType::RParen);
+                if (!rparen) return core::make_unexpected(rparen.error());
+                stmt.kind = AstStmtKind::ForwardUpstream;
+                stmt.name = name.value()->text;
+                stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
+                return stmt;
+            }
+
+            // Peek for the response builder. We recognise `response`
+            // by the literal identifier text; no dedicated keyword yet
+            // because `response` is also a valid identifier elsewhere.
             const Token& peek = cur();
             const bool is_builder = peek.type == TokenType::Ident && peek.text.eq({"response", 8});
             if (is_builder) {
@@ -990,15 +1012,9 @@ struct Parser {
             stmt.span = Span{start.start, rbrace.value()->end, start.line, start.col};
             return stmt;
         }
-        if (take(TokenType::KwForward)) {
-            auto name = expect(TokenType::Ident);
-            if (!name) return core::make_unexpected(name.error());
-            AstStatement stmt{};
-            stmt.kind = AstStmtKind::ForwardUpstream;
-            stmt.name = name.value()->text;
-            stmt.span = Span{start.start, name.value()->end, start.line, start.col};
-            return stmt;
-        }
+        // Bare `forward <name>` is no longer accepted — use
+        // `return forward(<name>)` instead so the terminator is
+        // explicit and consistent with `return response(...)`.
         if (cur().type == TokenType::Eof)
             return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
         return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);

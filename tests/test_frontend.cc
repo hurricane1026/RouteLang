@@ -247,6 +247,55 @@ TEST(frontend, parse_return_response_rejects_unknown_kwarg) {
     CHECK(ast.error().detail.eq(lit("header")));
 }
 
+TEST(frontend, parse_return_forward_name) {
+    // `return forward(<ident>)` is the only accepted spelling —
+    // analyze resolves the ident to an upstream_index, HIR stores it
+    // on the ForwardUpstream terminator, and RIR lowers to RetForward
+    // with that index as the operand. Runtime dispatch is covered by
+    // integration tests; here we just verify the compile-side path.
+    const char* src = "upstream api\nroute GET \"/users\" { return forward(api) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    // Route has a single ForwardUpstream statement naming "api".
+    const auto& route = ast->items[1].route;
+    REQUIRE_EQ(route.statements.len, 1u);
+    const auto& stmt = route.statements[0];
+    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::ForwardUpstream));
+    CHECK(stmt.name.eq(lit("api")));
+    // HIR resolves the name to upstream_index 0.
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK_EQ(static_cast<u8>(term.kind), static_cast<u8>(HirTerminatorKind::ForwardUpstream));
+    CHECK_EQ(term.upstream_index, 0u);
+}
+
+TEST(frontend, parse_return_forward_rejects_bare_forward_statement) {
+    // Bare `forward <name>` is no longer accepted — the keyword only
+    // parses as part of the `return forward(<name>)` builder. Keep a
+    // dedicated reject test so a future re-introduction surfaces here.
+    const char* src = "upstream api\nroute GET \"/users\" { forward api }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_return_forward_rejects_missing_parens) {
+    // `return forward api` without parens is rejected.
+    const char* src = "upstream api\nroute GET \"/users\" { return forward api }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
 TEST(frontend, parse_return_response_with_headers) {
     // Headers dict carries through parser → HIR → MIR → RIR:
     // intern_response_headers writes one set into rir::Module's flat
@@ -6175,7 +6224,7 @@ TEST(frontend, known_named_error_match_selects_error_case) {
 }
 TEST(frontend, if_const_selects_then_without_checking_else) {
     const char* src =
-        "route GET \"/users\" { if const true { return 200 } else { forward missing } }\n";
+        "route GET \"/users\" { if const true { return 200 } else { return forward(missing) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6203,7 +6252,7 @@ TEST(frontend, match_const_selects_variant_case_without_checking_other_arms) {
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/users\" { let state = Result.ok(200) match const state { case .ok(x): if x "
-        "== 200 { return 200 } else { return 500 } case .err: forward missing } }\n";
+        "== 200 { return 200 } else { return 500 } case .err: return forward(missing) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6354,7 +6403,7 @@ TEST(frontend, analyze_rejects_duplicate_variant_match_case) {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, lower_forward_route_to_rir) {
-    const char* src = "upstream api\nroute GET \"/users\" { forward api }\n";
+    const char* src = "upstream api\nroute GET \"/users\" { return forward(api) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6387,7 +6436,8 @@ TEST(frontend, lower_forward_route_to_rir) {
 TEST(frontend, let_if_lowers_to_branching_rir) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let ok = true if ok { return 200 } else { forward api } }\n";
+        "route GET \"/users\" { let ok = true if ok { return 200 } else { return forward(api) } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6456,7 +6506,8 @@ TEST(frontend, route_if_branch_block_with_guard_is_supported) {
 TEST(frontend, guard_lowers_to_fail_and_continue_blocks) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let failed = error(7) guard failed else { return 401 } forward api "
+        "route GET \"/users\" { let failed = error(7) guard failed else { return 401 } return "
+        "forward(api) "
         "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -6556,7 +6607,8 @@ TEST(frontend, guard_let_does_not_unwrap_nil) {
 TEST(frontend, equality_expression_lowers_to_cmp_eq) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let code = 200 if code == 200 { forward api } else { return 404 } "
+        "route GET \"/users\" { let code = 200 if code == 200 { return forward(api) } else { "
+        "return 404 } "
         "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -6748,7 +6800,7 @@ TEST(frontend, or_builtin_falls_back_from_error_alias) {
     CHECK_EQ(hir->routes[0].locals[2].init.int_value, 200);
 }
 TEST(frontend, analyze_rejects_unknown_upstream) {
-    const char* src = "route GET \"/users\" { forward api }\n";
+    const char* src = "route GET \"/users\" { return forward(api) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6760,7 +6812,8 @@ TEST(frontend, analyze_rejects_unknown_upstream) {
 TEST(frontend, match_lowers_to_cmp_eq_chain) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let code = 200 match code { case 200: forward api case _: return "
+        "route GET \"/users\" { let code = 200 match code { case 200: return forward(api) case _: "
+        "return "
         "404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -6794,7 +6847,7 @@ TEST(frontend, guard_then_match_lowers_to_guard_and_match_blocks) {
     const char* src =
         "upstream api\n"
         "route GET \"/users\" { let failed = error(7) let code = 200 guard code else { return 401 "
-        "} match code { case 200: forward api case _: return 404 } }\n";
+        "} match code { case 200: return forward(api) case _: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6938,7 +6991,7 @@ TEST(frontend, guard_lowers_from_error_alias) {
     const char* src =
         "upstream api\n"
         "route GET \"/users\" { let failed = error(7) let alias = failed guard alias else { return "
-        "401 } forward api }\n";
+        "401 } return forward(api) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());

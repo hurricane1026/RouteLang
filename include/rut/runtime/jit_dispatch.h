@@ -43,13 +43,17 @@ struct JitDispatchOutcome {
     //
     // Meaning of body_idx == 0 depends on response_headers_idx:
     //   body_idx == 0, headers_idx == 0: "no custom body" → dispatch
-    //       falls back to format_static_response, emitting the default
-    //       status reason-phrase as body.
+    //       falls back to format_static_response. For status codes
+    //       that allow a body, that emits the reason-phrase as body;
+    //       for codes that must have no body (1xx / 204 / 304) the
+    //       formatter correctly emits Content-Length: 0 and no body
+    //       bytes.
     //   body_idx == 0, headers_idx != 0: "headers-only response" (the
     //       user wrote `response(301, headers: {...})`) → empty body,
     //       Content-Length: 0, custom headers emitted on the wire.
     //   body_idx > 0 but out-of-range: config mismatch; dispatch falls
-    //       back to the reason-phrase body — preserved in both the
+    //       back to the reason-phrase body (subject to the same
+    //       no-body-code rule above). Preserved in both the
     //       no-headers and headers paths.
     u16 response_body_idx = 0;
     // 1-based index into RouteConfig::response_header_sets for

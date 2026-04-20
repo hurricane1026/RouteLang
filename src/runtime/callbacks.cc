@@ -463,7 +463,8 @@ void format_response_with_body_and_headers(Connection& conn,
                                            u32 body_len,
                                            const ResponseHeaderKV* headers,
                                            u32 header_count,
-                                           bool keep_alive) {
+                                           bool keep_alive,
+                                           bool body_is_fallback_reason_phrase) {
     const bool kNoBody = (code < 200 || code == 204 || code == 304);
     const u32 body_len_emit = kNoBody ? 0 : body_len;
     const char* reason = status_reason(code);
@@ -481,6 +482,13 @@ void format_response_with_body_and_headers(Connection& conn,
             break;
         }
     }
+    // Skip the default Content-Type when the body is a system-
+    // generated reason phrase (fallback path). The bytes aren't
+    // user content — format_static_response would have emitted no
+    // Content-Type at all here, so suppressing it keeps the fallback
+    // wire shape consistent regardless of whether headers are present.
+    const bool emit_default_content_type =
+        !user_has_content_type && body_len_emit > 0 && !body_is_fallback_reason_phrase;
 
     // Precompute the exact number of bytes we're about to write.
     // Buffer::write() silently truncates on capacity — if we ran past
@@ -499,7 +507,7 @@ void format_response_with_body_and_headers(Connection& conn,
     constexpr u32 kConnCloseLine = 19;      // "Connection: close\r\n"
     u64 needed = kStatusLineFixed + reason_len + kContentLengthPrefix +
                  decimal_digit_count(body_len_emit) + 2;
-    if (!user_has_content_type && body_len_emit > 0) needed += kDefaultContentTypeLine;
+    if (emit_default_content_type) needed += kDefaultContentTypeLine;
     for (u32 i = 0; i < header_count; i++) {
         if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
             continue;
@@ -542,7 +550,7 @@ void format_response_with_body_and_headers(Connection& conn,
     // we're actually going to send a body. No-body responses (1xx /
     // 204 / 304 and redirect-style header-only responses) shouldn't
     // advertise a Content-Type — matches format_static_response.
-    if (!user_has_content_type && body_len_emit > 0) {
+    if (emit_default_content_type) {
         static const char kDefaultContentType[] = "Content-Type: text/plain; charset=utf-8\r\n";
         conn.send_buf.write(reinterpret_cast<const u8*>(kDefaultContentType),
                             sizeof(kDefaultContentType) - 1);

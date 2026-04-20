@@ -46,6 +46,14 @@ void format_response_with_body(
 // meaningful on 204/304, e.g. Cache-Control) but the body is omitted
 // per spec. If the precomputed response size won't fit in the
 // connection's send_buf, fails closed with a 500 + Connection: close.
+//
+// `body_is_fallback_reason_phrase` tells the formatter the body bytes
+// are a system-generated status-reason phrase (e.g. "OK" after an
+// invalid body_idx config mismatch), not user content. In that case
+// the default Content-Type is suppressed even when body_len > 0 —
+// matches format_static_response's wire shape so the "fallback"
+// semantic is consistent regardless of whether custom headers were
+// present.
 struct ResponseHeaderKV {
     const char* key_data;
     u32 key_len;
@@ -58,7 +66,8 @@ void format_response_with_body_and_headers(Connection& conn,
                                            u32 body_len,
                                            const ResponseHeaderKV* headers,
                                            u32 header_count,
-                                           bool keep_alive);
+                                           bool keep_alive,
+                                           bool body_is_fallback_reason_phrase = false);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -371,6 +380,7 @@ void handle_jit_outcome(Loop* loop,
                 }
                 const char* body_data = nullptr;
                 u32 body_len = 0;
+                bool body_is_fallback = false;
                 if (has_body) {
                     const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                     body_data = body.data;
@@ -378,16 +388,26 @@ void handle_jit_outcome(Loop* loop,
                 } else if (body_idx_invalid) {
                     // Out-of-range body_idx + headers present: render
                     // the default reason-phrase as body so the
-                    // fallback matches the no-headers path's
-                    // "fall back rather than render garbage" rule.
+                    // fallback matches the no-headers path's "fall
+                    // back rather than render garbage" rule. Flag it
+                    // so the formatter suppresses the default
+                    // Content-Type (format_static_response doesn't
+                    // advertise one for reason-phrase bodies either).
                     const char* reason = status_reason(outcome.status_code);
                     u32 reason_len = 0;
                     while (reason[reason_len]) reason_len++;
                     body_data = reason;
                     body_len = reason_len;
+                    body_is_fallback = true;
                 }
-                format_response_with_body_and_headers(
-                    conn, outcome.status_code, body_data, body_len, kvs, ref.count, keep_alive);
+                format_response_with_body_and_headers(conn,
+                                                      outcome.status_code,
+                                                      body_data,
+                                                      body_len,
+                                                      kvs,
+                                                      ref.count,
+                                                      keep_alive,
+                                                      body_is_fallback);
             } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 format_response_with_body(

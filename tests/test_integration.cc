@@ -2792,6 +2792,11 @@ TEST(route, jit_handler_unknown_body_idx_with_headers_falls_back) {
     CHECK(has("\r\n\r\nOK", 6));
     // Custom header still emitted alongside the fallback body.
     CHECK(has("X-Service: auth\r\n", 17));
+    // Fallback-reason-phrase body must NOT carry the default
+    // Content-Type — matches format_static_response's wire shape so
+    // the two fallback paths (with / without headers) are
+    // byte-compatible modulo the extra user headers.
+    CHECK(!has("Content-Type:", 13));
 
     close(c);
     lt.stop();

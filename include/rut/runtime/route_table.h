@@ -227,9 +227,16 @@ struct RouteConfig {
     // (0 reserved as "no custom headers") that JIT handlers encode in
     // HandlerResult.next_state for ReturnStatus.
     //
-    // Returns 0 on any capacity failure (sets table, key/value array,
-    // or bytes pool) or if arguments are nonsensical (count > 0 with
-    // null pointer table, or null data + non-zero len for a pair).
+    // Returns 0 on any of:
+    //   - count == 0 or null pointer tables
+    //   - null data + non-zero len for any pair
+    //   - capacity failure: sets table, (key, value) arrays (per-set
+    //     cap = kMaxHeadersPerSet), or bytes pool
+    //   - validation failure: key fails the HTTP tchar grammar, value
+    //     contains control chars, or key names a reserved framing
+    //     header (Content-Length / Transfer-Encoding / Connection)
+    //   - duplicate: two keys in the set compare equal under ASCII
+    //     case folding (parity with the DSL parser's dup-reject)
     u16 add_response_header_set(const char* const* keys,
                                 const u32* key_lens,
                                 const char* const* values,

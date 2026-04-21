@@ -48,10 +48,6 @@ enum class AstExprKind : u8 {
     MethodCall,
     Field,
     ReqHeader,
-    // Leaf for the magic `req` identifier. Followed by `.X` → Field
-    // access (e.g. req.method) or `.header("X")` → ReqHeader (the
-    // existing special form). Field-name resolution happens in analyze.
-    ReqObject,
     // HTTP method literal as expression. The concrete method (GET,
     // POST, …) is encoded in int_val using the HttpMethod enum
     // values from rut/runtime/http_parser.h. Lets `POST` etc. appear

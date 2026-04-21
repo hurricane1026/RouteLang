@@ -108,8 +108,8 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.variant_index = variant_index;
     shape.struct_index = struct_index;
     shape.tuple_len = tuple_len;
-    shape.is_concrete =
-        type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::Str;
+    shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
+                        type == HirTypeKind::Str || type == HirTypeKind::Method;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Tuple) {
@@ -295,6 +295,7 @@ static bool hir_type_shape_satisfies_eq_constraint(const HirModule& mod,
         case HirTypeKind::Bool:
         case HirTypeKind::I32:
         case HirTypeKind::Str:
+        case HirTypeKind::Method:
             return true;
         case HirTypeKind::Tuple:
             for (u32 i = 0; i < tuple_len; i++) {
@@ -4025,21 +4026,36 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
     if (expr.kind == AstExprKind::MethodCall) {
         return analyze_method_call_expr(expr, route, mod, locals, local_count, binding);
     }
-    // Intercept `req.X` before the generic struct/variant/namespace
-    // Field handler below: the lhs is our magic ReqObject leaf, not a
-    // real value the general analyzer knows how to type-check.
+    // `req.X` is magic only when the name `req` isn't shadowed by a
+    // local in scope. A user who writes `let req = Foo(...); req.id`
+    // still gets normal struct-field access on their local. Otherwise
+    // the request object is not a first-class value, so we intercept
+    // before the generic Field handler (which would try to analyze
+    // `req` as an expression and fail for the unshadowed case).
     if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
-        expr.lhs->kind == AstExprKind::ReqObject) {
-        // Known fields: method (HttpMethod). Future fields (path, …)
-        // add branches here. `header` isn't reached via this path —
-        // the parser captures `req.header("...")` as the dedicated
-        // ReqHeader special form before generic Field parsing runs.
-        if (expr.name.eq({"method", 6})) {
-            out.kind = HirExprKind::ReqMethod;
-            out.type = HirTypeKind::Method;
-            return out;
+        expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq({"req", 3})) {
+        bool shadowed = false;
+        for (u32 i = 0; i < local_count; i++) {
+            if (locals[i].name.eq({"req", 3})) {
+                shadowed = true;
+                break;
+            }
         }
-        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        if (!shadowed) {
+            // Known fields: method (HttpMethod). Future fields (path,
+            // …) add branches here. `header` isn't reached via this
+            // path — the parser captures `req.header("...")` as the
+            // dedicated ReqHeader special form before generic Field
+            // parsing runs.
+            if (expr.name.eq({"method", 6})) {
+                out.kind = HirExprKind::ReqMethod;
+                out.type = HirTypeKind::Method;
+                return out;
+            }
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        }
+        // Shadowed — fall through to the generic Field path so the
+        // user's local `req` resolves normally.
     }
     if (expr.kind == AstExprKind::Field) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -4376,13 +4392,6 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
         out.type = HirTypeKind::Method;
         out.int_value = expr.int_value;
         return out;
-    }
-    // A bare `req` (not followed by `.`) parsed as ReqObject is a
-    // standalone identifier use — analyze rejects it because the
-    // request object isn't a first-class value today. The `req.X`
-    // Field form is handled earlier, before the generic Field path.
-    if (expr.kind == AstExprKind::ReqObject) {
-        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     }
     if (expr.kind == AstExprKind::Nil) {
         out.kind = HirExprKind::Nil;

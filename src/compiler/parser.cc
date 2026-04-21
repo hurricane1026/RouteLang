@@ -320,19 +320,6 @@ struct Parser {
             expr.span = Span{start_tok.start, rparen.value()->end, start_tok.line, start_tok.col};
             return expr;
         }
-        // `req` as a leaf — only when followed by `.`, otherwise treat
-        // as a normal identifier so users can still bind a local
-        // called `req`. The trailer machinery in parse_primary_expr
-        // will turn `req.X` into Field{lhs=ReqObject, name="X"};
-        // analyze maps the specific field names to request opcodes.
-        if (cur().type == TokenType::Ident && cur().text.eq({"req", 3}) &&
-            peek().type == TokenType::Dot) {
-            const Token tok = cur();
-            pos++;
-            expr.kind = AstExprKind::ReqObject;
-            expr.span = span_from(tok);
-            return expr;
-        }
         // HTTP method literals as expressions (POST, GET, …). The
         // lexer already tokenizes these as KwGet/KwPost/etc.; until
         // now they were only consumed in route declarations. Map each

@@ -593,6 +593,9 @@ TEST(frontend, parse_method_keyword_as_expression) {
     // POST / GET / PUT / DELETE / HEAD / OPTIONS / PATCH each need
     // to parse as standalone expressions with distinct HttpMethod
     // enum values (matching runtime/http_parser.h: GET=0, POST=1, ...).
+    // Asserts the rhs of `req.method == <KW>` is HIR ConstMethod
+    // with the matching enum value so a broken keyword→int mapping
+    // in the parser would fail here, not silently at runtime.
     struct Case {
         const char* src;
         i32 expected_value;
@@ -613,6 +616,17 @@ TEST(frontend, parse_method_keyword_as_expression) {
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE(hir);
+        REQUIRE_EQ(hir->routes.len, 1u);
+        REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+        const auto& cond = hir->routes[0].guards[0].cond;
+        REQUIRE_EQ(static_cast<u8>(cond.kind), static_cast<u8>(HirExprKind::Eq));
+        REQUIRE(cond.rhs != nullptr);
+        REQUIRE_EQ(static_cast<u8>(cond.rhs->kind), static_cast<u8>(HirExprKind::ConstMethod));
+        CHECK_EQ(cond.rhs->int_value, tc.expected_value);
+        // Also verify the lhs is req.method (ReqMethod) so a broken
+        // parser that swapped operands wouldn't pass by coincidence.
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(HirExprKind::ReqMethod));
     }
 }
 
@@ -645,6 +659,55 @@ TEST(frontend, parse_method_vs_non_method_compare_rejected) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(!hir);
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_method_let_binding_round_trips) {
+    // `let m = req.method; guard m == POST else { ... }` — exercises
+    // the HIR→MIR type-mapping and carrier-ready paths for Method.
+    // If mir_type_kind / shape_carrier_ready dropped Method to
+    // Unknown, the guard's == would see an unknown-shape lhs and
+    // fail in lower_to_rir. Full pipeline through RIR proves Method
+    // flows as a first-class scalar.
+    const char* src =
+        "route POST \"/x\" { let m = req.method guard m == POST else { return 405 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, parse_user_local_req_shadows_magic_path) {
+    // A user who writes `let req = SomeStruct(...); req.field` should
+    // get normal struct-field access on their local, not the magic
+    // request-object path. The magic `req.X` handler only fires when
+    // no local named `req` is in scope; the generic Field resolver
+    // takes over otherwise.
+    const char* src = R"rut(
+struct Box { value: i32 }
+route GET "/users" {
+    let req = Box(value: 42)
+    guard req.value == 42 else { return 500 }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    // The local binding is the Box struct; req.value resolves to
+    // the struct's i32 field, so the guard compares two i32s rather
+    // than any Method value. Any regression to the magic path would
+    // surface as an "unknown req field" analyze error.
 }
 
 TEST(frontend, parse_return_response_with_headers) {

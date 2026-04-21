@@ -40,6 +40,7 @@ static MirTypeKind mir_type_kind(HirTypeKind kind) {
     return kind == HirTypeKind::Bool      ? MirTypeKind::Bool
            : kind == HirTypeKind::I32     ? MirTypeKind::I32
            : kind == HirTypeKind::Str     ? MirTypeKind::Str
+           : kind == HirTypeKind::Method  ? MirTypeKind::Method
            : kind == HirTypeKind::Variant ? MirTypeKind::Variant
            : kind == HirTypeKind::Tuple   ? MirTypeKind::Tuple
            : kind == HirTypeKind::Struct  ? MirTypeKind::Struct
@@ -96,7 +97,7 @@ static bool shape_carrier_ready(const MirModule& mir,
     const auto& shape = mir.type_shapes[shape_index];
     if (!shape.is_concrete) return false;
     if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 ||
-        shape.type == MirTypeKind::Str)
+        shape.type == MirTypeKind::Str || shape.type == MirTypeKind::Method)
         return true;
     if (shape.type == MirTypeKind::Struct)
         return shape.struct_index < mir.structs.len && struct_ready[shape.struct_index];
@@ -145,7 +146,7 @@ static bool field_carrier_ready(const MirModule& mir,
     if (field.shape_index != 0xffffffffu)
         return shape_carrier_ready(mir, field.shape_index, struct_ready, variant_ready);
     if (field.type == MirTypeKind::Bool || field.type == MirTypeKind::I32 ||
-        field.type == MirTypeKind::Str)
+        field.type == MirTypeKind::Str || field.type == MirTypeKind::Method)
         return true;
     if (field.type == MirTypeKind::Struct)
         return field.struct_index < mir.structs.len && struct_ready[field.struct_index];
@@ -162,7 +163,7 @@ static bool variant_payload_carrier_ready(const MirModule& mir,
     if (c.payload_shape_index != 0xffffffffu)
         return shape_carrier_ready(mir, c.payload_shape_index, struct_ready, variant_ready);
     if (c.payload_type == MirTypeKind::Bool || c.payload_type == MirTypeKind::I32 ||
-        c.payload_type == MirTypeKind::Str)
+        c.payload_type == MirTypeKind::Str || c.payload_type == MirTypeKind::Method)
         return true;
     if (c.payload_type == MirTypeKind::Struct)
         return c.payload_struct_index < mir.structs.len && struct_ready[c.payload_struct_index];
@@ -536,13 +537,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     }
     if (expr.kind == HirExprKind::LocalRef) {
         v.kind = MirValueKind::LocalRef;
-        v.type = expr.type == HirTypeKind::Bool      ? MirTypeKind::Bool
-                 : expr.type == HirTypeKind::I32     ? MirTypeKind::I32
-                 : expr.type == HirTypeKind::Str     ? MirTypeKind::Str
-                 : expr.type == HirTypeKind::Variant ? MirTypeKind::Variant
-                 : expr.type == HirTypeKind::Tuple   ? MirTypeKind::Tuple
-                 : expr.type == HirTypeKind::Struct  ? MirTypeKind::Struct
-                                                     : MirTypeKind::Unknown;
+        v.type = mir_type_kind(expr.type);
         v.variant_index = expr.variant_index;
         v.struct_index = expr.struct_index;
         v.local_index = expr.local_index;

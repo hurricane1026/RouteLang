@@ -3505,7 +3505,18 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     // only the upstream gets populated; routes still need to be
     // registered explicitly (they depend on the JIT-compiled fn).
     REQUIRE(populate_route_config(cfg, rir.module));
-    CHECK_EQ(cfg.upstream_count, 1u);
+    // Strong assertion that the helper actually bound the DSL upstream:
+    // the slot must exist, be at the same index the compiler emits,
+    // carry the DSL name verbatim, and resolve to the declared address.
+    // Without these, a "not-found → 502" could masquerade as the
+    // "connect refused → 502" below and let this test pass spuriously.
+    REQUIRE_EQ(cfg.upstream_count, 1u);
+    CHECK_EQ(cfg.upstreams[0].name_len, 7u);
+    const Str actual_name{cfg.upstreams[0].name, 7u};
+    const Str expected_name{"backend", 7u};
+    CHECK(actual_name.eq(expected_name));
+    CHECK_EQ(cfg.upstreams[0].addr.sin_port, __builtin_bswap16(9999));
+    CHECK_EQ(cfg.upstreams[0].addr.sin_addr.s_addr, __builtin_bswap32(0x7F000001));
     REQUIRE(cfg.add_jit_handler("/api", 'G', handler_fn));
     const RouteConfig* active = &cfg;
 

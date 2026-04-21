@@ -141,7 +141,7 @@ struct AstUpstreamDecl {
     // fields, distinguished only by what the parser saw after the name:
     //   A. `upstream backend at "127.0.0.1:8080"`
     //      → host_lit = "127.0.0.1:8080", port_is_set = false.
-    //   C. `upstream backend { host: "127.0.0.1", port: 8080 }`
+    //   B. `upstream backend { host: "127.0.0.1", port: 8080 }`
     //      → host_lit = "127.0.0.1", port_lit = 8080, port_is_set = true.
     // Analyze parses host_lit + port_lit into (ip u32, port u16) and
     // stores the result on HirUpstream. has_address == false means no

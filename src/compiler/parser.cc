@@ -1042,10 +1042,16 @@ struct Parser {
             // port_is_set stays false — analyze splits host_lit into
             // (ip, port) for the `at "..."` form.
             end_off = lit.value()->end;
-        } else if (take(TokenType::LBrace)) {
+        } else if (cur().type == TokenType::LBrace) {
+            auto lbrace = expect(TokenType::LBrace);
+            if (!lbrace) return core::make_unexpected(lbrace.error());
             item.upstream.has_address = true;
-            item.upstream.addr_span =
-                Span{name.value()->end, name.value()->end, name.value()->line, name.value()->col};
+            // Span the whole `{ ... }` block so analyze-time
+            // diagnostics (bad host, missing field, out-of-range port)
+            // highlight the address site rather than the bare name.
+            // We extend addr_span.end to the closing brace below once
+            // we've consumed it.
+            item.upstream.addr_span = span_from(*lbrace.value());
             bool seen_host = false;
             bool seen_port = false;
             // Empty dict (`upstream foo {}`) is a parse error — omit
@@ -1100,6 +1106,9 @@ struct Parser {
                 return frontend_error(FrontendError::UnsupportedSyntax, span_from(*rbrace.value()));
             }
             end_off = rbrace.value()->end;
+            // Stretch the addr_span to cover the full `{ ... }` block
+            // so analyze diagnostics point at the whole address site.
+            item.upstream.addr_span.end = rbrace.value()->end;
         }
         item.span = Span{kw.value()->start, end_off, kw.value()->line, kw.value()->col};
         item.upstream.span = item.span;

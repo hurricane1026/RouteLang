@@ -25,13 +25,23 @@
 namespace rut {
 
 inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
-    // Upstreams: skip entries without an address (those are declared
-    // name-only in the DSL and bound by the runtime via an explicit
-    // add_upstream() from a config file / env / CLI flag). Entries
-    // with an address go straight in.
+    // Upstreams: the compiler emits `forward(name)` as a 0-based index
+    // into the declaration order (0 = first `upstream` decl, 1 = second,
+    // …). `RouteConfig::upstreams` is also declaration-order (add_upstream
+    // appends). So for the indices to stay aligned, we either add an
+    // entry per DSL upstream OR refuse to populate at all.
+    //
+    // Refusing to skip name-only upstreams: if any upstream in the
+    // module lacks an address, we fail-fast. Mixing DSL-addressed and
+    // name-only upstreams would desync compile-time `upstream_index`
+    // from cfg slot, sending `forward(a)` to whichever backend happened
+    // to occupy slot 0 after compaction. Callers with name-only
+    // upstreams should wire them up manually, in DSL declaration order.
+    for (u32 i = 0; i < mod.upstream_count; i++) {
+        if (!mod.upstreams[i].has_address) return false;
+    }
     for (u32 i = 0; i < mod.upstream_count; i++) {
         const auto& up = mod.upstreams[i];
-        if (!up.has_address) continue;
         // add_upstream's name parameter is a NUL-terminated C string;
         // rir::Module stores Str (ptr + len) where the bytes may not
         // be NUL-terminated (arena-allocated slices). Copy into a
@@ -43,6 +53,10 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         name_buf[up.name.len] = '\0';
         auto r = cfg.add_upstream(name_buf, up.ip, up.port);
         if (!r.has_value()) return false;
+        // The helper only makes sense when cfg starts empty — assert
+        // that the newly-added slot matches the DSL's compile-time
+        // index i, so forward() resolves correctly at runtime.
+        if (r.value() != i) return false;
     }
 
     // Response bodies (1-based index preserved). Empty bodies don't

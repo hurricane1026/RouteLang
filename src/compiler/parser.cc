@@ -1,6 +1,7 @@
 #include "rut/compiler/parser.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/runtime/http_parser.h"
 #include <memory>
 
 namespace rut {
@@ -322,35 +323,37 @@ struct Parser {
         }
         // HTTP method literals as expressions (POST, GET, …). The
         // lexer already tokenizes these as KwGet/KwPost/etc.; until
-        // now they were only consumed in route declarations. Map each
-        // keyword to the corresponding HttpMethod enum value (stored
-        // in int_value), letting `guard req.method == POST else { … }`
-        // compile. Values match HttpMethod in rut/runtime/http_parser.h.
+        // now they were only consumed in route declarations. Map
+        // each keyword to the HttpMethod enum value stored in
+        // int_value — sourcing from the runtime enum rather than
+        // hard-coded integers so the two stay in sync if the enum
+        // ever shifts. Lets `POST` etc. appear in contexts like
+        // `guard req.method == POST else { … }`.
         if (is_method_keyword(cur().type)) {
             const Token tok = cur();
             pos++;
             expr.kind = AstExprKind::LitMethod;
             switch (tok.type) {
                 case TokenType::KwGet:
-                    expr.int_value = 0;
+                    expr.int_value = static_cast<i32>(HttpMethod::GET);
                     break;
                 case TokenType::KwPost:
-                    expr.int_value = 1;
+                    expr.int_value = static_cast<i32>(HttpMethod::POST);
                     break;
                 case TokenType::KwPut:
-                    expr.int_value = 2;
+                    expr.int_value = static_cast<i32>(HttpMethod::PUT);
                     break;
                 case TokenType::KwDelete:
-                    expr.int_value = 3;
+                    expr.int_value = static_cast<i32>(HttpMethod::DELETE);
                     break;
                 case TokenType::KwPatch:
-                    expr.int_value = 4;
+                    expr.int_value = static_cast<i32>(HttpMethod::PATCH);
                     break;
                 case TokenType::KwHead:
-                    expr.int_value = 5;
+                    expr.int_value = static_cast<i32>(HttpMethod::HEAD);
                     break;
                 case TokenType::KwOptions:
-                    expr.int_value = 6;
+                    expr.int_value = static_cast<i32>(HttpMethod::OPTIONS);
                     break;
                 default:
                     return frontend_error(FrontendError::UnsupportedSyntax, span_from(tok));

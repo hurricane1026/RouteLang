@@ -49,7 +49,7 @@ enum class AstExprKind : u8 {
     Field,
     ReqHeader,
     // HTTP method literal as expression. The concrete method (GET,
-    // POST, …) is encoded in int_val using the HttpMethod enum
+    // POST, …) is encoded in int_value using the HttpMethod enum
     // values from rut/runtime/http_parser.h. Lets `POST` etc. appear
     // in contexts like `guard req.method == POST else { ... }`.
     LitMethod,

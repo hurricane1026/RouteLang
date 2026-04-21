@@ -565,10 +565,12 @@ TEST(frontend, parse_upstream_dict_rejects_unknown_field) {
 
 TEST(frontend, parse_guard_req_method_eq_post) {
     // `guard req.method == POST else { return 405 }` — the keystone
-    // use case. Parser yields LitMethod + Field(ReqObject, "method");
-    // analyze resolves both to typed HIR; MIR/RIR downstream carry
-    // the ConstMethod / ReqMethod opcodes. Codegen emits i8 constant
-    // and a helper-call to read the parsed method from the request.
+    // use case. Parser yields LitMethod + Field(Ident("req"), "method");
+    // analyze routes the Field through the magic `req.X` path when
+    // `req` isn't shadowed by a local/variant/import, producing
+    // typed HIR ReqMethod / ConstMethod. MIR/RIR downstream carry
+    // those opcodes; codegen emits an i8 constant and a helper call
+    // that reads the parsed method from the request.
     const char* src =
         "route GET \"/\" { guard req.method == POST else { return 405 } return 200 }\n";
     auto lexed = lex(lit(src));

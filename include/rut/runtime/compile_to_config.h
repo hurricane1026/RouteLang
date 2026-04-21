@@ -14,6 +14,29 @@
 //      header sets
 //   4. cfg.add_jit_handler(path, method, fn) per route
 //
+// Two supported preconditions on `cfg`:
+//
+//   1. FULLY EMPTY (no routes / upstreams / bodies / header sets).
+//      Helper populates every upstream from the module. Requires every
+//      DSL upstream to have an address (`upstream X at "..."` or
+//      `upstream X { host, port }`). Name-only upstreams cause a
+//      fail-fast return because the helper has no address to bind.
+//
+//   2. PRE-BOUND UPSTREAMS (cfg.upstream_count == mod.upstream_count,
+//      bodies / header sets / routes still empty). Helper skips the
+//      upstream loop and only populates bodies + header sets. The
+//      caller is responsible for having added upstreams in DSL
+//      declaration order — the helper verifies each cfg.upstreams[i]
+//      name matches mod.upstreams[i] under ASCII case-sensitive
+//      compare, so mis-ordered or mis-named entries are caught before
+//      the compile-time `upstream_index` resolves to the wrong
+//      backend. This is the workflow to use when some or all
+//      upstreams are name-only in the DSL and bound at runtime (from
+//      a config file, env var, CLI flag, service discovery, etc.).
+//
+// Any other shape — partial routes / bodies / header sets already in
+// cfg, or upstream_count mismatching mod.upstream_count — is rejected.
+//
 // Returns true on full success. On any partial failure (capacity
 // exceeded, validation rejected) the function stops and returns false;
 // `cfg` may have been partially populated, so callers should discard
@@ -25,16 +48,22 @@
 namespace rut {
 
 inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
-    // Helper assumes cfg starts empty — otherwise newly-added slots
-    // would not begin at index 0, breaking the compiler's
-    // declaration-order upstream_id / body_idx / headers_idx
-    // invariant. Refuse rather than silently produce a mis-aligned
-    // config. Callers that need to start from a partially-populated
-    // cfg should wire things up manually.
-    if (cfg.route_count != 0 || cfg.upstream_count != 0 || cfg.response_body_count != 0 ||
+    // Bodies / header sets / routes must always start empty — there's
+    // no "merge" semantics for those tables, and a non-zero count
+    // would break the compile-time body_idx / headers_idx invariants.
+    if (cfg.route_count != 0 || cfg.response_body_count != 0 ||
         cfg.response_header_set_count != 0) {
         return false;
     }
+
+    // Upstreams admit one of two shapes (see file docstring):
+    //   - Fully empty: helper adds every upstream itself.
+    //   - Pre-bound: caller already populated exactly mod.upstream_count
+    //     upstream slots in DSL declaration order. Helper verifies
+    //     names match and skips the add loop.
+    const bool upstreams_pre_bound = cfg.upstream_count == mod.upstream_count;
+    const bool upstreams_empty = cfg.upstream_count == 0;
+    if (!upstreams_empty && !upstreams_pre_bound) return false;
 
     // Defensive bounds-checks against malformed modules (e.g. a
     // hand-built rir::Module with inconsistent counts). Refuse before
@@ -52,53 +81,56 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // Upstreams: the compiler emits `forward(name)` as a 0-based index
     // into the declaration order (0 = first `upstream` decl, 1 = second,
     // …). `RouteConfig::upstreams` is also declaration-order (add_upstream
-    // appends). So for the indices to stay aligned, we either add an
-    // entry per DSL upstream OR refuse to populate at all.
-    //
-    // Refusing to skip name-only upstreams: if any upstream in the
-    // module lacks an address, we fail-fast. Mixing DSL-addressed and
-    // name-only upstreams would desync compile-time `upstream_index`
-    // from cfg slot, sending `forward(a)` to whichever backend happened
-    // to occupy slot 0 after compaction. Callers with name-only
-    // upstreams should wire them up manually, in DSL declaration order.
-    // (Mixed-mode support would need an in-place RouteConfig::
-    // bind_upstream_at(idx, ip, port) API — not worth adding until a
-    // concrete use case motivates it.)
-    for (u32 i = 0; i < mod.upstream_count; i++) {
-        if (!mod.upstreams[i].has_address) return false;
-    }
-    for (u32 i = 0; i < mod.upstream_count; i++) {
-        const auto& up = mod.upstreams[i];
-        // add_upstream's name parameter is a NUL-terminated C string;
-        // rir::Module stores Str (ptr + len) where the bytes may not
-        // be NUL-terminated (arena-allocated slices). Copy into a
-        // small fixed buffer matching UpstreamTarget::kMaxUpstreamNameLen
-        // so the underlying set_name sees a terminator. Truncate
-        // names that exceed the buffer — matches the silent-truncate
-        // behavior of UpstreamTarget::set_name so the helper doesn't
-        // introduce a new runtime-only failure mode. (A hard limit
-        // should be enforced at the frontend with a compile-time
-        // diagnostic, not here.)
-        char name_buf[UpstreamTarget::kMaxUpstreamNameLen];
-        // Defensive null guard: a hand-built rir::Module could set
-        // len > 0 with a null ptr; the copy below would segfault.
-        // lower_rir never produces this shape, but the helper is
-        // reachable from arbitrary callers so fail closed.
-        if (up.name.len > 0 && up.name.ptr == nullptr) return false;
-        // Compute copy_len as min(len, cap-1) with no `len + 1`
-        // arithmetic — that expression would wrap for a hand-built
-        // module with len == 0xffffffff, making the subsequent copy
-        // loop run far past name_buf.
-        u32 copy_len = up.name.len;
-        if (copy_len >= sizeof(name_buf)) copy_len = sizeof(name_buf) - 1;
-        for (u32 j = 0; j < copy_len; j++) name_buf[j] = up.name.ptr[j];
-        name_buf[copy_len] = '\0';
-        auto r = cfg.add_upstream(name_buf, up.ip, up.port);
-        if (!r.has_value()) return false;
-        // The helper only makes sense when cfg starts empty — assert
-        // that the newly-added slot matches the DSL's compile-time
-        // index i, so forward() resolves correctly at runtime.
-        if (r.value() != i) return false;
+    // appends). So for the indices to stay aligned we need one cfg slot
+    // per DSL upstream, in the same order.
+    if (upstreams_empty) {
+        // Name-only upstreams have no address to bind, so fail-fast.
+        // Callers who have them should either declare addresses in the
+        // DSL (`upstream X at "..."` / `{ host, port }`) or use the
+        // pre-bound mode: add_upstream manually in DSL order, then
+        // call the helper just for bodies / headers.
+        for (u32 i = 0; i < mod.upstream_count; i++) {
+            if (!mod.upstreams[i].has_address) return false;
+        }
+        for (u32 i = 0; i < mod.upstream_count; i++) {
+            const auto& up = mod.upstreams[i];
+            // add_upstream's name parameter is a NUL-terminated C
+            // string; rir::Module stores Str (ptr + len) where the
+            // bytes may not be NUL-terminated. Copy into a buffer
+            // matching UpstreamTarget::kMaxUpstreamNameLen. Truncate
+            // over-long names to match set_name's silent-truncate —
+            // a hard limit belongs as a frontend diagnostic, not here.
+            char name_buf[UpstreamTarget::kMaxUpstreamNameLen];
+            if (up.name.len > 0 && up.name.ptr == nullptr) return false;
+            u32 copy_len = up.name.len;
+            if (copy_len >= sizeof(name_buf)) copy_len = sizeof(name_buf) - 1;
+            for (u32 j = 0; j < copy_len; j++) name_buf[j] = up.name.ptr[j];
+            name_buf[copy_len] = '\0';
+            auto r = cfg.add_upstream(name_buf, up.ip, up.port);
+            if (!r.has_value()) return false;
+            if (r.value() != i) return false;
+        }
+    } else {
+        // Pre-bound mode: verify the caller added upstreams in DSL
+        // declaration order. A mismatch here would send forward(a) to
+        // the backend at slot a's index but with a different name —
+        // silent misconfiguration we'd rather catch up front.
+        for (u32 i = 0; i < mod.upstream_count; i++) {
+            const auto& up = mod.upstreams[i];
+            if (up.name.len > 0 && up.name.ptr == nullptr) return false;
+            // Compare against cfg.upstreams[i].name (NUL-terminated,
+            // at most kMaxUpstreamNameLen-1 chars). set_name truncates
+            // silently, so the comparison uses the truncated length
+            // on the cfg side for consistency.
+            u32 expected_len = up.name.len;
+            if (expected_len >= UpstreamTarget::kMaxUpstreamNameLen) {
+                expected_len = UpstreamTarget::kMaxUpstreamNameLen - 1;
+            }
+            if (cfg.upstreams[i].name_len != expected_len) return false;
+            for (u32 j = 0; j < expected_len; j++) {
+                if (cfg.upstreams[i].name[j] != up.name.ptr[j]) return false;
+            }
+        }
     }
 
     // Response bodies (1-based index preserved). Empty bodies don't

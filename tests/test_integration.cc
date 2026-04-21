@@ -3457,24 +3457,23 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
     rir.destroy();
 }
 
-// populate_route_config requires an empty RouteConfig so newly-added
-// slots line up with declaration order from the compiled module. Any
-// partially-populated config would silently mis-align indices across
-// upstreams / bodies / header sets, so the helper fail-fast rejects.
-TEST(route, populate_route_config_rejects_non_empty_cfg) {
+// populate_route_config requires bodies / header sets / routes to
+// start empty (there's no merge semantics). Upstreams are more
+// flexible: either empty (helper binds from the module) or exactly
+// mod.upstream_count (caller pre-bound, helper verifies + just
+// populates bodies/headers). Anything else — partial bodies, partial
+// routes, partial header sets, or upstream_count mismatch — rejects.
+TEST(route, populate_route_config_rejects_partial_cfg) {
     using namespace rut;
-    // The helper relies on cfg starting empty so newly-added slots
-    // match declaration order. A pre-populated cfg would silently
-    // mis-align indices; refuse instead of corrupting. Covers all
-    // four "partially populated" cases.
     FrontendRirModule rir{};
     REQUIRE(rir.init(1, 8));
     RouteConfig cfg_with_route{};
     REQUIRE(cfg_with_route.add_static("/x", 0, 200));
     CHECK(!populate_route_config(cfg_with_route, rir.module));
-    RouteConfig cfg_with_upstream{};
-    REQUIRE(cfg_with_upstream.add_upstream("x", 0x7F000001, 1).has_value());
-    CHECK(!populate_route_config(cfg_with_upstream, rir.module));
+    // upstream_count == 1 but module has 0 → mismatch, reject.
+    RouteConfig cfg_upstream_mismatch{};
+    REQUIRE(cfg_upstream_mismatch.add_upstream("x", 0x7F000001, 1).has_value());
+    CHECK(!populate_route_config(cfg_upstream_mismatch, rir.module));
     RouteConfig cfg_with_body{};
     REQUIRE_EQ(cfg_with_body.add_response_body("hi", 2), 1u);
     CHECK(!populate_route_config(cfg_with_body, rir.module));
@@ -3486,6 +3485,75 @@ TEST(route, populate_route_config_rejects_non_empty_cfg) {
     REQUIRE_EQ(cfg_with_headers.add_response_header_set(keys, klens, vals, vlens, 1), 1u);
     CHECK(!populate_route_config(cfg_with_headers, rir.module));
     rir.destroy();
+}
+
+// Pre-bound upstream mode: caller registers upstreams manually (e.g.
+// because the DSL declared them name-only, addresses come from a
+// runtime config file), then the helper fills in bodies / header
+// sets only. This is the workflow the reviewer called out as a
+// first-class use case.
+TEST(route, populate_route_config_accepts_pre_bound_upstreams) {
+    using namespace rut;
+    const char* src =
+        "upstream backend\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.upstream_count, 1u);
+    CHECK(!rir.module.upstreams[0].has_address);  // name-only
+
+    RouteConfig cfg{};
+    // Caller binds the upstream manually — same name, in DSL order.
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    // Helper accepts the pre-bound cfg (upstream_count matches) and
+    // returns true even though the module had a name-only upstream.
+    CHECK(populate_route_config(cfg, rir.module));
+    // The manually-bound address is untouched.
+    CHECK_EQ(cfg.upstreams[0].addr.sin_port, __builtin_bswap16(8080));
+    rir.destroy();
+}
+
+// Pre-bound mode with a name mismatch: caller populated cfg in the
+// wrong order / with wrong names. Helper verifies name-for-name
+// (ASCII case-sensitive) and rejects so forward() can't resolve to
+// the wrong backend silently.
+TEST(route, populate_route_config_rejects_pre_bound_name_mismatch) {
+    using namespace rut;
+    const char* src =
+        "upstream backend\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    RouteConfig cfg{};
+    // Wrong name ("other" vs DSL's "backend"). upstream_count matches,
+    // so the shape check passes, but the per-slot name compare fails.
+    REQUIRE(cfg.add_upstream("other", 0x7F000001, 8080).has_value());
+    CHECK(!populate_route_config(cfg, rir.module));
 }
 
 // End-to-end: compile DSL with an address-carrying `upstream` decl and

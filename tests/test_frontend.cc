@@ -411,6 +411,24 @@ TEST(frontend, parse_upstream_rejects_port_zero_and_overflow) {
     }
 }
 
+TEST(frontend, parse_upstream_dict_port_range_diagnostic_mentions_port) {
+    // `at "host:port"` form: the whole host_lit is the natural detail
+    // (the full bad string). But dict form gave port its own token, so
+    // pointing the error at host_lit would be misleading — use "port"
+    // as the detail instead.
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", port: 65536 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("port")));
+}
+
 TEST(frontend, parse_upstream_dict_rejects_missing_field) {
     // Both host and port are required in dict form.
     for (const char* src : {
@@ -6584,7 +6602,9 @@ TEST(frontend, lower_forward_route_to_rir) {
     REQUIRE(hir);
     REQUIRE_EQ(hir->upstreams.len, 1u);
     REQUIRE_EQ(hir->routes.len, 1u);
-    CHECK_EQ(hir->upstreams[0].id, 1u);
+    // Upstream IDs are 0-based so they index RouteConfig::upstreams
+    // directly. The first declared upstream gets id 0, not 1.
+    CHECK_EQ(hir->upstreams[0].id, 0u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].control.direct_term.kind),
              static_cast<u8>(HirTerminatorKind::ForwardUpstream));
     auto mir = build_mir_heap(hir.value());
@@ -6601,7 +6621,7 @@ TEST(frontend, lower_forward_route_to_rir) {
     REQUIRE_EQ(fn.block_count, 1u);
     REQUIRE_EQ(fn.blocks[0].inst_count, 2u);
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ConstI32));
-    CHECK_EQ(fn.blocks[0].insts[0].imm.i32_val, 1);
+    CHECK_EQ(fn.blocks[0].insts[0].imm.i32_val, 0);
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[1].op), static_cast<u8>(rir::Opcode::RetForward));
     rir.destroy();
 }

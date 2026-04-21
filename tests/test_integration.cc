@@ -3465,6 +3465,33 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
 //   2. populate_route_config called add_upstream with the compiled
 //      (ip, port) — otherwise the runtime would have had no upstream
 //      entry and returned some other error.
+TEST(route, populate_route_config_rejects_non_empty_cfg) {
+    using namespace rut;
+    // The helper relies on cfg starting empty so newly-added slots
+    // match declaration order. A pre-populated cfg would silently
+    // mis-align indices; refuse instead of corrupting. Covers all
+    // four "partially populated" cases.
+    FrontendRirModule rir{};
+    REQUIRE(rir.init(1, 8));
+    RouteConfig cfg_with_route{};
+    REQUIRE(cfg_with_route.add_static("/x", 0, 200));
+    CHECK(!populate_route_config(cfg_with_route, rir.module));
+    RouteConfig cfg_with_upstream{};
+    REQUIRE(cfg_with_upstream.add_upstream("x", 0x7F000001, 1).has_value());
+    CHECK(!populate_route_config(cfg_with_upstream, rir.module));
+    RouteConfig cfg_with_body{};
+    REQUIRE_EQ(cfg_with_body.add_response_body("hi", 2), 1u);
+    CHECK(!populate_route_config(cfg_with_body, rir.module));
+    RouteConfig cfg_with_headers{};
+    const char* keys[1] = {"X-Foo"};
+    u32 klens[1] = {5};
+    const char* vals[1] = {"v"};
+    u32 vlens[1] = {1};
+    REQUIRE_EQ(cfg_with_headers.add_response_header_set(keys, klens, vals, vlens, 1), 1u);
+    CHECK(!populate_route_config(cfg_with_headers, rir.module));
+    rir.destroy();
+}
+
 TEST(route, populate_route_config_binds_upstream_from_dsl) {
     using namespace rut;
 

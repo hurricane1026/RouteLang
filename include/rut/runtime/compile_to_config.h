@@ -25,6 +25,30 @@
 namespace rut {
 
 inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
+    // Helper assumes cfg starts empty — otherwise newly-added slots
+    // would not begin at index 0, breaking the compiler's
+    // declaration-order upstream_id / body_idx / headers_idx
+    // invariant. Refuse rather than silently produce a mis-aligned
+    // config. Callers that need to start from a partially-populated
+    // cfg should wire things up manually.
+    if (cfg.route_count != 0 || cfg.upstream_count != 0 || cfg.response_body_count != 0 ||
+        cfg.response_header_set_count != 0) {
+        return false;
+    }
+
+    // Defensive bounds-checks against malformed modules (e.g. a
+    // hand-built rir::Module with inconsistent counts). Refuse before
+    // we dereference anything out of range.
+    if (mod.upstream_count > rir::Module::kMaxUpstreams) return false;
+    if (mod.response_body_count > rir::Module::kMaxResponseBodies) return false;
+    if (mod.header_set_count > rir::Module::kMaxHeaderSets) return false;
+    if (mod.header_pool_used > rir::Module::kMaxHeaderPoolEntries) return false;
+    for (u32 i = 0; i < mod.header_set_count; i++) {
+        const auto& ref = mod.header_sets[i];
+        if (static_cast<u32>(ref.offset) + ref.count > mod.header_pool_used) return false;
+        if (ref.count > RouteConfig::kMaxHeadersPerSet) return false;
+    }
+
     // Upstreams: the compiler emits `forward(name)` as a 0-based index
     // into the declaration order (0 = first `upstream` decl, 1 = second,
     // …). `RouteConfig::upstreams` is also declaration-order (add_upstream
@@ -37,6 +61,9 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // from cfg slot, sending `forward(a)` to whichever backend happened
     // to occupy slot 0 after compaction. Callers with name-only
     // upstreams should wire them up manually, in DSL declaration order.
+    // (Mixed-mode support would need an in-place RouteConfig::
+    // bind_upstream_at(idx, ip, port) API — not worth adding until a
+    // concrete use case motivates it.)
     for (u32 i = 0; i < mod.upstream_count; i++) {
         if (!mod.upstreams[i].has_address) return false;
     }

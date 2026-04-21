@@ -7099,7 +7099,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
         HirUpstream up{};
         up.span = item.upstream.span;
         up.name = item.upstream.name;
-        up.id = static_cast<u16>(mod.upstreams.len + 1);
+        // 0-based index so compiler-emitted upstream IDs align
+        // directly with RouteConfig::upstreams[] slots — the runtime
+        // dispatch does `if (upstream_id < cfg->upstream_count)`
+        // without adjustment.
+        up.id = static_cast<u16>(mod.upstreams.len);
         // Resolve the parsed address (if any) into concrete (ip, port).
         // Two AST shapes produce this: `at "host:port"` packs both
         // into host_lit; dict form separates host_lit and port_lit.
@@ -7135,8 +7139,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 }
             }
             if (port_value == 0 || port_value > 0xffffu) {
+                // Point the detail at "port" when dict-form made the
+                // port its own token — pointing at host_lit would be
+                // misleading. `at "..."` packs both into host_lit, so
+                // the whole literal is the right detail there.
+                const Str port_detail = item.upstream.port_is_set ? Str{"port", 4} : lit;
                 return frontend_error(
-                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, lit);
+                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, port_detail);
             }
             u32 ip = 0;
             if (!parse_ipv4(host_part.ptr, host_part.len, ip)) {

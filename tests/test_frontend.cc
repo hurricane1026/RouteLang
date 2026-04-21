@@ -710,6 +710,49 @@ route GET "/users" {
     // surface as an "unknown req field" analyze error.
 }
 
+TEST(frontend, parse_user_variant_named_req_shadows_magic_path) {
+    // A variant literally named `req` must take precedence so
+    // `req.case` resolves as variant construction (VariantCase),
+    // not the magic request-object path. The parser would otherwise
+    // hijack every dotted `req.*` before variant/import resolution
+    // gets a turn.
+    const char* src = R"rut(
+variant req { case_a, case_b }
+route GET "/users" {
+    let x = req.case_a
+    if x == req.case_a { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, parse_import_namespace_named_req_shadows_magic_path) {
+    // An import namespace alias `req` must also block the magic
+    // fast-path: `req.someFn()` should resolve to the imported
+    // function, not get rewritten into request-field access.
+    const std::string dir = "/tmp/rut_import_namespace_req_shadow_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/req.rut", std::ios::binary);
+        out << "func ping() -> i32 => 200\n";
+    }
+    const auto src = R"rut(
+import "req.rut"
+route GET "/users" { if req.ping() == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
 TEST(frontend, parse_return_response_with_headers) {
     // Headers dict carries through parser → HIR → MIR → RIR:
     // intern_response_headers writes one set into rir::Module's flat

@@ -4026,22 +4026,35 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
     if (expr.kind == AstExprKind::MethodCall) {
         return analyze_method_call_expr(expr, route, mod, locals, local_count, binding);
     }
-    // `req.X` is magic only when the name `req` isn't shadowed by a
-    // local in scope. A user who writes `let req = Foo(...); req.id`
-    // still gets normal struct-field access on their local. Otherwise
-    // the request object is not a first-class value, so we intercept
-    // before the generic Field handler (which would try to analyze
-    // `req` as an expression and fail for the unshadowed case).
+    // `req.X` is magic only when the name `req` doesn't already
+    // resolve to something the user declared: a local binding, a
+    // variant name, or an import namespace alias. Any of those wins
+    // and we fall through to the generic Field handler below, which
+    // knows how to route variant construction / namespace members /
+    // local field access. Only when `req` resolves to nothing does
+    // the magic request-object path take over.
     if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
         expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq({"req", 3})) {
-        bool shadowed = false;
+        bool user_bound = false;
         for (u32 i = 0; i < local_count; i++) {
             if (locals[i].name.eq({"req", 3})) {
-                shadowed = true;
+                user_bound = true;
                 break;
             }
         }
-        if (!shadowed) {
+        if (!user_bound) {
+            for (u32 i = 0; i < mod.variants.len; i++) {
+                if (mod.variants[i].name.eq({"req", 3})) {
+                    user_bound = true;
+                    break;
+                }
+            }
+        }
+        if (!user_bound) {
+            Str ignored_qualified{};
+            if (resolve_import_namespace_member(mod, expr, ignored_qualified)) user_bound = true;
+        }
+        if (!user_bound) {
             // Known fields: method (HttpMethod). Future fields (path,
             // …) add branches here. `header` isn't reached via this
             // path — the parser captures `req.header("...")` as the
@@ -4054,8 +4067,8 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
             }
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
         }
-        // Shadowed — fall through to the generic Field path so the
-        // user's local `req` resolves normally.
+        // Otherwise fall through to the generic Field path so the
+        // user's local / variant / namespace `req` resolves normally.
     }
     if (expr.kind == AstExprKind::Field) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);

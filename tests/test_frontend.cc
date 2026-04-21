@@ -663,6 +663,34 @@ TEST(frontend, parse_method_vs_non_method_compare_rejected) {
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
+TEST(frontend, parse_generic_eq_function_accepts_method_instance) {
+    // Calling an `Eq`-constrained generic with Method operands
+    // binds T → Method. Exercises the HIR→MIR copy paths for
+    // struct / variant `instance_type_args` plus the Eq-constraint
+    // check in analyze (which must accept Method as an Eq-capable
+    // scalar). A regression would either fail analyze with
+    // "generic T missing Eq" or die in lower_to_rir when the
+    // Method-typed instance is downgraded to Unknown.
+    const char* src = R"rut(
+func same<T: Eq>(x: T, y: T) -> bool => x == y
+route POST "/x" {
+    if same(req.method, POST) { return 200 } else { return 405 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, parse_method_let_binding_round_trips) {
     // `let m = req.method; guard m == POST else { ... }` — exercises
     // the HIR→MIR type-mapping and carrier-ready paths for Method.

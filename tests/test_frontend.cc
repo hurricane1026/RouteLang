@@ -429,6 +429,22 @@ TEST(frontend, parse_upstream_dict_port_range_diagnostic_mentions_port) {
     CHECK(hir.error().detail.eq(lit("port")));
 }
 
+TEST(frontend, parse_upstream_dict_port_overflow_safe) {
+    // A dict-form port literal with enough leading digits to wrap u64
+    // past 2^64 must still be rejected as InvalidInteger, not
+    // accidentally accepted after wraparound. Uses 20+ digits —
+    // 10^20 > 2^64 so the accumulator would wrap without the
+    // pre-multiply overflow check.
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", port: 99999999999999999999 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
+}
+
 TEST(frontend, parse_upstream_empty_host_diagnostic_has_nonempty_detail) {
     // An empty host (`:8080` in at-form, `{ host: "" }` in dict form)
     // previously produced a zero-length detail, hiding what went

@@ -1087,15 +1087,20 @@ struct Parser {
                     auto lit = expect(TokenType::IntLit);
                     if (!lit) return core::make_unexpected(lit.error());
                     // Parse digits into u32; analyze range-checks to
-                    // 1..65535 with a friendlier diagnostic.
+                    // 1..65535 with a friendlier diagnostic. Pre-multiply
+                    // overflow check prevents long literals (20+ digits
+                    // with the right leading byte) from silently
+                    // wrapping past 2^64 and landing below 0xffffffff —
+                    // the post-multiply guard alone isn't enough.
                     u64 v = 0;
                     for (u32 i = 0; i < lit.value()->text.len; i++) {
-                        v = v * 10 + static_cast<u64>(lit.value()->text.ptr[i] - '0');
-                        if (v > 0xffffffffu) {
+                        const u64 digit = static_cast<u64>(lit.value()->text.ptr[i] - '0');
+                        if (v > (static_cast<u64>(0xffffffffu) - digit) / 10u) {
                             return frontend_error(FrontendError::InvalidInteger,
                                                   span_from(*lit.value()),
                                                   lit.value()->text);
                         }
+                        v = v * 10 + digit;
                     }
                     item.upstream.port_lit = static_cast<u32>(v);
                     item.upstream.port_is_set = true;

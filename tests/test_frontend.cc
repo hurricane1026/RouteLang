@@ -429,6 +429,38 @@ TEST(frontend, parse_upstream_dict_port_range_diagnostic_mentions_port) {
     CHECK(hir.error().detail.eq(lit("port")));
 }
 
+TEST(frontend, parse_upstream_empty_host_diagnostic_has_nonempty_detail) {
+    // An empty host (`:8080` in at-form, `{ host: "" }` in dict form)
+    // previously produced a zero-length detail, hiding what went
+    // wrong in diagnostics. The fallback now surfaces the full at-
+    // form literal or "host" for dict form so the user can see which
+    // part tripped the check.
+    {
+        const char* src = "upstream api at \":8080\"\nroute GET \"/u\" { return 200 }\n";
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit(":8080")));
+    }
+    {
+        const char* src =
+            "upstream api { host: \"\", port: 80 }\n"
+            "route GET \"/u\" { return 200 }\n";
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit("host")));
+    }
+}
+
 TEST(frontend, parse_upstream_dict_rejects_missing_field) {
     // Both host and port are required in dict form.
     for (const char* src : {

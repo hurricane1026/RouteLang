@@ -7149,8 +7149,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             u32 ip = 0;
             if (!parse_ipv4(host_part.ptr, host_part.len, ip)) {
+                // Keep the detail informative when host_part is
+                // empty (`":8080"` in at-form, `{ host: "" }` in dict
+                // form). An empty detail prints nothing and hides
+                // what went wrong. Falls back to the full at-form
+                // literal or to "host" for dict form.
+                const Str host_detail = host_part.len != 0
+                                            ? host_part
+                                            : (item.upstream.port_is_set ? Str{"host", 4} : lit);
                 return frontend_error(
-                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, host_part);
+                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, host_detail);
             }
             up.has_address = true;
             up.ip = ip;

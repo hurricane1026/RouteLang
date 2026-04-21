@@ -1027,9 +1027,112 @@ struct Parser {
         if (!name) return core::make_unexpected(name.error());
         AstItem item{};
         item.kind = AstItemKind::Upstream;
-        item.span = Span{kw.value()->start, name.value()->end, kw.value()->line, kw.value()->col};
-        item.upstream.span = item.span;
         item.upstream.name = name.value()->text;
+        u32 end_off = name.value()->end;
+        // Optional address after the name. Two forms:
+        //   `at "<host>:<port>"`          — single string literal
+        //   `{ host: "...", port: N }`    — dict form; order-independent,
+        //                                    both fields required
+        // `at` is a contextual keyword — we peek for an Ident with
+        // exactly that text rather than reserving it globally. Keeps
+        // `at` available as a user identifier elsewhere.
+        const Token& after_name = cur();
+        const bool is_at_keyword =
+            after_name.type == TokenType::Ident && after_name.text.eq({"at", 2});
+        if (is_at_keyword) {
+            pos++;  // consume `at`
+            auto lit = expect(TokenType::StringLit);
+            if (!lit) return core::make_unexpected(lit.error());
+            item.upstream.has_address = true;
+            item.upstream.host_lit = lit.value()->text;
+            item.upstream.addr_span = span_from(*lit.value());
+            // port_is_set stays false — analyze splits host_lit into
+            // (ip, port) for the `at "..."` form.
+            end_off = lit.value()->end;
+        } else if (cur().type == TokenType::LBrace) {
+            auto lbrace = expect(TokenType::LBrace);
+            if (!lbrace) return core::make_unexpected(lbrace.error());
+            item.upstream.has_address = true;
+            // Span the whole `{ ... }` block so analyze-time
+            // diagnostics (bad host, missing field, out-of-range port)
+            // highlight the address site rather than the bare name.
+            // We extend addr_span.end to the closing brace below once
+            // we've consumed it.
+            item.upstream.addr_span = span_from(*lbrace.value());
+            bool seen_host = false;
+            bool seen_port = false;
+            // Empty dict (`upstream foo {}`) is a parse error — omit
+            // the braces entirely if no address is being declared.
+            if (cur().type == TokenType::RBrace) {
+                return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()));
+            }
+            while (true) {
+                auto field = expect(TokenType::Ident);
+                if (!field) return core::make_unexpected(field.error());
+                const Str field_name = field.value()->text;
+                auto colon = expect(TokenType::Colon);
+                if (!colon) return core::make_unexpected(colon.error());
+                if (field_name.eq({"host", 4})) {
+                    if (seen_host)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    auto lit = expect(TokenType::StringLit);
+                    if (!lit) return core::make_unexpected(lit.error());
+                    item.upstream.host_lit = lit.value()->text;
+                    seen_host = true;
+                } else if (field_name.eq({"port", 4})) {
+                    if (seen_port)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    auto lit = expect(TokenType::IntLit);
+                    if (!lit) return core::make_unexpected(lit.error());
+                    // Parse digits into u32; analyze range-checks to
+                    // 1..65535 with a friendlier diagnostic. Pre-multiply
+                    // overflow check prevents long literals (20+ digits
+                    // with the right leading byte) from silently
+                    // wrapping past 2^64 and landing below 0xffffffff —
+                    // the post-multiply guard alone isn't enough.
+                    u64 v = 0;
+                    for (u32 i = 0; i < lit.value()->text.len; i++) {
+                        const u64 digit = static_cast<u64>(lit.value()->text.ptr[i] - '0');
+                        if (v > (static_cast<u64>(0xffffffffu) - digit) / 10u) {
+                            return frontend_error(FrontendError::InvalidInteger,
+                                                  span_from(*lit.value()),
+                                                  lit.value()->text);
+                        }
+                        v = v * 10 + digit;
+                    }
+                    item.upstream.port_lit = static_cast<u32>(v);
+                    item.upstream.port_is_set = true;
+                    seen_port = true;
+                } else {
+                    return frontend_error(
+                        FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                }
+                if (!take(TokenType::Comma)) break;
+                if (cur().type == TokenType::RBrace) break;  // trailing comma
+            }
+            auto rbrace = expect(TokenType::RBrace);
+            if (!rbrace) return core::make_unexpected(rbrace.error());
+            if (!seen_host || !seen_port) {
+                // Name the specific missing field in the detail so the
+                // diagnostic tells the user what to add. Point the
+                // span at the address block (the `{` we captured),
+                // not the closing brace. If both are missing, call
+                // out "host" first since order in the dict is
+                // host-then-port; the user will see "port" missing
+                // after fixing the host.
+                const Str detail = !seen_host ? Str{"host", 4} : Str{"port", 4};
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, detail);
+            }
+            end_off = rbrace.value()->end;
+            // Stretch the addr_span to cover the full `{ ... }` block
+            // so analyze diagnostics point at the whole address site.
+            item.upstream.addr_span.end = rbrace.value()->end;
+        }
+        item.span = Span{kw.value()->start, end_off, kw.value()->line, kw.value()->col};
+        item.upstream.span = item.span;
         return item;
     }
 

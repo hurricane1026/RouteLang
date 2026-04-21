@@ -7,6 +7,7 @@
 #include "rut/compiler/parser.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/shard.h"
@@ -3448,6 +3449,297 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
     CHECK(has("HTTP/1.1 502", 12));
 
     close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// populate_route_config requires bodies / header sets / routes to
+// start empty (there's no merge semantics). Upstreams are more
+// flexible: either empty (helper binds from the module) or exactly
+// mod.upstream_count (caller pre-bound, helper verifies + just
+// populates bodies/headers). Anything else — partial bodies, partial
+// routes, partial header sets, or upstream_count mismatch — rejects.
+TEST(route, populate_route_config_rejects_partial_cfg) {
+    using namespace rut;
+    FrontendRirModule rir{};
+    REQUIRE(rir.init(1, 8));
+    RouteConfig cfg_with_route{};
+    REQUIRE(cfg_with_route.add_static("/x", 0, 200));
+    CHECK(!populate_route_config(cfg_with_route, rir.module));
+    // upstream_count == 1 but module has 0 → mismatch, reject.
+    RouteConfig cfg_upstream_mismatch{};
+    REQUIRE(cfg_upstream_mismatch.add_upstream("x", 0x7F000001, 1).has_value());
+    CHECK(!populate_route_config(cfg_upstream_mismatch, rir.module));
+    RouteConfig cfg_with_body{};
+    REQUIRE_EQ(cfg_with_body.add_response_body("hi", 2), 1u);
+    CHECK(!populate_route_config(cfg_with_body, rir.module));
+    RouteConfig cfg_with_headers{};
+    const char* keys[1] = {"X-Foo"};
+    u32 klens[1] = {5};
+    const char* vals[1] = {"v"};
+    u32 vlens[1] = {1};
+    REQUIRE_EQ(cfg_with_headers.add_response_header_set(keys, klens, vals, vlens, 1), 1u);
+    CHECK(!populate_route_config(cfg_with_headers, rir.module));
+    rir.destroy();
+}
+
+// Pre-bound upstream mode: caller registers upstreams manually (e.g.
+// because the DSL declared them name-only, addresses come from a
+// runtime config file), then the helper fills in bodies / header
+// sets only. This is the workflow the reviewer called out as a
+// first-class use case.
+TEST(route, populate_route_config_accepts_pre_bound_upstreams) {
+    using namespace rut;
+    const char* src =
+        "upstream backend\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.upstream_count, 1u);
+    CHECK(!rir.module.upstreams[0].has_address);  // name-only
+
+    RouteConfig cfg{};
+    // Caller binds the upstream manually — same name, in DSL order.
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    // Helper accepts the pre-bound cfg (upstream_count matches) and
+    // returns true even though the module had a name-only upstream.
+    CHECK(populate_route_config(cfg, rir.module));
+    // The manually-bound address is untouched.
+    CHECK_EQ(cfg.upstreams[0].addr.sin_port, __builtin_bswap16(8080));
+    rir.destroy();
+}
+
+// Pre-bound mode with a name mismatch: caller populated cfg in the
+// wrong order / with wrong names. Helper verifies name-for-name
+// (ASCII case-sensitive) and rejects so forward() can't resolve to
+// the wrong backend silently.
+TEST(route, populate_route_config_rejects_pre_bound_name_mismatch) {
+    using namespace rut;
+    const char* src =
+        "upstream backend\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    RouteConfig cfg{};
+    // Wrong name ("other" vs DSL's "backend"). upstream_count matches,
+    // so the shape check passes, but the per-slot name compare fails.
+    REQUIRE(cfg.add_upstream("other", 0x7F000001, 8080).has_value());
+    CHECK(!populate_route_config(cfg, rir.module));
+    rir.destroy();
+}
+
+// Pre-bound mode: a module upstream with a name longer than the cfg
+// can hold (kMaxUpstreamNameLen - 1 = 31 bytes) can't round-trip
+// through set_name without truncation. Two such names with the same
+// first 31 bytes would compare equal after truncation, letting a
+// caller pre-bind in the wrong order and slip past the verification.
+// Helper rejects over-long names up front in pre-bound mode to close
+// that gap.
+TEST(route, populate_route_config_rejects_pre_bound_over_long_name) {
+    using namespace rut;
+    // 32 bytes — one past the 31-byte cap. Build at compile time so
+    // the DSL source is deterministic.
+    const char* src =
+        "upstream "
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"  // 32 'a's
+        "route GET \"/api\" { return forward(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.upstream_count, 1u);
+    REQUIRE_EQ(rir.module.upstreams[0].name.len, 32u);
+
+    RouteConfig cfg{};
+    // Caller pre-binds using the truncated name (what set_name would
+    // store anyway). Under the old comparison this would have matched
+    // the truncated module name and incorrectly accepted the config.
+    REQUIRE(cfg.add_upstream("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  // 31 'a's
+                             0x7F000001,
+                             8080)
+                .has_value());
+    CHECK(!populate_route_config(cfg, rir.module));
+    rir.destroy();
+}
+
+// End-to-end: compile DSL with an address-carrying `upstream` decl and
+// let populate_route_config bind the RouteConfig. Since no real backend
+// is listening on the compiled port, the forward will ECONNREFUSED and
+// the client will get 502 — which proves:
+//   1. `upstream X at "127.0.0.1:NNN"` parses + validates + lowers.
+//   2. populate_route_config called add_upstream with the compiled
+//      (ip, port) — otherwise the runtime would have had no upstream
+//      entry and returned some other error.
+TEST(route, populate_route_config_binds_upstream_from_dsl) {
+    using namespace rut;
+
+    // Reserve an ephemeral port for the "unreachable backend". Hard-
+    // coding 9999 would be flaky: if the CI runner already has
+    // something listening there, the test would behave differently.
+    // Bind (but don't listen) on 127.0.0.1:0 so the kernel picks a
+    // free port, capture it, keep the socket open for the duration
+    // of the test so no other process can steal it, and feed the
+    // number into the DSL source. Connect attempts during the test
+    // get ECONNREFUSED — exactly the "no backend is listening"
+    // behaviour we want to drive.
+    //
+    // Guard closes the fd on scope exit so an early REQUIRE failure
+    // (before the explicit close at the bottom) doesn't leak the
+    // reserved socket and starve subsequent tests of ephemeral ports.
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    FdGuard reserve{socket(AF_INET, SOCK_STREAM, 0)};
+    REQUIRE_GE(reserve.fd, 0);
+    const i32 reserve_fd = reserve.fd;
+    struct sockaddr_in reserve_addr{};
+    reserve_addr.sin_family = AF_INET;
+    reserve_addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001u);
+    reserve_addr.sin_port = 0;
+    REQUIRE_EQ(
+        bind(reserve_fd, reinterpret_cast<struct sockaddr*>(&reserve_addr), sizeof(reserve_addr)),
+        0);
+    struct sockaddr_in got{};
+    socklen_t got_len = sizeof(got);
+    REQUIRE_EQ(getsockname(reserve_fd, reinterpret_cast<struct sockaddr*>(&got), &got_len), 0);
+    const u16 upstream_port = __builtin_bswap16(got.sin_port);
+
+    char src_buf[256];
+    const int src_len = snprintf(src_buf,
+                                 sizeof(src_buf),
+                                 "upstream backend at \"127.0.0.1:%u\"\n"
+                                 "route GET \"/api\" { return forward(backend) }\n",
+                                 upstream_port);
+    REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
+    auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    // RIR module carries the declared upstream with its address.
+    REQUIRE_EQ(rir.module.upstream_count, 1u);
+    CHECK(rir.module.upstreams[0].has_address);
+    CHECK_EQ(rir.module.upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(rir.module.upstreams[0].port, upstream_port);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    // The helper walks mod.upstreams / response_bodies / header_sets
+    // and calls the corresponding cfg.add_* methods. For this test
+    // only the upstream gets populated; routes still need to be
+    // registered explicitly (they depend on the JIT-compiled fn).
+    REQUIRE(populate_route_config(cfg, rir.module));
+    // Strong assertion that the helper actually bound the DSL upstream:
+    // the slot must exist, be at the same index the compiler emits,
+    // carry the DSL name verbatim, and resolve to the declared address.
+    // Without these, a "not-found → 502" could masquerade as the
+    // "connect refused → 502" below and let this test pass spuriously.
+    REQUIRE_EQ(cfg.upstream_count, 1u);
+    CHECK_EQ(cfg.upstreams[0].name_len, 7u);
+    const Str actual_name{cfg.upstreams[0].name, 7u};
+    const Str expected_name{"backend", 7u};
+    CHECK(actual_name.eq(expected_name));
+    CHECK_EQ(cfg.upstreams[0].addr.sin_port, __builtin_bswap16(upstream_port));
+    CHECK_EQ(cfg.upstreams[0].addr.sin_addr.s_addr, __builtin_bswap32(0x7F000001));
+    REQUIRE(cfg.add_jit_handler("/api", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[1024];
+    i32 total = 0;
+    while (total < static_cast<i32>(sizeof(buf))) {
+        i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
+        if (n <= 0) break;
+        total += n;
+        if (buf_contains(buf, static_cast<u32>(total), "\r\n", 2)) break;
+    }
+    CHECK_GT(total, 0);
+    const Str response{buf, static_cast<u32>(total)};
+    // Connect to 127.0.0.1:<reserved port> fails with ECONNREFUSED
+    // (nothing listening because reserve_fd never called listen()) →
+    // 502. If populate_route_config had NOT populated the upstream,
+    // the runtime's upstream_id lookup would have failed earlier and
+    // the error shape would differ (still 502 today, but the branch
+    // is different). The upstream_count / name / (ip, port) asserts
+    // above are the strong evidence that the DSL-compiled address
+    // reached cfg.
+    CHECK(buf_contains(
+        reinterpret_cast<const char*>(response.ptr), response.len, "HTTP/1.1 502", 12));
+
+    close(c);
+    // reserve_fd is closed by FdGuard at scope exit.
     lt.stop();
     loop->shutdown();
     close(lfd);

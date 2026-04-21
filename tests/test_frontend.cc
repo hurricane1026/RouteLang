@@ -296,6 +296,273 @@ TEST(frontend, parse_return_forward_rejects_missing_parens) {
     CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
 }
 
+TEST(frontend, parse_upstream_at_form) {
+    // `upstream NAME at "host:port"` packs both into a single string
+    // that analyze splits at the last colon. Result: HirUpstream has
+    // has_address=true and host-byte-order ip + port.
+    const char* src = "upstream api at \"127.0.0.1:8080\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    const auto& up = ast->items[0].upstream;
+    CHECK(up.has_address);
+    CHECK(up.host_lit.eq(lit("127.0.0.1:8080")));
+    CHECK(!up.port_is_set);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    const auto& u = hir->upstreams[0];
+    CHECK(u.has_address);
+    CHECK_EQ(u.ip, 0x7F000001u);
+    CHECK_EQ(u.port, 8080u);
+}
+
+TEST(frontend, parse_upstream_dict_form) {
+    // Dict form `{ host: "...", port: N }` — same analyze output,
+    // order-independent, both fields required.
+    const char* src_host_first =
+        "upstream api { host: \"10.0.0.1\", port: 9090 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    const char* src_port_first =
+        "upstream api { port: 9090, host: \"10.0.0.1\" }\n"
+        "route GET \"/u\" { return 200 }\n";
+    for (const char* src : {src_host_first, src_port_first}) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->upstreams.len, 1u);
+        const auto& u = hir->upstreams[0];
+        CHECK(u.has_address);
+        CHECK_EQ(u.ip, 0x0A000001u);
+        CHECK_EQ(u.port, 9090u);
+    }
+}
+
+TEST(frontend, parse_upstream_no_address_still_works) {
+    // Backwards-compat: `upstream NAME` (no address) stays legal.
+    // HirUpstream.has_address == false means the runtime must bind
+    // this upstream via add_upstream() itself.
+    const char* src = "upstream api\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    CHECK(!hir->upstreams[0].has_address);
+}
+
+TEST(frontend, parse_upstream_rejects_malformed_ip) {
+    // IPv4 dotted-quad with an out-of-range octet → analyze rejects.
+    const char* src = "upstream api at \"256.0.0.1:8080\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_upstream_rejects_hostname) {
+    // DNS names aren't supported yet — only IPv4 dotted-quad literals.
+    const char* src = "upstream api at \"example.com:8080\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_upstream_rejects_missing_port) {
+    // `at "127.0.0.1"` without `:port` is rejected at analyze.
+    const char* src = "upstream api at \"127.0.0.1\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_upstream_rejects_port_zero_and_overflow) {
+    // Port must be 1..65535 — 0 is reserved, and anything > 65535 is
+    // rejected at parse time (IntLit overflow) or at analyze.
+    for (const char* src : {
+             "upstream api at \"127.0.0.1:0\"\nroute GET \"/u\" { return 200 }\n",
+             "upstream api at \"127.0.0.1:65536\"\nroute GET \"/u\" { return 200 }\n",
+         }) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, parse_upstream_dict_rejects_port_zero) {
+    // At-form `:0` is covered by parse_upstream_rejects_port_zero_and_
+    // overflow, but dict form hits a different diagnostic path (port
+    // is a separate token, detail == "port"). Cover that branch too.
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", port: 0 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("port")));
+}
+
+TEST(frontend, parse_upstream_dict_port_range_diagnostic_mentions_port) {
+    // `at "host:port"` form: the whole host_lit is the natural detail
+    // (the full bad string). But dict form gave port its own token, so
+    // pointing the error at host_lit would be misleading — use "port"
+    // as the detail instead.
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", port: 65536 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("port")));
+}
+
+TEST(frontend, parse_upstream_dict_port_overflow_safe) {
+    // A dict-form port literal with enough leading digits to wrap u64
+    // past 2^64 must still be rejected as InvalidInteger, not
+    // accidentally accepted after wraparound. Uses 20+ digits —
+    // 10^20 > 2^64 so the accumulator would wrap without the
+    // pre-multiply overflow check.
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", port: 99999999999999999999 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
+}
+
+TEST(frontend, parse_upstream_empty_host_diagnostic_has_nonempty_detail) {
+    // An empty host (`:8080` in at-form, `{ host: "" }` in dict form)
+    // previously produced a zero-length detail, hiding what went
+    // wrong in diagnostics. The fallback now surfaces the full at-
+    // form literal or "host" for dict form so the user can see which
+    // part tripped the check.
+    {
+        const char* src = "upstream api at \":8080\"\nroute GET \"/u\" { return 200 }\n";
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit(":8080")));
+    }
+    {
+        const char* src =
+            "upstream api { host: \"\", port: 80 }\n"
+            "route GET \"/u\" { return 200 }\n";
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit("host")));
+    }
+}
+
+TEST(frontend, parse_upstream_dict_rejects_missing_field) {
+    // Both host and port are required in dict form. The diagnostic
+    // detail must name the missing field so the user knows what to
+    // add — an empty detail made the error uninformative.
+    struct Case {
+        const char* src;
+        const char* missing;  // expected detail, or nullptr for the empty-dict case
+    };
+    const Case kCases[] = {
+        {"upstream api { host: \"127.0.0.1\" }\nroute GET \"/u\" { return 200 }\n", "port"},
+        {"upstream api { port: 8080 }\nroute GET \"/u\" { return 200 }\n", "host"},
+        // Empty `{}` is rejected by the earlier empty-dict branch
+        // (no specific missing field to name).
+        {"upstream api {}\nroute GET \"/u\" { return 200 }\n", nullptr},
+    };
+    for (const auto& tc : kCases) {
+        auto lexed = lex(lit(tc.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(!ast);
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+        if (tc.missing != nullptr) {
+            CHECK(ast.error().detail.eq(lit(tc.missing)));
+        }
+    }
+}
+
+TEST(frontend, parse_upstream_dict_rejects_duplicate_field) {
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", host: \"10.0.0.1\", port: 80 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_upstream_at_is_contextual_not_reserved) {
+    // `at` is a contextual keyword recognised only after an upstream
+    // name. Using `at` as a regular identifier elsewhere — here as a
+    // route-path literal substring and as a header key — must parse
+    // without the lexer reserving the word. Regression guard against
+    // accidentally promoting `at` to a global keyword.
+    const char* src =
+        "upstream api at \"127.0.0.1:80\"\n"
+        "route GET \"/at\" { return response(200, headers: { \"at\": \"ok\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    CHECK(hir->upstreams[0].has_address);
+}
+
+TEST(frontend, parse_upstream_dict_rejects_unknown_field) {
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", port: 80, weight: 3 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("weight")));
+}
+
 TEST(frontend, parse_return_response_with_headers) {
     // Headers dict carries through parser → HIR → MIR → RIR:
     // intern_response_headers writes one set into rir::Module's flat
@@ -6412,7 +6679,9 @@ TEST(frontend, lower_forward_route_to_rir) {
     REQUIRE(hir);
     REQUIRE_EQ(hir->upstreams.len, 1u);
     REQUIRE_EQ(hir->routes.len, 1u);
-    CHECK_EQ(hir->upstreams[0].id, 1u);
+    // Upstream IDs are 0-based so they index RouteConfig::upstreams
+    // directly. The first declared upstream gets id 0, not 1.
+    CHECK_EQ(hir->upstreams[0].id, 0u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].control.direct_term.kind),
              static_cast<u8>(HirTerminatorKind::ForwardUpstream));
     auto mir = build_mir_heap(hir.value());
@@ -6429,7 +6698,7 @@ TEST(frontend, lower_forward_route_to_rir) {
     REQUIRE_EQ(fn.block_count, 1u);
     REQUIRE_EQ(fn.blocks[0].inst_count, 2u);
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ConstI32));
-    CHECK_EQ(fn.blocks[0].insts[0].imm.i32_val, 1);
+    CHECK_EQ(fn.blocks[0].insts[0].imm.i32_val, 0);
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[1].op), static_cast<u8>(rir::Opcode::RetForward));
     rir.destroy();
 }

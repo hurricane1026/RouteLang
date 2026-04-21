@@ -115,19 +115,22 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         // declaration order. A mismatch here would send forward(a) to
         // the backend at slot a's index but with a different name —
         // silent misconfiguration we'd rather catch up front.
+        //
+        // The match MUST be exact, so reject any module name that
+        // wouldn't round-trip through the 31-byte cfg.upstreams name
+        // buffer. If we truncated both sides before comparing, two
+        // DSL names with identical first 31 bytes but different
+        // suffixes would compare equal, and a caller who pre-bound
+        // them in the wrong order could slip past the verification.
+        // The empty-cfg branch above can tolerate truncation (it's
+        // the one doing the bind, and forward() resolves by index,
+        // not by name) but this branch can't.
         for (u32 i = 0; i < mod.upstream_count; i++) {
             const auto& up = mod.upstreams[i];
             if (up.name.len > 0 && up.name.ptr == nullptr) return false;
-            // Compare against cfg.upstreams[i].name (NUL-terminated,
-            // at most kMaxUpstreamNameLen-1 chars). set_name truncates
-            // silently, so the comparison uses the truncated length
-            // on the cfg side for consistency.
-            u32 expected_len = up.name.len;
-            if (expected_len >= UpstreamTarget::kMaxUpstreamNameLen) {
-                expected_len = UpstreamTarget::kMaxUpstreamNameLen - 1;
-            }
-            if (cfg.upstreams[i].name_len != expected_len) return false;
-            for (u32 j = 0; j < expected_len; j++) {
+            if (up.name.len >= UpstreamTarget::kMaxUpstreamNameLen) return false;
+            if (cfg.upstreams[i].name_len != up.name.len) return false;
+            for (u32 j = 0; j < up.name.len; j++) {
                 if (cfg.upstreams[i].name[j] != up.name.ptr[j]) return false;
             }
         }

@@ -3557,6 +3557,50 @@ TEST(route, populate_route_config_rejects_pre_bound_name_mismatch) {
     rir.destroy();
 }
 
+// Pre-bound mode: a module upstream with a name longer than the cfg
+// can hold (kMaxUpstreamNameLen - 1 = 31 bytes) can't round-trip
+// through set_name without truncation. Two such names with the same
+// first 31 bytes would compare equal after truncation, letting a
+// caller pre-bind in the wrong order and slip past the verification.
+// Helper rejects over-long names up front in pre-bound mode to close
+// that gap.
+TEST(route, populate_route_config_rejects_pre_bound_over_long_name) {
+    using namespace rut;
+    // 32 bytes — one past the 31-byte cap. Build at compile time so
+    // the DSL source is deterministic.
+    const char* src =
+        "upstream "
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"  // 32 'a's
+        "route GET \"/api\" { return forward(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.upstream_count, 1u);
+    REQUIRE_EQ(rir.module.upstreams[0].name.len, 32u);
+
+    RouteConfig cfg{};
+    // Caller pre-binds using the truncated name (what set_name would
+    // store anyway). Under the old comparison this would have matched
+    // the truncated module name and incorrectly accepted the config.
+    REQUIRE(cfg.add_upstream("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  // 31 'a's
+                             0x7F000001,
+                             8080)
+                .has_value());
+    CHECK(!populate_route_config(cfg, rir.module));
+    rir.destroy();
+}
+
 // End-to-end: compile DSL with an address-carrying `upstream` decl and
 // let populate_route_config bind the RouteConfig. Since no real backend
 // is listening on the compiled port, the forward will ECONNREFUSED and

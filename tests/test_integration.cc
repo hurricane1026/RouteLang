@@ -3495,10 +3495,37 @@ TEST(route, populate_route_config_rejects_non_empty_cfg) {
 TEST(route, populate_route_config_binds_upstream_from_dsl) {
     using namespace rut;
 
-    const char* src =
-        "upstream backend at \"127.0.0.1:9999\"\n"
-        "route GET \"/api\" { return forward(backend) }\n";
-    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    // Reserve an ephemeral port for the "unreachable backend". Hard-
+    // coding 9999 would be flaky: if the CI runner already has
+    // something listening there, the test would behave differently.
+    // Bind (but don't listen) on 127.0.0.1:0 so the kernel picks a
+    // free port, capture it, keep the socket open for the duration
+    // of the test so no other process can steal it, and feed the
+    // number into the DSL source. Connect attempts during the test
+    // get ECONNREFUSED — exactly the "no backend is listening"
+    // behaviour we want to drive.
+    const i32 reserve_fd = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE_GE(reserve_fd, 0);
+    struct sockaddr_in reserve_addr{};
+    reserve_addr.sin_family = AF_INET;
+    reserve_addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001u);
+    reserve_addr.sin_port = 0;
+    REQUIRE_EQ(
+        bind(reserve_fd, reinterpret_cast<struct sockaddr*>(&reserve_addr), sizeof(reserve_addr)),
+        0);
+    struct sockaddr_in got{};
+    socklen_t got_len = sizeof(got);
+    REQUIRE_EQ(getsockname(reserve_fd, reinterpret_cast<struct sockaddr*>(&got), &got_len), 0);
+    const u16 upstream_port = __builtin_bswap16(got.sin_port);
+
+    char src_buf[256];
+    const int src_len = snprintf(src_buf,
+                                 sizeof(src_buf),
+                                 "upstream backend at \"127.0.0.1:%u\"\n"
+                                 "route GET \"/api\" { return forward(backend) }\n",
+                                 upstream_port);
+    REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
+    auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE(ast);
@@ -3516,7 +3543,7 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     REQUIRE_EQ(rir.module.upstream_count, 1u);
     CHECK(rir.module.upstreams[0].has_address);
     CHECK_EQ(rir.module.upstreams[0].ip, 0x7F000001u);
-    CHECK_EQ(rir.module.upstreams[0].port, 9999u);
+    CHECK_EQ(rir.module.upstreams[0].port, upstream_port);
 
     auto cg = jit::codegen(rir.module);
     REQUIRE(cg.ok);
@@ -3542,7 +3569,7 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     const Str actual_name{cfg.upstreams[0].name, 7u};
     const Str expected_name{"backend", 7u};
     CHECK(actual_name.eq(expected_name));
-    CHECK_EQ(cfg.upstreams[0].addr.sin_port, __builtin_bswap16(9999));
+    CHECK_EQ(cfg.upstreams[0].addr.sin_port, __builtin_bswap16(upstream_port));
     CHECK_EQ(cfg.upstreams[0].addr.sin_addr.s_addr, __builtin_bswap32(0x7F000001));
     REQUIRE(cfg.add_jit_handler("/api", 'G', handler_fn));
     const RouteConfig* active = &cfg;
@@ -3572,16 +3599,19 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     }
     CHECK_GT(total, 0);
     const Str response{buf, static_cast<u32>(total)};
-    // The connect to 127.0.0.1:9999 fails (nothing listening) → 502.
-    // If populate_route_config had NOT populated the upstream, the
-    // runtime's upstream_id lookup would have failed earlier and the
-    // error shape would differ (still 502 today, but the branch is
-    // different). We rely on upstream_count == 1 above as the
-    // strong evidence that the DSL-compiled address reached cfg.
+    // Connect to 127.0.0.1:<reserved port> fails with ECONNREFUSED
+    // (nothing listening because reserve_fd never called listen()) →
+    // 502. If populate_route_config had NOT populated the upstream,
+    // the runtime's upstream_id lookup would have failed earlier and
+    // the error shape would differ (still 502 today, but the branch
+    // is different). The upstream_count / name / (ip, port) asserts
+    // above are the strong evidence that the DSL-compiled address
+    // reached cfg.
     CHECK(buf_contains(
         reinterpret_cast<const char*>(response.ptr), response.len, "HTTP/1.1 502", 12));
 
     close(c);
+    close(reserve_fd);
     lt.stop();
     loop->shutdown();
     close(lfd);

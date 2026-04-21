@@ -73,16 +73,26 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         // rir::Module stores Str (ptr + len) where the bytes may not
         // be NUL-terminated (arena-allocated slices). Copy into a
         // small fixed buffer matching UpstreamTarget::kMaxUpstreamNameLen
-        // so the underlying strncpy-equivalent sees a terminator.
+        // so the underlying set_name sees a terminator. Truncate
+        // names that exceed the buffer — matches the silent-truncate
+        // behavior of UpstreamTarget::set_name so the helper doesn't
+        // introduce a new runtime-only failure mode. (A hard limit
+        // should be enforced at the frontend with a compile-time
+        // diagnostic, not here.)
         char name_buf[UpstreamTarget::kMaxUpstreamNameLen];
         // Defensive null guard: a hand-built rir::Module could set
         // len > 0 with a null ptr; the copy below would segfault.
         // lower_rir never produces this shape, but the helper is
         // reachable from arbitrary callers so fail closed.
         if (up.name.len > 0 && up.name.ptr == nullptr) return false;
-        if (up.name.len + 1 > sizeof(name_buf)) return false;  // name too long
-        for (u32 j = 0; j < up.name.len; j++) name_buf[j] = up.name.ptr[j];
-        name_buf[up.name.len] = '\0';
+        // Compute copy_len as min(len, cap-1) with no `len + 1`
+        // arithmetic — that expression would wrap for a hand-built
+        // module with len == 0xffffffff, making the subsequent copy
+        // loop run far past name_buf.
+        u32 copy_len = up.name.len;
+        if (copy_len >= sizeof(name_buf)) copy_len = sizeof(name_buf) - 1;
+        for (u32 j = 0; j < copy_len; j++) name_buf[j] = up.name.ptr[j];
+        name_buf[copy_len] = '\0';
         auto r = cfg.add_upstream(name_buf, up.ip, up.port);
         if (!r.has_value()) return false;
         // The helper only makes sense when cfg starts empty — assert

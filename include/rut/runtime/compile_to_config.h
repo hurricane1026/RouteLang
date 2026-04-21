@@ -75,6 +75,11 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         // small fixed buffer matching UpstreamTarget::kMaxUpstreamNameLen
         // so the underlying strncpy-equivalent sees a terminator.
         char name_buf[UpstreamTarget::kMaxUpstreamNameLen];
+        // Defensive null guard: a hand-built rir::Module could set
+        // len > 0 with a null ptr; the copy below would segfault.
+        // lower_rir never produces this shape, but the helper is
+        // reachable from arbitrary callers so fail closed.
+        if (up.name.len > 0 && up.name.ptr == nullptr) return false;
         if (up.name.len + 1 > sizeof(name_buf)) return false;  // name too long
         for (u32 j = 0; j < up.name.len; j++) name_buf[j] = up.name.ptr[j];
         name_buf[up.name.len] = '\0';

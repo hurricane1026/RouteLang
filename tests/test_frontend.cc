@@ -437,6 +437,25 @@ TEST(frontend, parse_upstream_dict_rejects_duplicate_field) {
     CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
 }
 
+TEST(frontend, parse_upstream_at_is_contextual_not_reserved) {
+    // `at` is a contextual keyword recognised only after an upstream
+    // name. Using `at` as a regular identifier elsewhere — here as a
+    // route-path literal substring and as a header key — must parse
+    // without the lexer reserving the word. Regression guard against
+    // accidentally promoting `at` to a global keyword.
+    const char* src =
+        "upstream api at \"127.0.0.1:80\"\n"
+        "route GET \"/at\" { return response(200, headers: { \"at\": \"ok\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    CHECK(hir->upstreams[0].has_address);
+}
+
 TEST(frontend, parse_upstream_dict_rejects_unknown_field) {
     const char* src =
         "upstream api { host: \"127.0.0.1\", port: 80, weight: 3 }\n"

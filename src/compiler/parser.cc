@@ -1033,7 +1033,14 @@ struct Parser {
         //   `at "<host>:<port>"`          — single string literal
         //   `{ host: "...", port: N }`    — dict form; order-independent,
         //                                    both fields required
-        if (take(TokenType::KwAt)) {
+        // `at` is a contextual keyword — we peek for an Ident with
+        // exactly that text rather than reserving it globally. Keeps
+        // `at` available as a user identifier elsewhere.
+        const Token& after_name = cur();
+        const bool is_at_keyword =
+            after_name.type == TokenType::Ident && after_name.text.eq({"at", 2});
+        if (is_at_keyword) {
+            pos++;  // consume `at`
             auto lit = expect(TokenType::StringLit);
             if (!lit) return core::make_unexpected(lit.error());
             item.upstream.has_address = true;

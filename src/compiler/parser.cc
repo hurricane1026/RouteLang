@@ -1115,7 +1115,16 @@ struct Parser {
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
             if (!seen_host || !seen_port) {
-                return frontend_error(FrontendError::UnsupportedSyntax, span_from(*rbrace.value()));
+                // Name the specific missing field in the detail so the
+                // diagnostic tells the user what to add. Point the
+                // span at the address block (the `{` we captured),
+                // not the closing brace. If both are missing, call
+                // out "host" first since order in the dict is
+                // host-then-port; the user will see "port" missing
+                // after fixing the host.
+                const Str detail = !seen_host ? Str{"host", 4} : Str{"port", 4};
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, detail);
             }
             end_off = rbrace.value()->end;
             // Stretch the addr_span to cover the full `{ ... }` block

@@ -3554,6 +3554,7 @@ TEST(route, populate_route_config_rejects_pre_bound_name_mismatch) {
     // so the shape check passes, but the per-slot name compare fails.
     REQUIRE(cfg.add_upstream("other", 0x7F000001, 8080).has_value());
     CHECK(!populate_route_config(cfg, rir.module));
+    rir.destroy();
 }
 
 // End-to-end: compile DSL with an address-carrying `upstream` decl and

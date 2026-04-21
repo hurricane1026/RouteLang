@@ -495,17 +495,29 @@ TEST(frontend, parse_upstream_empty_host_diagnostic_has_nonempty_detail) {
 }
 
 TEST(frontend, parse_upstream_dict_rejects_missing_field) {
-    // Both host and port are required in dict form.
-    for (const char* src : {
-             "upstream api { host: \"127.0.0.1\" }\nroute GET \"/u\" { return 200 }\n",
-             "upstream api { port: 8080 }\nroute GET \"/u\" { return 200 }\n",
-             "upstream api {}\nroute GET \"/u\" { return 200 }\n",
-         }) {
-        auto lexed = lex(lit(src));
+    // Both host and port are required in dict form. The diagnostic
+    // detail must name the missing field so the user knows what to
+    // add — an empty detail made the error uninformative.
+    struct Case {
+        const char* src;
+        const char* missing;  // expected detail, or nullptr for the empty-dict case
+    };
+    const Case kCases[] = {
+        {"upstream api { host: \"127.0.0.1\" }\nroute GET \"/u\" { return 200 }\n", "port"},
+        {"upstream api { port: 8080 }\nroute GET \"/u\" { return 200 }\n", "host"},
+        // Empty `{}` is rejected by the earlier empty-dict branch
+        // (no specific missing field to name).
+        {"upstream api {}\nroute GET \"/u\" { return 200 }\n", nullptr},
+    };
+    for (const auto& tc : kCases) {
+        auto lexed = lex(lit(tc.src));
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
         REQUIRE(!ast);
         CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+        if (tc.missing != nullptr) {
+            CHECK(ast.error().detail.eq(lit(tc.missing)));
+        }
     }
 }
 

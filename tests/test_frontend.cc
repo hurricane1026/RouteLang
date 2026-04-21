@@ -563,6 +563,90 @@ TEST(frontend, parse_upstream_dict_rejects_unknown_field) {
     CHECK(ast.error().detail.eq(lit("weight")));
 }
 
+TEST(frontend, parse_guard_req_method_eq_post) {
+    // `guard req.method == POST else { return 405 }` — the keystone
+    // use case. Parser yields LitMethod + Field(ReqObject, "method");
+    // analyze resolves both to typed HIR; MIR/RIR downstream carry
+    // the ConstMethod / ReqMethod opcodes. Codegen emits i8 constant
+    // and a helper-call to read the parsed method from the request.
+    const char* src =
+        "route GET \"/\" { guard req.method == POST else { return 405 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    // Lower fully through MIR → RIR so we know codegen gets the right
+    // inputs. The parser / analyzer paths are the ones that changed;
+    // downstream is reused machinery.
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, parse_method_keyword_as_expression) {
+    // POST / GET / PUT / DELETE / HEAD / OPTIONS / PATCH each need
+    // to parse as standalone expressions with distinct HttpMethod
+    // enum values (matching runtime/http_parser.h: GET=0, POST=1, ...).
+    struct Case {
+        const char* src;
+        i32 expected_value;
+    };
+    const Case kCases[] = {
+        {"route GET \"/\" { guard req.method == GET else { return 405 } return 200 }\n", 0},
+        {"route GET \"/\" { guard req.method == POST else { return 405 } return 200 }\n", 1},
+        {"route GET \"/\" { guard req.method == PUT else { return 405 } return 200 }\n", 2},
+        {"route GET \"/\" { guard req.method == DELETE else { return 405 } return 200 }\n", 3},
+        {"route GET \"/\" { guard req.method == PATCH else { return 405 } return 200 }\n", 4},
+        {"route GET \"/\" { guard req.method == HEAD else { return 405 } return 200 }\n", 5},
+        {"route GET \"/\" { guard req.method == OPTIONS else { return 405 } return 200 }\n", 6},
+    };
+    for (const auto& tc : kCases) {
+        auto lexed = lex(lit(tc.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+    }
+}
+
+TEST(frontend, parse_req_unknown_field_rejected) {
+    // `req.X` for a field name analyze doesn't recognize must reject
+    // at analyze time. `header` is accepted as a call form via the
+    // dedicated ReqHeader path, but `req.header` without parens falls
+    // into this path and is rejected (same as any other non-method
+    // field name).
+    const char* src = "route GET \"/\" { guard req.bogus == GET else { return 405 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("bogus")));
+}
+
+TEST(frontend, parse_method_vs_non_method_compare_rejected) {
+    // `req.method == 200` mixes Method and i32 — analyze enforces
+    // type-equality on the == operands and rejects.
+    const char* src =
+        "route GET \"/\" { guard req.method == 200 else { return 405 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
 TEST(frontend, parse_return_response_with_headers) {
     // Headers dict carries through parser → HIR → MIR → RIR:
     // intern_response_headers writes one set into rir::Module's flat

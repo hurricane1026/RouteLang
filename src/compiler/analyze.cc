@@ -4025,6 +4025,22 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
     if (expr.kind == AstExprKind::MethodCall) {
         return analyze_method_call_expr(expr, route, mod, locals, local_count, binding);
     }
+    // Intercept `req.X` before the generic struct/variant/namespace
+    // Field handler below: the lhs is our magic ReqObject leaf, not a
+    // real value the general analyzer knows how to type-check.
+    if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
+        expr.lhs->kind == AstExprKind::ReqObject) {
+        // Known fields: method (HttpMethod). Future fields (path, …)
+        // add branches here. `header` isn't reached via this path —
+        // the parser captures `req.header("...")` as the dedicated
+        // ReqHeader special form before generic Field parsing runs.
+        if (expr.name.eq({"method", 6})) {
+            out.kind = HirExprKind::ReqMethod;
+            out.type = HirTypeKind::Method;
+            return out;
+        }
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+    }
     if (expr.kind == AstExprKind::Field) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (expr.lhs->kind == AstExprKind::Ident) {
@@ -4352,6 +4368,21 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
         out.may_nil = true;
         out.str_value = expr.str_value;
         return out;
+    }
+    if (expr.kind == AstExprKind::LitMethod) {
+        // Method literal (POST / GET / …). int_value carries the
+        // HttpMethod enum value the parser decoded.
+        out.kind = HirExprKind::ConstMethod;
+        out.type = HirTypeKind::Method;
+        out.int_value = expr.int_value;
+        return out;
+    }
+    // A bare `req` (not followed by `.`) parsed as ReqObject is a
+    // standalone identifier use — analyze rejects it because the
+    // request object isn't a first-class value today. The `req.X`
+    // Field form is handled earlier, before the generic Field path.
+    if (expr.kind == AstExprKind::ReqObject) {
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     }
     if (expr.kind == AstExprKind::Nil) {
         out.kind = HirExprKind::Nil;
@@ -5473,6 +5504,14 @@ static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
     cond.type = HirTypeKind::Bool;
 
     if (!analyzed->may_error) {
+        // Plain boolean — pass through so `guard <cond> else { ... }`
+        // rejects on falsy (Swift-style reject-or-continue). Without
+        // this, any non-errorable guard would fold to always-true.
+        if (analyzed->type == HirTypeKind::Bool && !analyzed->may_nil) {
+            if (!route->exprs.push(analyzed.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            return route->exprs[route->exprs.len - 1];
+        }
         cond.bool_value = true;
         return cond;
     }

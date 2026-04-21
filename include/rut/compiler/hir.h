@@ -59,6 +59,11 @@ enum class HirExprKind : u8 {
     StructInit,
     Field,
     ReqHeader,
+    // HTTP method literal — int_value holds the HttpMethod enum
+    // value (0=GET, 1=POST, …, matching rut/runtime/http_parser.h).
+    ConstMethod,
+    // Read of the parsed request method from the current connection.
+    ReqMethod,
     Nil,
     Error,
     LocalRef,
@@ -83,6 +88,7 @@ enum class HirTypeKind : u8 {
     Variant,
     Tuple,
     Struct,
+    Method,
 };
 
 inline constexpr u32 kMaxTupleSlots = 10;

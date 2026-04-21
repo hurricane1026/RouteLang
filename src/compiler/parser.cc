@@ -320,6 +320,57 @@ struct Parser {
             expr.span = Span{start_tok.start, rparen.value()->end, start_tok.line, start_tok.col};
             return expr;
         }
+        // `req` as a leaf — only when followed by `.`, otherwise treat
+        // as a normal identifier so users can still bind a local
+        // called `req`. The trailer machinery in parse_primary_expr
+        // will turn `req.X` into Field{lhs=ReqObject, name="X"};
+        // analyze maps the specific field names to request opcodes.
+        if (cur().type == TokenType::Ident && cur().text.eq({"req", 3}) &&
+            peek().type == TokenType::Dot) {
+            const Token tok = cur();
+            pos++;
+            expr.kind = AstExprKind::ReqObject;
+            expr.span = span_from(tok);
+            return expr;
+        }
+        // HTTP method literals as expressions (POST, GET, …). The
+        // lexer already tokenizes these as KwGet/KwPost/etc.; until
+        // now they were only consumed in route declarations. Map each
+        // keyword to the corresponding HttpMethod enum value (stored
+        // in int_value), letting `guard req.method == POST else { … }`
+        // compile. Values match HttpMethod in rut/runtime/http_parser.h.
+        if (is_method_keyword(cur().type)) {
+            const Token tok = cur();
+            pos++;
+            expr.kind = AstExprKind::LitMethod;
+            switch (tok.type) {
+                case TokenType::KwGet:
+                    expr.int_value = 0;
+                    break;
+                case TokenType::KwPost:
+                    expr.int_value = 1;
+                    break;
+                case TokenType::KwPut:
+                    expr.int_value = 2;
+                    break;
+                case TokenType::KwDelete:
+                    expr.int_value = 3;
+                    break;
+                case TokenType::KwPatch:
+                    expr.int_value = 4;
+                    break;
+                case TokenType::KwHead:
+                    expr.int_value = 5;
+                    break;
+                case TokenType::KwOptions:
+                    expr.int_value = 6;
+                    break;
+                default:
+                    return frontend_error(FrontendError::UnsupportedSyntax, span_from(tok));
+            }
+            expr.span = span_from(tok);
+            return expr;
+        }
         auto ident = expect(TokenType::Ident);
         if (!ident) return core::make_unexpected(ident.error());
         if (ident.value()->text.len >= 2 && ident.value()->text.ptr[0] == '_') {

@@ -324,6 +324,17 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.str_value = expr.str_value;
         return v;
     }
+    if (expr.kind == HirExprKind::ConstMethod) {
+        v.kind = MirValueKind::ConstMethod;
+        v.type = MirTypeKind::Method;
+        v.int_value = expr.int_value;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqMethod) {
+        v.kind = MirValueKind::ReqMethod;
+        v.type = MirTypeKind::Method;
+        return v;
+    }
     if (expr.kind == HirExprKind::Nil) {
         v.kind = MirValueKind::Nil;
         v.type = MirTypeKind::Unknown;

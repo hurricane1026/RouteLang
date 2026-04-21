@@ -411,6 +411,23 @@ TEST(frontend, parse_upstream_rejects_port_zero_and_overflow) {
     }
 }
 
+TEST(frontend, parse_upstream_dict_rejects_port_zero) {
+    // At-form `:0` is covered by parse_upstream_rejects_port_zero_and_
+    // overflow, but dict form hits a different diagnostic path (port
+    // is a separate token, detail == "port"). Cover that branch too.
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", port: 0 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("port")));
+}
+
 TEST(frontend, parse_upstream_dict_port_range_diagnostic_mentions_port) {
     // `at "host:port"` form: the whole host_lit is the natural detail
     // (the full bad string). But dict form gave port its own token, so

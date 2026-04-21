@@ -3457,14 +3457,10 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
     rir.destroy();
 }
 
-// End-to-end: compile DSL with an address-carrying `upstream` decl and
-// let populate_route_config bind the RouteConfig. Since no real backend
-// is listening on the compiled port, the forward will ECONNREFUSED and
-// the client will get 502 — which proves:
-//   1. `upstream X at "127.0.0.1:NNN"` parses + validates + lowers.
-//   2. populate_route_config called add_upstream with the compiled
-//      (ip, port) — otherwise the runtime would have had no upstream
-//      entry and returned some other error.
+// populate_route_config requires an empty RouteConfig so newly-added
+// slots line up with declaration order from the compiled module. Any
+// partially-populated config would silently mis-align indices across
+// upstreams / bodies / header sets, so the helper fail-fast rejects.
 TEST(route, populate_route_config_rejects_non_empty_cfg) {
     using namespace rut;
     // The helper relies on cfg starting empty so newly-added slots
@@ -3492,6 +3488,14 @@ TEST(route, populate_route_config_rejects_non_empty_cfg) {
     rir.destroy();
 }
 
+// End-to-end: compile DSL with an address-carrying `upstream` decl and
+// let populate_route_config bind the RouteConfig. Since no real backend
+// is listening on the compiled port, the forward will ECONNREFUSED and
+// the client will get 502 — which proves:
+//   1. `upstream X at "127.0.0.1:NNN"` parses + validates + lowers.
+//   2. populate_route_config called add_upstream with the compiled
+//      (ip, port) — otherwise the runtime would have had no upstream
+//      entry and returned some other error.
 TEST(route, populate_route_config_binds_upstream_from_dsl) {
     using namespace rut;
 
@@ -3504,8 +3508,19 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     // number into the DSL source. Connect attempts during the test
     // get ECONNREFUSED — exactly the "no backend is listening"
     // behaviour we want to drive.
-    const i32 reserve_fd = socket(AF_INET, SOCK_STREAM, 0);
-    REQUIRE_GE(reserve_fd, 0);
+    //
+    // Guard closes the fd on scope exit so an early REQUIRE failure
+    // (before the explicit close at the bottom) doesn't leak the
+    // reserved socket and starve subsequent tests of ephemeral ports.
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    FdGuard reserve{socket(AF_INET, SOCK_STREAM, 0)};
+    REQUIRE_GE(reserve.fd, 0);
+    const i32 reserve_fd = reserve.fd;
     struct sockaddr_in reserve_addr{};
     reserve_addr.sin_family = AF_INET;
     reserve_addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001u);
@@ -3611,7 +3626,7 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
         reinterpret_cast<const char*>(response.ptr), response.len, "HTTP/1.1 502", 12));
 
     close(c);
-    close(reserve_fd);
+    // reserve_fd is closed by FdGuard at scope exit.
     lt.stop();
     loop->shutdown();
     close(lfd);

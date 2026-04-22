@@ -1289,7 +1289,7 @@ TEST(tls_state_machine, spurious_epollout_with_empty_tls_send_state_is_ignored) 
     backend.shutdown();
 }
 
-// === io_uring backend (TODO #3 + #4) ===
+// === io_uring backend smoke coverage ===
 
 // Verify IoUringBackend::init creates a timerfd
 TEST(uring, init_creates_timerfd) {
@@ -1326,6 +1326,94 @@ TEST(uring, return_buffer_no_crash) {
     backend.return_buffer(static_cast<u16>(kProvidedBufCount - 1));
     backend.shutdown();
     close(lfd);
+}
+
+// Verify wait() turns a timerfd expiration into a Timeout IoEvent.
+TEST(uring, wait_emits_timeout_tick) {
+    IoUringBackend backend;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    auto rc = backend.init(0, lfd);
+    if (!rc) {
+        close(lfd);
+        CHECK(true);
+        return;
+    }
+
+    // Override the default 1-second periodic tick with an immediate one-shot
+    // so the already-armed timer read completes on this wait().
+    struct itimerspec ts{};
+    ts.it_value.tv_nsec = 1;
+    REQUIRE_EQ(timerfd_settime(backend.timer_fd, 0, &ts, nullptr), 0);
+
+    IoEvent events[4]{};
+    u32 n = backend.wait(events, 4, nullptr, 0);
+    REQUIRE_GE(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Timeout);
+    CHECK_GE(events[0].result, 1);
+    CHECK_EQ(events[0].has_buf, 0u);
+    CHECK_EQ(events[0].buf_id, 0u);
+
+    backend.shutdown();
+    close(lfd);
+}
+
+// Verify provided-buffer recv CQEs are copied into Connection.recv_buf and the
+// emitted IoEvent no longer owns a provided buffer.
+TEST(uring, wait_copies_recv_into_conn_buffer) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    IoUringBackend backend;
+    auto init_rc = backend.init(0, -1);
+    if (!init_rc) {
+        close(fds[0]);
+        close(fds[1]);
+        CHECK(true);
+        return;
+    }
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+
+    REQUIRE(backend.add_recv(fds[0], conn.id));
+    static const u8 kReq[] = "GET / HTTP/1.1\r\n\r\n";
+    static constexpr u32 kExpectedLen = sizeof(kReq) - 1;
+    REQUIRE(send_all(fds[1], reinterpret_cast<const char*>(kReq), kExpectedLen));
+
+    // Accumulate Recv CQEs across wait() calls until recv_buf holds the full
+    // request (POSIX permits SOCK_STREAM recv to split an 18-byte write across
+    // CQEs; non-Recv CQEs are skipped). add_recv uses IORING_RECV_MULTISHOT,
+    // so one SQE yields multiple CQEs without resubmission.
+    //
+    // The 8-attempt cap + init's default 1s periodic timerfd act together as
+    // a hang guard: if multishot recv is silently broken (error CQE, no
+    // buffer, etc.), timer CQEs wake wait() every 1s and the loop exits in
+    // ~8s with a clean REQUIRE failure instead of deadlocking.
+    IoEvent events[4]{};
+    bool saw_any_event = false;
+    bool saw_recv_event = false;
+    for (u32 attempt = 0; attempt < 8 && conn.recv_buf.len() < kExpectedLen; ++attempt) {
+        u32 n = backend.wait(events, 4, &conn, 1);
+        if (n > 0) saw_any_event = true;
+        for (u32 i = 0; i < n; ++i) {
+            if (events[i].type != IoEventType::Recv) continue;
+            saw_recv_event = true;
+            CHECK_EQ(events[i].conn_id, conn.id);
+            CHECK_GT(events[i].result, 0);
+            CHECK_EQ(events[i].has_buf, 0u);
+            CHECK_EQ(events[i].buf_id, 0u);
+        }
+    }
+    REQUIRE(saw_any_event);
+    REQUIRE(saw_recv_event);
+    REQUIRE_EQ(conn.recv_buf.len(), kExpectedLen);
+    CHECK_EQ(memcmp(conn.recv_buf.data(), kReq, kExpectedLen), 0);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
 }
 
 // === Shard lifecycle ===

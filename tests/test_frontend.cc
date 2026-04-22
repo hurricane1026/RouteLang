@@ -811,6 +811,28 @@ route GET "/users" { if req.ping() == 200 { return 200 } else { return 500 } }
     REQUIRE(hir);
 }
 
+TEST(frontend, parse_match_payload_named_req_shadows_magic_path) {
+    // Match payload bindings named `req` must also win over the
+    // special request-object path. Otherwise `req.value` in a match
+    // arm would be intercepted as magic request access instead of
+    // field access on the bound payload.
+    const char* src = R"rut(
+struct Payload { value: i32 }
+variant Box { value(Payload) }
+route GET "/users" {
+    match Box.value(Payload(value: 42)) {
+        case .value(req): if req.value == 42 { return 200 } else { return 500 }
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 TEST(frontend, parse_return_response_with_headers) {
     // Headers dict carries through parser → HIR → MIR → RIR:
     // intern_response_headers writes one set into rir::Module's flat

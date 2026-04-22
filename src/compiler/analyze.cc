@@ -4036,6 +4036,7 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
     if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
         expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq({"req", 3})) {
         bool user_bound = false;
+        if (binding && binding->subject && binding->name.eq({"req", 3})) user_bound = true;
         for (u32 i = 0; i < local_count; i++) {
             if (locals[i].name.eq({"req", 3})) {
                 user_bound = true;

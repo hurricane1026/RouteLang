@@ -663,6 +663,34 @@ TEST(frontend, parse_method_vs_non_method_compare_rejected) {
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
+TEST(frontend, parse_const_if_folds_method_eq) {
+    // `if const POST == GET` is a compile-time predicate — analyze
+    // folds the equality during const-eval and picks the else
+    // branch. Requires const_eval_expr to recognise ConstMethod and
+    // fold `==` over HirTypeKind::Method. Before this fix, analyze
+    // failed with UnsupportedSyntax because Method wasn't in the
+    // eval table.
+    const char* src = R"rut(
+route GET "/" {
+    if const POST == GET { return 500 } else { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    // Const-fold chose the else branch → direct return 200. Lower
+    // through MIR/RIR to confirm the whole pipeline stays happy.
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, parse_generic_eq_function_accepts_method_instance) {
     // Calling an `Eq`-constrained generic with Method operands
     // binds T → Method. Exercises the HIR→MIR copy paths for

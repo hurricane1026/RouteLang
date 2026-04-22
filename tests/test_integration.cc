@@ -3799,34 +3799,39 @@ TEST(route, dsl_req_method_guard_real_socket) {
     loop->config_ptr = &active;
     LoopThread lt = {loop, {}, 100};
     lt.start();
+    usleep(10000);  // let accept registration settle before the first client connect
+
+    // Helper: send one request and record response + pass/fail
+    // against expected substrings. Uses CHECK (not REQUIRE) and
+    // guards socket use behind fd >= 0 so lt.stop() still runs at
+    // the end — REQUIRE's early-return would leak the loop thread.
+    auto exercise = [&](const char* req,
+                        u32 req_len,
+                        const char* want,
+                        u32 want_len,
+                        const char* reject,
+                        u32 reject_len) {
+        const i32 c = connect_to(port);
+        CHECK_GE(c, 0);
+        if (c < 0) return;
+        send_all(c, req, req_len);
+        char buf[2048];
+        const i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+        close(c);
+        CHECK_GT(n, 0);
+        if (n <= 0) return;
+        const auto len = static_cast<u32>(n);
+        CHECK(buf_contains(buf, len, want, want_len));
+        CHECK(!buf_contains(buf, len, reject, reject_len));
+    };
 
     // POST /x → guard passes → 200 OK.
-    {
-        i32 c = connect_to(port);
-        REQUIRE(c >= 0);
-        const char kReq[] = "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
-        send_all(c, kReq, sizeof(kReq) - 1);
-        char buf[2048];
-        i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
-        close(c);
-        CHECK_GT(n, 0);
-        CHECK(buf_contains(buf, static_cast<u32>(n), "200 OK", 6));
-        CHECK(!buf_contains(buf, static_cast<u32>(n), "405", 3));
-    }
+    const char kPostReq[] = "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+    exercise(kPostReq, sizeof(kPostReq) - 1, "200 OK", 6, "405", 3);
 
     // GET /x → guard fails → 405.
-    {
-        i32 c = connect_to(port);
-        REQUIRE(c >= 0);
-        const char kReq[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
-        send_all(c, kReq, sizeof(kReq) - 1);
-        char buf[2048];
-        i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
-        close(c);
-        CHECK_GT(n, 0);
-        CHECK(buf_contains(buf, static_cast<u32>(n), "405", 3));
-        CHECK(!buf_contains(buf, static_cast<u32>(n), "200 OK", 6));
-    }
+    const char kGetReq[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    exercise(kGetReq, sizeof(kGetReq) - 1, "405", 3, "200 OK", 6);
 
     lt.stop();
     loop->shutdown();

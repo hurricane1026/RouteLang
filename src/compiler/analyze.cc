@@ -5458,7 +5458,13 @@ static const HirExpr* known_error_expr(const HirExpr& expr,
 
 static bool const_eval_expr(
     const HirExpr& expr, const HirLocal* locals, u32 local_count, ConstValue* out, u32 depth) {
-    if (depth > local_count) return false;
+    // `depth` guards against LocalRef cycles. For any realistic
+    // program, local_count caps how many unique LocalRefs can be
+    // chained. A zero-local route with a nested expression (e.g.
+    // `if const POST == GET`) still needs a few levels of natural
+    // tree recursion, so we add a fixed headroom on top of
+    // local_count for the Eq/Lt/Gt descent.
+    if (depth > local_count + HirRoute::kMaxLocals) return false;
     if (expr.kind == HirExprKind::BoolLit) {
         out->type = HirTypeKind::Bool;
         out->bool_value = expr.bool_value;
@@ -5466,6 +5472,13 @@ static bool const_eval_expr(
     }
     if (expr.kind == HirExprKind::IntLit) {
         out->type = HirTypeKind::I32;
+        out->int_value = expr.int_value;
+        return true;
+    }
+    if (expr.kind == HirExprKind::ConstMethod) {
+        // Method literals (POST, GET, …) are compile-time constants;
+        // fold them so `if const POST == GET { ... }` works.
+        out->type = HirTypeKind::Method;
         out->int_value = expr.int_value;
         return true;
     }
@@ -5492,7 +5505,7 @@ static bool const_eval_expr(
                 out->bool_value = lhs.bool_value == rhs.bool_value;
                 return true;
             }
-            if (lhs.type == HirTypeKind::I32) {
+            if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::Method) {
                 out->bool_value = lhs.int_value == rhs.int_value;
                 return true;
             }

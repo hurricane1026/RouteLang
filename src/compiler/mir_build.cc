@@ -145,8 +145,19 @@ static bool field_carrier_ready(const MirModule& mir,
     if (field.is_error_type) return true;
     if (field.shape_index != 0xffffffffu)
         return shape_carrier_ready(mir, field.shape_index, struct_ready, variant_ready);
+    // Note: Method is intentionally omitted here (and in the variant
+    // payload analog below). lower_rir's struct-field and variant-
+    // payload builders don't yet have a Method carrier — a
+    // Method-typed struct field / payload would lower to an Optional
+    // <I32> slot and fail in emit_struct_create. Method as a plain
+    // value is fine (shape_carrier_ready accepts it) because it's
+    // lowered as a bare i8; these per-field helpers only run when
+    // there's no shape index to delegate to, so until someone wires
+    // Method into the carrier builders, reporting it as "ready"
+    // here would mislead the lowering pass. Today's surface DSL
+    // can't declare Method-typed struct fields anyway.
     if (field.type == MirTypeKind::Bool || field.type == MirTypeKind::I32 ||
-        field.type == MirTypeKind::Str || field.type == MirTypeKind::Method)
+        field.type == MirTypeKind::Str)
         return true;
     if (field.type == MirTypeKind::Struct)
         return field.struct_index < mir.structs.len && struct_ready[field.struct_index];
@@ -162,8 +173,10 @@ static bool variant_payload_carrier_ready(const MirModule& mir,
     if (!c.has_payload) return true;
     if (c.payload_shape_index != 0xffffffffu)
         return shape_carrier_ready(mir, c.payload_shape_index, struct_ready, variant_ready);
+    // See field_carrier_ready: Method payloads have no lower_rir
+    // carrier yet, so don't claim they're ready.
     if (c.payload_type == MirTypeKind::Bool || c.payload_type == MirTypeKind::I32 ||
-        c.payload_type == MirTypeKind::Str || c.payload_type == MirTypeKind::Method)
+        c.payload_type == MirTypeKind::Str)
         return true;
     if (c.payload_type == MirTypeKind::Struct)
         return c.payload_struct_index < mir.structs.len && struct_ready[c.payload_struct_index];

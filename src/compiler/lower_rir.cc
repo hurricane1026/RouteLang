@@ -505,6 +505,11 @@ static FrontendResult<const rir::Type*> rir_type_for_shape(
         if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
         return ty.value();
     }
+    if (type == MirTypeKind::Method) {
+        auto ty = b.make_type(rir::TypeKind::Method);
+        if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
+        return ty.value();
+    }
     if (type == MirTypeKind::Variant && variant_index != 0xffffffffu &&
         variant_infos[variant_index].struct_type != nullptr)
         return variant_infos[variant_index].struct_type;
@@ -648,7 +653,8 @@ static FrontendResult<rir::ValueId> emit_eq_for_shape(MirTypeKind type,
                                                       const rir::StructDef* const* user_struct_defs,
                                                       rir::Builder& b,
                                                       Span span) {
-    if (type == MirTypeKind::Bool || type == MirTypeKind::I32 || type == MirTypeKind::Str) {
+    if (type == MirTypeKind::Bool || type == MirTypeKind::I32 || type == MirTypeKind::Str ||
+        type == MirTypeKind::Method) {
         auto cmp = b.emit_cmp(rir::Opcode::CmpEq, lhs, rhs, {span.line, span.col});
         if (!cmp) return frontend_error(FrontendError::OutOfMemory, span);
         return cmp.value();
@@ -1354,6 +1360,16 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
     }
     if (value.kind == MirValueKind::ReqHeader) {
         auto v = b.emit_req_header(value.str_value, {span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ConstMethod) {
+        auto v = b.emit_const_method(static_cast<u8>(value.int_value), {span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqMethod) {
+        auto v = b.emit_req_method({span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }

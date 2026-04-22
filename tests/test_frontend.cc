@@ -563,6 +563,276 @@ TEST(frontend, parse_upstream_dict_rejects_unknown_field) {
     CHECK(ast.error().detail.eq(lit("weight")));
 }
 
+TEST(frontend, parse_guard_req_method_eq_post) {
+    // `guard req.method == POST else { return 405 }` — the keystone
+    // use case. Parser yields LitMethod + Field(Ident("req"), "method");
+    // analyze routes the Field through the magic `req.X` path when
+    // `req` isn't shadowed by a local/variant/import, producing
+    // typed HIR ReqMethod / ConstMethod. MIR/RIR downstream carry
+    // those opcodes; codegen emits an i8 constant and a helper call
+    // that reads the parsed method from the request.
+    const char* src =
+        "route GET \"/\" { guard req.method == POST else { return 405 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    // Lower fully through MIR → RIR so we know codegen gets the right
+    // inputs. The parser / analyzer paths are the ones that changed;
+    // downstream is reused machinery.
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, parse_method_keyword_as_expression) {
+    // POST / GET / PUT / DELETE / HEAD / OPTIONS / PATCH each need
+    // to parse as standalone expressions with distinct HttpMethod
+    // enum values (matching runtime/http_parser.h: GET=0, POST=1, ...).
+    // Asserts the rhs of `req.method == <KW>` is HIR ConstMethod
+    // with the matching enum value so a broken keyword→int mapping
+    // in the parser would fail here, not silently at runtime.
+    struct Case {
+        const char* src;
+        i32 expected_value;
+    };
+    const Case kCases[] = {
+        {"route GET \"/\" { guard req.method == GET else { return 405 } return 200 }\n", 0},
+        {"route GET \"/\" { guard req.method == POST else { return 405 } return 200 }\n", 1},
+        {"route GET \"/\" { guard req.method == PUT else { return 405 } return 200 }\n", 2},
+        {"route GET \"/\" { guard req.method == DELETE else { return 405 } return 200 }\n", 3},
+        {"route GET \"/\" { guard req.method == PATCH else { return 405 } return 200 }\n", 4},
+        {"route GET \"/\" { guard req.method == HEAD else { return 405 } return 200 }\n", 5},
+        {"route GET \"/\" { guard req.method == OPTIONS else { return 405 } return 200 }\n", 6},
+    };
+    for (const auto& tc : kCases) {
+        auto lexed = lex(lit(tc.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->routes.len, 1u);
+        REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+        const auto& cond = hir->routes[0].guards[0].cond;
+        REQUIRE_EQ(static_cast<u8>(cond.kind), static_cast<u8>(HirExprKind::Eq));
+        REQUIRE(cond.rhs != nullptr);
+        REQUIRE_EQ(static_cast<u8>(cond.rhs->kind), static_cast<u8>(HirExprKind::ConstMethod));
+        CHECK_EQ(cond.rhs->int_value, tc.expected_value);
+        // Also verify the lhs is req.method (ReqMethod) so a broken
+        // parser that swapped operands wouldn't pass by coincidence.
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(HirExprKind::ReqMethod));
+    }
+}
+
+TEST(frontend, parse_req_unknown_field_rejected) {
+    // `req.X` for a field name analyze doesn't recognize must reject
+    // at analyze time. `header` is accepted as a call form via the
+    // dedicated ReqHeader path, but `req.header` without parens falls
+    // into this path and is rejected (same as any other non-method
+    // field name).
+    const char* src = "route GET \"/\" { guard req.bogus == GET else { return 405 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("bogus")));
+}
+
+TEST(frontend, parse_method_vs_non_method_compare_rejected) {
+    // `req.method == 200` mixes Method and i32 — analyze enforces
+    // type-equality on the == operands and rejects.
+    const char* src =
+        "route GET \"/\" { guard req.method == 200 else { return 405 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, parse_const_if_folds_method_eq) {
+    // `if const POST == GET` is a compile-time predicate — analyze
+    // folds the equality during const-eval and picks the else
+    // branch. Requires const_eval_expr to recognise ConstMethod and
+    // fold `==` over HirTypeKind::Method. Before this fix, analyze
+    // failed with UnsupportedSyntax because Method wasn't in the
+    // eval table.
+    const char* src = R"rut(
+route GET "/" {
+    if const POST == GET { return 500 } else { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    // Const-fold chose the else branch → direct return 200. Lower
+    // through MIR/RIR to confirm the whole pipeline stays happy.
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, parse_generic_eq_function_accepts_method_instance) {
+    // Calling an `Eq`-constrained generic with Method operands
+    // binds T → Method. Exercises the HIR→MIR copy paths for
+    // struct / variant `instance_type_args` plus the Eq-constraint
+    // check in analyze (which must accept Method as an Eq-capable
+    // scalar). A regression would either fail analyze with
+    // "generic T missing Eq" or die in lower_to_rir when the
+    // Method-typed instance is downgraded to Unknown.
+    const char* src = R"rut(
+func same<T: Eq>(x: T, y: T) -> bool => x == y
+route POST "/x" {
+    if same(req.method, POST) { return 200 } else { return 405 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, parse_method_let_binding_round_trips) {
+    // `let m = req.method; guard m == POST else { ... }` — exercises
+    // the HIR→MIR type-mapping and carrier-ready paths for Method.
+    // If mir_type_kind / shape_carrier_ready dropped Method to
+    // Unknown, the guard's == would see an unknown-shape lhs and
+    // fail in lower_to_rir. Full pipeline through RIR proves Method
+    // flows as a first-class scalar.
+    const char* src =
+        "route POST \"/x\" { let m = req.method guard m == POST else { return 405 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, parse_user_local_req_shadows_magic_path) {
+    // A user who writes `let req = SomeStruct(...); req.field` should
+    // get normal struct-field access on their local, not the magic
+    // request-object path. The magic `req.X` handler only fires when
+    // no local named `req` is in scope; the generic Field resolver
+    // takes over otherwise.
+    const char* src = R"rut(
+struct Box { value: i32 }
+route GET "/users" {
+    let req = Box(value: 42)
+    guard req.value == 42 else { return 500 }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    // The local binding is the Box struct; req.value resolves to
+    // the struct's i32 field, so the guard compares two i32s rather
+    // than any Method value. Any regression to the magic path would
+    // surface as an "unknown req field" analyze error.
+}
+
+TEST(frontend, parse_user_variant_named_req_shadows_magic_path) {
+    // A variant literally named `req` must take precedence so
+    // `req.case` resolves as variant construction (VariantCase),
+    // not the magic request-object path. The parser would otherwise
+    // hijack every dotted `req.*` before variant/import resolution
+    // gets a turn.
+    const char* src = R"rut(
+variant req { case_a, case_b }
+route GET "/users" {
+    let x = req.case_a
+    if x == req.case_a { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, parse_import_namespace_named_req_shadows_magic_path) {
+    // An import namespace alias `req` must also block the magic
+    // fast-path: `req.someFn()` should resolve to the imported
+    // function, not get rewritten into request-field access.
+    const std::string dir = "/tmp/rut_import_namespace_req_shadow_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/req.rut", std::ios::binary);
+        out << "func ping() -> i32 => 200\n";
+    }
+    const auto src = R"rut(
+import "req.rut"
+route GET "/users" { if req.ping() == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
+TEST(frontend, parse_match_payload_named_req_shadows_magic_path) {
+    // Match payload bindings named `req` must also win over the
+    // special request-object path. Otherwise `req.value` in a match
+    // arm would be intercepted as magic request access instead of
+    // field access on the bound payload.
+    const char* src = R"rut(
+struct Payload { value: i32 }
+variant Box { value(Payload) }
+route GET "/users" {
+    match Box.value(Payload(value: 42)) {
+        case .value(req): if req.value == 42 { return 200 } else { return 500 }
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 TEST(frontend, parse_return_response_with_headers) {
     // Headers dict carries through parser → HIR → MIR → RIR:
     // intern_response_headers writes one set into rir::Module's flat
@@ -2999,6 +3269,33 @@ route GET "/users" {
     const auto& shape = mir->type_shapes[local.shape_index];
     CHECK(shape.is_concrete);
     CHECK(shape.carrier_ready);
+}
+
+TEST(frontend, lower_to_rir_rejects_generic_variant_method_payload_carrier) {
+    // Generic variant payloads instantiated with Method currently
+    // have no dedicated lower_rir carrier. They should be rejected
+    // deterministically instead of being treated as carrier-ready
+    // through the payload shape index and failing later in struct
+    // creation with a type mismatch.
+    const auto src = R"rut(
+variant Box<T> { value(T) }
+func wrap<T>(x: T) -> Box<T> => Box.value(x)
+route GET "/users" {
+    let state = wrap(POST)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(!lowered);
 }
 
 TEST(frontend, import_namespace_struct_init_is_supported) {

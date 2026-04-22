@@ -3748,6 +3748,99 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     rir.destroy();
 }
 
+// End-to-end: `guard req.method == POST else { return 405 }` inside a
+// DSL handler. Registers the handler with method=0 so both GET and
+// POST reach it — the guard (not RouteConfig's method filter) is what
+// discriminates. Asserts POST → 200, GET → 405.
+TEST(route, dsl_req_method_guard_real_socket) {
+    using namespace rut;
+
+    const char* src =
+        "route POST \"/x\" { "
+        "guard req.method == POST else { return 405 } "
+        "return 200 "
+        "}\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    // method=0 means "any method" — both GET and POST requests reach
+    // the handler so the DSL-level guard is what we're actually
+    // exercising. The DSL's `route POST` token is irrelevant here.
+    REQUIRE(cfg.add_jit_handler("/x", 0, handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+    usleep(10000);  // let accept registration settle before the first client connect
+
+    // Helper: send one request and record response + pass/fail
+    // against expected substrings. Uses CHECK (not REQUIRE) and
+    // guards socket use behind fd >= 0 so lt.stop() still runs at
+    // the end — REQUIRE's early-return would leak the loop thread.
+    auto exercise = [&](const char* req,
+                        u32 req_len,
+                        const char* want,
+                        u32 want_len,
+                        const char* reject,
+                        u32 reject_len) {
+        const i32 c = connect_to(port);
+        CHECK_GE(c, 0);
+        if (c < 0) return;
+        send_all(c, req, req_len);
+        char buf[2048];
+        const i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+        close(c);
+        CHECK_GT(n, 0);
+        if (n <= 0) return;
+        const auto len = static_cast<u32>(n);
+        CHECK(buf_contains(buf, len, want, want_len));
+        CHECK(!buf_contains(buf, len, reject, reject_len));
+    };
+
+    // POST /x → guard passes → 200 OK.
+    const char kPostReq[] = "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+    exercise(kPostReq, sizeof(kPostReq) - 1, "200 OK", 6, "405", 3);
+
+    // GET /x → guard fails → 405.
+    const char kGetReq[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    exercise(kGetReq, sizeof(kGetReq) - 1, "405", 3, "200 OK", 6);
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

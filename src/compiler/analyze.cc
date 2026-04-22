@@ -108,8 +108,8 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.variant_index = variant_index;
     shape.struct_index = struct_index;
     shape.tuple_len = tuple_len;
-    shape.is_concrete =
-        type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::Str;
+    shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
+                        type == HirTypeKind::Str || type == HirTypeKind::Method;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Tuple) {
@@ -295,6 +295,7 @@ static bool hir_type_shape_satisfies_eq_constraint(const HirModule& mod,
         case HirTypeKind::Bool:
         case HirTypeKind::I32:
         case HirTypeKind::Str:
+        case HirTypeKind::Method:
             return true;
         case HirTypeKind::Tuple:
             for (u32 i = 0; i < tuple_len; i++) {
@@ -4025,6 +4026,51 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
     if (expr.kind == AstExprKind::MethodCall) {
         return analyze_method_call_expr(expr, route, mod, locals, local_count, binding);
     }
+    // `req.X` is magic only when the name `req` doesn't already
+    // resolve to something the user declared: a local binding, a
+    // variant name, or an import namespace alias. Any of those wins
+    // and we fall through to the generic Field handler below, which
+    // knows how to route variant construction / namespace members /
+    // local field access. Only when `req` resolves to nothing does
+    // the magic request-object path take over.
+    if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
+        expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq({"req", 3})) {
+        bool user_bound = false;
+        if (binding && binding->subject && binding->name.eq({"req", 3})) user_bound = true;
+        for (u32 i = 0; i < local_count; i++) {
+            if (locals[i].name.eq({"req", 3})) {
+                user_bound = true;
+                break;
+            }
+        }
+        if (!user_bound) {
+            for (u32 i = 0; i < mod.variants.len; i++) {
+                if (mod.variants[i].name.eq({"req", 3})) {
+                    user_bound = true;
+                    break;
+                }
+            }
+        }
+        if (!user_bound) {
+            Str ignored_qualified{};
+            if (resolve_import_namespace_member(mod, expr, ignored_qualified)) user_bound = true;
+        }
+        if (!user_bound) {
+            // Known fields: method (HttpMethod). Future fields (path,
+            // …) add branches here. `header` isn't reached via this
+            // path — the parser captures `req.header("...")` as the
+            // dedicated ReqHeader special form before generic Field
+            // parsing runs.
+            if (expr.name.eq({"method", 6})) {
+                out.kind = HirExprKind::ReqMethod;
+                out.type = HirTypeKind::Method;
+                return out;
+            }
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        }
+        // Otherwise fall through to the generic Field path so the
+        // user's local / variant / namespace `req` resolves normally.
+    }
     if (expr.kind == AstExprKind::Field) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (expr.lhs->kind == AstExprKind::Ident) {
@@ -4351,6 +4397,14 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
         out.type = HirTypeKind::Str;
         out.may_nil = true;
         out.str_value = expr.str_value;
+        return out;
+    }
+    if (expr.kind == AstExprKind::LitMethod) {
+        // Method literal (POST / GET / …). int_value carries the
+        // HttpMethod enum value the parser decoded.
+        out.kind = HirExprKind::ConstMethod;
+        out.type = HirTypeKind::Method;
+        out.int_value = expr.int_value;
         return out;
     }
     if (expr.kind == AstExprKind::Nil) {
@@ -5405,7 +5459,13 @@ static const HirExpr* known_error_expr(const HirExpr& expr,
 
 static bool const_eval_expr(
     const HirExpr& expr, const HirLocal* locals, u32 local_count, ConstValue* out, u32 depth) {
-    if (depth > local_count) return false;
+    // `depth` guards against LocalRef cycles. For any realistic
+    // program, local_count caps how many unique LocalRefs can be
+    // chained. A zero-local route with a nested expression (e.g.
+    // `if const POST == GET`) still needs a few levels of natural
+    // tree recursion, so we add a fixed headroom on top of
+    // local_count for the Eq/Lt/Gt descent.
+    if (depth > local_count + HirRoute::kMaxLocals) return false;
     if (expr.kind == HirExprKind::BoolLit) {
         out->type = HirTypeKind::Bool;
         out->bool_value = expr.bool_value;
@@ -5413,6 +5473,13 @@ static bool const_eval_expr(
     }
     if (expr.kind == HirExprKind::IntLit) {
         out->type = HirTypeKind::I32;
+        out->int_value = expr.int_value;
+        return true;
+    }
+    if (expr.kind == HirExprKind::ConstMethod) {
+        // Method literals (POST, GET, …) are compile-time constants;
+        // fold them so `if const POST == GET { ... }` works.
+        out->type = HirTypeKind::Method;
         out->int_value = expr.int_value;
         return true;
     }
@@ -5439,7 +5506,7 @@ static bool const_eval_expr(
                 out->bool_value = lhs.bool_value == rhs.bool_value;
                 return true;
             }
-            if (lhs.type == HirTypeKind::I32) {
+            if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::Method) {
                 out->bool_value = lhs.int_value == rhs.int_value;
                 return true;
             }
@@ -5473,6 +5540,14 @@ static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
     cond.type = HirTypeKind::Bool;
 
     if (!analyzed->may_error) {
+        // Plain boolean — pass through so `guard <cond> else { ... }`
+        // rejects on falsy (Swift-style reject-or-continue). Without
+        // this, any non-errorable guard would fold to always-true.
+        if (analyzed->type == HirTypeKind::Bool && !analyzed->may_nil) {
+            if (!route->exprs.push(analyzed.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            return route->exprs[route->exprs.len - 1];
+        }
         cond.bool_value = true;
         return cond;
     }

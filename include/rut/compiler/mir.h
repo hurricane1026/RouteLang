@@ -24,6 +24,10 @@ enum class MirValueKind : u8 {
     StructInit,
     Field,
     ReqHeader,
+    // HTTP method literal — int_value holds the HttpMethod enum value.
+    ConstMethod,
+    // Read of the parsed request method from the current connection.
+    ReqMethod,
     Nil,
     Error,
     LocalRef,
@@ -46,6 +50,7 @@ enum class MirTypeKind : u8 {
     Variant,
     Tuple,
     Struct,
+    Method,
 };
 
 struct MirTypeShape {

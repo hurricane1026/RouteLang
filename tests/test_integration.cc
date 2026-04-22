@@ -1289,7 +1289,7 @@ TEST(tls_state_machine, spurious_epollout_with_empty_tls_send_state_is_ignored) 
     backend.shutdown();
 }
 
-// === io_uring backend (TODO #3 + #4) ===
+// === io_uring backend smoke coverage ===
 
 // Verify IoUringBackend::init creates a timerfd
 TEST(uring, init_creates_timerfd) {
@@ -1326,6 +1326,69 @@ TEST(uring, return_buffer_no_crash) {
     backend.return_buffer(static_cast<u16>(kProvidedBufCount - 1));
     backend.shutdown();
     close(lfd);
+}
+
+// Verify wait() turns a timerfd expiration into a Timeout IoEvent.
+TEST(uring, wait_emits_timeout_tick) {
+    IoUringBackend backend;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    auto rc = backend.init(0, lfd);
+    if (!rc) {
+        close(lfd);
+        CHECK(true);
+        return;
+    }
+
+    // Override the default 1-second periodic tick with an immediate one-shot
+    // so the already-armed timer read completes on this wait().
+    struct itimerspec ts{};
+    ts.it_value.tv_nsec = 1;
+    REQUIRE_EQ(timerfd_settime(backend.timer_fd, 0, &ts, nullptr), 0);
+
+    IoEvent events[4]{};
+    const u32 n = backend.wait(events, 4, nullptr, 0);
+    REQUIRE_GE(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Timeout);
+    CHECK_EQ(events[0].result, 1);
+    CHECK_EQ(events[0].has_buf, 0u);
+    CHECK_EQ(events[0].buf_id, 0u);
+
+    backend.shutdown();
+    close(lfd);
+}
+
+// Verify provided-buffer recv CQEs are copied into Connection.recv_buf and the
+// emitted IoEvent no longer owns a provided buffer.
+TEST(uring, wait_copies_recv_into_conn_buffer) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    IoUringBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+
+    REQUIRE(backend.add_recv(fds[0], conn.id));
+    static const u8 kReq[] = "GET / HTTP/1.1\r\n\r\n";
+    REQUIRE(send_all(fds[1], reinterpret_cast<const char*>(kReq), sizeof(kReq) - 1));
+
+    IoEvent events[4]{};
+    const u32 n = backend.wait(events, 4, &conn, 1);
+    REQUIRE_GE(n, 1u);
+    CHECK_EQ(events[0].conn_id, conn.id);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, static_cast<i32>(sizeof(kReq) - 1));
+    CHECK_EQ(events[0].has_buf, 0u);
+    CHECK_EQ(events[0].buf_id, 0u);
+    REQUIRE_EQ(conn.recv_buf.len(), sizeof(kReq) - 1);
+    CHECK_EQ(memcmp(conn.recv_buf.data(), kReq, sizeof(kReq) - 1), 0);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
 }
 
 // === Shard lifecycle ===

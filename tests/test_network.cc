@@ -1426,7 +1426,7 @@ TEST(partial_send, backend_gets_correct_buffer) {
     CHECK_EQ(op->send_len, c->send_buf.len());
 }
 
-// === io_uring integration (TODO #3 + #4) ===
+// === io_uring dispatch semantics ===
 
 // Verify Timeout event with tick count is properly dispatched
 TEST(uring_timer, timeout_dispatches_tick) {

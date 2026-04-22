@@ -1347,7 +1347,7 @@ TEST(uring, wait_emits_timeout_tick) {
     REQUIRE_EQ(timerfd_settime(backend.timer_fd, 0, &ts, nullptr), 0);
 
     IoEvent events[4]{};
-    const u32 n = backend.wait(events, 4, nullptr, 0);
+    u32 n = backend.wait(events, 4, nullptr, 0);
     REQUIRE_GE(n, 1u);
     CHECK_EQ(events[0].type, IoEventType::Timeout);
     CHECK_GE(events[0].result, 1);
@@ -1386,33 +1386,35 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
 
     REQUIRE(backend.add_recv(fds[0], conn.id));
     static const u8 kReq[] = "GET / HTTP/1.1\r\n\r\n";
-    REQUIRE(send_all(fds[1], reinterpret_cast<const char*>(kReq), sizeof(kReq) - 1));
+    static constexpr u32 kExpectedLen = sizeof(kReq) - 1;
+    REQUIRE(send_all(fds[1], reinterpret_cast<const char*>(kReq), kExpectedLen));
 
-    // Defence in depth: the timerfd push above already removes the only
-    // competing CQE source, so one wait() should suffice. Still, bound-retry
-    // across up to 8 wait() calls so any unexpected non-Recv CQE (future
-    // backend changes, probe/cancel side effects) cannot flake the assertion.
+    // Defence in depth:
+    //   - the timerfd push above removes today's only competing CQE source
+    //   - POSIX permits SOCK_STREAM recv to return partial reads, so the
+    //     18 bytes could in principle arrive across multiple Recv CQEs
+    // Loop wait() up to 8 times accumulating Recv events until recv_buf
+    // holds the full request. add_recv uses IORING_RECV_MULTISHOT, so one
+    // SQE yields multiple CQEs without resubmission.
     IoEvent events[4]{};
-    const IoEvent* recv_ev = nullptr;
     bool saw_any_event = false;
-    for (u32 attempt = 0; attempt < 8 && recv_ev == nullptr; ++attempt) {
+    bool saw_recv_event = false;
+    for (u32 attempt = 0; attempt < 8 && conn.recv_buf.len() < kExpectedLen; ++attempt) {
         u32 n = backend.wait(events, 4, &conn, 1);
         if (n > 0) saw_any_event = true;
         for (u32 i = 0; i < n; ++i) {
-            if (events[i].type == IoEventType::Recv) {
-                recv_ev = &events[i];
-                break;
-            }
+            if (events[i].type != IoEventType::Recv) continue;
+            saw_recv_event = true;
+            CHECK_EQ(events[i].conn_id, conn.id);
+            CHECK_GT(events[i].result, 0);
+            CHECK_EQ(events[i].has_buf, 0u);
+            CHECK_EQ(events[i].buf_id, 0u);
         }
     }
     REQUIRE(saw_any_event);
-    REQUIRE(recv_ev != nullptr);
-    CHECK_EQ(recv_ev->conn_id, conn.id);
-    CHECK_EQ(recv_ev->result, static_cast<i32>(sizeof(kReq) - 1));
-    CHECK_EQ(recv_ev->has_buf, 0u);
-    CHECK_EQ(recv_ev->buf_id, 0u);
-    REQUIRE_EQ(conn.recv_buf.len(), sizeof(kReq) - 1);
-    CHECK_EQ(memcmp(conn.recv_buf.data(), kReq, sizeof(kReq) - 1), 0);
+    REQUIRE(saw_recv_event);
+    REQUIRE_EQ(conn.recv_buf.len(), kExpectedLen);
+    CHECK_EQ(memcmp(conn.recv_buf.data(), kReq, kExpectedLen), 0);
 
     close(fds[0]);
     close(fds[1]);

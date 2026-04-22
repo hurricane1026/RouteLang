@@ -3271,6 +3271,33 @@ route GET "/users" {
     CHECK(shape.carrier_ready);
 }
 
+TEST(frontend, lower_to_rir_rejects_generic_variant_method_payload_carrier) {
+    // Generic variant payloads instantiated with Method currently
+    // have no dedicated lower_rir carrier. They should be rejected
+    // deterministically instead of being treated as carrier-ready
+    // through the payload shape index and failing later in struct
+    // creation with a type mismatch.
+    const auto src = R"rut(
+variant Box<T> { value(T) }
+func wrap<T>(x: T) -> Box<T> => Box.value(x)
+route GET "/users" {
+    let state = wrap(POST)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(!lowered);
+}
+
 TEST(frontend, import_namespace_struct_init_is_supported) {
     const std::string dir = "/tmp/rut_import_namespace_struct_frontend";
     std::filesystem::create_directories(dir);

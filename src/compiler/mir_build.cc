@@ -112,6 +112,30 @@ static bool shape_carrier_ready(const MirModule& mir,
     return true;
 }
 
+static bool shape_slot_carrier_ready(const MirModule& mir,
+                                     u32 shape_index,
+                                     const bool* struct_ready,
+                                     const bool* variant_ready) {
+    if (shape_index >= mir.type_shapes.len) return false;
+    const auto& shape = mir.type_shapes[shape_index];
+    if (!shape.is_concrete) return false;
+    if (shape.type == MirTypeKind::Method) return false;
+    if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 ||
+        shape.type == MirTypeKind::Str)
+        return true;
+    if (shape.type == MirTypeKind::Struct)
+        return shape.struct_index < mir.structs.len && struct_ready[shape.struct_index];
+    if (shape.type == MirTypeKind::Variant)
+        return shape.variant_index < mir.variants.len && variant_ready[shape.variant_index];
+    if (shape.type != MirTypeKind::Tuple) return false;
+    for (u32 i = 0; i < shape.tuple_len; i++) {
+        if (!shape_carrier_ready(
+                mir, shape.tuple_elem_shape_indices[i], struct_ready, variant_ready))
+            return false;
+    }
+    return true;
+}
+
 static bool instance_arg_concrete(const MirModule& mir, MirTypeKind type, u32 shape_index) {
     if (shape_index != 0xffffffffu) {
         if (shape_index >= mir.type_shapes.len) return false;
@@ -144,7 +168,7 @@ static bool field_carrier_ready(const MirModule& mir,
                                 const bool* variant_ready) {
     if (field.is_error_type) return true;
     if (field.shape_index != 0xffffffffu)
-        return shape_carrier_ready(mir, field.shape_index, struct_ready, variant_ready);
+        return shape_slot_carrier_ready(mir, field.shape_index, struct_ready, variant_ready);
     // Note: Method is intentionally omitted here (and in the variant
     // payload analog below). lower_rir's struct-field and variant-
     // payload builders don't yet have a Method carrier — a
@@ -172,7 +196,7 @@ static bool variant_payload_carrier_ready(const MirModule& mir,
                                           const bool* variant_ready) {
     if (!c.has_payload) return true;
     if (c.payload_shape_index != 0xffffffffu)
-        return shape_carrier_ready(mir, c.payload_shape_index, struct_ready, variant_ready);
+        return shape_slot_carrier_ready(mir, c.payload_shape_index, struct_ready, variant_ready);
     // See field_carrier_ready: Method payloads have no lower_rir
     // carrier yet, so don't claim they're ready.
     if (c.payload_type == MirTypeKind::Bool || c.payload_type == MirTypeKind::I32 ||

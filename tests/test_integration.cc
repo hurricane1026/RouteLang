@@ -1377,6 +1377,13 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
     tc.init(0, fds[0]);
     Connection& conn = tc.conn;
 
+    // Push the timerfd far out so the already-armed periodic tick can't race
+    // the recv CQE under scheduler stalls. The SUT here is the provided-buffer
+    // recv copy path, not timer/recv ordering.
+    struct itimerspec ts{};
+    ts.it_value.tv_sec = 60;
+    REQUIRE_EQ(timerfd_settime(backend.timer_fd, 0, &ts, nullptr), 0);
+
     REQUIRE(backend.add_recv(fds[0], conn.id));
     static const u8 kReq[] = "GET / HTTP/1.1\r\n\r\n";
     REQUIRE(send_all(fds[1], reinterpret_cast<const char*>(kReq), sizeof(kReq) - 1));

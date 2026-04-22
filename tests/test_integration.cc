@@ -1377,25 +1377,20 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
     tc.init(0, fds[0]);
     Connection& conn = tc.conn;
 
-    // Push the timerfd far out so the already-armed periodic tick can't race
-    // the recv CQE under scheduler stalls. The SUT here is the provided-buffer
-    // recv copy path, not timer/recv ordering.
-    struct itimerspec ts{};
-    ts.it_value.tv_sec = 60;
-    REQUIRE_EQ(timerfd_settime(backend.timer_fd, 0, &ts, nullptr), 0);
-
     REQUIRE(backend.add_recv(fds[0], conn.id));
     static const u8 kReq[] = "GET / HTTP/1.1\r\n\r\n";
     static constexpr u32 kExpectedLen = sizeof(kReq) - 1;
     REQUIRE(send_all(fds[1], reinterpret_cast<const char*>(kReq), kExpectedLen));
 
-    // Defence in depth:
-    //   - the timerfd push above removes today's only competing CQE source
-    //   - POSIX permits SOCK_STREAM recv to return partial reads, so the
-    //     18 bytes could in principle arrive across multiple Recv CQEs
-    // Loop wait() up to 8 times accumulating Recv events until recv_buf
-    // holds the full request. add_recv uses IORING_RECV_MULTISHOT, so one
-    // SQE yields multiple CQEs without resubmission.
+    // Accumulate Recv CQEs across wait() calls until recv_buf holds the full
+    // request (POSIX permits SOCK_STREAM recv to split an 18-byte write across
+    // CQEs; non-Recv CQEs are skipped). add_recv uses IORING_RECV_MULTISHOT,
+    // so one SQE yields multiple CQEs without resubmission.
+    //
+    // The 8-attempt cap + init's default 1s periodic timerfd act together as
+    // a hang guard: if multishot recv is silently broken (error CQE, no
+    // buffer, etc.), timer CQEs wake wait() every 1s and the loop exits in
+    // ~8s with a clean REQUIRE failure instead of deadlocking.
     IoEvent events[4]{};
     bool saw_any_event = false;
     bool saw_recv_event = false;

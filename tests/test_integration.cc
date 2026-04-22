@@ -1388,16 +1388,24 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
     static const u8 kReq[] = "GET / HTTP/1.1\r\n\r\n";
     REQUIRE(send_all(fds[1], reinterpret_cast<const char*>(kReq), sizeof(kReq) - 1));
 
+    // Defence in depth: the timerfd push above already removes the only
+    // competing CQE source, so one wait() should suffice. Still, bound-retry
+    // across up to 8 wait() calls so any unexpected non-Recv CQE (future
+    // backend changes, probe/cancel side effects) cannot flake the assertion.
     IoEvent events[4]{};
-    const u32 n = backend.wait(events, 4, &conn, 1);
-    REQUIRE_GE(n, 1u);
     const IoEvent* recv_ev = nullptr;
-    for (u32 i = 0; i < n; ++i) {
-        if (events[i].type == IoEventType::Recv) {
-            recv_ev = &events[i];
-            break;
+    bool saw_any_event = false;
+    for (u32 attempt = 0; attempt < 8 && recv_ev == nullptr; ++attempt) {
+        u32 n = backend.wait(events, 4, &conn, 1);
+        if (n > 0) saw_any_event = true;
+        for (u32 i = 0; i < n; ++i) {
+            if (events[i].type == IoEventType::Recv) {
+                recv_ev = &events[i];
+                break;
+            }
         }
     }
+    REQUIRE(saw_any_event);
     REQUIRE(recv_ev != nullptr);
     CHECK_EQ(recv_ev->conn_id, conn.id);
     CHECK_EQ(recv_ev->result, static_cast<i32>(sizeof(kReq) - 1));

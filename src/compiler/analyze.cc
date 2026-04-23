@@ -3742,6 +3742,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 auto init =
                     analyze_expr(inner.expr, scratch, mod, cur_locals, cur_local_count, nullptr);
                 if (!init) return core::make_unexpected(init.error());
+                // Mirror the route-level let handler's ArrayLit-at-RHS gate
+                // (MIR has no ArrayLit lowering yet).
+                if (init->kind == HirExprKind::ArrayLit)
+                    return frontend_error(FrontendError::UnsupportedSyntax, inner.expr.span);
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                 if (!typed) return core::make_unexpected(typed.error());
                 if (cur_local_count >= HirRoute::kMaxLocals)
@@ -5756,6 +5760,10 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 auto init = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 if (!init) return core::make_unexpected(init.error());
+                // Mirror the route-level let handler's ArrayLit-at-RHS gate
+                // (MIR has no ArrayLit lowering yet).
+                if (init->kind == HirExprKind::ArrayLit)
+                    return frontend_error(FrontendError::UnsupportedSyntax, inner.expr.span);
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                 if (!typed) return core::make_unexpected(typed.error());
                 local.type = init->type;
@@ -5948,6 +5956,10 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                 auto init = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 if (!init) return core::make_unexpected(init.error());
+                // Mirror the route-level let handler's ArrayLit-at-RHS gate
+                // (MIR has no ArrayLit lowering yet).
+                if (init->kind == HirExprKind::ArrayLit)
+                    return frontend_error(FrontendError::UnsupportedSyntax, inner.expr.span);
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                 if (!typed) return core::make_unexpected(typed.error());
                 local.type = init->type;
@@ -9821,12 +9833,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
                 if (!init) return core::make_unexpected(init.error());
                 // ArrayLit at let RHS fails at MIR because MIR has no
-                // ArrayLit → MirValue lowering (arrays are only consumed via
-                // for-loop unroll in Phase 4; indexing and const-folded
-                // array locals are future work). Reject at analyze so users
+                // ArrayLit → MirValue lowering. Reject at analyze so users
                 // get a clean diagnostic at the declaration site instead of
-                // a late MIR error. Inline form (`for x in [1,2,3]`) still
-                // works because for-loop unroll skips mir_value on iter_expr.
+                // a later MIR error.
+                // Note: inline `for x in [1,2,3] { ... }` passes analyze
+                // (iter_expr is analyzed but not a let RHS), but Phase 4a's
+                // mir_build also rejects any route with for_loops.len > 0.
+                // End-to-end compilation of array-bearing programs lands
+                // once Phase 4b implements MIR unroll (and, separately,
+                // MIR gains array-constant lowering for let-RHS arrays).
                 if (init->kind == HirExprKind::ArrayLit)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, stmt);

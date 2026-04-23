@@ -13555,7 +13555,7 @@ TEST(frontend, parse_array_lit_trailing_comma) {
 }
 
 TEST(frontend, parse_array_lit_nested_type) {
-    // `[[i32]]` desugars recursively: outer [T] → Array<T>, inner [T] → Array<Int>.
+    // `[[i32]]` desugars recursively: outer [T] → Array<T>, inner [T] → Array<i32>.
     // Validates parse_func_type_ref's recursion on leading LBracket.
     const char* src = "route GET \"/x\" { let xss: [[i32]] = [] return 200 }\n";
     auto lexed = lex(lit(src));
@@ -13630,11 +13630,12 @@ TEST(frontend, parse_for_loop_multi_stmt_body) {
 }
 
 TEST(frontend, analyze_array_lit_at_let_rhs_rejected) {
-    // ArrayLit at let RHS is rejected because MIR cannot yet lower array
-    // values as constants (no indexing, no const-folded array locals).
-    // Inline `for x in [1,2,3] { ... }` still works — for-loop unroll
-    // skips mir_value on iter_expr. Phase 4+ may relax this once MIR
-    // gains array-constant lowering.
+    // ArrayLit at let RHS is rejected in analyze because MIR cannot yet
+    // lower array values as constants (no indexing, no const-folded array
+    // locals). Inline `for x in [1,2,3] { ... }` is allowed at analyze
+    // level, but Phase 4a's mir_build also rejects any route with
+    // `for_loops.len > 0` — so no for-loop-bearing program compiles end
+    // to end until Phase 4b implements MIR unroll.
     const char* src = "route GET \"/x\" { let xs: [i32] = [1, 2, 3] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -13770,6 +13771,21 @@ TEST(frontend, mir_rejects_for_loop_until_phase_4b) {
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
     CHECK(!mir);
+}
+
+TEST(frontend, analyze_array_lit_at_nested_let_rhs_rejected) {
+    // ArrayLit rejection must fire at every let-analysis path, not just the
+    // route top-level handler. Exercises analyze_guard_fail_body (a let
+    // inside a guard's `else { ... }` block).
+    const char* src =
+        "route GET \"/x\" { guard true else { let xs: [i32] = [1, 2, 3] return 400 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
 }
 
 TEST(frontend, analyze_for_loop_rejects_guard_after_terminator) {

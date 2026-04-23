@@ -925,6 +925,20 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 return frontend_error(FrontendError::UnsupportedSyntax, fl.span);
             }
 
+            // Block budget pre-check. The unroll produces 2T+1 blocks
+            // (T virtual guards + 1 body + T fail blocks, T = N × M).
+            // MirFunction caps at kMaxBlocks, so worst-case shapes like
+            // N=8,M=1 or N=4,M=2 would push past the cap mid-emission.
+            // Reject up-front with a deterministic error at the for-loop
+            // span instead of a TooManyItems buried inside a later push.
+            {
+                const u64 total_guards =
+                    static_cast<u64>(fl.iter_expr.args.len) * fl.body.guards.len;
+                if (2 * total_guards + 1 > MirFunction::kMaxBlocks) {
+                    return frontend_error(FrontendError::TooManyItems, fl.span);
+                }
+            }
+
             // Unroll N × M virtual guards. Each entry pairs a body-guard
             // pointer with the ForLoopCtx that mir_value uses to substitute
             // the loop variable's LocalRef on the condition expression.

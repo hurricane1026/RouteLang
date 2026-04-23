@@ -13812,8 +13812,27 @@ TEST(frontend, mir_rejects_for_loop_with_body_terminator) {
     // unconditionally, making later iterations dead). Analyze accepts this
     // shape (Phase 3b), but MIR rejects until Scope B. Assertion: MIR fails
     // cleanly instead of silently dropping the loop.
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    CHECK(!mir);
+}
+
+TEST(frontend, mir_rejects_for_loop_exceeding_block_budget) {
+    // A Scope-A-shape program (one for-loop, body guards only, Direct
+    // control, no route guards) that unrolls to more than MirFunction::
+    // kMaxBlocks (16) blocks must reject cleanly at the for-loop span
+    // rather than fail mid-emission with a TooManyItems buried inside a
+    // later `fn.blocks.push`. N=8, M=1 → 2T+1 = 17 > 16. Analyze accepts
+    // this shape (kMaxArgs=8), so the reject must live in MIR's pre-check.
     const char* src =
-        "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
+        "route GET \"/x\" { for n in [1, 2, 3, 4, 5, 6, 7, 8] { "
+        "guard n > 0 else { return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());

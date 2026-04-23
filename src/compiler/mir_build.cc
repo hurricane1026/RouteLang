@@ -209,9 +209,22 @@ static bool variant_payload_carrier_ready(const MirModule& mir,
     return false;
 }
 
+// Context for MIR for-loop unrolling (Phase 4b). When lowering the body of
+// a HirForLoop iteration, the caller passes a non-null ctx so that any
+// LocalRef to the loop variable's ref_index is replaced with the current
+// iteration's element MirValue. External callers (route-level guards /
+// terminator / let init) pass nullptr: route-level code cannot reference
+// the loop variable because analyze clears its name after the body (see
+// analyze.cc:10123-10137), so substitution is never needed there.
+struct ForLoopCtx {
+    u32 loop_var_ref_index;    // matches HirExpr::local_index on LocalRef to loop var
+    MirValue current_element;  // value to substitute at that LocalRef
+};
+
 static FrontendResult<MirValue> mir_value(const HirExpr& expr,
                                           const HirModule& module,
-                                          MirFunction* fn) {
+                                          MirFunction* fn,
+                                          const ForLoopCtx* ctx = nullptr) {
     MirValue v{};
     v.shape_index = expr.shape_index;
     v.may_nil = expr.may_nil;
@@ -253,7 +266,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
                               v.tuple_variant_indices,
                               v.tuple_struct_indices);
         for (u32 i = 0; i < expr.args.len; i++) {
-            auto elem = mir_value(*expr.args[i], module, fn);
+            auto elem = mir_value(*expr.args[i], module, fn, ctx);
             if (!elem) return core::make_unexpected(elem.error());
             if (!fn->values.push(elem.value()))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -269,7 +282,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.str_value = expr.str_value;
         apply_expr_shape_if_available(module, expr, &v);
         for (u32 i = 0; i < expr.field_inits.len; i++) {
-            auto field_value = mir_value(*expr.field_inits[i].value, module, fn);
+            auto field_value = mir_value(*expr.field_inits[i].value, module, fn, ctx);
             if (!field_value) return core::make_unexpected(field_value.error());
             if (!fn->values.push(field_value.value()))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -282,7 +295,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::TupleSlot) {
-        auto lhs = mir_value(*expr.lhs, module, fn);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -305,7 +318,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.int_value = expr.int_value;
         apply_expr_shape_if_available(module, expr, &v);
         if (expr.lhs != nullptr) {
-            auto payload = mir_value(*expr.lhs, module, fn);
+            auto payload = mir_value(*expr.lhs, module, fn, ctx);
             if (!payload) return core::make_unexpected(payload.error());
             if (!fn->values.push(payload.value()))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -314,7 +327,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::Field) {
-        auto lhs = mir_value(*expr.lhs, module, fn);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -367,7 +380,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.error_case_index = expr.error_case_index;
         v.str_value = expr.str_value;
         for (u32 i = 0; i < expr.field_inits.len; i++) {
-            auto field_value = mir_value(*expr.field_inits[i].value, module, fn);
+            auto field_value = mir_value(*expr.field_inits[i].value, module, fn, ctx);
             if (!field_value) return core::make_unexpected(field_value.error());
             if (!fn->values.push(field_value.value()))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -381,9 +394,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     }
     if (expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
         expr.kind == HirExprKind::Gt) {
-        auto lhs = mir_value(*expr.lhs, module, fn);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
-        auto rhs = mir_value(*expr.rhs, module, fn);
+        auto rhs = mir_value(*expr.rhs, module, fn, ctx);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -401,11 +414,11 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::IfElse) {
-        auto cond = mir_value(*expr.lhs, module, fn);
+        auto cond = mir_value(*expr.lhs, module, fn, ctx);
         if (!cond) return core::make_unexpected(cond.error());
-        auto then_v = mir_value(*expr.rhs, module, fn);
+        auto then_v = mir_value(*expr.rhs, module, fn, ctx);
         if (!then_v) return core::make_unexpected(then_v.error());
-        auto else_v = mir_value(*expr.args[0], module, fn);
+        auto else_v = mir_value(*expr.args[0], module, fn, ctx);
         if (!else_v) return core::make_unexpected(else_v.error());
         if (!fn->values.push(cond.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -429,9 +442,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::Or) {
-        auto lhs = mir_value(*expr.lhs, module, fn);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
-        auto rhs = mir_value(*expr.rhs, module, fn);
+        auto rhs = mir_value(*expr.rhs, module, fn, ctx);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -450,7 +463,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::NoError) {
-        auto lhs = mir_value(*expr.lhs, module, fn);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -461,7 +474,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::HasValue) {
-        auto lhs = mir_value(*expr.lhs, module, fn);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -475,7 +488,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::ValueOf) {
-        auto lhs = mir_value(*expr.lhs, module, fn);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -490,7 +503,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::MissingOf) {
-        auto lhs = mir_value(*expr.lhs, module, fn);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -507,7 +520,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::MatchPayload) {
-        auto lhs = mir_value(*expr.lhs, module, fn);
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -522,6 +535,24 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::LocalRef) {
+        // For-loop unroll (Phase 4b): when lowering a body expression for
+        // iteration j, ctx carries the loop var's ref_index and the element
+        // MirValue for that iteration. A LocalRef whose local_index matches
+        // the loop var is replaced with the element directly; the element
+        // already carries its own shape / may_nil / may_error from having
+        // been lowered via mir_value() on the ArrayLit element expr, so no
+        // metadata merge is needed.
+        //
+        // LocalRefs to other locals (outer `let` bindings referenced from
+        // inside the loop body, e.g. `guard n > threshold`) fall through
+        // to the normal LocalRef lowering below — that path is exercised
+        // whenever ctx is null (route-level lowering) or the local_index
+        // doesn't match. The loop-var ref_index sentinel is validated once
+        // in the unroll driver, not here, to keep this hot path branchless
+        // for non-loop-var refs.
+        if (ctx != nullptr && expr.local_index == ctx->loop_var_ref_index) {
+            return ctx->current_element;
+        }
         v.kind = MirValueKind::LocalRef;
         v.type = mir_type_kind(expr.type);
         v.variant_index = expr.variant_index;
@@ -693,16 +724,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         fn.path = module.routes[i].path;
         fn.name = {"route", 5};
         fn.error_variant_index = module.routes[i].error_variant_index;
-
-        // Phase 4a: MIR doesn't yet unroll for-loops into its guard chain.
-        // Analyze (Phase 3b) populates route.for_loops; without the unroll
-        // pass the loop body is silently dropped and the route is compiled
-        // as if the loop never existed. Reject explicitly instead of
-        // miscompiling — Phase 4b will implement the unroll (loop-var
-        // substitution in mir_value + emit per-iteration guard blocks).
-        if (module.routes[i].for_loops.len != 0)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  module.routes[i].for_loops[0].span);
 
         // Propagate wait(ms) list 1:1. Codegen will turn each into a yield
         // boundary in the generated state machine.
@@ -879,6 +900,108 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             }
             return {};
         };
+
+        // Phase 4b Scope A for-loop unroll. A for-loop compiles to a flat
+        // chain of N × M virtual guards (N = iter_expr.args.len, M =
+        // body.guards.len), each branching to the next on pass and to its
+        // own fail block on failure. Pass of the final virtual guard falls
+        // into the route's direct terminator. This pass handles only the
+        // canonical allowlist-shaped pattern; other shapes remain rejected
+        // here until Phase 4c/d generalize the emission.
+        //
+        // Scope A preconditions (checked below): exactly one for-loop, no
+        // sibling route-level guards, route control is Direct, body has at
+        // least one guard and no body terminator. Rejected shapes (route
+        // guards mixed with for-loop, body terminator, if/match route
+        // control, multiple for-loops) get FrontendError::UnsupportedSyntax
+        // pointing at the for-loop span.
+        if (module.routes[i].for_loops.len != 0) {
+            const auto& fl = module.routes[i].for_loops[0];
+            const bool scope_a = module.routes[i].for_loops.len == 1 &&
+                                 module.routes[i].guards.len == 0 &&
+                                 module.routes[i].control.kind == HirControlKind::Direct &&
+                                 !fl.body.has_term && fl.body.guards.len != 0;
+            if (!scope_a || fl.loop_var_ref_index == 0xffffffffu) {
+                return frontend_error(FrontendError::UnsupportedSyntax, fl.span);
+            }
+
+            // Unroll N × M virtual guards. Each entry pairs a body-guard
+            // pointer with the ForLoopCtx that mir_value uses to substitute
+            // the loop variable's LocalRef on the condition expression.
+            // Phase 3b body guards are restricted to fail_kind == Term, so
+            // emit_guard_fail pushes exactly one fail block per guard.
+            struct UnrolledGuard {
+                const HirGuard* guard;
+                ForLoopCtx ctx;
+            };
+            constexpr u32 kMaxUnrolled = HirExpr::kMaxArgs * HirForLoopBody::kMaxGuards;
+            FixedVec<UnrolledGuard, kMaxUnrolled> expanded{};
+            for (u32 ai = 0; ai < fl.iter_expr.args.len; ai++) {
+                auto elem = mir_value(*fl.iter_expr.args[ai], module, &fn);
+                if (!elem) return core::make_unexpected(elem.error());
+                for (u32 gi = 0; gi < fl.body.guards.len; gi++) {
+                    UnrolledGuard u{};
+                    u.guard = &fl.body.guards[gi];
+                    u.ctx.loop_var_ref_index = fl.loop_var_ref_index;
+                    u.ctx.current_element = elem.value();
+                    if (!expanded.push(u))
+                        return frontend_error(FrontendError::TooManyItems, fl.span);
+                }
+            }
+
+            const u32 total = expanded.len;
+            const u32 body_index = total;
+            u32 guard_fail_index[kMaxUnrolled]{};
+            u32 fail_cursor = body_index + 1;
+            for (u32 gi = 0; gi < total; gi++) {
+                guard_fail_index[gi] = fail_cursor++;
+            }
+
+            // Entry block: test the first virtual guard's condition.
+            MirBlock entry_block{};
+            entry_block.label = entry_label();
+            entry_block.term.kind = MirTerminatorKind::Branch;
+            entry_block.term.span = expanded[0].guard->span;
+            auto cond0 = mir_value(expanded[0].guard->cond, module, &fn, &expanded[0].ctx);
+            if (!cond0) return core::make_unexpected(cond0.error());
+            entry_block.term.cond = cond0.value();
+            entry_block.term.then_block = total > 1 ? 1 : body_index;
+            entry_block.term.else_block = guard_fail_index[0];
+            if (!fn.blocks.push(entry_block))
+                return frontend_error(FrontendError::TooManyItems, fn.span);
+
+            // Subsequent virtual-guard blocks.
+            for (u32 gi = 1; gi < total; gi++) {
+                MirBlock guard_block{};
+                guard_block.label = cont_label();
+                guard_block.term.kind = MirTerminatorKind::Branch;
+                guard_block.term.span = expanded[gi].guard->span;
+                auto cond = mir_value(expanded[gi].guard->cond, module, &fn, &expanded[gi].ctx);
+                if (!cond) return core::make_unexpected(cond.error());
+                guard_block.term.cond = cond.value();
+                guard_block.term.then_block = gi + 1 < total ? gi + 1 : body_index;
+                guard_block.term.else_block = guard_fail_index[gi];
+                if (!fn.blocks.push(guard_block))
+                    return frontend_error(FrontendError::TooManyItems, fn.span);
+            }
+
+            // Body block: the route's direct terminator.
+            MirBlock body_block{};
+            body_block.label = cont_label();
+            set_term_from_hir(&body_block.term, module.routes[i].control.direct_term);
+            if (!fn.blocks.push(body_block))
+                return frontend_error(FrontendError::TooManyItems, fn.span);
+
+            // Fail blocks, one per virtual guard.
+            for (u32 gi = 0; gi < total; gi++) {
+                auto emitted = emit_guard_fail(*expanded[gi].guard);
+                if (!emitted) return core::make_unexpected(emitted.error());
+            }
+
+            if (!mir->functions.push(fn))
+                return frontend_error(FrontendError::TooManyItems, fn.span);
+            continue;
+        }
 
         MirBlock block{};
         block.label = entry_label();

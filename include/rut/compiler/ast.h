@@ -27,6 +27,15 @@ enum class AstStmtKind : u8 {
     Match,
     Block,
     Wait,  // `wait(N)` — suspend handler for N milliseconds (v1: IntLit only)
+    // `for <name> in <expr> { <body> }`. Fields reused from AstStatement:
+    //   - name        = loop variable identifier (e.g., "item" in `for item in xs`)
+    //   - expr        = iteration source expression (must type-check as Array<T>)
+    //   - then_stmt   = body block (via parse_braced_stmt_body; may be a single
+    //                   stmt if the block contained exactly one stmt)
+    // No break / continue / else / labels (spec §3.3.9: every iteration runs
+    // to completion). Analyze (Phase 3) enforces iteration source is array-typed
+    // and compile-time-sized; MIR (Phase 4) fully unrolls the loop.
+    For,
 };
 
 // Single response header key/value pair, used by `response(N, headers: {...})`.
@@ -41,6 +50,12 @@ enum class AstExprKind : u8 {
     IntLit,
     StrLit,
     Tuple,
+    // Array literal `[e1, e2, ...]` — elements stored in `args`.
+    // Parser accepts empty `[]`; analyze enforces "empty requires type annotation"
+    // since Rutlang has no push/append and all sizes are compile-time known.
+    // Surface `[T]` type syntax desugars to `AstTypeRef{name="Array", type_args=[T]}`
+    // in parse_func_type_ref.
+    ArrayLit,
     StructInit,
     Placeholder,
     VariantCase,
@@ -93,7 +108,11 @@ struct AstExpr {
     AstExpr* lhs = nullptr;
     AstExpr* rhs = nullptr;
     static constexpr u32 kMaxFieldInits = 8;
-    static constexpr u32 kMaxArgs = 8;
+    // Shared capacity for tuple elements, call arguments, field inits, and
+    // array literals. 8 was historically too tight for array literals (DSL
+    // allowlists / upstream pools routinely exceed 8); 32 covers the common
+    // case with bounded per-AstExpr footprint (~192 bytes extra vs 8).
+    static constexpr u32 kMaxArgs = 32;
     FixedVec<FieldInit, kMaxFieldInits> field_inits;
     FixedVec<AstTypeRef, kMaxTypeArgs> type_args;
     FixedVec<AstExpr*, kMaxArgs> args;

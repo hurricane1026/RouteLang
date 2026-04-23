@@ -13757,6 +13757,25 @@ TEST(frontend, analyze_for_loop_iter_not_array_rejected) {
     CHECK(!hir);
 }
 
+TEST(frontend, mir_rejects_for_loop_until_phase_4b) {
+    // Phase 4a: analyze accepts for-loops (Phase 3b), but MIR doesn't yet
+    // unroll them. Until Phase 4b lands the subst-aware mir_value + guard
+    // chain emission, MIR rejects any route with for_loops.len > 0 so
+    // users see a clean error at build time instead of a silent miscompile
+    // (loop body dropped, handler treats the loop as a no-op).
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    CHECK(!mir);
+}
+
 TEST(frontend, analyze_for_loop_rejects_shadowing_outer_local) {
     // Ident resolution scans route.locals by name from index 0 upward, so a
     // loop var that shares its name with an outer local would let the outer

@@ -145,6 +145,23 @@ struct Parser {
     FrontendResult<AstExpr> parse_primary_atom() {
         const Token start = cur();
         AstExpr expr{};
+        if (take(TokenType::LBracket)) {
+            AstExpr arr{};
+            arr.kind = AstExprKind::ArrayLit;
+            while (!take(TokenType::RBracket)) {
+                auto elem = parse_expr();
+                if (!elem) return core::make_unexpected(elem.error());
+                auto elem_ptr = alloc_expr(elem.value());
+                if (!elem_ptr) return core::make_unexpected(elem_ptr.error());
+                if (!arr.args.push(elem_ptr.value()))
+                    return frontend_error(FrontendError::TooManyItems, elem->span);
+                if (take(TokenType::RBracket)) break;
+                auto comma = expect(TokenType::Comma);
+                if (!comma) return core::make_unexpected(comma.error());
+            }
+            arr.span = Span{start.start, prev().end, start.line, start.col};
+            return arr;
+        }
         if (take(TokenType::LParen)) {
             auto first = parse_expr();
             if (!first) return core::make_unexpected(first.error());
@@ -1009,6 +1026,27 @@ struct Parser {
             stmt.span = Span{start.start, else_stmt->span.end, start.line, start.col};
             return stmt;
         }
+        if (take(TokenType::KwFor)) {
+            auto var_name = expect(TokenType::Ident);
+            if (!var_name) return core::make_unexpected(var_name.error());
+            auto in_kw = expect(TokenType::KwIn);
+            if (!in_kw) return core::make_unexpected(in_kw.error());
+            auto iter_expr = parse_expr();
+            if (!iter_expr) return core::make_unexpected(iter_expr.error());
+            auto lbrace = expect(TokenType::LBrace);
+            if (!lbrace) return core::make_unexpected(lbrace.error());
+            auto body = parse_braced_stmt_body(*lbrace.value());
+            if (!body) return core::make_unexpected(body.error());
+            auto body_ptr = alloc_stmt(body.value());
+            if (!body_ptr) return core::make_unexpected(body_ptr.error());
+            AstStatement stmt{};
+            stmt.kind = AstStmtKind::For;
+            stmt.name = var_name.value()->text;
+            stmt.expr = iter_expr.value();
+            stmt.then_stmt = body_ptr.value();
+            stmt.span = Span{start.start, body->span.end, start.line, start.col};
+            return stmt;
+        }
         if (take(TokenType::KwMatch)) {
             const bool is_const = take(TokenType::KwConst) != nullptr;
             auto subject = parse_expr();
@@ -1325,6 +1363,26 @@ struct Parser {
 
     FrontendResult<AstTypeRef> parse_func_type_ref() {
         AstTypeRef out{};
+        // Surface sugar: `[T]` desugars to `Array<T>`. Recurses for nested
+        // forms like `[[Int]]` → `Array<Array<Int>>`. The "Array" name here
+        // uses a C-string literal with static storage duration, matching the
+        // pattern for other internal names (e.g., `Str{"Self", 4}`).
+        if (const Token* lbracket = take(TokenType::LBracket)) {
+            auto elem = parse_func_type_ref();
+            if (!elem) return core::make_unexpected(elem.error());
+            auto rbracket = expect(TokenType::RBracket);
+            if (!rbracket) return core::make_unexpected(rbracket.error());
+            out.name = Str{"Array", 5};
+            auto elem_ptr = alloc_type(elem.value());
+            if (!elem_ptr) return core::make_unexpected(elem_ptr.error());
+            if (!out.type_arg_namespaces.push(elem->namespace_name))
+                return frontend_error(FrontendError::TooManyItems, span_from(*lbracket));
+            if (!out.type_arg_names.push(elem->name))
+                return frontend_error(FrontendError::TooManyItems, span_from(*lbracket));
+            if (!out.type_args.push(elem_ptr.value()))
+                return frontend_error(FrontendError::TooManyItems, span_from(*lbracket));
+            return out;
+        }
         if (take(TokenType::LParen)) {
             out.is_tuple = true;
             while (true) {
@@ -1830,7 +1888,7 @@ struct Parser {
             if (!item.route.statements.push(stmt.value()))
                 return frontend_error(FrontendError::TooManyItems, stmt.value().span);
             if (stmt->kind != AstStmtKind::Let && stmt->kind != AstStmtKind::Guard &&
-                stmt->kind != AstStmtKind::Wait)
+                stmt->kind != AstStmtKind::Wait && stmt->kind != AstStmtKind::For)
                 break;
         }
         auto rbrace = expect(TokenType::RBrace);

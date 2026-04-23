@@ -39,6 +39,7 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"if", 2})) return TokenType::KwIf;
     if (text.eq({"else", 4})) return TokenType::KwElse;
     if (text.eq({"for", 3})) return TokenType::KwFor;
+    if (text.eq({"in", 2})) return TokenType::KwIn;
     if (text.eq({"or", 2})) return TokenType::KwOr;
     if (text.eq({"nil", 3})) return TokenType::KwNil;
     if (text.eq({"upstream", 8})) return TokenType::KwUpstream;
@@ -249,6 +250,12 @@ LexResult lex(Str source) {
                 break;
             case ')':
                 tok.type = TokenType::RParen;
+                break;
+            case '[':
+                tok.type = TokenType::LBracket;
+                break;
+            case ']':
+                tok.type = TokenType::RBracket;
                 break;
             case ',':
                 tok.type = TokenType::Comma;

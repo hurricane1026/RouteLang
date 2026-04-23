@@ -27,6 +27,18 @@ enum class AstStmtKind : u8 {
     Match,
     Block,
     Wait,  // `wait(N)` — suspend handler for N milliseconds (v1: IntLit only)
+    // `for <name> in <expr> { <body> }`. Fields reused from AstStatement:
+    //   - name        = loop variable identifier (e.g., "item" in `for item in xs`)
+    //   - expr        = iteration source expression (must type-check as Array<T>)
+    //   - then_stmt   = body block (via parse_braced_stmt_body; may be a single
+    //                   stmt if the block contained exactly one stmt)
+    // No break / continue / else / labels (spec §3.3.9: every iteration runs
+    // to completion). Analyze (Phase 3b) enforces the iteration source is
+    // array-typed and compile-time-sized and builds a HirForLoop. MIR build
+    // currently rejects any route carrying for_loops (Phase 4a) — the full
+    // unroll (loop-var substitution + per-iteration guard blocks) lands in
+    // Phase 4b.
+    For,
 };
 
 // Single response header key/value pair, used by `response(N, headers: {...})`.
@@ -41,6 +53,14 @@ enum class AstExprKind : u8 {
     IntLit,
     StrLit,
     Tuple,
+    // Array literal `[e1, e2, ...]` — elements stored in `args`.
+    // Parser accepts empty `[]`; analyze currently rejects empty array
+    // literals unconditionally (Rutlang has no push/append so the element
+    // type can't be inferred later). Contextual inference from a surrounding
+    // type annotation is deferred; until then `let xs: [i32] = []` also
+    // errors.  Surface `[T]` type syntax desugars to
+    // `AstTypeRef{name="Array", type_args=[T]}` in parse_func_type_ref.
+    ArrayLit,
     StructInit,
     Placeholder,
     VariantCase,
@@ -93,6 +113,13 @@ struct AstExpr {
     AstExpr* lhs = nullptr;
     AstExpr* rhs = nullptr;
     static constexpr u32 kMaxFieldInits = 8;
+    // Shared capacity for tuple elements, call arguments, field inits, and
+    // array literals. HirExpr::kMaxArgs must stay at 8 (HirRoute stack
+    // budget — see the comment there), so keeping AstExpr at 8 too means
+    // ArrayLit with > 8 elements fails at parse with TooManyItems at the
+    // 9th element's span, instead of parsing successfully and then failing
+    // ambiguously in analyze. Once HIR gets an out-of-line element pool
+    // for arrays, both caps can rise together.
     static constexpr u32 kMaxArgs = 8;
     FixedVec<FieldInit, kMaxFieldInits> field_inits;
     FixedVec<AstTypeRef, kMaxTypeArgs> type_args;

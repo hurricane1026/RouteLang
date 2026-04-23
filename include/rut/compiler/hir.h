@@ -52,6 +52,13 @@ enum class HirExprKind : u8 {
     IntLit,
     StrLit,
     Tuple,
+    // Array literal: elements stored in `args`. analyze rejects heterogeneous
+    // arrays and empty `[]` (Rutlang has no push/append so size + element
+    // type must be compile-time known; contextual inference from annotations
+    // is deferred — empty literals currently error even with an annotation).
+    // Element count is a value property on `HirExpr.array_len`, not a type
+    // property; the result's HirTypeShape carries only `array_elem_shape_index`.
+    ArrayLit,
     TupleSlot,
     VariantCase,
     IfElse,
@@ -89,6 +96,14 @@ enum class HirTypeKind : u8 {
     Tuple,
     Struct,
     Method,
+    // Homogeneous fixed-size sequence. Carrier for `for x in <arr>` iteration.
+    // Type-shape info lives in HirTypeShape via `array_elem_shape_index`
+    // alone; length is a *value* property on `HirExpr.array_len` so two
+    // arrays with the same element type but different lengths share one
+    // shape. Composite-type host structures (HirLocal, HirExpr, etc.)
+    // reference the shape through their existing `shape_index` rather than
+    // mirroring inline fields.
+    Array,
 };
 
 inline constexpr u32 kMaxTupleSlots = 10;
@@ -101,6 +116,13 @@ struct HirTypeShape {
     u32 struct_index = 0xffffffffu;
     u32 tuple_len = 0;
     u32 tuple_elem_shape_indices[kMaxTupleSlots]{};
+    // Array-typed shape: array_elem_shape_index points at another
+    // HirTypeShape in HirModule::type_shapes describing the element type.
+    // Length is a *value* property (lives on HirExpr.array_len, carried
+    // forward to MIR for unroll) — not a type property, so two arrays of
+    // the same element type with different lengths still share one shape.
+    // Sentinel: type != Array → array_elem_shape_index = 0xffffffffu.
+    u32 array_elem_shape_index = 0xffffffffu;
 };
 
 struct HirProtocol {
@@ -296,9 +318,19 @@ struct HirExpr {
     u32 error_struct_index = 0xffffffffu;
     u32 error_variant_index = 0xffffffffu;
     u32 error_case_index = 0xffffffffu;
+    // For HirExprKind::ArrayLit: compile-time-known element count. Elements
+    // themselves live in `args`. For non-Array exprs: 0.
+    u32 array_len = 0;
     HirExpr* lhs = nullptr;
     HirExpr* rhs = nullptr;
     static constexpr u32 kMaxFieldInits = 8;
+    // HIR-level cap stays at 8 even though AstExpr::kMaxArgs = 32: HirRoute
+    // sits at ~300 KB on stack and is copied on each recursive
+    // analyze_file_internal call (via `HirRoute scratch{}`). A 32-wide cap
+    // here inflates the exprs / locals / for_loops pools enough to blow the
+    // 8 MB thread stack during cyclic-import tests. Phase 3a's ArrayLit
+    // analyze catches > kMaxArgs element arrays cleanly; a larger HIR cap
+    // can land when we introduce an out-of-line array-element pool.
     static constexpr u32 kMaxArgs = 8;
     FixedVec<FieldInit, kMaxFieldInits> field_inits;
     FixedVec<HirExpr*, kMaxArgs> args;
@@ -653,6 +685,44 @@ struct HirControl {
     HirTerminator direct_term{};
 };
 
+// Body of a `for ... in` loop. Phase 3b MVP: body is `guard*` plus an
+// optional terminator (return / forward). Lets, nested for-loops, and
+// arbitrary if/match are deferred to later phases. The body's guards carry
+// inline HirExpr cond subtrees whose lhs/rhs/args* point into the parent
+// HirRoute::exprs pool; HirRoute::rebase_from must walk them. HirTerminator
+// has no HirExpr pointers (only status_code / upstream_index / response
+// strings), so it doesn't participate in rebase.
+struct HirForLoopBody {
+    // 2 guards cover the canonical DESIGN.md examples (1 guard short-circuits
+    // the request, rarely 2 for compound checks). Each HirGuard is ~4.5 KB
+    // inline, so raising this directly grows HirRoute on the stack — see
+    // HirExpr::kMaxArgs comment for the recursive-analyze stack budget.
+    static constexpr u32 kMaxGuards = 2;
+    FixedVec<HirGuard, kMaxGuards> guards;
+    HirTerminator term{};
+    bool has_term = false;
+};
+
+struct HirForLoop {
+    Span span{};
+    // Iteration source. Must type-check as Array<T>; the element type T
+    // binds the loop variable's HirTypeKind below. iter_expr's HirExpr*
+    // subfields point into HirRoute::exprs, so they need rebase too.
+    HirExpr iter_expr{};
+    // Loop variable (e.g., `item` in `for item in xs`). Scope is the body
+    // only. analyze pushes it into route.locals so body HirExpr LocalRefs
+    // bind to a stable ref_index (required once MIR unroll substitutes per
+    // iteration), then *clears the name* after body analysis — Ident
+    // resolution scans locals by name so post-loop code can't reach the
+    // loop variable, and next_local_ref_index still won't reuse the slot.
+    Str loop_var_name{};
+    HirTypeKind loop_var_type = HirTypeKind::Unknown;
+    u32 loop_var_variant_index = 0xffffffffu;
+    u32 loop_var_struct_index = 0xffffffffu;
+    u32 loop_var_shape_index = 0xffffffffu;
+    HirForLoopBody body{};
+};
+
 struct HirRoute {
     struct DecoratorRef {
         Span span{};
@@ -674,11 +744,17 @@ struct HirRoute {
     static constexpr u32 kMaxExprs = 64;
     static constexpr u32 kMaxDecorators = 8;
     static constexpr u32 kMaxWaits = 4;
+    // 2 for-loops per route covers realistic DSL patterns (one allowlist
+    // check + one server-pool iteration) while keeping HirRoute under the
+    // stack budget. Each HirForLoop is ~10 KB even at kMaxGuards=2; a
+    // larger cap would push HirRoute past the recursive-analyze budget.
+    static constexpr u32 kMaxForLoops = 2;
     FixedVec<HirExpr, kMaxExprs> exprs;
     FixedVec<HirLocal, kMaxLocals> locals;
     FixedVec<HirGuard, kMaxGuards> guards;
     FixedVec<DecoratorRef, kMaxDecorators> decorators;
     FixedVec<Wait, kMaxWaits> waits;
+    FixedVec<HirForLoop, kMaxForLoops> for_loops;
     HirControl control{};
     u32 error_variant_index = 0xffffffffu;
 
@@ -692,6 +768,7 @@ struct HirRoute {
           guards(other.guards),
           decorators(other.decorators),
           waits(other.waits),
+          for_loops(other.for_loops),
           control(other.control),
           error_variant_index(other.error_variant_index) {
         rebase_from(other);
@@ -706,6 +783,7 @@ struct HirRoute {
         guards = other.guards;
         decorators = other.decorators;
         waits = other.waits;
+        for_loops = other.for_loops;
         control = other.control;
         error_variant_index = other.error_variant_index;
         rebase_from(other);
@@ -720,6 +798,7 @@ struct HirRoute {
           guards(other.guards),
           decorators(other.decorators),
           waits(other.waits),
+          for_loops(other.for_loops),
           control(other.control),
           error_variant_index(other.error_variant_index) {
         rebase_from(other);
@@ -734,6 +813,7 @@ struct HirRoute {
         guards = other.guards;
         decorators = other.decorators;
         waits = other.waits;
+        for_loops = other.for_loops;
         control = other.control;
         error_variant_index = other.error_variant_index;
         rebase_from(other);
@@ -768,6 +848,16 @@ private:
             rebase_expr(guards[i].cond, other);
             rebase_expr(guards[i].fail_match_expr, other);
             rebase_expr(guards[i].fail_body.cond, other);
+        }
+        // For-loops: iter_expr and the body's guard conds all point into
+        // `exprs`, so rebase them the same way as top-level guards.
+        for (u32 i = 0; i < for_loops.len; i++) {
+            rebase_expr(for_loops[i].iter_expr, other);
+            for (u32 gi = 0; gi < for_loops[i].body.guards.len; gi++) {
+                rebase_expr(for_loops[i].body.guards[gi].cond, other);
+                rebase_expr(for_loops[i].body.guards[gi].fail_match_expr, other);
+                rebase_expr(for_loops[i].body.guards[gi].fail_body.cond, other);
+            }
         }
         rebase_expr(control.cond, other);
         rebase_expr(control.match_expr, other);

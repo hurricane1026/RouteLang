@@ -694,6 +694,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         fn.name = {"route", 5};
         fn.error_variant_index = module.routes[i].error_variant_index;
 
+        // Phase 4a: MIR doesn't yet unroll for-loops into its guard chain.
+        // Analyze (Phase 3b) populates route.for_loops; without the unroll
+        // pass the loop body is silently dropped and the route is compiled
+        // as if the loop never existed. Reject explicitly instead of
+        // miscompiling — Phase 4b will implement the unroll (loop-var
+        // substitution in mir_value + emit per-iteration guard blocks).
+        if (module.routes[i].for_loops.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  module.routes[i].for_loops[0].span);
+
         // Propagate wait(ms) list 1:1. Codegen will turn each into a yield
         // boundary in the generated state machine.
         for (u32 wi = 0; wi < module.routes[i].waits.len; wi++) {

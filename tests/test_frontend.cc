@@ -13823,6 +13823,34 @@ TEST(frontend, mir_rejects_for_loop_with_body_terminator) {
     CHECK(!mir);
 }
 
+TEST(frontend, for_loop_lowers_through_rir_without_synthetic_local) {
+    // The loop variable is a synthetic HirLocal (analyze blanks its name
+    // for scope-hiding) whose init is a self-referential LocalRef. MIR
+    // must skip this slot so lower_rir's materialize_local_init doesn't
+    // resolve the self-ref to ValueId{0} on an unset slot. Regression
+    // guard: lower the canonical Scope A program end-to-end through RIR
+    // and confirm it succeeds. Also asserts that the MIR function has
+    // zero locals (the only HIR local was the loop var, which must have
+    // been skipped).
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, mir_rejects_for_loop_exceeding_block_budget) {
     // A Scope-A-shape program (one for-loop, body guards only, Direct
     // control, no route guards) that unrolls to more than MirFunction::

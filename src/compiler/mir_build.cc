@@ -736,6 +736,18 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
+            // Skip synthetic name-cleared locals. Analyze keeps for-loop
+            // loop variables in HirRoute::locals so body LocalRefs bind to
+            // a stable ref_index, then blanks the name for scope-hiding
+            // (see analyze.cc:10137). MIR unroll substitutes every
+            // reference to the loop var with the per-iteration element
+            // (see ForLoopCtx in mir_value), so its MIR slot is never
+            // read. Emitting it anyway would push a MirLocal whose init
+            // is a self-referential LocalRef — lower_rir's
+            // materialize_local_init would resolve it to ValueId{0} since
+            // the slot is still being initialized, turning any future
+            // substitution regression into a silent miscompile.
+            if (module.routes[i].locals[li].name.len == 0) continue;
             MirLocal local{};
             local.span = module.routes[i].locals[li].span;
             local.name = module.routes[i].locals[li].name;

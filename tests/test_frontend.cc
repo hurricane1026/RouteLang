@@ -13788,6 +13788,19 @@ TEST(frontend, analyze_array_lit_at_nested_let_rhs_rejected) {
     CHECK(!hir);
 }
 
+TEST(frontend, analyze_array_lit_direct_function_body_rejected) {
+    // ArrayLit is only allowed as a for-loop iteration source until MIR can
+    // lower array constants. Direct expression bodies must reject in analyze
+    // instead of reaching mir_build as unsupported HirExprKind::ArrayLit.
+    const char* src = "func ids() => [1, 2, 3]\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
 TEST(frontend, analyze_for_loop_rejects_guard_after_terminator) {
     // HirForLoopBody stores guards and terminator in separate fields (no
     // source-ordered stmt list), so accepting a guard after a terminator

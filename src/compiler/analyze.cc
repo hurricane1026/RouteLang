@@ -2288,6 +2288,11 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
                                             const HirLocal* locals,
                                             u32 local_count,
                                             const MatchPayloadBinding* binding);
+static FrontendResult<HirExpr> analyze_array_iter_expr(const AstExpr& expr,
+                                                       HirRoute* route,
+                                                       const HirModule& mod,
+                                                       const HirLocal* locals,
+                                                       u32 local_count);
 static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          HirRoute* route,
                                                          const HirModule& mod,
@@ -3903,12 +3908,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
 }
 
-static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
-                                            HirRoute* route,
-                                            const HirModule& mod,
-                                            const HirLocal* locals,
-                                            u32 local_count,
-                                            const MatchPayloadBinding* binding) {
+static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
+                                                 HirRoute* route,
+                                                 const HirModule& mod,
+                                                 const HirLocal* locals,
+                                                 u32 local_count,
+                                                 const MatchPayloadBinding* binding,
+                                                 bool allow_array_lit) {
     HirExpr out{};
     out.span = expr.span;
     if (expr.kind == AstExprKind::Placeholder)
@@ -4456,6 +4462,7 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
         return out;
     }
     if (expr.kind == AstExprKind::ArrayLit) {
+        if (!allow_array_lit) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         // Empty array `[]` has no inferable element type; Rutlang has no
         // push/append so the element type can't be resolved later either.
         // Future: contextual inference from a declared type annotation can
@@ -4862,6 +4869,23 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
         return out;
     }
     return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+}
+
+static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
+                                            HirRoute* route,
+                                            const HirModule& mod,
+                                            const HirLocal* locals,
+                                            u32 local_count,
+                                            const MatchPayloadBinding* binding) {
+    return analyze_expr_impl(expr, route, mod, locals, local_count, binding, false);
+}
+
+static FrontendResult<HirExpr> analyze_array_iter_expr(const AstExpr& expr,
+                                                       HirRoute* route,
+                                                       const HirModule& mod,
+                                                       const HirLocal* locals,
+                                                       u32 local_count) {
+    return analyze_expr_impl(expr, route, mod, locals, local_count, nullptr, true);
 }
 
 static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
@@ -9977,8 +10001,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 // get a stable ref_index, then has its *name* cleared once
                 // the body is analyzed (the block below) — so it stays
                 // out of later Ident resolution without freeing the slot.
-                auto iter = analyze_expr(
-                    stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+                auto iter = analyze_array_iter_expr(
+                    stmt.expr, &route, mod, route.locals.data, route.locals.len);
                 if (!iter) return core::make_unexpected(iter.error());
                 if (iter->type != HirTypeKind::Array || iter->shape_index >= mod.type_shapes.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);

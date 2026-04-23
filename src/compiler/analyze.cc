@@ -9820,6 +9820,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto init = analyze_expr(
                     stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
                 if (!init) return core::make_unexpected(init.error());
+                // ArrayLit at let RHS fails at MIR because MIR has no
+                // ArrayLit → MirValue lowering (arrays are only consumed via
+                // for-loop unroll in Phase 4; indexing and const-folded
+                // array locals are future work). Reject at analyze so users
+                // get a clean diagnostic at the declaration site instead of
+                // a late MIR error. Inline form (`for x in [1,2,3]`) still
+                // works because for-loop unroll skips mir_value on iter_expr.
+                if (init->kind == HirExprKind::ArrayLit)
+                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, stmt);
                 if (!typed) return core::make_unexpected(typed.error());
                 local.type = init->type;
@@ -9969,6 +9978,19 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 fl.loop_var_variant_index = elem_shape.variant_index;
                 fl.loop_var_struct_index = elem_shape.struct_index;
                 fl.loop_var_shape_index = iter_shape.array_elem_shape_index;
+
+                // Reject shadowing of an outer local by the loop variable.
+                // Ident resolution scans locals by name from index 0 upward,
+                // so an earlier local with the same name would win over the
+                // per-iteration loop var (`let item = 1; for item in [2] { ... }`
+                // would bind `item` inside the body to the outer `1`).
+                // Making the collision a compile error is simpler than
+                // rewriting name lookup to prefer most-recent.
+                for (u32 li = 0; li < route.locals.len; li++) {
+                    if (route.locals[li].name.len != 0 &&
+                        route.locals[li].name.eq(stmt.name))
+                        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                }
 
                 const u32 locals_saved = route.locals.len;
                 HirLocal loop_var{};

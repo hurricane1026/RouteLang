@@ -13629,30 +13629,19 @@ TEST(frontend, parse_for_loop_multi_stmt_body) {
              static_cast<u8>(AstStmtKind::Guard));
 }
 
-TEST(frontend, analyze_array_lit_int_roundtrip) {
-    // End-to-end: `let xs: [i32] = [1, 2, 3]` parses + type-checks. The
-    // annotation `[i32]` desugars to Array<Int>; the literal infers element
-    // type from the first I32 element; same_hir_type_shape accepts the match.
+TEST(frontend, analyze_array_lit_at_let_rhs_rejected) {
+    // ArrayLit at let RHS is rejected because MIR cannot yet lower array
+    // values as constants (no indexing, no const-folded array locals).
+    // Inline `for x in [1,2,3] { ... }` still works — for-loop unroll
+    // skips mir_value on iter_expr. Phase 4+ may relax this once MIR
+    // gains array-constant lowering.
     const char* src = "route GET \"/x\" { let xs: [i32] = [1, 2, 3] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    REQUIRE_EQ(hir->routes.len, 1u);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    const auto& local = hir->routes[0].locals[0];
-    CHECK(local.name.eq(lit("xs")));
-    CHECK_EQ(static_cast<u8>(local.type), static_cast<u8>(HirTypeKind::Array));
-    REQUIRE(local.shape_index < hir->type_shapes.len);
-    const auto& shape = hir->type_shapes[local.shape_index];
-    CHECK_EQ(static_cast<u8>(shape.type), static_cast<u8>(HirTypeKind::Array));
-    REQUIRE(shape.array_elem_shape_index < hir->type_shapes.len);
-    CHECK_EQ(static_cast<u8>(hir->type_shapes[shape.array_elem_shape_index].type),
-             static_cast<u8>(HirTypeKind::I32));
-    // Length carried on the expr (not the shape), for MIR unroll in Phase 4.
-    CHECK_EQ(local.init.array_len, 3u);
+    CHECK(!hir);
 }
 
 TEST(frontend, analyze_array_lit_heterogeneous_rejected) {
@@ -13760,6 +13749,22 @@ TEST(frontend, analyze_for_loop_var_scoped_to_body) {
 TEST(frontend, analyze_for_loop_iter_not_array_rejected) {
     // Iter source must be Array<T>; iterating a scalar is a type error.
     const char* src = "route GET \"/x\" { for item in 42 { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_rejects_shadowing_outer_local) {
+    // Ident resolution scans route.locals by name from index 0 upward, so a
+    // loop var that shares its name with an outer local would let the outer
+    // binding win in the body — producing wrong guard behavior under MIR
+    // unroll. Analyze rejects the collision outright.
+    const char* src =
+        "route GET \"/x\" { let item = 1 for item in [2, 3] { guard item > 1 else "
+        "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());

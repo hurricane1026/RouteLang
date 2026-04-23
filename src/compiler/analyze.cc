@@ -9987,8 +9987,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 // Making the collision a compile error is simpler than
                 // rewriting name lookup to prefer most-recent.
                 for (u32 li = 0; li < route.locals.len; li++) {
-                    if (route.locals[li].name.len != 0 &&
-                        route.locals[li].name.eq(stmt.name))
+                    if (route.locals[li].name.len != 0 && route.locals[li].name.eq(stmt.name))
                         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 }
 

@@ -13495,6 +13495,300 @@ func keep(x: (i32, bool), y: (Box, i32)) -> (i32, bool) => x
     CHECK(mir->type_shapes[struct_tuple_shape].carrier_ready);
 }
 
+TEST(frontend, parse_array_lit_basic) {
+    // `[i32]` in type position desugars to Array<Int> via parse_func_type_ref;
+    // `[1, 2, 3]` in expression position produces AstExprKind::ArrayLit with
+    // three IntLit elements in `args`. Parser-only: analyze doesn't yet
+    // understand ArrayLit, so this test stops after parse_file_heap.
+    const char* src = "route GET \"/x\" { let xs: [i32] = [1, 2, 3] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    const auto& let_stmt = route.statements[0];
+    CHECK_EQ(static_cast<u8>(let_stmt.kind), static_cast<u8>(AstStmtKind::Let));
+    CHECK(let_stmt.type.name.eq(lit("Array")));
+    REQUIRE_EQ(let_stmt.type.type_args.len, 1u);
+    CHECK(let_stmt.type.type_args[0]->name.eq(lit("i32")));
+    CHECK_EQ(static_cast<u8>(let_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
+    REQUIRE_EQ(let_stmt.expr.args.len, 3u);
+    CHECK_EQ(static_cast<u8>(let_stmt.expr.args[0]->kind), static_cast<u8>(AstExprKind::IntLit));
+    CHECK_EQ(let_stmt.expr.args[0]->int_value, 1);
+    CHECK_EQ(let_stmt.expr.args[1]->int_value, 2);
+    CHECK_EQ(let_stmt.expr.args[2]->int_value, 3);
+}
+
+TEST(frontend, parse_array_lit_empty) {
+    // Empty `[]` is syntactically legal — analyze is expected to require a
+    // type annotation (Rutlang has no push/append so all array sizes are
+    // compile-time known). Parser accepts it as a zero-element ArrayLit.
+    const char* src = "route GET \"/x\" { let xs: [i32] = [] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& let_stmt = ast->items[0].route.statements[0];
+    CHECK(let_stmt.type.name.eq(lit("Array")));
+    CHECK_EQ(static_cast<u8>(let_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
+    CHECK_EQ(let_stmt.expr.args.len, 0u);
+}
+
+TEST(frontend, parse_array_lit_trailing_comma) {
+    // `[1, 2, 3,]` — trailing comma accepted (Swift/Rust style) so diffs stay
+    // minimal when elements are appended. Element count matches the non-trailing
+    // form exactly; no phantom empty element.
+    const char* src = "route GET \"/x\" { let xs: [i32] = [1, 2, 3,] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& let_stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(let_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
+    REQUIRE_EQ(let_stmt.expr.args.len, 3u);
+    CHECK_EQ(let_stmt.expr.args[2]->int_value, 3);
+}
+
+TEST(frontend, parse_array_lit_nested_type) {
+    // `[[i32]]` desugars recursively: outer [T] → Array<T>, inner [T] → Array<Int>.
+    // Validates parse_func_type_ref's recursion on leading LBracket.
+    const char* src = "route GET \"/x\" { let xss: [[i32]] = [] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& let_stmt = ast->items[0].route.statements[0];
+    CHECK(let_stmt.type.name.eq(lit("Array")));
+    REQUIRE_EQ(let_stmt.type.type_args.len, 1u);
+    CHECK(let_stmt.type.type_args[0]->name.eq(lit("Array")));
+    REQUIRE_EQ(let_stmt.type.type_args[0]->type_args.len, 1u);
+    CHECK(let_stmt.type.type_args[0]->type_args[0]->name.eq(lit("i32")));
+}
+
+TEST(frontend, parse_for_loop_basic) {
+    // `for item in xs { return 200 }` — loop variable stored in `name`,
+    // iteration source in `expr`, body block in `then_stmt`. Parser-only:
+    // analyze doesn't yet understand For/ArrayLit.
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    const auto& for_stmt = route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(for_stmt.name.eq(lit("item")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
+    REQUIRE_EQ(for_stmt.expr.args.len, 3u);
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    // Body is a single-stmt `return 200` (parse_braced_stmt_body collapses
+    // one-stmt blocks to the stmt itself — not a Block wrapper).
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind),
+             static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
+}
+
+TEST(frontend, parse_for_loop_field_access_source) {
+    // `for server in up.servers` — iteration source is a field access expr,
+    // not a literal. Exercises parse_expr → parse_primary_expr → Field path
+    // inside the for's iter-expr slot.
+    const char* src = "route GET \"/x\" { for server in up.servers { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& for_stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(for_stmt.name.eq(lit("server")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
+}
+
+TEST(frontend, parse_for_loop_multi_stmt_body) {
+    // Body with multiple statements — parse_braced_stmt_body returns a Block
+    // wrapping them; then_stmt points to that Block.
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 } } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& for_stmt = ast->items[0].route.statements[0];
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
+    REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[0]->kind),
+             static_cast<u8>(AstStmtKind::Let));
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[1]->kind),
+             static_cast<u8>(AstStmtKind::Guard));
+}
+
+TEST(frontend, analyze_array_lit_int_roundtrip) {
+    // End-to-end: `let xs: [i32] = [1, 2, 3]` parses + type-checks. The
+    // annotation `[i32]` desugars to Array<Int>; the literal infers element
+    // type from the first I32 element; same_hir_type_shape accepts the match.
+    const char* src = "route GET \"/x\" { let xs: [i32] = [1, 2, 3] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    const auto& local = hir->routes[0].locals[0];
+    CHECK(local.name.eq(lit("xs")));
+    CHECK_EQ(static_cast<u8>(local.type), static_cast<u8>(HirTypeKind::Array));
+    REQUIRE(local.shape_index < hir->type_shapes.len);
+    const auto& shape = hir->type_shapes[local.shape_index];
+    CHECK_EQ(static_cast<u8>(shape.type), static_cast<u8>(HirTypeKind::Array));
+    REQUIRE(shape.array_elem_shape_index < hir->type_shapes.len);
+    CHECK_EQ(static_cast<u8>(hir->type_shapes[shape.array_elem_shape_index].type),
+             static_cast<u8>(HirTypeKind::I32));
+    // Length carried on the expr (not the shape), for MIR unroll in Phase 4.
+    CHECK_EQ(local.init.array_len, 3u);
+}
+
+TEST(frontend, analyze_array_lit_heterogeneous_rejected) {
+    // Mixed element types — analyze must reject. Phase 3a MVP is strict:
+    // first-element-is-truth, no widening.
+    const char* src = "route GET \"/x\" { let xs: [i32] = [1, \"two\", 3] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_array_lit_empty_rejected) {
+    // `[]` leaves element type unresolvable with Rutlang's no-push rule.
+    // Contextual inference from annotation is future work; MVP rejects.
+    const char* src = "route GET \"/x\" { let xs: [i32] = [] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_array_annotation_type_mismatch_rejected) {
+    // Annotation `[Str]` vs literal `[1, 2, 3]` (Array<I32>) — apply_declared_
+    // type_to_expr's same_hir_type_shape must reject. This exercises the
+    // mod-aware shape comparison path since Array info lives in shape_index.
+    const char* src = "route GET \"/x\" { let xs: [str] = [1, 2, 3] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_terminator_body) {
+    // Phase 3b: body is a single `return` terminator. Analyze must produce a
+    // HirForLoop on route.for_loops with iter_expr typed Array<I32>, loop_var
+    // bound to I32, and body.term populated (has_term = true).
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.for_loops.len, 1u);
+    const auto& fl = route.for_loops[0];
+    CHECK(fl.loop_var_name.eq(lit("item")));
+    CHECK_EQ(static_cast<u8>(fl.loop_var_type), static_cast<u8>(HirTypeKind::I32));
+    CHECK_EQ(static_cast<u8>(fl.iter_expr.type), static_cast<u8>(HirTypeKind::Array));
+    CHECK_EQ(fl.iter_expr.array_len, 3u);
+    CHECK(fl.body.has_term);
+    CHECK_EQ(static_cast<u8>(fl.body.term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(fl.body.term.status_code, 200);
+    // route still needs a top-level terminator (after the for-loop).
+    CHECK_EQ(static_cast<u8>(route.control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+}
+
+TEST(frontend, analyze_for_loop_guard_body) {
+    // Canonical Phase 3b use: iterate an allowlist-style array with a guard
+    // that short-circuits the handler. The loop var (`n`) must be in scope
+    // inside the guard's condition.
+    const char* src =
+        "route GET \"/x\" { for n in [1, 2, 3] { guard n > 0 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.for_loops.len, 1u);
+    const auto& fl = route.for_loops[0];
+    CHECK(fl.loop_var_name.eq(lit("n")));
+    REQUIRE_EQ(fl.body.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(fl.body.guards[0].fail_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(fl.body.guards[0].fail_term.status_code, 400);
+    // No body terminator — control falls through to the next iteration.
+    CHECK(!fl.body.has_term);
+}
+
+TEST(frontend, analyze_for_loop_var_scoped_to_body) {
+    // The loop variable must NOT leak to code after the for-loop. Writing
+    // `item` in a post-loop let should fail to resolve (Ident unknown).
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { return 200 } "
+        "let x = item return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_iter_not_array_rejected) {
+    // Iter source must be Array<T>; iterating a scalar is a type error.
+    const char* src = "route GET \"/x\" { for item in 42 { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_rejects_let_in_body) {
+    // Phase 3b MVP: body allows `guard*` + optional terminator. A nested let
+    // inside the body is an explicit scope restriction — future phases may
+    // relax this, but for now we fail loudly.
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { let y = 7 return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, parse_for_loop_rejects_missing_in) {
+    // `for item <missing in> [1, 2, 3]` — expect must see KwIn, else unexpected-token.
+    const char* src = "route GET \"/x\" { for item [1, 2, 3] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    CHECK(!ast);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

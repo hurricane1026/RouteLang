@@ -127,9 +127,8 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
         // Array is concrete iff its element shape is concrete and the element
         // shape is actually resolved. Element shape is already interned (the
         // caller passed array_elem_shape_index), so just look it up.
-        shape.is_concrete =
-            array_elem_shape_index < mod->type_shapes.len &&
-            mod->type_shapes[array_elem_shape_index].is_concrete;
+        shape.is_concrete = array_elem_shape_index < mod->type_shapes.len &&
+                            mod->type_shapes[array_elem_shape_index].is_concrete;
     }
     if (type == HirTypeKind::Tuple) {
         shape.is_concrete = true;
@@ -1577,7 +1576,15 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
         // checks because "Array" is a reserved builtin, not a user-defined
         // struct or generic param. The element type is resolved recursively
         // and interned so we can return a shape_index to the caller.
+        //
+        // Callers that don't support arrays pass array_elem_shape_index_out
+        // == nullptr. Those positions (protocol / function params, struct /
+        // variant fields — all of Phase 5's scope) cannot carry the array
+        // element shape, so silently accepting Array there would lose type
+        // info. Reject so users get a clear error at the declaration site.
         if (ref.namespace_name.len == 0 && resolved_name.eq(Str{"Array", 5})) {
+            if (array_elem_shape_index_out == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
             if (ref.type_arg_names.len != 1)
                 return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
             u32 elem_variant_index = 0xffffffffu;
@@ -1616,8 +1623,7 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
                                                     span,
                                                     elem_nested_array_shape);
             if (!elem_shape) return core::make_unexpected(elem_shape.error());
-            if (array_elem_shape_index_out)
-                *array_elem_shape_index_out = elem_shape.value();
+            if (array_elem_shape_index_out) *array_elem_shape_index_out = elem_shape.value();
             return HirTypeKind::Array;
         }
         if (type_params != nullptr && ref.namespace_name.len == 0) {
@@ -1787,9 +1793,12 @@ static bool same_hir_type_shape(const HirExpr& lhs, const HirExpr& rhs) {
         }
     }
     // Array element type lives in HirTypeShape via shape_index (no inline
-    // mirror on HirExpr). Shape interning makes equal types share the same
-    // index, so a mismatch here = genuinely different element types or
-    // lengths. Callers that want mod-aware comparison use the 3-arg overload.
+    // mirror on HirExpr). Length is a value property — not part of the
+    // shape — so two arrays of the same element type with different lengths
+    // share one shape_index. Shape interning makes equal element-type shapes
+    // share the same index, so a mismatch here means genuinely different
+    // element types. Callers that want mod-aware comparison use the 3-arg
+    // overload.
     if (lhs.type == HirTypeKind::Array) {
         if (lhs.shape_index == 0xffffffffu || rhs.shape_index == 0xffffffffu) return false;
         return lhs.shape_index == rhs.shape_index;
@@ -4447,8 +4456,7 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
         // push/append so the element type can't be resolved later either.
         // Future: contextual inference from a declared type annotation can
         // relax this, but Phase 3a rejects it outright for clarity.
-        if (expr.args.len == 0)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        if (expr.args.len == 0) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         out.kind = HirExprKind::ArrayLit;
         out.type = HirTypeKind::Array;
         out.array_len = expr.args.len;
@@ -9946,8 +9954,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto iter = analyze_expr(
                     stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
                 if (!iter) return core::make_unexpected(iter.error());
-                if (iter->type != HirTypeKind::Array ||
-                    iter->shape_index >= mod.type_shapes.len)
+                if (iter->type != HirTypeKind::Array || iter->shape_index >= mod.type_shapes.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
                 const auto& iter_shape = mod.type_shapes[iter->shape_index];
                 if (iter_shape.array_elem_shape_index >= mod.type_shapes.len)
@@ -9990,9 +9997,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 const u32 body_item_count =
                     body->kind == AstStmtKind::Block ? body->block_stmts.len : 1u;
                 for (u32 bi = 0; bi < body_item_count; bi++) {
-                    const AstStatement& bstmt = (body->kind == AstStmtKind::Block)
-                                                    ? *body->block_stmts[bi]
-                                                    : *body;
+                    const AstStatement& bstmt =
+                        (body->kind == AstStmtKind::Block) ? *body->block_stmts[bi] : *body;
                     if (bstmt.kind == AstStmtKind::Guard) {
                         // Phase 3b MVP: only `guard cond else { return N }` or
                         // `guard cond else { return forward(...) }`. No
@@ -10006,12 +10012,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
                         HirGuard guard{};
                         guard.span = bstmt.span;
-                        auto cond = analyze_expr(bstmt.expr,
-                                                 &route,
-                                                 mod,
-                                                 route.locals.data,
-                                                 route.locals.len,
-                                                 nullptr);
+                        // Use analyze_guard_cond (matches the top-level
+                        // guard dispatch at route scope): it enforces the
+                        // boolean predicate shape and rejects may_error /
+                        // may_nil conditions, unlike plain analyze_expr.
+                        auto cond = analyze_guard_cond(
+                            bstmt.expr, &route, mod, route.locals.data, route.locals.len);
                         if (!cond) return core::make_unexpected(cond.error());
                         guard.cond = cond.value();
                         auto fail = analyze_term(*bstmt.else_stmt, mod);
@@ -10035,9 +10041,21 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
                 }
 
-                // Roll back loop_var scope. FixedVec doesn't expose a resize
-                // helper, so truncate by setting len directly.
-                route.locals.len = locals_saved;
+                // Keep loop_var *in* route.locals so its ref_index stays
+                // stable for body HirExpr LocalRefs (MIR unroll will read
+                // those). Hide the *name* by clearing it — Ident resolution
+                // scans locals by name, so post-loop code that references
+                // the loop variable won't find it (scope semantics) while
+                // the ref_index itself is never reused by
+                // next_local_ref_index. Naive truncation would let later
+                // lets reuse the slot and collide with the body's LocalRefs.
+                //
+                // Note: `locals_saved` is retained in the debugger view via
+                // the assert below to catch accidental double-push of the
+                // loop_var (which would break the name-clearing trick).
+                if (route.locals.len != locals_saved + 1)
+                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                route.locals[locals_saved].name = {};
                 if (!route.for_loops.push(fl))
                     return frontend_error(FrontendError::TooManyItems, stmt.span);
                 continue;

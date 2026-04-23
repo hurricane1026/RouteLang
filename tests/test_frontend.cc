@@ -13496,10 +13496,11 @@ func keep(x: (i32, bool), y: (Box, i32)) -> (i32, bool) => x
 }
 
 TEST(frontend, parse_array_lit_basic) {
-    // `[i32]` in type position desugars to Array<Int> via parse_func_type_ref;
+    // `[i32]` in type position desugars to Array<i32> via parse_func_type_ref;
     // `[1, 2, 3]` in expression position produces AstExprKind::ArrayLit with
-    // three IntLit elements in `args`. Parser-only: analyze doesn't yet
-    // understand ArrayLit, so this test stops after parse_file_heap.
+    // three IntLit elements in `args`. Intentionally parse-only: stops after
+    // parse_file_heap to assert AST shape (the analyze_array_lit_int_roundtrip
+    // test below covers the full HIR pipeline for the same input).
     const char* src = "route GET \"/x\" { let xs: [i32] = [1, 2, 3] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -13522,9 +13523,11 @@ TEST(frontend, parse_array_lit_basic) {
 }
 
 TEST(frontend, parse_array_lit_empty) {
-    // Empty `[]` is syntactically legal — analyze is expected to require a
-    // type annotation (Rutlang has no push/append so all array sizes are
-    // compile-time known). Parser accepts it as a zero-element ArrayLit.
+    // Empty `[]` is syntactically legal; the parser accepts it as a
+    // zero-element ArrayLit. analyze rejects it regardless of annotation
+    // in Phase 3a (contextual inference from annotation is future work) —
+    // see analyze_array_lit_empty_rejected below. This test only covers
+    // the parse shape.
     const char* src = "route GET \"/x\" { let xs: [i32] = [] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -13569,8 +13572,9 @@ TEST(frontend, parse_array_lit_nested_type) {
 
 TEST(frontend, parse_for_loop_basic) {
     // `for item in xs { return 200 }` — loop variable stored in `name`,
-    // iteration source in `expr`, body block in `then_stmt`. Parser-only:
-    // analyze doesn't yet understand For/ArrayLit.
+    // iteration source in `expr`, body block in `then_stmt`. Intentionally
+    // parse-only: asserts AST shape independent of analyze (full-pipeline
+    // coverage lives in analyze_for_loop_* tests below).
     const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -13586,8 +13590,7 @@ TEST(frontend, parse_for_loop_basic) {
     REQUIRE(for_stmt.then_stmt != nullptr);
     // Body is a single-stmt `return 200` (parse_braced_stmt_body collapses
     // one-stmt blocks to the stmt itself — not a Block wrapper).
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind),
-             static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ReturnStatus));
     CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
 }
 
@@ -13709,8 +13712,7 @@ TEST(frontend, analyze_for_loop_terminator_body) {
     CHECK_EQ(static_cast<u8>(fl.iter_expr.type), static_cast<u8>(HirTypeKind::Array));
     CHECK_EQ(fl.iter_expr.array_len, 3u);
     CHECK(fl.body.has_term);
-    CHECK_EQ(static_cast<u8>(fl.body.term.kind),
-             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(static_cast<u8>(fl.body.term.kind), static_cast<u8>(HirTerminatorKind::ReturnStatus));
     CHECK_EQ(fl.body.term.status_code, 200);
     // route still needs a top-level terminator (after the for-loop).
     CHECK_EQ(static_cast<u8>(route.control.direct_term.kind),

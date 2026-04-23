@@ -51,10 +51,12 @@ enum class AstExprKind : u8 {
     StrLit,
     Tuple,
     // Array literal `[e1, e2, ...]` — elements stored in `args`.
-    // Parser accepts empty `[]`; analyze enforces "empty requires type annotation"
-    // since Rutlang has no push/append and all sizes are compile-time known.
-    // Surface `[T]` type syntax desugars to `AstTypeRef{name="Array", type_args=[T]}`
-    // in parse_func_type_ref.
+    // Parser accepts empty `[]`; analyze currently rejects empty array
+    // literals unconditionally (Rutlang has no push/append so the element
+    // type can't be inferred later). Contextual inference from a surrounding
+    // type annotation is deferred; until then `let xs: [i32] = []` also
+    // errors.  Surface `[T]` type syntax desugars to
+    // `AstTypeRef{name="Array", type_args=[T]}` in parse_func_type_ref.
     ArrayLit,
     StructInit,
     Placeholder,

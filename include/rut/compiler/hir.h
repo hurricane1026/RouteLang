@@ -53,9 +53,11 @@ enum class HirExprKind : u8 {
     StrLit,
     Tuple,
     // Array literal: elements stored in `args`. analyze rejects heterogeneous
-    // arrays and empty `[]` without a type annotation (Rutlang has no
-    // push/append so size + element type must be compile-time known). The
-    // result's HirTypeShape carries array_len + array_elem_shape_index.
+    // arrays and empty `[]` (Rutlang has no push/append so size + element
+    // type must be compile-time known; contextual inference from annotations
+    // is deferred — empty literals currently error even with an annotation).
+    // Element count is a value property on `HirExpr.array_len`, not a type
+    // property; the result's HirTypeShape carries only `array_elem_shape_index`.
     ArrayLit,
     TupleSlot,
     VariantCase,
@@ -95,10 +97,12 @@ enum class HirTypeKind : u8 {
     Struct,
     Method,
     // Homogeneous fixed-size sequence. Carrier for `for x in <arr>` iteration.
-    // Complete type info lives in HirTypeShape via (array_len,
-    // array_elem_shape_index) — composite-type host structures (HirLocal,
-    // HirExpr, etc.) reference it through their existing `shape_index`
-    // rather than mirroring inline fields.
+    // Type-shape info lives in HirTypeShape via `array_elem_shape_index`
+    // alone; length is a *value* property on `HirExpr.array_len` so two
+    // arrays with the same element type but different lengths share one
+    // shape. Composite-type host structures (HirLocal, HirExpr, etc.)
+    // reference the shape through their existing `shape_index` rather than
+    // mirroring inline fields.
     Array,
 };
 
@@ -320,7 +324,14 @@ struct HirExpr {
     HirExpr* lhs = nullptr;
     HirExpr* rhs = nullptr;
     static constexpr u32 kMaxFieldInits = 8;
-    static constexpr u32 kMaxArgs = 32;  // shared w/ AstExpr::kMaxArgs (Phase 1)
+    // HIR-level cap stays at 8 even though AstExpr::kMaxArgs = 32: HirRoute
+    // sits at ~300 KB on stack and is copied on each recursive
+    // analyze_file_internal call (via `HirRoute scratch{}`). A 32-wide cap
+    // here inflates the exprs / locals / for_loops pools enough to blow the
+    // 8 MB thread stack during cyclic-import tests. Phase 3a's ArrayLit
+    // analyze catches > kMaxArgs element arrays cleanly; a larger HIR cap
+    // can land when we introduce an out-of-line array-element pool.
+    static constexpr u32 kMaxArgs = 8;
     FixedVec<FieldInit, kMaxFieldInits> field_inits;
     FixedVec<HirExpr*, kMaxArgs> args;
 };
@@ -680,7 +691,11 @@ struct HirControl {
 // body's guards/terminator point into the parent HirRoute::exprs pool — so
 // HirRoute::rebase_from must walk this substructure too.
 struct HirForLoopBody {
-    static constexpr u32 kMaxGuards = 4;
+    // 2 guards cover the canonical DESIGN.md examples (1 guard short-circuits
+    // the request, rarely 2 for compound checks). Each HirGuard is ~4.5 KB
+    // inline, so raising this directly grows HirRoute on the stack — see
+    // HirExpr::kMaxArgs comment for the recursive-analyze stack budget.
+    static constexpr u32 kMaxGuards = 2;
     FixedVec<HirGuard, kMaxGuards> guards;
     HirTerminator term{};
     bool has_term = false;
@@ -724,7 +739,11 @@ struct HirRoute {
     static constexpr u32 kMaxExprs = 64;
     static constexpr u32 kMaxDecorators = 8;
     static constexpr u32 kMaxWaits = 4;
-    static constexpr u32 kMaxForLoops = 4;
+    // 2 for-loops per route covers realistic DSL patterns (one allowlist
+    // check + one server-pool iteration) while keeping HirRoute under the
+    // stack budget. Each HirForLoop is ~10 KB even at kMaxGuards=2; a
+    // larger cap would push HirRoute past the recursive-analyze budget.
+    static constexpr u32 kMaxForLoops = 2;
     FixedVec<HirExpr, kMaxExprs> exprs;
     FixedVec<HirLocal, kMaxLocals> locals;
     FixedVec<HirGuard, kMaxGuards> guards;

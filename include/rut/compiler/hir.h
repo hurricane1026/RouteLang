@@ -687,9 +687,11 @@ struct HirControl {
 
 // Body of a `for ... in` loop. Phase 3b MVP: body is `guard*` plus an
 // optional terminator (return / forward). Lets, nested for-loops, and
-// arbitrary if/match are deferred to later phases. All HirExpr* inside this
-// body's guards/terminator point into the parent HirRoute::exprs pool — so
-// HirRoute::rebase_from must walk this substructure too.
+// arbitrary if/match are deferred to later phases. The body's guards carry
+// inline HirExpr cond subtrees whose lhs/rhs/args* point into the parent
+// HirRoute::exprs pool; HirRoute::rebase_from must walk them. HirTerminator
+// has no HirExpr pointers (only status_code / upstream_index / response
+// strings), so it doesn't participate in rebase.
 struct HirForLoopBody {
     // 2 guards cover the canonical DESIGN.md examples (1 guard short-circuits
     // the request, rarely 2 for compound checks). Each HirGuard is ~4.5 KB
@@ -708,8 +710,11 @@ struct HirForLoop {
     // subfields point into HirRoute::exprs, so they need rebase too.
     HirExpr iter_expr{};
     // Loop variable (e.g., `item` in `for item in xs`). Scope is the body
-    // only; analyze pushes it into route.locals, analyzes the body, then
-    // rolls back route.locals.len so the name doesn't leak.
+    // only. analyze pushes it into route.locals so body HirExpr LocalRefs
+    // bind to a stable ref_index (required once MIR unroll substitutes per
+    // iteration), then *clears the name* after body analysis — Ident
+    // resolution scans locals by name so post-loop code can't reach the
+    // loop variable, and next_local_ref_index still won't reuse the slot.
     Str loop_var_name{};
     HirTypeKind loop_var_type = HirTypeKind::Unknown;
     u32 loop_var_variant_index = 0xffffffffu;

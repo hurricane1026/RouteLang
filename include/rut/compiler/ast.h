@@ -111,10 +111,13 @@ struct AstExpr {
     AstExpr* rhs = nullptr;
     static constexpr u32 kMaxFieldInits = 8;
     // Shared capacity for tuple elements, call arguments, field inits, and
-    // array literals. 8 was historically too tight for array literals (DSL
-    // allowlists / upstream pools routinely exceed 8); 32 covers the common
-    // case with bounded per-AstExpr footprint (~192 bytes extra vs 8).
-    static constexpr u32 kMaxArgs = 32;
+    // array literals. HirExpr::kMaxArgs must stay at 8 (HirRoute stack
+    // budget — see the comment there), so keeping AstExpr at 8 too means
+    // ArrayLit with > 8 elements fails at parse with TooManyItems at the
+    // 9th element's span, instead of parsing successfully and then failing
+    // ambiguously in analyze. Once HIR gets an out-of-line element pool
+    // for arrays, both caps can rise together.
+    static constexpr u32 kMaxArgs = 8;
     FixedVec<FieldInit, kMaxFieldInits> field_inits;
     FixedVec<AstTypeRef, kMaxTypeArgs> type_args;
     FixedVec<AstExpr*, kMaxArgs> args;

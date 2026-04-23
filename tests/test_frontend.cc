@@ -13668,18 +13668,14 @@ TEST(frontend, analyze_array_lit_empty_rejected) {
     CHECK(!hir);
 }
 
-TEST(frontend, analyze_array_annotation_type_mismatch_rejected) {
-    // Annotation `[Str]` vs literal `[1, 2, 3]` (Array<I32>) — apply_declared_
-    // type_to_expr's same_hir_type_shape must reject. This exercises the
-    // mod-aware shape comparison path since Array info lives in shape_index.
-    const char* src = "route GET \"/x\" { let xs: [str] = [1, 2, 3] return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
-}
+// NOTE: a former `analyze_array_annotation_type_mismatch_rejected` test used
+// `let xs: [str] = [1, 2, 3]` to exercise `apply_declared_type_to_expr` /
+// `same_hir_type_shape` for Array. That path is unreachable in Phase 3a/3b
+// because any ArrayLit at a let RHS is rejected earlier (see
+// `analyze_array_lit_at_let_rhs_rejected`). The Array-shape comparison path
+// will regain test coverage once Phase 5 adds struct fields / function
+// params typed as `Array<T>`, which route `resolve_func_type_ref` through
+// positions where the ArrayLit-at-let gate doesn't fire first.
 
 TEST(frontend, analyze_for_loop_terminator_body) {
     // Phase 3b: body is a single `return` terminator. Analyze must produce a
@@ -13774,6 +13770,23 @@ TEST(frontend, mir_rejects_for_loop_until_phase_4b) {
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
     CHECK(!mir);
+}
+
+TEST(frontend, analyze_for_loop_rejects_guard_after_terminator) {
+    // HirForLoopBody stores guards and terminator in separate fields (no
+    // source-ordered stmt list), so accepting a guard after a terminator
+    // would let MIR unroll silently reorder an unreachable guard in front
+    // of the already-fired return. Analyze rejects to preserve source
+    // semantics until lowering is order-aware.
+    const char* src =
+        "route GET \"/x\" { for x in [1] { return 200 guard x > 0 else "
+        "{ return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
 }
 
 TEST(frontend, analyze_for_loop_rejects_shadowing_outer_local) {

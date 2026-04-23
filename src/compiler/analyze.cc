@@ -9957,9 +9957,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (stmt.kind == AstStmtKind::For) {
                 // Phase 3b: analyze `for <var> in <iter> { <body> }` into a
                 // HirForLoop node. Body is restricted to `guard*` + optional
-                // terminator (return/forward) per Phase 3b MVP. Loop var is
-                // pushed into route.locals for body visibility, then rolled
-                // back after body analysis so it doesn't leak.
+                // terminator (return/forward) per Phase 3b MVP. The loop
+                // variable is pushed into route.locals so body LocalRefs
+                // get a stable ref_index, then has its *name* cleared once
+                // the body is analyzed (the block below) — so it stays
+                // out of later Ident resolution without freeing the slot.
                 auto iter = analyze_expr(
                     stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
                 if (!iter) return core::make_unexpected(iter.error());
@@ -10001,9 +10003,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 loop_var.variant_index = fl.loop_var_variant_index;
                 loop_var.struct_index = fl.loop_var_struct_index;
                 loop_var.shape_index = fl.loop_var_shape_index;
-                // Synthetic init — MIR will substitute the per-iteration
-                // element value when unrolling. Shape/type must match so
-                // downstream same_hir_type_shape checks succeed.
+                // Synthetic init — MIR unroll (Phase 4b) substitutes the
+                // per-iteration element value when reaching a LocalRef to
+                // this slot, so init is never read at runtime. We still
+                // need a consistent HirExpr for downstream passes that
+                // inspect local.init.kind (const-fold, diagnostics) — use
+                // a self-referential LocalRef so the node reads as "look
+                // up my own slot", obviously synthetic. Leaving kind at
+                // the HirExpr default BoolLit would claim a false bool
+                // value while type says i32/str.
+                loop_var.init.kind = HirExprKind::LocalRef;
+                loop_var.init.local_index = loop_var.ref_index;
                 loop_var.init.type = fl.loop_var_type;
                 loop_var.init.variant_index = fl.loop_var_variant_index;
                 loop_var.init.struct_index = fl.loop_var_struct_index;
@@ -10025,6 +10035,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         // `guard cond else { return forward(...) }`. No
                         // bind_value, no match arms, no non-terminator fail
                         // body.
+                        //
+                        // HirForLoopBody stores guards and the terminator in
+                        // separate fields rather than a single ordered stmt
+                        // list. If we accepted a guard after `has_term` was
+                        // already set, MIR unroll would silently reorder the
+                        // guard before the (already-fired) terminator —
+                        // miscompile. Reject so source order is preserved.
+                        if (fl.body.has_term)
+                            return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
                         if (bstmt.bind_value || bstmt.match_arms.len != 0)
                             return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
                         if (bstmt.else_stmt == nullptr ||

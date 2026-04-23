@@ -13499,8 +13499,9 @@ TEST(frontend, parse_array_lit_basic) {
     // `[i32]` in type position desugars to Array<i32> via parse_func_type_ref;
     // `[1, 2, 3]` in expression position produces AstExprKind::ArrayLit with
     // three IntLit elements in `args`. Intentionally parse-only: stops after
-    // parse_file_heap to assert AST shape (the analyze_array_lit_int_roundtrip
-    // test below covers the full HIR pipeline for the same input).
+    // parse_file_heap to assert AST shape. Analyze coverage for array literals
+    // currently comes from for-loop iter-expression tests, not this let-RHS
+    // form.
     const char* src = "route GET \"/x\" { let xs: [i32] = [1, 2, 3] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);

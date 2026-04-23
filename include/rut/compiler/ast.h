@@ -33,8 +33,11 @@ enum class AstStmtKind : u8 {
     //   - then_stmt   = body block (via parse_braced_stmt_body; may be a single
     //                   stmt if the block contained exactly one stmt)
     // No break / continue / else / labels (spec §3.3.9: every iteration runs
-    // to completion). Analyze (Phase 3) enforces iteration source is array-typed
-    // and compile-time-sized; MIR (Phase 4) fully unrolls the loop.
+    // to completion). Analyze (Phase 3b) enforces the iteration source is
+    // array-typed and compile-time-sized and builds a HirForLoop. MIR build
+    // currently rejects any route carrying for_loops (Phase 4a) — the full
+    // unroll (loop-var substitution + per-iteration guard blocks) lands in
+    // Phase 4b.
     For,
 };
 

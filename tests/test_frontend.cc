@@ -13823,7 +13823,7 @@ TEST(frontend, mir_rejects_for_loop_with_body_terminator) {
     CHECK(!mir);
 }
 
-TEST(frontend, for_loop_lowers_through_rir_without_synthetic_local) {
+TEST(frontend, mir_for_loop_lowers_through_rir_without_synthetic_local) {
     // The loop variable is a synthetic HirLocal (analyze blanks its name
     // for scope-hiding) whose init is a self-referential LocalRef. MIR
     // must skip this slot so lower_rir's materialize_local_init doesn't

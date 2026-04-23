@@ -929,10 +929,19 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         // pointing at the for-loop span.
         if (module.routes[i].for_loops.len != 0) {
             const auto& fl = module.routes[i].for_loops[0];
-            const bool scope_a = module.routes[i].for_loops.len == 1 &&
-                                 module.routes[i].guards.len == 0 &&
-                                 module.routes[i].control.kind == HirControlKind::Direct &&
-                                 !fl.body.has_term && fl.body.guards.len != 0;
+            // Scope A also requires an inline array literal as the iter
+            // expression — the unroll reads elements from iter_expr.args
+            // which only ArrayLit populates. Today analyze only produces
+            // Array-typed HirExprs via the ArrayLit path (analyze.cc:4472
+            // is the sole producer), so this check is defensive against
+            // a future analyze change that admits other array-producing
+            // expressions (LocalRef/Field/call) — those would need a
+            // different MIR strategy since args.len would be 0 for them.
+            const bool scope_a =
+                module.routes[i].for_loops.len == 1 && module.routes[i].guards.len == 0 &&
+                module.routes[i].control.kind == HirControlKind::Direct && !fl.body.has_term &&
+                fl.body.guards.len != 0 && fl.iter_expr.kind == HirExprKind::ArrayLit &&
+                fl.iter_expr.args.len != 0;
             if (!scope_a || fl.loop_var_ref_index == 0xffffffffu) {
                 return frontend_error(FrontendError::UnsupportedSyntax, fl.span);
             }

@@ -312,47 +312,71 @@ TEST(route_trie, insert_atomic_on_node_pool_exhaustion_midpath) {
     // capacity until legitimate shorter routes were rejected — the
     // "bricked" route admission scenario.
     //
-    // Setup: fill the pool to within ~30 nodes of kMaxNodes, then
-    // attempt a 30-segment insert. Without rollback, 27 of those
-    // pushes would succeed before nodes.len hits the cap; with
-    // rollback, node_count returns to the pre-insert level and a
-    // small follow-up route still fits.
-    //
-    // Fill shape: 20 top-level "/pNN" parents × 100 children "/pNN/qMM"
-    // each = 2000 routes, 1 + 20 + 2000 = 2021 nodes. Headroom = 27.
-    // (All within kMaxChildren=128 per-node cap.)
+    // Setup: fill the pool to within `kDeepSegs - 1` of kMaxNodes so
+    // a kDeepSegs-segment insert is guaranteed to overflow partway
+    // through. Without rollback, the partial pushes would leak and
+    // the follow-up short insert would fail. kMaxNodes-agnostic: the
+    // exact fill shape is computed from the current cap.
     RouteTrie t;
-    static constexpr u32 kParents = 20;
-    static constexpr u32 kChildren = 100;
+    // kDeepSegs × 3-byte segments ("/zX") must fit in
+    // RouteEntry::kMaxPathLen=128. 40 segments × 3 = 120 bytes.
+    static constexpr u32 kDeepSegs = 40;
+    static_assert(kDeepSegs * 3 <= 128, "deep_path must fit RouteEntry::kMaxPathLen");
+
+    // Main 2-level fill: "/pNN/cMM" paths stay within
+    // TrieNode::kMaxChildren at every level. Target budget leaves a
+    // small margin; a top-up loop below tightens the headroom.
+    static constexpr u32 kParents = 40;
+    static constexpr u32 kChildren = (RouteTrie::kMaxNodes - 1 - kParents - kDeepSegs) / kParents;
     static constexpr u32 kFillRoutes = kParents * kChildren;
-    static char fill_paths[kFillRoutes][10] = {};
+    static_assert(kChildren > 0 && kChildren <= TrieNode::kMaxChildren,
+                  "children count must stay within per-node cap");
+    static char fill_paths[kFillRoutes][12] = {};
     for (u32 i = 0; i < kFillRoutes; i++) {
         const u32 p = i / kChildren;
         const u32 c = i % kChildren;
-        fill_paths[i][0] = '/';
-        fill_paths[i][1] = 'p';
-        fill_paths[i][2] = static_cast<char>('0' + p / 10);
-        fill_paths[i][3] = static_cast<char>('0' + p % 10);
-        fill_paths[i][4] = '/';
-        fill_paths[i][5] = 'q';
-        fill_paths[i][6] = static_cast<char>('0' + c / 10);
-        fill_paths[i][7] = static_cast<char>('0' + c % 10);
-        REQUIRE(t.insert(Str{fill_paths[i], 8}, 0, static_cast<u16>(i)));
+        u32 n = 0;
+        fill_paths[i][n++] = '/';
+        fill_paths[i][n++] = 'p';
+        fill_paths[i][n++] = static_cast<char>('0' + p / 10);
+        fill_paths[i][n++] = static_cast<char>('0' + p % 10);
+        fill_paths[i][n++] = '/';
+        fill_paths[i][n++] = 'c';
+        if (c >= 100) fill_paths[i][n++] = static_cast<char>('0' + c / 100);
+        fill_paths[i][n++] = static_cast<char>('0' + (c / 10) % 10);
+        fill_paths[i][n++] = static_cast<char>('0' + c % 10);
+        REQUIRE(t.insert(Str{fill_paths[i], n}, 0, static_cast<u16>(i)));
+    }
+
+    // Top up with single-segment routes at root ("/tNN") to close
+    // the remaining slack below kDeepSegs. Each adds exactly one
+    // node (a new root child). Root has TrieNode::kMaxChildren=128
+    // total slots, of which kParents are already used.
+    static char topup_paths[128][6] = {};
+    u32 topup = 0;
+    while (t.node_count() + kDeepSegs <= RouteTrie::kMaxNodes) {
+        topup_paths[topup][0] = '/';
+        topup_paths[topup][1] = 't';
+        topup_paths[topup][2] = static_cast<char>('0' + topup / 10);
+        topup_paths[topup][3] = static_cast<char>('0' + topup % 10);
+        REQUIRE(t.insert(Str{topup_paths[topup], 4}, 0, 0));
+        topup++;
+        REQUIRE(topup < 128);  // guard against infinite loop
     }
     const u32 before = t.node_count();
-    // Expected: 1 root + 20 parents + 2000 terminals = 2021.
-    CHECK_EQ(before, 1u + kParents + kFillRoutes);
+    // With this setup, a kDeepSegs insert needs more nodes than are
+    // actually free, so it MUST hit kMaxNodes partway through.
+    CHECK_GT(before + kDeepSegs, RouteTrie::kMaxNodes);
 
-    // Attempt a 30-segment insert. Path bytes = 30 × 3 = 90 (fits in
-    // RouteEntry::kMaxPathLen=128). Pool headroom is only 27, so 27
-    // of the 30 pushes would succeed before the cap fires. With
-    // rollback, node_count is unchanged after the failed insert.
-    char deep_path[128];
+    // Attempt the deep insert. With rollback, node_count returns to
+    // `before`. Without rollback, the partial pushes leak and
+    // node_count ends up at RouteTrie::kMaxNodes (or close to it).
+    char deep_path[kDeepSegs * 3];
     u32 dpi = 0;
-    for (u32 i = 0; i < 30; i++) {
+    for (u32 i = 0; i < kDeepSegs; i++) {
         deep_path[dpi++] = '/';
         deep_path[dpi++] = 'z';
-        deep_path[dpi++] = static_cast<char>('a' + i);
+        deep_path[dpi++] = static_cast<char>('a' + i % 26);
     }
     CHECK(!t.insert(Str{deep_path, dpi}, 0, 999));
     CHECK_EQ(t.node_count(), before);

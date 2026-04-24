@@ -157,13 +157,20 @@ struct RouteConfig {
     char header_bytes_pool[kResponseHeaderBytesPoolBytes];
     u32 header_bytes_pool_used = 0;
 
-    // Reject route paths containing '?' or '#'. These belong to the
-    // query / fragment components of a URI, which routing does not
-    // match on. Accepting them would store the raw bytes in
-    // RouteEntry::path while the trie tokenized only the pre-'?'
-    // prefix, silently broadening the stored route. Callers that
-    // accidentally pass a full URL should fail fast, not silently.
+    // Reject route paths that aren't in origin-form:
+    //   - must start with '/' (an empty path or one without a leading
+    //     slash like "api" would tokenize to the same key as "/api"
+    //     under the trie's segment normalization, silently matching
+    //     real traffic — Codex P2 on #41 round 10).
+    //   - must not contain '?' or '#'. Those belong to the query /
+    //     fragment components of a URI; routing doesn't match on them.
+    //     Accepting them would store raw bytes in RouteEntry::path
+    //     while the trie tokenized only the pre-'?' prefix, broadening
+    //     the stored route.
+    // Callers that accidentally pass a malformed path (typo, full
+    // URL, query string) should fail fast, not silently.
     static bool is_routable_path(const char* path) {
+        if (path[0] != '/') return false;
         for (u32 i = 0; path[i] != '\0'; i++) {
             if (path[i] == '?' || path[i] == '#') return false;
         }

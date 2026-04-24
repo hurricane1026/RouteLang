@@ -2358,6 +2358,21 @@ static u64 test_stub_jit_handler(void*, jit::HandlerCtx*, const u8*, u32, void*)
     return 0;
 }
 
+TEST(route, add_rejects_path_missing_leading_slash) {
+    // Codex P2 on #41 round 10: a typo like "api" (missing '/')
+    // used to pass is_routable_path() and get registered. The trie
+    // tokenizes "api" and "/api" to the same key (both produce
+    // segments ["api"]), so the typoed route would silently start
+    // matching real /api traffic. Reject up-front instead.
+    RouteConfig cfg;
+    (void)cfg.add_upstream("x", 0x7F000001, 80);
+    CHECK(!cfg.add_static("api", 0, 200));  // no leading slash
+    CHECK(!cfg.add_static("", 0, 200));     // empty
+    CHECK(!cfg.add_proxy("api/v1", 0, 0));  // no leading slash
+    // Properly-formed paths still work.
+    CHECK(cfg.add_static("/api", 0, 200));
+}
+
 TEST(route, add_rejects_query_and_fragment_in_path) {
     // Route paths are static configuration and must not contain '?'
     // or '#' — those belong to the query / fragment components of a

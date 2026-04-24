@@ -2349,6 +2349,15 @@ TEST(route, add_response_body_rejects_at_capacity) {
     CHECK_EQ(cfg.add_response_body("x", 1), 0u);  // table full
 }
 
+// Stub with the real HandlerFn signature so we can pass a well-defined
+// non-null function pointer to add_jit_handler() — integer-to-function-
+// pointer casts are UB under strict interpretations of the standard.
+// The stub is never actually invoked in this test; add_jit_handler
+// rejects the path before registration.
+static u64 test_stub_jit_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return 0;
+}
+
 TEST(route, add_rejects_query_and_fragment_in_path) {
     // Route paths are static configuration and must not contain '?'
     // or '#' — those belong to the query / fragment components of a
@@ -2360,7 +2369,7 @@ TEST(route, add_rejects_query_and_fragment_in_path) {
     CHECK(!cfg.add_static("/api?foo=1", 0, 200));
     CHECK(!cfg.add_static("/api#frag", 0, 200));
     CHECK(!cfg.add_proxy("/api?x", 0, 0));
-    CHECK(!cfg.add_jit_handler("/api?x", 'G', reinterpret_cast<jit::HandlerFn>(0xdeadbeef)));
+    CHECK(!cfg.add_jit_handler("/api?x", 'G', &test_stub_jit_handler));
     // Plain paths still work.
     CHECK(cfg.add_static("/api", 0, 200));
 }

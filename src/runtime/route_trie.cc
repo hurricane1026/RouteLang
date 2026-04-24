@@ -164,6 +164,17 @@ u16 RouteTrie::match(Str path, u8 method_char) const {
     }
     path.len = end;
 
+    // Require origin-form request target (begins with '/') before
+    // applying any route. Non-origin-form targets — OPTIONS `*`
+    // (asterisk-form), CONNECT `host:port` (authority-form), and
+    // absolute-form URLs — shouldn't route through path-based
+    // matching at all; the pre-trie byte-prefix matcher rejected
+    // them implicitly because pattern "/" failed to match their
+    // first byte. The trie's root-terminal seed was bypassing that
+    // and sending '*' / 'example:443' into a configured `/` catchall
+    // (Codex P2 on #41).
+    if (path.len == 0 || path.ptr[0] != '/') return TrieNode::kInvalidRoute;
+
     FixedVec<Str, kMaxPathSegments> segs{};
     // Ignore tokenize's return value on overflow: `segs` still holds
     // the first kMaxPathSegments, and we want to walk the trie as deep

@@ -60,6 +60,25 @@ TEST(route_trie, no_match_returns_sentinel_when_no_catchall) {
     CHECK_EQ(t.match(S("/"), 0), TrieNode::kInvalidRoute);
 }
 
+TEST(route_trie, rejects_non_origin_form_request_targets) {
+    // Codex P2 on #41: match() used to seed `best` from the root
+    // terminal unconditionally, so a configured "/" catchall would
+    // match HTTP/1.1 non-origin-form request targets like "*"
+    // (OPTIONS asterisk-form) or "example.com:443" (CONNECT
+    // authority-form). Path-based routing shouldn't apply to those;
+    // the pre-trie byte-prefix matcher rejected them implicitly.
+    RouteTrie t;
+    const Insert items[] = {{"/", 0, 99}};
+    REQUIRE(build_ok(t, items, 1));
+    // Origin-form paths still hit the catchall.
+    CHECK_EQ(t.match(S("/"), 0), 99u);
+    CHECK_EQ(t.match(S("/deep/path"), 0), 99u);
+    // Non-origin-form request targets — no leading '/', no match.
+    CHECK_EQ(t.match(S("*"), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(t.match(S("example.com:443"), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(t.match(S(""), 0), TrieNode::kInvalidRoute);
+}
+
 TEST(route_trie, catchall_root_matches_unrouted_paths) {
     RouteTrie t;
     const Insert items[] = {{"/health", 0, 7}, {"/", 0, 99}};
@@ -245,9 +264,15 @@ TEST(route_trie, empty_path_inserts_at_root) {
     RouteTrie t;
     const Insert items[] = {{"", 0, 42}};
     REQUIRE(build_ok(t, items, 1));
-    CHECK_EQ(t.match(S(""), 0), 42u);
+    // Inserting "" is semantically the same as inserting "/" — both
+    // tokenize to the empty-segment root terminal, so the slot is
+    // populated and origin-form requests hit it.
     CHECK_EQ(t.match(S("/"), 0), 42u);          // "/" normalizes to root
     CHECK_EQ(t.match(S("/anything"), 0), 42u);  // catchall
+    // An empty request target is NOT origin-form and must not match
+    // path-based routing (Codex P2 on #41 — don't let a catchall
+    // swallow asterisk-form / authority-form / empty targets).
+    CHECK_EQ(t.match(S(""), 0), TrieNode::kInvalidRoute);
 }
 
 TEST(route_trie, node_count_shows_prefix_sharing) {

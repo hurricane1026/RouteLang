@@ -9859,13 +9859,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 // ArrayLit at let RHS fails at MIR because MIR has no
                 // ArrayLit → MirValue lowering. Reject at analyze so users
                 // get a clean diagnostic at the declaration site instead of
-                // a later MIR error.
-                // Note: inline `for x in [1,2,3] { ... }` passes analyze
-                // (iter_expr is analyzed but not a let RHS), but Phase 4a's
-                // mir_build also rejects any route with for_loops.len > 0.
-                // End-to-end compilation of array-bearing programs lands
-                // once Phase 4b implements MIR unroll (and, separately,
-                // MIR gains array-constant lowering for let-RHS arrays).
+                // a later MIR error. Arrays only exist transiently as
+                // for-loop iterables today (MIR unroll lowers elements
+                // directly and never materializes the array as a MirValue);
+                // let-RHS arrays need a separate array-constant lowering
+                // pass before they can be supported.
                 if (init->kind == HirExprKind::ArrayLit)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, stmt);
@@ -10038,13 +10036,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 loop_var.name = stmt.name;
                 loop_var.ref_index =
                     next_local_ref_index(&route, route.locals.data, route.locals.len);
+                fl.loop_var_ref_index = loop_var.ref_index;
                 loop_var.type = fl.loop_var_type;
                 loop_var.variant_index = fl.loop_var_variant_index;
                 loop_var.struct_index = fl.loop_var_struct_index;
                 loop_var.shape_index = fl.loop_var_shape_index;
-                // Synthetic init — MIR unroll (Phase 4b) substitutes the
-                // per-iteration element value when reaching a LocalRef to
-                // this slot, so init is never read at runtime. We still
+                // Synthetic init — MIR unroll substitutes the per-iteration
+                // element value when reaching a LocalRef to this slot (via
+                // ForLoopCtx in mir_build.cc), so init is never read at
+                // runtime. We still
                 // need a consistent HirExpr for downstream passes that
                 // inspect local.init.kind (const-fold, diagnostics) — use
                 // a self-referential LocalRef so the node reads as "look

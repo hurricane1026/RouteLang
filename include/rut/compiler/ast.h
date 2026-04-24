@@ -35,9 +35,11 @@ enum class AstStmtKind : u8 {
     // No break / continue / else / labels (spec §3.3.9: every iteration runs
     // to completion). Analyze (Phase 3b) enforces the iteration source is
     // array-typed and compile-time-sized and builds a HirForLoop. MIR build
-    // currently rejects any route carrying for_loops (Phase 4a) — the full
-    // unroll (loop-var substitution + per-iteration guard blocks) lands in
-    // Phase 4b.
+    // unrolls for-loops in the Scope A pattern (one for-loop, body-guards
+    // only, Direct route control, no sibling route guards) — see
+    // mir_build.cc. Out-of-scope shapes (body terminator, if/match route
+    // control, interleaving with route guards, multiple for-loops) remain
+    // rejected here and are the target of Phase 4c/d.
     For,
 };
 

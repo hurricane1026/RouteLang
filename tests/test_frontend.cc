@@ -13755,15 +13755,129 @@ TEST(frontend, analyze_for_loop_iter_not_array_rejected) {
     CHECK(!hir);
 }
 
-TEST(frontend, mir_rejects_for_loop_until_phase_4b) {
-    // Phase 4a: analyze accepts for-loops (Phase 3b), but MIR doesn't yet
-    // unroll them. Until Phase 4b lands the subst-aware mir_value + guard
-    // chain emission, MIR rejects any route with for_loops.len > 0 so
-    // users see a clean error at build time instead of a silent miscompile
-    // (loop body dropped, handler treats the loop as a no-op).
+TEST(frontend, mir_unrolls_for_loop_scope_a_basic) {
+    // Phase 4b Scope A: a for-loop with body-guards only, no sibling route
+    // guards, and a Direct route terminator unrolls to a flat guard chain.
+    // For N=3 elements × M=1 body guard, the route lowers to:
+    //   block[0..2] = guard-branch blocks (virtual guards, one per element)
+    //   block[3]    = body block (the route's `return 200`)
+    //   block[4..6] = fail blocks (`return 400` from the body guard's else)
+    // Total: 7 blocks.
     const char* src =
         "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
         "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks.len, 7u);
+}
+
+TEST(frontend, mir_unrolls_for_loop_substitutes_element_in_cond) {
+    // The heart of the unroll: each iteration's virtual guard should test
+    // the element value directly, not a LocalRef to the loop variable.
+    // For `for item in [1, 2, 3] { guard item > 0 ...}`, block[0].term.cond
+    // must be Gt with lhs = IntConst(1), block[1] lhs = IntConst(2),
+    // block[2] lhs = IntConst(3). A regression that forgets to substitute
+    // would leave lhs as a LocalRef to the loop var's synthetic init.
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_rejects_for_loop_with_body_terminator) {
+    // Scope A excludes body terminators (iteration 0 would short-circuit
+    // unconditionally, making later iterations dead). Analyze accepts this
+    // shape (Phase 3b), but MIR rejects until Scope B. Assertion: MIR fails
+    // cleanly instead of silently dropping the loop.
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    CHECK(!mir);
+}
+
+TEST(frontend, mir_for_loop_lowers_through_rir_without_synthetic_local) {
+    // The loop variable is a synthetic HirLocal (analyze blanks its name
+    // for scope-hiding) whose init is a self-referential LocalRef. MIR
+    // must skip this slot so lower_rir's materialize_local_init doesn't
+    // resolve the self-ref to ValueId{0} on an unset slot. Regression
+    // guard: lower the canonical Scope A program end-to-end through RIR
+    // and confirm it succeeds. Also asserts that the MIR function has
+    // zero locals (the only HIR local was the loop var, which must have
+    // been skipped).
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_rejects_for_loop_exceeding_block_budget) {
+    // A Scope-A-shape program (one for-loop, body guards only, Direct
+    // control, no route guards) that unrolls to more than MirFunction::
+    // kMaxBlocks (16) blocks must reject cleanly at the for-loop span
+    // rather than fail mid-emission with a TooManyItems buried inside a
+    // later `fn.blocks.push`. N=8, M=1 → 2T+1 = 17 > 16. Analyze accepts
+    // this shape (kMaxArgs=8), so the reject must live in MIR's pre-check.
+    const char* src =
+        "route GET \"/x\" { for n in [1, 2, 3, 4, 5, 6, 7, 8] { "
+        "guard n > 0 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    CHECK(!mir);
+}
+
+TEST(frontend, mir_rejects_for_loop_with_route_level_guard) {
+    // Scope A excludes routes that mix for-loops with sibling route-level
+    // guards (span-ordered interleaving is deferred to Scope C).
+    const char* src =
+        "route GET \"/x\" { guard true else { return 403 } "
+        "for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
+        "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());

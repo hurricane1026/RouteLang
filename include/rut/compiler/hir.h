@@ -720,6 +720,10 @@ struct HirForLoop {
     u32 loop_var_variant_index = 0xffffffffu;
     u32 loop_var_struct_index = 0xffffffffu;
     u32 loop_var_shape_index = 0xffffffffu;
+    // Value that body LocalRefs carry in `local_index` when they refer to
+    // the loop variable. Set at analyze time from loop_var.ref_index; MIR
+    // unroll matches against this to substitute the per-iteration element.
+    u32 loop_var_ref_index = 0xffffffffu;
     HirForLoopBody body{};
 };
 

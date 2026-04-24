@@ -173,15 +173,34 @@ static bool copy_str_into_arena(MmapArena& arena, const char* src, u32 len, Str*
     return true;
 }
 
+// Effective pattern length with any trailing '/' stripped. The runtime
+// trie treats "/api" and "/api/" as equivalent (tokenize drops the
+// empty trailing segment), and "/" normalizes to the empty-segment
+// root catchall. The simulator walks characters, so we match those
+// semantics by normalizing the pattern length up front.
+static u32 effective_pattern_len(const Engine::CompiledRoute& route) {
+    u32 len = route.pattern_len;
+    while (len > 0 && route.pattern[len - 1] == '/') len--;
+    return len;
+}
+
 static bool route_matches(const Engine::CompiledRoute& route, const char* path, u32 path_len) {
+    const u32 pattern_len = effective_pattern_len(route);
+    // Root catchall: a pattern of just '/' (or all-slash pathological
+    // variants) normalizes to zero segments and should match any path
+    // that begins with '/'. Codex P1 on #41 flagged this regressing
+    // when the segment-boundary check was added — the runtime trie
+    // treats "/" as a root terminal matching deeper requests.
+    if (pattern_len == 0) return path_len > 0 && path[0] == '/';
+
     u32 pi = 0;
     u32 ri = 0;
-    while (ri < route.pattern_len) {
+    while (ri < pattern_len) {
         const bool kParamSegment =
             route.pattern[ri] == ':' && (ri == 0 || route.pattern[ri - 1] == '/');
         if (kParamSegment) {
             ri++;
-            while (ri < route.pattern_len && route.pattern[ri] != '/') ri++;
+            while (ri < pattern_len && route.pattern[ri] != '/') ri++;
             const u32 param_start = pi;
             while (pi < path_len && path[pi] != '/' && path[pi] != '?') pi++;
             if (pi == param_start) return false;
@@ -194,12 +213,12 @@ static bool route_matches(const Engine::CompiledRoute& route, const char* path, 
         pi++;
     }
     // Segment boundary at the pattern's end: after consuming all of
-    // the pattern, the path must either be fully consumed or the
-    // next byte must be a segment separator ('/' / '?' / '#'). This
-    // matches the runtime RouteTrie's segment-aware prefix rule —
-    // without it, route "/api" would match "/apix" here while the
-    // runtime trie would not, and traffic replay would report
-    // phantom mismatches. Codex flagged the divergence on #41.
+    // the (normalized) pattern, the path must either be fully
+    // consumed or the next byte must be a segment separator
+    // ('/' / '?' / '#'). This matches the runtime RouteTrie's
+    // segment-aware prefix rule — without it, route "/api" would
+    // spuriously match "/apix" here while the runtime trie would
+    // not, and traffic replay would report phantom mismatches.
     if (pi == path_len) return true;
     const char next = path[pi];
     return next == '/' || next == '?' || next == '#';
@@ -224,12 +243,18 @@ static const Engine::CompiledRoute* select_route(const Engine& engine,
         const auto& route = engine.routes[i];
         if (route.method != 0 && route.method != method_char) continue;
         if (!route_matches(route, path, path_len)) continue;
-        const bool beats_on_length = best == nullptr || route.pattern_len > best_len;
-        const bool beats_on_specificity = best != nullptr && route.pattern_len == best_len &&
-                                          route.method != 0 && best->method == 0;
+        // Rank on the NORMALIZED pattern length — the trie keys off
+        // normalized paths too, so "/api" and "/api/" have the same
+        // effective length there. Using raw pattern_len here would
+        // let "/api/" beat "/api" by one byte despite both keying
+        // the same trie node. Codex P2 on #41.
+        const u32 route_len = effective_pattern_len(route);
+        const bool beats_on_length = best == nullptr || route_len > best_len;
+        const bool beats_on_specificity =
+            best != nullptr && route_len == best_len && route.method != 0 && best->method == 0;
         if (beats_on_length || beats_on_specificity) {
             best = &route;
-            best_len = route.pattern_len;
+            best_len = route_len;
         }
     }
     return best;

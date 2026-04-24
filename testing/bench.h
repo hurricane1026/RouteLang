@@ -339,9 +339,13 @@ struct Bench {
                 out_u64(frac);
             }
             if (total_cref > 0) {
-                // Cache miss rate in ‰ (per-mille) for 1-decimal %
+                // PERF_COUNT_HW_CACHE_MISSES / _REFERENCES are the
+                // generic hardware cache events. On most x86 machines
+                // the kernel maps these to last-level-cache (LLC)
+                // counters, not L1 — label accordingly to avoid a
+                // misleading "L1-miss" attribution.
                 const u64 miss_thou = (total_cmiss * 1000) / total_cref;
-                out("  L1-miss: ");
+                out("  cache-miss: ");
                 out_u64(miss_thou / 10);
                 out(".");
                 out_u64(miss_thou % 10);
@@ -475,11 +479,24 @@ inline void print_environment_warnings() {
         out("\n");
     }
 
-    // perf_event_paranoid — gate on PMU access.
+    // perf_event_paranoid — gate on PMU access. `perf_event_open`
+    // allows unprivileged hardware-event counting up to and including
+    // paranoid=2; above that (newer kernels default to 4) the group
+    // open fails with EACCES. Parse as an integer so multi-digit
+    // values like "10" aren't misread via buf[0].
     if (read_small_file("/proc/sys/kernel/perf_event_paranoid", buf, sizeof(buf))) {
         out("  perf_event_paranoid: ");
         out(buf);
-        if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2') {
+        // Accept a leading '-' for defensive parsing (kernel allows -1).
+        int paranoid = 0;
+        u32 i = (buf[0] == '-') ? 1 : 0;
+        bool valid = i < sizeof(buf) && buf[i] != '\0';
+        while (valid && buf[i] >= '0' && buf[i] <= '9') {
+            paranoid = paranoid * 10 + (buf[i] - '0');
+            i++;
+        }
+        if (buf[0] == '-') paranoid = -paranoid;
+        if (paranoid > 2) {
             out("  [!]  (perf counters will be unavailable; sudo sysctl "
                 "kernel.perf_event_paranoid=2)");
         }

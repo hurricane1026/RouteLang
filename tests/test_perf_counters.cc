@@ -1,9 +1,8 @@
 // Tests for testing/perf_counters.h — verifies the RAII wrapper around
-// perf_event_open works end-to-end. These tests gracefully skip the
-// substantive checks when perf_event_paranoid is too high (e.g., running
-// inside a default container or restricted CI), so the test binary
-// always passes but emits a clear "SKIPPED" note when the kernel refuses
-// access.
+// perf_event_open works end-to-end. The tests SKIP (not silently pass)
+// when the kernel refuses PMU access, so restricted environments
+// (containers, perf_event_paranoid > 2, kernels without hardware
+// counters) show up as visible skip notes rather than fake green.
 
 #include "perf_counters.h"
 #include "test.h"
@@ -24,13 +23,8 @@ __attribute__((noinline)) static u64 busy_work(u32 iters) {
 
 TEST(perf_counters, open_reports_capability) {
     PerfCounters pc;
-    const bool opened = pc.open();
-    if (!opened) {
-        // Most likely perf_event_paranoid > 2 or we're in a container
-        // that blocks PMU access. Not a failure of the wrapper — the
-        // caller just needs to fall back to wall-clock-only reporting.
-        CHECK(true);
-        return;
+    if (!pc.open()) {
+        SKIP("PMU unavailable (perf_event_paranoid > 2 or no hardware counters)");
     }
     // Leader must be valid if open() returned true; secondary counters
     // are best-effort.
@@ -40,8 +34,7 @@ TEST(perf_counters, open_reports_capability) {
 TEST(perf_counters, enable_disable_cycles_nonzero) {
     PerfCounters pc;
     if (!pc.open()) {
-        CHECK(true);
-        return;
+        SKIP("PMU unavailable");
     }
     pc.enable();
     u64 sink = busy_work(100000);
@@ -61,8 +54,7 @@ TEST(perf_counters, enable_disable_cycles_nonzero) {
 TEST(perf_counters, reset_between_measurements) {
     PerfCounters pc;
     if (!pc.open()) {
-        CHECK(true);
-        return;
+        SKIP("PMU unavailable");
     }
     // First measurement
     pc.enable();
@@ -94,8 +86,7 @@ TEST(perf_counters, reset_between_measurements) {
 TEST(perf_counters, accumulate_sums_values) {
     PerfCounters a, b;
     if (!a.open() || !b.open()) {
-        CHECK(true);
-        return;
+        SKIP("PMU unavailable");
     }
     a.enable();
     u64 s1 = busy_work(5000);

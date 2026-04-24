@@ -25,8 +25,9 @@
 //
 // Common blockers and how to clear them:
 //   - /proc/sys/kernel/perf_event_paranoid > 2 prevents unprivileged
-//     access to hardware counters. Lower it (sudo sysctl
-//     kernel.perf_event_paranoid=0) or run under a user with CAP_PERFMON.
+//     access to hardware counters. Lower it (`sudo sysctl
+//     kernel.perf_event_paranoid=2`, matching the threshold the
+//     group open tolerates) or run under a user with CAP_PERFMON.
 //   - Containers / VMs often block PMU access entirely; open() returns
 //     EACCES or ENOENT.
 //   - Some kernels gate cache events behind extra permissions; those
@@ -77,15 +78,22 @@ public:
     PerfCounters(const PerfCounters&) = delete;
     PerfCounters& operator=(const PerfCounters&) = delete;
 
-    // Open the full counter group. Returns true if the leader (cycles)
-    // and at least one secondary counter opened successfully. Returns
-    // false if the leader itself failed — in that case the whole group
-    // is unusable; caller should fall back to wall-clock-only reporting.
+    // Open the full counter group. Returns true iff the leader (cycles)
+    // opens successfully — secondary counters are best-effort and may
+    // individually fail without affecting the return value (callers
+    // should use has() / value() defensively, e.g. check
+    // has(kPerfInstructions) before computing IPC).
     //
-    // Individual secondary counters that fail to open are marked invalid
-    // and will report as zero via has(); the rest of the group still
-    // works.
+    // Idempotent: calling open() on an already-open or partially-open
+    // instance first tears down the previous group so fds don't leak
+    // and stale valid_/last_values_ state can't carry over.
     bool open() {
+        close_all();  // safe no-op if no fds are open
+        for (u32 i = 0; i < kPerfCounterCount; i++) {
+            last_values_[i] = 0;
+            valid_[i] = false;
+        }
+
         // Leader = CPU cycles. Disabled at start; PERF_EVENT_IOC_ENABLE
         // on the leader propagates to the whole group via
         // PERF_IOC_FLAG_GROUP.
@@ -187,15 +195,34 @@ private:
         // Layout with PERF_FORMAT_GROUP (no TIME_* / ID bits):
         //   u64 nr;
         //   u64 values[nr];
-        // where values[] is in the order counters were opened.
+        // where values[] is in the order group members were opened
+        // (only successfully-opened counters appear).
+        //
+        // Zero the snapshot up front: on short/failed read the caller
+        // must see zeros, not stale values from the previous epoch —
+        // otherwise a silent read failure quietly poisons the next
+        // accumulate() and the printed cycles-per-iter becomes a
+        // phantom from some prior run.
+        for (u32 i = 0; i < kPerfCounterCount; i++) last_values_[i] = 0;
+
+        // Count how many group members were actually opened so we know
+        // the minimum correct read size.
+        u32 opened_count = 0;
+        for (u32 i = 0; i < kPerfCounterCount; i++) {
+            if (valid_[i]) opened_count++;
+        }
+        if (opened_count == 0) return;  // nothing to read
+
         constexpr u32 kBufSlots = 1 + kPerfCounterCount;
         u64 buf[kBufSlots];
         ssize_t n = ::read(fds_[kPerfCycles], buf, sizeof(buf));
-        if (n < static_cast<ssize_t>(sizeof(u64))) return;  // read failed; leave stale
+        const ssize_t expected = static_cast<ssize_t>((1 + opened_count) * sizeof(u64));
+        if (n < expected) return;  // short/failed read — values stay zero
+
         const u64 nr = buf[0];
-        // The kernel only reports values for counters that actually
-        // opened (group members that failed to open aren't in the group
-        // at all). Map them back by walking valid_ in the same order.
+        if (nr < opened_count) return;  // kernel disagrees; bail safely
+
+        // Map read values back to the stable per-counter slots.
         u32 slot = 1;
         for (u32 i = 0; i < kPerfCounterCount && slot < kBufSlots && slot - 1 < nr; i++) {
             if (!valid_[i]) continue;

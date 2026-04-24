@@ -165,13 +165,14 @@ TEST(route_trie, method_specific_beats_any_slot) {
     CHECK_EQ(t.match(S("/x"), 'D'), 10u);  // DELETE → any slot
 }
 
-TEST(route_trie, tokenize_preserves_question_and_hash_bytes) {
-    // tokenize_segments no longer strips '?' or '#' — that's now the
-    // caller's job. match() shortens above '?' / '#' in the incoming
-    // request, but insert() takes paths at face value. RouteConfig's
-    // add_* rejects route paths containing those bytes so production
-    // code can't reach the weird state, but the trie itself treats
-    // "/api" and "/api?x" as distinct keys.
+TEST(route_trie, match_strips_query_and_fragment) {
+    // Stripping '?' / '#' from the incoming request is match()'s job
+    // (tokenize_segments stays pure). A route registered at "/api"
+    // should match requests like "/api?x=1" or "/api#frag" despite
+    // the extra bytes after the path component. (Insert-time paths
+    // containing '?' / '#' are rejected earlier at RouteConfig::
+    // add_*, so insert() never sees such a path; the trie itself
+    // would happily store them as distinct bytes if it did.)
     RouteTrie t;
     const Insert items[] = {{"/api", 0, 1}};
     REQUIRE(build_ok(t, items, 1));
@@ -277,6 +278,64 @@ TEST(route_trie, deep_path_still_falls_through_to_catchall_or_prefix) {
     // All-unknown deep path — catchall '/' must still fire instead
     // of a spurious no-match.
     CHECK_EQ(t.match(S("/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q"), 0), 42u);
+}
+
+TEST(route_trie, insert_atomic_on_node_pool_exhaustion_midpath) {
+    // Codex P1 regression: a deep path insert that creates k-1 nodes
+    // successfully and then hits kMaxNodes at segment k used to leave
+    // the k-1 ghost nodes in the pool. Repeated failures would eat
+    // capacity until legitimate shorter routes were rejected — the
+    // "bricked" route admission scenario.
+    //
+    // Setup: fill the pool to within ~30 nodes of kMaxNodes, then
+    // attempt a 30-segment insert. Without rollback, 27 of those
+    // pushes would succeed before nodes.len hits the cap; with
+    // rollback, node_count returns to the pre-insert level and a
+    // small follow-up route still fits.
+    //
+    // Fill shape: 20 top-level "/pNN" parents × 100 children "/pNN/qMM"
+    // each = 2000 routes, 1 + 20 + 2000 = 2021 nodes. Headroom = 27.
+    // (All within kMaxChildren=128 per-node cap.)
+    RouteTrie t;
+    static constexpr u32 kParents = 20;
+    static constexpr u32 kChildren = 100;
+    static constexpr u32 kFillRoutes = kParents * kChildren;
+    static char fill_paths[kFillRoutes][10] = {};
+    for (u32 i = 0; i < kFillRoutes; i++) {
+        const u32 p = i / kChildren;
+        const u32 c = i % kChildren;
+        fill_paths[i][0] = '/';
+        fill_paths[i][1] = 'p';
+        fill_paths[i][2] = static_cast<char>('0' + p / 10);
+        fill_paths[i][3] = static_cast<char>('0' + p % 10);
+        fill_paths[i][4] = '/';
+        fill_paths[i][5] = 'q';
+        fill_paths[i][6] = static_cast<char>('0' + c / 10);
+        fill_paths[i][7] = static_cast<char>('0' + c % 10);
+        REQUIRE(t.insert(Str{fill_paths[i], 8}, 0, static_cast<u16>(i)));
+    }
+    const u32 before = t.node_count();
+    // Expected: 1 root + 20 parents + 2000 terminals = 2021.
+    CHECK_EQ(before, 1u + kParents + kFillRoutes);
+
+    // Attempt a 30-segment insert. Path bytes = 30 × 3 = 90 (fits in
+    // RouteEntry::kMaxPathLen=128). Pool headroom is only 27, so 27
+    // of the 30 pushes would succeed before the cap fires. With
+    // rollback, node_count is unchanged after the failed insert.
+    char deep_path[128];
+    u32 dpi = 0;
+    for (u32 i = 0; i < 30; i++) {
+        deep_path[dpi++] = '/';
+        deep_path[dpi++] = 'z';
+        deep_path[dpi++] = static_cast<char>('a' + i);
+    }
+    CHECK(!t.insert(Str{deep_path, dpi}, 0, 999));
+    CHECK_EQ(t.node_count(), before);
+
+    // A short route must still fit. If rollback leaked, we'd have
+    // burned through the remaining headroom and this would fail.
+    CHECK(t.insert(S("/ok"), 0, 500));
+    CHECK_EQ(t.match(S("/ok"), 0), 500u);
 }
 
 TEST(route_trie, insert_atomic_on_child_cap_overflow) {

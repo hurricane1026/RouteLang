@@ -78,27 +78,58 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     // registered at the wrong depth relative to what the user wrote.
     if (n > kMaxPathSegments) return false;
 
+    // Snapshot state before any mutation so a mid-insert failure can
+    // fully undo everything we've done so far. Per-iteration
+    // pre-flights aren't sufficient on their own: a deep route that
+    // creates k-1 nodes successfully and then fails at segment k was
+    // still leaving k-1 ghost nodes (and the children-array pushes
+    // that pointed at them) in place, consuming capacity until the
+    // pool filled up and legitimate later routes got rejected. Codex
+    // P1 on #41.
+    const u32 saved_nodes_len = nodes.len;
+    // Parents whose children list grew during this insert, one entry
+    // per appended child. Rollback pops each parent's children list
+    // in reverse order so they return to their pre-insert length.
+    FixedVec<u16, kMaxPathSegments> pushed_parents{};
+
+    auto rollback = [&]() {
+        for (u32 r = pushed_parents.len; r > 0; r--) {
+            nodes[pushed_parents[r - 1]].children.len--;
+        }
+        nodes.len = saved_nodes_len;
+    };
+
     u16 cur = 0;  // root
     for (u32 i = 0; i < n; i++) {
         u16 child = find_child(cur, segs[i]);
         if (child == TrieNode::kInvalidRoute) {
-            // Pre-flight both capacity checks before mutating. Without
-            // this, a successful nodes.push() followed by a failing
-            // children.push() would leak a dangling node whose segment
-            // view points into the route path buffer — on repeated
-            // failures the node pool fills with ghosts until legitimate
-            // inserts start failing.
-            if (nodes.len >= kMaxNodes) return false;
-            if (nodes[cur].children.full()) return false;
+            // Capacity pre-flight — no mutation if either cap would
+            // be exceeded. This avoids the usual "push succeeded,
+            // dangling node left behind" leak on a same-iteration
+            // failure.
+            if (nodes.len >= kMaxNodes || nodes[cur].children.full()) {
+                rollback();
+                return false;
+            }
             TrieNode nn{};
             nn.segment = segs[i];
-            if (!nodes.push(nn)) return false;
+            if (!nodes.push(nn)) {
+                rollback();
+                return false;
+            }
             child = static_cast<u16>(nodes.len - 1);
             if (!nodes[cur].children.push(child)) {
-                // Pre-flight above rules this out, but guard in case a
-                // future FixedVec invariant changes — roll the node
-                // back so the pool stays consistent.
-                nodes.len--;
+                // Pre-flight above rules this out, but if a future
+                // FixedVec invariant change makes it reachable, fall
+                // into the full rollback so the pool stays clean.
+                rollback();
+                return false;
+            }
+            if (!pushed_parents.push(cur)) {
+                // Unreachable: pushed_parents has the same cap as
+                // segs (kMaxPathSegments) and we push at most one
+                // entry per iteration. Roll back defensively anyway.
+                rollback();
                 return false;
             }
         }

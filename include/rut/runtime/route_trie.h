@@ -21,7 +21,7 @@ namespace rut {
 // and well under the ~7–10% overhead of the translation-unit boundary
 // production calls cross anyway. We take the simpler design — fewer
 // bytes per node, less code to maintain — and leave the first-byte index
-// as a re-introducible optimization if workloads change (longer segments,
+// as an optimization that can be re-added if workloads change (longer segments,
 // larger fan-outs, or SIMD-ready eq).
 //
 // Semantics: segment-aware prefix match with longest-match-wins.
@@ -179,12 +179,18 @@ private:
     FixedVec<TrieNode, kMaxNodes> nodes;
 
     // Split `path` into segments according to the normalization policy.
-    //   - Strip any query string / fragment first ("?..." or "#..."),
-    //     so only the path component participates in routing.
     //   - Drop empty segments ("/api//v1" → ["api", "v1"], "/" → []).
     //   - A trailing '/' produces an empty final segment that is then
     //     dropped — so "/api/" and "/api" both yield ["api"].
     //   - Match case-sensitively; preserve bytes verbatim (no tolower).
+    //
+    // Query and fragment stripping (the '?' / '#' bytes) is the
+    // caller's concern, not tokenize's. RouteConfig::add_* rejects
+    // route paths containing those bytes before we ever see them;
+    // match() shortens the incoming request path above the first '?'
+    // or '#' before calling tokenize. Keeping tokenize pure means
+    // the insert-vs-match round-trip always agrees on what counts
+    // as a segment.
     //
     // Returns the segment count on success, or kMaxPathSegments + 1 as
     // a sentinel when the path would produce more segments than `out`

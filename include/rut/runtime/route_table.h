@@ -158,23 +158,29 @@ struct RouteConfig {
     u32 header_bytes_pool_used = 0;
 
     // Reject route paths that aren't in origin-form:
-    //   - must start with '/' (an empty path or one without a leading
-    //     slash like "api" would tokenize to the same key as "/api"
-    //     under the trie's segment normalization, silently matching
-    //     real traffic — Codex P2 on #41 round 10).
+    //   - must be non-null and start with '/'. An empty path or one
+    //     without a leading slash like "api" would tokenize to the
+    //     same key as "/api" under the trie's segment normalization,
+    //     silently matching real traffic — Codex P2 on #41 round 10.
     //   - must not contain '?' or '#'. Those belong to the query /
-    //     fragment components of a URI; routing doesn't match on them.
-    //     Accepting them would store raw bytes in RouteEntry::path
-    //     while the trie tokenized only the pre-'?' prefix, broadening
-    //     the stored route.
+    //     fragment components of a URI; RouteTrie::match() strips
+    //     them from the incoming request target before tokenizing,
+    //     so accepting a configured route with '?' or '#' would be
+    //     surprising and effectively unmatchable as written.
+    //   - must have a terminating NUL within kMaxPathLen bytes. This
+    //     caps the scan regardless of what the caller passes in —
+    //     add_* will also refuse to copy past that bound, so a path
+    //     longer than kMaxPathLen is unroutable anyway.
     // Callers that accidentally pass a malformed path (typo, full
     // URL, query string) should fail fast, not silently.
     static bool is_routable_path(const char* path) {
-        if (path[0] != '/') return false;
-        for (u32 i = 0; path[i] != '\0'; i++) {
-            if (path[i] == '?' || path[i] == '#') return false;
+        if (path == nullptr || path[0] != '/') return false;
+        for (u32 i = 0; i < RouteEntry::kMaxPathLen; i++) {
+            const char ch = path[i];
+            if (ch == '\0') return true;
+            if (ch == '?' || ch == '#') return false;
         }
-        return true;
+        return false;  // no NUL within kMaxPathLen — unroutable
     }
 
     // Add a proxy route: path prefix → upstream target.

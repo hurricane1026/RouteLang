@@ -2376,9 +2376,10 @@ TEST(route, add_rejects_path_missing_leading_slash) {
 TEST(route, add_rejects_query_and_fragment_in_path) {
     // Route paths are static configuration and must not contain '?'
     // or '#' — those belong to the query / fragment components of a
-    // URI and are never matched against. Accepting them would store
-    // the raw bytes in RouteEntry::path while the trie tokenized
-    // only the pre-'?' prefix, silently broadening the stored route.
+    // URI. RouteTrie::match() strips them from the incoming request
+    // target before tokenizing, so accepting a configured route with
+    // '?' or '#' would be surprising and effectively unmatchable as
+    // written — fail fast on the clearly wrong input.
     RouteConfig cfg;
     (void)cfg.add_upstream("x", 0x7F000001, 80);
     CHECK(!cfg.add_static("/api?foo=1", 0, 200));

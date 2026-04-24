@@ -217,8 +217,18 @@ static bool route_matches(const Engine::CompiledRoute& route, const char* path, 
         // to consume past this point, it can't be a match.
         if (path[pi] == '?' || path[pi] == '#') return false;
         if (route.pattern[ri] != path[pi]) return false;
+        const char consumed = route.pattern[ri];
         ri++;
         pi++;
+        // P1a normalization: the runtime trie collapses consecutive
+        // '/' into a single segment boundary on both the configured
+        // pattern and the incoming request. Without this, "/api//v1"
+        // would match "/api/v1" at the trie but not here, and replay
+        // would report a phantom divergence. Codex P2 on #41.
+        if (consumed == '/') {
+            while (ri < pattern_len && route.pattern[ri] == '/') ri++;
+            while (pi < path_len && path[pi] == '/') pi++;
+        }
     }
     // Segment boundary at the pattern's end: after consuming all of
     // the (normalized) pattern, the path must either be fully

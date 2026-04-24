@@ -70,6 +70,7 @@ public:
             last_values_[i] = 0;
             valid_[i] = false;
         }
+        last_read_ok_ = true;
     }
 
     ~PerfCounters() { close_all(); }
@@ -124,6 +125,7 @@ public:
         if (fds_[kPerfCycles] < 0) return;
         ::ioctl(fds_[kPerfCycles], PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
         ::ioctl(fds_[kPerfCycles], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+        last_read_ok_ = true;
     }
 
     // Disable the group and pull the counter values. Subsequent has() /
@@ -133,6 +135,13 @@ public:
         ::ioctl(fds_[kPerfCycles], PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
         read_all();
     }
+
+    // True iff the most recent disable()'s read_all() returned a
+    // complete snapshot. False after a short / EINTR-final read —
+    // values in this case are zero rather than stale, but callers
+    // should suppress per-iteration perf output rather than print
+    // phantom zeros.
+    bool last_read_ok() const { return last_read_ok_; }
 
     // Whether the counter at `idx` was opened successfully. Secondary
     // counter opens can fail independently of the leader; callers that
@@ -167,6 +176,7 @@ private:
     int fds_[kPerfCounterCount];
     u64 last_values_[kPerfCounterCount];
     bool valid_[kPerfCounterCount];
+    bool last_read_ok_ = true;
 
     bool open_counter(u32 idx, u32 type, u64 config, int group_fd, bool disabled) {
         struct perf_event_attr attr;
@@ -211,16 +221,32 @@ private:
         for (u32 i = 0; i < kPerfCounterCount; i++) {
             if (valid_[i]) opened_count++;
         }
-        if (opened_count == 0) return;  // nothing to read
+        if (opened_count == 0) {
+            last_read_ok_ = false;
+            return;
+        }
 
         constexpr u32 kBufSlots = 1 + kPerfCounterCount;
         u64 buf[kBufSlots];
-        ssize_t n = ::read(fds_[kPerfCycles], buf, sizeof(buf));
+        ssize_t n;
+        do {
+            n = ::read(fds_[kPerfCycles], buf, sizeof(buf));
+        } while (n < 0 && errno == EINTR);
         const ssize_t expected = static_cast<ssize_t>((1 + opened_count) * sizeof(u64));
-        if (n < expected) return;  // short/failed read — values stay zero
+        if (n < expected) {
+            // Short or failed read. Values stay zero (already cleared
+            // above). Mark the snapshot invalid so Bench::run can
+            // suppress perf output for this epoch — printing "cycles/
+            // iter: 0" after a read failure would look like real data.
+            last_read_ok_ = false;
+            return;
+        }
 
         const u64 nr = buf[0];
-        if (nr < opened_count) return;  // kernel disagrees; bail safely
+        if (nr < opened_count) {
+            last_read_ok_ = false;
+            return;
+        }
 
         // Map read values back to the stable per-counter slots.
         u32 slot = 1;

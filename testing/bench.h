@@ -24,6 +24,7 @@
 #include "perf_counters.h"
 #include "rut/common/types.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <time.h>    // clock_gettime, CLOCK_MONOTONIC
 #include <unistd.h>  // write
@@ -205,7 +206,12 @@ struct Bench {
     void warmup(u64 n) { warmup_iters_ = n; }
     void epochs(u32 n) {
         epochs_ = n < 1 ? 1 : (n > kMaxEpochs ? kMaxEpochs : n);
-        if (epochs_ % 2 == 0) epochs_++;  // keep odd for clean median
+        if (epochs_ % 2 == 0) {
+            // Keep odd for clean median — but if we're already at the
+            // fixed-size array cap, stepping up would overrun
+            // epoch_ns[] / sorted[] / abs_dev[]. Step down instead.
+            epochs_ = (epochs_ == kMaxEpochs) ? (epochs_ - 1) : (epochs_ + 1);
+        }
     }
     void bytes_per_op(u64 n) { bytes_per_op_ = n; }
     // Enable hardware perf counters (cycles, instructions, branch-misses,
@@ -229,7 +235,7 @@ struct Bench {
         // kernel refuses (perf_event_paranoid too high), silently fall
         // back to wall-clock only — the measurement still happens.
         PerfCounters pc;
-        const bool perf_ok = perf_counters_ && pc.open();
+        bool perf_ok = perf_counters_ && pc.open();
 
         // Collect epoch timings + cumulative perf totals.
         u64 epoch_ns[kMaxEpochs];
@@ -246,11 +252,20 @@ struct Bench {
             u64 t1 = now_ns();
             if (perf_ok) {
                 pc.disable();
-                total_cycles += pc.cycles();
-                total_inst += pc.instructions();
-                total_bmiss += pc.branch_misses();
-                total_cref += pc.cache_refs();
-                total_cmiss += pc.cache_misses();
+                if (!pc.last_read_ok()) {
+                    // A short/interrupted read means this epoch's
+                    // counters are zero rather than real. Rolling it
+                    // into the totals would bias the per-iteration
+                    // averages; flip perf_ok off for the whole run
+                    // so the output section is suppressed instead.
+                    perf_ok = false;
+                } else {
+                    total_cycles += pc.cycles();
+                    total_inst += pc.instructions();
+                    total_bmiss += pc.branch_misses();
+                    total_cref += pc.cache_refs();
+                    total_cmiss += pc.cache_misses();
+                }
             }
             epoch_ns[e] = (t1 - t0) / iters_per_epoch;  // ns per iteration
             total_ns += (t1 - t0);
@@ -434,10 +449,17 @@ struct Bench {
 
 // Read up to `cap-1` bytes from `path` into `buf`, zero-terminate. Returns
 // the count read, or 0 on any error. Trims a single trailing newline.
+// Requires `cap >= 2` (one byte of payload + the trailing nul); smaller
+// caps are a caller bug and would underflow `cap - 1`. Retries `read()`
+// on EINTR so the env-warning path isn't silently defeated by a signal.
 inline u32 read_small_file(const char* path, char* buf, u32 cap) {
+    if (cap < 2) return 0;
     int fd = ::open(path, O_RDONLY);
     if (fd < 0) return 0;
-    ssize_t n = ::read(fd, buf, cap - 1);
+    ssize_t n;
+    do {
+        n = ::read(fd, buf, cap - 1);
+    } while (n < 0 && errno == EINTR);
     ::close(fd);
     if (n <= 0) return 0;
     u32 len = static_cast<u32>(n);

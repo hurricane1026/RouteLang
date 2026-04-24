@@ -101,10 +101,15 @@ struct RouteConfig {
 
     // Radix trie — parallel lookup structure that replaces the old O(n)
     // linear scan. Kept in sync with `routes[]` by every add_* method: a
-    // successful route insert also inserts into the trie, and a trie
-    // insert failure rolls back the route. Segment views inside the trie
-    // point into `routes[i].path`, which is stable for the config's RCU
-    // lifetime.
+    // successful route insert also inserts into the trie; a failed trie
+    // insert causes add_* to return false WITHOUT advancing
+    // route_count, so the partially-filled RouteEntry slot stays
+    // unused. Trie insertion itself is not guaranteed atomic on
+    // failure, so callers must treat a false return from add_* as
+    // fatal for this RouteConfig — discard it and build a fresh one
+    // rather than layering more add_* calls on a half-built table.
+    // Segment views inside the trie point into `routes[i].path`, which
+    // is stable for the config's RCU lifetime.
     RouteTrie trie;
 
     UpstreamTarget upstreams[kMaxUpstreams];

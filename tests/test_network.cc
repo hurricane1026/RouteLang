@@ -2352,8 +2352,8 @@ TEST(route, add_response_body_rejects_at_capacity) {
 TEST(route, add_route_at_capacity) {
     // Fill up to RouteConfig::kMaxRoutes with a nested topology — a flat
     // sibling structure ("/000", "/001", …) would overflow the trie's
-    // per-node child cap (RouteTrie::TrieNode::kMaxChildren = 32) long
-    // before hitting the route-count cap. A realistic gateway never has
+    // per-node child cap (TrieNode::kMaxChildren = 32) long before
+    // hitting the route-count cap. A realistic gateway never has
     // that many flat siblings anyway; distribute across a few top-level
     // groups so the trie can hold all 128 and the route-count check is
     // what actually fires.

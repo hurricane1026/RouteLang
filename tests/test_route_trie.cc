@@ -204,6 +204,65 @@ TEST(route_trie, node_count_shows_prefix_sharing) {
     CHECK_EQ(t.node_count(), 7u);
 }
 
+TEST(route_trie, deep_path_still_falls_through_to_catchall_or_prefix) {
+    // Regression guard (Codex P1): an earlier match() returned
+    // kInvalidRoute the moment tokenize reported segment-count
+    // overflow, letting requests with >16 segments bypass a '/'
+    // catchall or a matching prefix route. ConnectionBase::
+    // kMaxReqPathLen is 64 bytes — enough for 30+ two-byte segments
+    // — so the overflow is reachable from a single valid request.
+    // match() must walk as deep as the trie has data for and return
+    // the longest-match terminal it saw.
+    RouteTrie t;
+    const Insert items[] = {{"/", 0, 42}, {"/api", 0, 7}};
+    REQUIRE(build_ok(t, items, 2));
+    // 17 single-char segments — exceeds kMaxPathSegments=16, but
+    // starts with /api, so the /api terminal must still win.
+    CHECK_EQ(t.match(S("/api/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p"), 0), 7u);
+    // All-unknown deep path — catchall '/' must still fire instead
+    // of a spurious no-match.
+    CHECK_EQ(t.match(S("/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q"), 0), 42u);
+}
+
+TEST(route_trie, insert_atomic_on_child_cap_overflow) {
+    // Regression guard (Copilot P1 + Codex P2): an earlier insert()
+    // could push a new node into the pool and then fail on the
+    // subsequent children.push(), leaving a dangling unreferenced
+    // node. Repeated overflow attempts used to leak pool capacity
+    // until legitimate inserts started failing. This test asserts
+    // the pool size stays stable across 100 failed inserts after
+    // saturating a parent's child cap.
+    //
+    // Important: TrieNode::segment is a non-owning Str view into the
+    // path buffer the caller provided. Use a 2D array so every
+    // inserted path keeps its own backing storage alive for the
+    // lifetime of the trie — a single scratch buffer would alias
+    // and all children would collapse onto the same segment.
+    RouteTrie t;
+    static constexpr u32 kN = TrieNode::kMaxChildren;
+    char paths[kN][8] = {};
+    for (u32 i = 0; i < kN; i++) {
+        paths[i][0] = '/';
+        u32 n = 1;
+        const u32 d0 = i / 10;
+        const u32 d1 = i % 10;
+        if (d0 > 0) paths[i][n++] = static_cast<char>('0' + d0);
+        paths[i][n++] = static_cast<char>('0' + d1);
+        REQUIRE(t.insert(Str{paths[i], n}, 0, static_cast<u16>(i)));
+    }
+    const u32 saturated_count = t.node_count();
+    // Every insert from here on must hit root's child cap. None
+    // should grow node_count (what the old insert() leaked).
+    char overflow_paths[100][4] = {};
+    for (u32 i = 0; i < 100; i++) {
+        overflow_paths[i][0] = '/';
+        overflow_paths[i][1] = 'z';
+        overflow_paths[i][2] = static_cast<char>('a' + (i % 26));
+        CHECK(!t.insert(Str{overflow_paths[i], 3}, 0, 0));
+    }
+    CHECK_EQ(t.node_count(), saturated_count);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

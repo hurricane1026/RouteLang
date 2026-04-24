@@ -30,7 +30,9 @@ namespace rut {
 //   - Matching is case-sensitive (per RFC 3986).
 //   - A route attached at the root ("/") acts as a catch-all for any request.
 //   - If multiple routes share a path, the first-inserted wins (build-order
-//     determinism for duplicate keys; the trie is built once at finalize()).
+//     determinism for duplicate keys; the trie is built incrementally via
+//     add_* calls during RouteConfig construction, then treated as
+//     read-only once the RouteConfig is published via RCU swap).
 //
 // Method dispatch: each terminal node holds a small per-method slot table so
 // two routes with the same path but different HTTP methods both fit. Lookup
@@ -85,8 +87,9 @@ inline u32 method_slot(u8 method_char) {
 struct TrieNode {
     // 32 covers realistic gateway fan-outs: even a root that holds every
     // top-level API segment ("/api", "/auth", "/admin", health/metrics/…)
-    // plus a handful of static paths fits cleanly. Per-node memory cost
-    // is 32 × (1B first-byte + 2B child idx) + FixedVec overhead ≈ 100B.
+    // plus a handful of static paths fits cleanly. Per-node child
+    // storage is 32 × 2B child idx (plus FixedVec length overhead) —
+    // well under a cacheline even for the widest realistic parent.
     static constexpr u32 kMaxChildren = 32;
 
     // Edge label: the path segment that leads INTO this node. Non-owning,
@@ -115,8 +118,9 @@ struct TrieNode {
 // ---------------------------------------------------------------------------
 // RouteTrie
 // ---------------------------------------------------------------------------
-// Owns the node pool. Build once via a sequence of insert() calls, then
-// lookup via match(). No mutation after finalize — RCU-friendly.
+// Owns the node pool. Built incrementally via insert() calls (RouteConfig
+// drives these from its add_* methods). Once the enclosing RouteConfig is
+// published, treat the trie as read-only — RCU-friendly.
 
 class RouteTrie {
 public:
@@ -149,28 +153,31 @@ public:
 private:
     FixedVec<TrieNode, kMaxNodes> nodes;
 
-    // Split `path` into segments according to the normalization policy
-    // documented at the top of this file (P1a + P2a + P3a):
-    //   - P1a: drop empty segments ("/api//v1" → ["api", "v1"], "/" → [])
-    //   - P2a: trailing '/' drops to an empty final segment, which is
-    //          then dropped — so "/api/" and "/api" both yield ["api"]
-    //   - P3a: case-sensitive, preserve bytes verbatim (no tolower)
+    // Split `path` into segments according to the normalization policy.
+    //   - Strip any query string / fragment first ("?..." or "#..."),
+    //     so only the path component participates in routing.
+    //   - Drop empty segments ("/api//v1" → ["api", "v1"], "/" → []).
+    //   - A trailing '/' produces an empty final segment that is then
+    //     dropped — so "/api/" and "/api" both yield ["api"].
+    //   - Match case-sensitively; preserve bytes verbatim (no tolower).
     //
-    // Returns the number of segments pushed into `out`. Returns
-    // kMaxPathSegments + 1 (i.e. a sentinel larger than cap) if the path
-    // would produce more segments than fit — callers should reject such
-    // paths at build time and emit a clear error.
+    // Returns the segment count on success, or kMaxPathSegments + 1 as
+    // a sentinel when the path would produce more segments than `out`
+    // can hold. `insert()` rejects sentinel results so a build-time
+    // config with too-deep paths fails cleanly; `match()` ignores the
+    // sentinel and runs with the (truncated) segments so deep request
+    // URIs still fall back to a catchall or prefix route.
     //
-    // TODO(user contribution): implement this. ~8-12 lines. The three
-    // policy decisions (P1a/P2a/P3a) collapse cleanly into "scan bytes,
-    // split on '/', emit non-empty runs as Str views into the input."
-    // Do NOT allocate — `out` is caller-provided storage, Str views
-    // point into `path.ptr`.
+    // Does not allocate — `out` is caller-provided storage, emitted
+    // Str views point into the path portion of `path.ptr`.
     static u32 tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out);
 
-    // Internal helper — scans `child_first_bytes` for a first-byte match
-    // and then verifies full segment equality. Returns child index or
-    // kInvalidRoute.
+    // Linear-scan child lookup: walks `children` and compares the full
+    // segment via Str::eq. Returns the child's node index, or
+    // TrieNode::kInvalidRoute if no child matches. See the comment at
+    // the top of this file for why we don't layer a u8 first-byte
+    // index on top — at our segment-length distribution it's a net
+    // cost, not a savings.
     u16 find_child(u16 parent, Str segment) const;
 };
 

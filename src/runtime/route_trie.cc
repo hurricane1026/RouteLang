@@ -70,20 +70,34 @@ u16 RouteTrie::find_child(u16 parent, Str segment) const {
 bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     FixedVec<Str, kMaxPathSegments> segs{};
     const u32 n = tokenize_segments(path, segs);
-    // Sentinel: a path with more segments than we can hold is rejected.
+    // Sentinel: a path with more segments than we can hold is rejected
+    // at insert time. Silently truncating would create a route
+    // registered at the wrong depth relative to what the user wrote.
     if (n > kMaxPathSegments) return false;
 
     u16 cur = 0;  // root
     for (u32 i = 0; i < n; i++) {
         u16 child = find_child(cur, segs[i]);
         if (child == TrieNode::kInvalidRoute) {
-            // Create a new child node.
+            // Pre-flight both capacity checks before mutating. Without
+            // this, a successful nodes.push() followed by a failing
+            // children.push() would leak a dangling node whose segment
+            // view points into the route path buffer — on repeated
+            // failures the node pool fills with ghosts until legitimate
+            // inserts start failing.
             if (nodes.len >= kMaxNodes) return false;
+            if (nodes[cur].children.full()) return false;
             TrieNode nn{};
             nn.segment = segs[i];
             if (!nodes.push(nn)) return false;
             child = static_cast<u16>(nodes.len - 1);
-            if (!nodes[cur].children.push(child)) return false;
+            if (!nodes[cur].children.push(child)) {
+                // Pre-flight above rules this out, but guard in case a
+                // future FixedVec invariant changes — roll the node
+                // back so the pool stays consistent.
+                nodes.len--;
+                return false;
+            }
         }
         cur = child;
     }
@@ -98,9 +112,14 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
 
 u16 RouteTrie::match(Str path, u8 method_char) const {
     FixedVec<Str, kMaxPathSegments> segs{};
-    const u32 n = tokenize_segments(path, segs);
-    // Over-capacity paths can't match anything the trie stored.
-    if (n > kMaxPathSegments) return TrieNode::kInvalidRoute;
+    // Ignore tokenize's return value on overflow: `segs` still holds
+    // the first kMaxPathSegments, and we want to walk the trie as deep
+    // as we have data for. Bailing out on overflow would let a request
+    // with 17+ segments bypass a '/' catchall or a matching prefix
+    // route — realistic routes never go that deep, but realistic
+    // request URIs can (ConnectionBase::kMaxReqPathLen is 64 bytes,
+    // enough for 32 two-byte segments).
+    (void)tokenize_segments(path, segs);
 
     const u32 want_slot = method_slot(method_char);
     u16 cur = 0;
@@ -117,7 +136,7 @@ u16 RouteTrie::match(Str path, u8 method_char) const {
     };
     u16 best = pick_terminal(nodes[0], want_slot);
 
-    for (u32 i = 0; i < n; i++) {
+    for (u32 i = 0; i < segs.len; i++) {
         const u16 child = find_child(cur, segs[i]);
         if (child == TrieNode::kInvalidRoute) break;
         cur = child;

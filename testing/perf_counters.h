@@ -193,18 +193,23 @@ private:
         attr.disabled = disabled ? 1 : 0;
         attr.exclude_kernel = 1;  // measure userspace only — kernel work is noise
         attr.exclude_hv = 1;      // skip hypervisor ticks
-        attr.read_format = PERF_FORMAT_GROUP;
+        // Request TIME_ENABLED / TIME_RUNNING alongside the grouped
+        // values so read_all() can detect when the kernel actually
+        // multiplexes the group (time_running < time_enabled) and
+        // invalidate the snapshot instead of reporting silently
+        // scaled-down counts. Codex P2 on #42 (round 7) flagged that
+        // the pinned-open fallback left the bench exposed to this.
+        attr.read_format =
+            PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
         // Pin the group leader so the kernel either schedules all five
-        // counters together or refuses the open outright. Without
-        // pinning + multiplexing active, the kernel is free to
-        // time-slice counters in and out of hardware slots and
-        // PERF_FORMAT_GROUP alone gives us no way to tell (we'd need
-        // TOTAL_TIME_ENABLED / TOTAL_TIME_RUNNING to scale). Group
-        // members inherit the leader's pinning; `pinned = 1` is only
-        // valid on the leader (group_fd == -1). If pinning fails the
-        // leader open returns EINVAL — fall back to an unpinned open
-        // so benchmarks still run, just with the caveat that
-        // multiplexing (rare at only 5 counters) could bias numbers.
+        // counters together or refuses the open outright. Pinning
+        // avoids multiplexing in the first place whenever the system
+        // allows it; the TIME_ENABLED/RUNNING check is a safety net
+        // for the fallback case. Group members inherit the leader's
+        // pinning; `pinned = 1` is only valid on the leader
+        // (group_fd == -1). If pinning fails the leader open returns
+        // EINVAL — fall back to an unpinned open so benchmarks still
+        // run.
         if (group_fd == -1) attr.pinned = 1;
         // pid=0 → calling process. cpu=-1 → any CPU (the scheduler may
         // migrate us; caller should pin with taskset for stability).
@@ -227,24 +232,31 @@ private:
     }
 
     void read_all() {
-        // Layout with PERF_FORMAT_GROUP (no TIME_* / ID bits):
+        // Layout with PERF_FORMAT_GROUP |
+        //             PERF_FORMAT_TOTAL_TIME_ENABLED |
+        //             PERF_FORMAT_TOTAL_TIME_RUNNING:
         //   u64 nr;
+        //   u64 time_enabled;
+        //   u64 time_running;
         //   u64 values[nr];
         // where values[] is in the order group members were opened
         // (only successfully-opened counters appear).
+        //
+        // time_enabled ≥ time_running; when they differ, the kernel
+        // multiplexed the group off hardware slots for some of the
+        // window and the raw counts are proportionally under-reported.
+        // We refuse to "just scale them up" — multiplexed counts are
+        // a noisy proxy for the true rate, not a drop-in replacement
+        // — and instead flag the snapshot invalid so Bench::run
+        // suppresses the whole epoch.
         //
         // Zero the snapshot up front: on short/failed read the caller
         // must see zeros, not stale values from the previous epoch —
         // otherwise a silent read failure quietly poisons the next
         // accumulate() and the printed cycles-per-iter becomes a
-        // phantom from some prior run.
-        //
-        // Also re-optimize on success: start by assuming the read
-        // will succeed and only flip last_read_ok_ false on a
-        // concrete failure path. This way a successful read after a
-        // prior failure clears the sticky flag without requiring a
-        // matching enable() — otherwise a disable()-without-enable()
-        // would keep reporting stale "invalid snapshot".
+        // phantom from some prior run. Re-optimize on success: start
+        // by assuming the read will succeed and only flip
+        // last_read_ok_ false on a concrete failure path.
         for (u32 i = 0; i < kPerfCounterCount; i++) last_values_[i] = 0;
         last_read_ok_ = true;
 
@@ -259,31 +271,38 @@ private:
             return;
         }
 
-        constexpr u32 kBufSlots = 1 + kPerfCounterCount;
+        // Buffer: nr + time_enabled + time_running + values[nr].
+        constexpr u32 kBufSlots = 3 + kPerfCounterCount;
         u64 buf[kBufSlots];
         ssize_t n;
         do {
             n = ::read(fds_[kPerfCycles], buf, sizeof(buf));
         } while (n < 0 && errno == EINTR);
-        const ssize_t expected = static_cast<ssize_t>((1 + opened_count) * sizeof(u64));
+        const ssize_t expected = static_cast<ssize_t>((3 + opened_count) * sizeof(u64));
         if (n < expected) {
-            // Short or failed read. Values stay zero (already cleared
-            // above). Mark the snapshot invalid so Bench::run can
-            // suppress perf output for this epoch — printing "cycles/
-            // iter: 0" after a read failure would look like real data.
+            // Short or failed read.
             last_read_ok_ = false;
             return;
         }
 
         const u64 nr = buf[0];
+        const u64 time_enabled = buf[1];
+        const u64 time_running = buf[2];
         if (nr < opened_count) {
+            last_read_ok_ = false;
+            return;
+        }
+        // Multiplexing check: kernel only ran the counters for part
+        // of the enabled window. Don't trust the raw counts.
+        if (time_running < time_enabled) {
             last_read_ok_ = false;
             return;
         }
 
         // Map read values back to the stable per-counter slots.
-        u32 slot = 1;
-        for (u32 i = 0; i < kPerfCounterCount && slot < kBufSlots && slot - 1 < nr; i++) {
+        // Values start at buf[3] under this read_format.
+        u32 slot = 3;
+        for (u32 i = 0; i < kPerfCounterCount && slot < kBufSlots && slot - 3 < nr; i++) {
             if (!valid_[i]) continue;
             last_values_[i] = buf[slot++];
         }

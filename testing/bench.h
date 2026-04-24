@@ -370,8 +370,12 @@ struct Bench {
                 out_u64(total_inst / it);
             }
             if (pc.has(kPerfCycles) && pc.has(kPerfInstructions) && total_cycles > 0) {
-                // IPC × 100 (fixed-point 2 decimals)
-                const u64 ipc100 = (total_inst * 100) / total_cycles;
+                // IPC × 100 (fixed-point 2 decimals). Widen to
+                // __int128 for the multiply so long benches where
+                // total_inst exceeds ~1.8e17 don't overflow u64 and
+                // wrap to a nonsense IPC. Same pattern as err_pct.
+                const u64 ipc100 = static_cast<u64>(
+                    (static_cast<unsigned __int128>(total_inst) * 100) / total_cycles);
                 out("  IPC: ");
                 out_u64(ipc100 / 100);
                 out(".");
@@ -385,7 +389,8 @@ struct Bench {
                 // the kernel maps these to last-level-cache (LLC)
                 // counters, not L1 — label accordingly to avoid a
                 // misleading "L1-miss" attribution.
-                const u64 miss_thou = (total_cmiss * 1000) / total_cref;
+                const u64 miss_thou = static_cast<u64>(
+                    (static_cast<unsigned __int128>(total_cmiss) * 1000) / total_cref);
                 out("  cache-miss: ");
                 out_u64(miss_thou / 10);
                 out(".");

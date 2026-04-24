@@ -187,6 +187,19 @@ struct Result {
     u64 perf_cache_refs;
     u64 perf_cache_misses;
     bool perf_valid;
+    // Bitmask of PerfCounterIndex entries that the kernel actually
+    // granted. On a partial-PMU box the kernel may open cycles /
+    // instructions but refuse cache events (or vice versa); without
+    // this mask, a total of `0` in perf_cache_misses is ambiguous
+    // between "counter unavailable" and "legitimate zero" (a tiny
+    // hot dataset on a correctly opened counter). Downstream
+    // consumers should gate per-counter reads on has_perf_counter()
+    // rather than peeking at perf_valid alone.
+    u32 perf_available_mask;
+
+    bool has_perf_counter(u32 idx) const {
+        return perf_valid && idx < kPerfCounterCount && ((perf_available_mask >> idx) & 1u) != 0;
+    }
 };
 
 struct Bench {
@@ -319,6 +332,16 @@ struct Bench {
         r.perf_branch_misses = total_bmiss;
         r.perf_cache_refs = total_cref;
         r.perf_cache_misses = total_cmiss;
+        // Snapshot per-counter availability. Zero on invalidated runs
+        // so a caller that only inspects the mask still sees "no
+        // data", matching the zeroed totals.
+        u32 available = 0;
+        if (perf_ok) {
+            for (u32 i = 0; i < kPerfCounterCount; i++) {
+                if (pc.has(i)) available |= (1u << i);
+            }
+        }
+        r.perf_available_mask = available;
 
         // Print result
         out("  ");

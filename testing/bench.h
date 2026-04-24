@@ -256,9 +256,17 @@ struct Bench {
                     // A short/interrupted read means this epoch's
                     // counters are zero rather than real. Rolling it
                     // into the totals would bias the per-iteration
-                    // averages; flip perf_ok off for the whole run
-                    // so the output section is suppressed instead.
+                    // averages; flip perf_ok off for the whole run so
+                    // the output section is suppressed, and zero out
+                    // any totals accumulated from earlier epochs so
+                    // the returned Result doesn't carry partial data
+                    // from an invalidated measurement window.
                     perf_ok = false;
+                    total_cycles = 0;
+                    total_inst = 0;
+                    total_bmiss = 0;
+                    total_cref = 0;
+                    total_cmiss = 0;
                 } else {
                     total_cycles += pc.cycles();
                     total_inst += pc.instructions();
@@ -293,8 +301,14 @@ struct Bench {
         }
         sort_u64(abs_dev, epochs_);
         r.mad_ns = abs_dev[epochs_ / 2];
+        // Widen to __int128 for the multiply so multi-second per-iter
+        // benchmarks (mad_ns above ~1.8e17) don't overflow u64 and
+        // wrap to a nonsense err_pct. __int128 is a compiler builtin
+        // on every x86_64 clang/gcc we target — no stdlib dep.
         r.err_pct = r.median_ns > 0
-                        ? static_cast<u32>((r.mad_ns * 100 + r.median_ns / 2) / r.median_ns)
+                        ? static_cast<u32>(((static_cast<unsigned __int128>(r.mad_ns) * 100) +
+                                            (static_cast<unsigned __int128>(r.median_ns) / 2)) /
+                                           static_cast<unsigned __int128>(r.median_ns))
                         : 0;
 
         r.iterations = iters_per_epoch * epochs_;
@@ -344,8 +358,14 @@ struct Bench {
             if (total_inst > 0) {
                 out("  inst/iter: ");
                 out_u64(total_inst / it);
+            }
+            // IPC requires cycles > 0; otherwise print nothing rather
+            // than dividing by a `? : 1` fallback that would emit a
+            // huge phantom IPC on an unsupported-event / read-failure
+            // edge case.
+            if (total_cycles > 0 && total_inst > 0) {
                 // IPC × 100 (fixed-point 2 decimals)
-                const u64 ipc100 = (total_inst * 100) / (total_cycles > 0 ? total_cycles : 1);
+                const u64 ipc100 = (total_inst * 100) / total_cycles;
                 out("  IPC: ");
                 out_u64(ipc100 / 100);
                 out(".");
@@ -438,14 +458,19 @@ struct Bench {
 // Environment checks
 // ============================================================================
 //
-// Microbenchmarks are only as reliable as the system they run on. These
-// helpers read /sys and /proc to flag the well-known foot-guns:
+// Microbenchmarks are only as reliable as the system they run on.
+// print_environment_warnings() reads /sys and /proc to flag the
+// well-known foot-guns it can actually detect from file state:
 //   - CPU governor != performance  (frequency varies during the run)
 //   - Intel turbo boost on         (same — amplified)
-//   - CPU unpinned (no taskset)    (scheduler migration flushes caches)
+//   - perf_event_paranoid > 2      (perf counters will be unavailable)
 //
-// Call print_environment_warnings() once at the start of main() so the
-// user sees the flags before reading numbers they might otherwise trust.
+// It also prints a `taskset -c N` hint so the user remembers to pin
+// the benchmark to one core, but it does NOT currently detect the
+// process's actual CPU affinity — that would need a sched_getaffinity
+// probe and is deferred. Call print_environment_warnings() once at
+// the start of main() so the user sees the flags before reading
+// numbers they might otherwise trust.
 
 // Read up to `cap-1` bytes from `path` into `buf`, zero-terminate. Returns
 // the count read, or 0 on any error. Trims a single trailing newline.

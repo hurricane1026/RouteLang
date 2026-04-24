@@ -40,7 +40,7 @@ u32 RouteTrie::tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out)
 }
 
 // ---------------------------------------------------------------------------
-// Scaffolding (done — do not touch for the user contribution)
+// Trie storage and lookup helpers
 // ---------------------------------------------------------------------------
 
 void RouteTrie::clear() {
@@ -68,6 +68,13 @@ u16 RouteTrie::find_child(u16 parent, Str segment) const {
 }
 
 bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
+    // Reject unsupported method bytes up-front. An earlier revision
+    // fell back to slot 0 ("any") for unknown chars, which would
+    // silently broaden a route's method filter; fail fast instead so
+    // callers notice (Codex P2 on #41).
+    const u32 slot = method_slot(method_char);
+    if (slot == kMethodSlotInvalid) return false;
+
     FixedVec<Str, kMaxPathSegments> segs{};
     const u32 n = tokenize_segments(path, segs);
     // Sentinel: a path with more segments than we can hold is rejected
@@ -103,7 +110,6 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     }
     // Record at the terminal. First-insert-wins on the same (path, method)
     // pair — preserves the existing add-order semantics for duplicates.
-    const u32 slot = method_slot(method_char);
     if (nodes[cur].route_idx_by_method[slot] == TrieNode::kInvalidRoute) {
         nodes[cur].route_idx_by_method[slot] = route_idx;
     }
@@ -111,17 +117,19 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
 }
 
 u16 RouteTrie::match(Str path, u8 method_char) const {
+    // Unsupported method bytes can't match anything — bail before
+    // touching the trie. Consistent with the insert-time rejection.
+    const u32 want_slot = method_slot(method_char);
+    if (want_slot == kMethodSlotInvalid) return TrieNode::kInvalidRoute;
+
     FixedVec<Str, kMaxPathSegments> segs{};
     // Ignore tokenize's return value on overflow: `segs` still holds
     // the first kMaxPathSegments, and we want to walk the trie as deep
     // as we have data for. Bailing out on overflow would let a request
-    // with 17+ segments bypass a '/' catchall or a matching prefix
-    // route — realistic routes never go that deep, but realistic
-    // request URIs can (ConnectionBase::kMaxReqPathLen is 64 bytes,
-    // enough for 32 two-byte segments).
+    // that's deeper than cap bypass a '/' catchall or a matching
+    // prefix route — insert() already rejects too-deep route configs,
+    // so the trie never contains a terminal we'd miss.
     (void)tokenize_segments(path, segs);
-
-    const u32 want_slot = method_slot(method_char);
     u16 cur = 0;
     // Track the deepest terminal we've seen that's compatible with the
     // requested method. Initialize from the root so a route inserted at

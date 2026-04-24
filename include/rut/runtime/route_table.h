@@ -100,17 +100,26 @@ struct RouteConfig {
     u32 route_count = 0;
 
     // Radix trie — parallel lookup structure that replaces the old O(n)
-    // linear scan. Kept in sync with `routes[]` by every add_* method: a
-    // successful route insert also inserts into the trie; a failed trie
-    // insert causes add_* to return false WITHOUT advancing
-    // route_count, so the partially-filled RouteEntry slot stays
-    // unused. Trie insertion itself is not guaranteed atomic on
-    // failure, so callers must treat a false return from add_* as
-    // fatal for this RouteConfig — discard it and build a fresh one
-    // rather than layering more add_* calls on a half-built table.
-    // Segment views inside the trie point into `routes[i].path`, which
-    // is stable for the config's RCU lifetime.
+    // linear scan. Kept in sync with `routes[]` by every add_* method:
+    // a successful route insert also inserts into the trie; a failed
+    // trie insert causes add_* to return false WITHOUT advancing
+    // route_count, and the trie is left unchanged (RouteTrie::insert
+    // pre-flights every capacity check before any mutation). Callers
+    // may continue to layer more add_* calls after a false return,
+    // though capacity failures will usually persist unless the input
+    // changes. Segment views inside the trie point into
+    // `routes[i].path`, which is stable for the config's RCU
+    // lifetime.
     RouteTrie trie;
+
+    // Keep the two caps locked together. If either side is retuned,
+    // this static_assert forces the other to follow — otherwise valid
+    // 128-route flat configs would start failing at the trie's
+    // per-node child cap, a silent behavioral regression Codex
+    // flagged on #41.
+    static_assert(kMaxRoutes == TrieNode::kMaxChildren,
+                  "RouteConfig::kMaxRoutes must equal TrieNode::kMaxChildren so a config "
+                  "whose routes all share a single parent fits the trie's per-node fan-out.");
 
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;

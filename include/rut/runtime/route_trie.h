@@ -48,9 +48,16 @@ namespace rut {
 // scheme has a known ambiguity for POST/PUT/PATCH that we preserve here to
 // keep this PR scoped — a proper method enum is a separate change.
 //
-// method_slot() packs the handful of valid first-byte values into a dense
-// [0..kMethodSlots) index for use as an array subscript. Slot 0 = "any".
+// method_slot() packs the handful of valid first-byte values into a
+// dense [0..kMethodSlots) index for use as an array subscript. Slot 0
+// = "any". Unsupported bytes (typos like 'g', future HTTP verbs, or
+// garbage on the wire) return kMethodSlotInvalid so callers can
+// reject them — an earlier revision mapped them to slot 0 ("any"),
+// which silently widened a method-specific route into all-methods
+// and/or conflated distinct method-specific routes. Codex flagged
+// the silent coalescence (#41 P2); keep failure explicit.
 static constexpr u32 kMethodSlots = 8;
+static constexpr u32 kMethodSlotInvalid = 0xffffffffu;
 inline u32 method_slot(u8 method_char) {
     switch (method_char) {
         case 0:
@@ -70,7 +77,7 @@ inline u32 method_slot(u8 method_char) {
         case 'T':
             return 7;  // TRACE
         default:
-            return 0;  // unknown → treat as any
+            return kMethodSlotInvalid;
     }
 }
 
@@ -128,8 +135,15 @@ struct TrieNode {
 
 class RouteTrie {
 public:
-    static constexpr u32 kMaxNodes = 512;        // ~128 routes × ~4 segs with sharing
-    static constexpr u32 kMaxPathSegments = 16;  // longest realistic URL depth
+    static constexpr u32 kMaxNodes = 512;  // ~128 routes × ~4 segs with sharing
+    // Sized so any legal request URI or registered route fits without
+    // truncation. RouteEntry::kMaxPathLen is 128 bytes, which at a
+    // minimum per-segment cost of 2 bytes ('/' + one content byte)
+    // gives 64 segments worst case; ConnectionBase::kMaxReqPathLen is
+    // 64 bytes (→ 32 segments). Pick the larger to cover route
+    // admission. Codex flagged #41 P2 where a 16-cap rejected valid
+    // 17-segment route configs.
+    static constexpr u32 kMaxPathSegments = 64;
 
     RouteTrie() { clear(); }
 

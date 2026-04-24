@@ -1,12 +1,13 @@
 // Tests for runtime/route_trie.h: segment tokenization + trie insert/match.
 //
 // Coverage strategy: the trie has four moving parts — tokenize_segments
-// (policy), find_child (first-byte-indexed scan), insert (build), match
-// (longest-match + method fallback). Tokenize is covered by public
-// observation: insert/match depend on it, so asserting correct
-// lookup behavior across the canonical edge-case paths (multi-slash,
-// trailing slash, case) exercises tokenize indirectly, while dedicated
-// tests below pin the policy at the per-path level.
+// (policy), find_child (linear scan with full segment compare), insert
+// (build), match (longest-match + method fallback). Tokenize is
+// covered by public observation: insert/match depend on it, so
+// asserting correct lookup behavior across the canonical edge-case
+// paths (multi-slash, trailing slash, case) exercises tokenize
+// indirectly, while dedicated tests below pin the policy at the
+// per-path level.
 
 #include "rut/runtime/route_trie.h"
 #include "test.h"
@@ -162,6 +163,46 @@ TEST(route_trie, method_specific_beats_any_slot) {
     CHECK_EQ(t.match(S("/x"), 'G'), 20u);
     CHECK_EQ(t.match(S("/x"), 'P'), 10u);  // POST → any slot
     CHECK_EQ(t.match(S("/x"), 'D'), 10u);  // DELETE → any slot
+}
+
+TEST(route_trie, rejects_unsupported_method_at_insert) {
+    // Codex P2 on #41: the earlier method_slot() mapped unknown method
+    // bytes to slot 0 (any), which would silently broaden a typoed
+    // route into an all-methods route. Now unknown bytes reject at
+    // insert() cleanly so callers see the failure.
+    RouteTrie t;
+    t.clear();
+    // Lowercase 'g' (typo for GET), uppercase 'X', or any unsupported
+    // first byte must fail.
+    CHECK(!t.insert(S("/x"), 'g', 1));
+    CHECK(!t.insert(S("/x"), 'X', 1));
+    CHECK(!t.insert(S("/x"), 'Z', 1));
+    // Known chars still work.
+    CHECK(t.insert(S("/x"), 'G', 1));
+    CHECK(t.insert(S("/y"), 0, 2));  // method=0 is "any", still valid
+}
+
+TEST(route_trie, rejects_unsupported_method_at_match) {
+    // Symmetric: a request with an unsupported method byte can't
+    // match anything, even routes at the same path.
+    RouteTrie t;
+    const Insert items[] = {{"/x", 0, 10}, {"/x", 'G', 20}};
+    REQUIRE(build_ok(t, items, 2));
+    CHECK_EQ(t.match(S("/x"), 'G'), 20u);
+    CHECK_EQ(t.match(S("/x"), 'g'), TrieNode::kInvalidRoute);  // typo
+    CHECK_EQ(t.match(S("/x"), 'X'), TrieNode::kInvalidRoute);  // unknown verb
+}
+
+TEST(route_trie, admits_routes_with_more_than_16_segments) {
+    // Codex P2 on #41: kMaxPathSegments was 16, which rejected valid
+    // route configs with 17+ segments even when the path fit within
+    // RouteEntry::kMaxPathLen. Bumped to 64 to cover the worst-case
+    // 128-byte path (= 64 two-byte segments). A 17-segment path must
+    // now insert and match.
+    RouteTrie t;
+    const char* deep = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q";  // 17 segments
+    CHECK(t.insert(S(deep), 0, 99));
+    CHECK_EQ(t.match(S(deep), 0), 99u);
 }
 
 TEST(route_trie, method_first_insert_wins_on_exact_dup) {

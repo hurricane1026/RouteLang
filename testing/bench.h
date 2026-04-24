@@ -352,18 +352,24 @@ struct Bench {
         if (perf_ok) {
             // Per-iteration perf metrics — the numbers that actually
             // explain WHY something is faster or slower.
+            // Gate each line on whether the underlying counter
+            // actually opened — not just on "sum > 0". An unopened
+            // counter's value() returns 0, which is indistinguishable
+            // from a legitimate zero count, and on partial-PMU
+            // configurations (some kernels refuse cache events while
+            // granting cycles/instructions) we were printing
+            // "cache-miss: 0.0%" and "IPC: 0.00" as if they were real
+            // measurements (Codex P2 on #42).
             const u64 it = r.iterations;
-            out("                              cycles/iter: ");
-            out_u64(total_cycles / it);
-            if (total_inst > 0) {
+            if (pc.has(kPerfCycles)) {
+                out("                              cycles/iter: ");
+                out_u64(total_cycles / it);
+            }
+            if (pc.has(kPerfInstructions)) {
                 out("  inst/iter: ");
                 out_u64(total_inst / it);
             }
-            // IPC requires cycles > 0; otherwise print nothing rather
-            // than dividing by a `? : 1` fallback that would emit a
-            // huge phantom IPC on an unsupported-event / read-failure
-            // edge case.
-            if (total_cycles > 0 && total_inst > 0) {
+            if (pc.has(kPerfCycles) && pc.has(kPerfInstructions) && total_cycles > 0) {
                 // IPC × 100 (fixed-point 2 decimals)
                 const u64 ipc100 = (total_inst * 100) / total_cycles;
                 out("  IPC: ");
@@ -373,7 +379,7 @@ struct Bench {
                 if (frac < 10) out("0");
                 out_u64(frac);
             }
-            if (total_cref > 0) {
+            if (pc.has(kPerfCacheRefs) && pc.has(kPerfCacheMisses) && total_cref > 0) {
                 // PERF_COUNT_HW_CACHE_MISSES / _REFERENCES are the
                 // generic hardware cache events. On most x86 machines
                 // the kernel maps these to last-level-cache (LLC)
@@ -386,7 +392,7 @@ struct Bench {
                 out_u64(miss_thou % 10);
                 out("%");
             }
-            if (total_bmiss > 0) {
+            if (pc.has(kPerfBranchMisses)) {
                 out("  br-miss/iter: ");
                 out_u64(total_bmiss / it);
             }

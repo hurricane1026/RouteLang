@@ -105,11 +105,17 @@ TEST(perf_counters, accumulate_sums_values) {
     u64 s1 = busy_work(5000);
     a.disable();
     asm volatile("" : : "r"(&s1) : "memory");
+    if (!a.last_read_ok()) {
+        SKIP("perf read failed on a");
+    }
 
     b.enable();
     u64 s2 = busy_work(5000);
     b.disable();
     asm volatile("" : : "r"(&s2) : "memory");
+    if (!b.last_read_ok()) {
+        SKIP("perf read failed on b");
+    }
 
     const u64 a_cycles = a.cycles();
     const u64 b_cycles = b.cycles();

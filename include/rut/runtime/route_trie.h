@@ -135,7 +135,14 @@ struct TrieNode {
 
 class RouteTrie {
 public:
-    static constexpr u32 kMaxNodes = 512;  // ~128 routes × ~4 segs with sharing
+    // 128 routes × 4-segment distinct paths already need 513 nodes
+    // (root + 128*4). Codex P1 on #41 flagged that 512 was too tight
+    // to admit even that realistic shape. 2048 covers every
+    // 128-route layout up to 16 segments each with no prefix
+    // sharing — deeper worst cases (17+ segments, no sharing) are
+    // still pathological and get rejected explicitly. Memory cost:
+    // 2048 × ~290 B/node ≈ 600 KB per RouteConfig.
+    static constexpr u32 kMaxNodes = 2048;
     // Sized so any legal request URI or registered route fits without
     // truncation. RouteEntry::kMaxPathLen is 128 bytes, which at a
     // minimum per-segment cost of 2 bytes ('/' + one content byte)

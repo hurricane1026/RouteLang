@@ -157,11 +157,25 @@ struct RouteConfig {
     char header_bytes_pool[kResponseHeaderBytesPoolBytes];
     u32 header_bytes_pool_used = 0;
 
+    // Reject route paths containing '?' or '#'. These belong to the
+    // query / fragment components of a URI, which routing does not
+    // match on. Accepting them would store the raw bytes in
+    // RouteEntry::path while the trie tokenized only the pre-'?'
+    // prefix, silently broadening the stored route. Callers that
+    // accidentally pass a full URL should fail fast, not silently.
+    static bool is_routable_path(const char* path) {
+        for (u32 i = 0; path[i] != '\0'; i++) {
+            if (path[i] == '?' || path[i] == '#') return false;
+        }
+        return true;
+    }
+
     // Add a proxy route: path prefix → upstream target.
     // Returns false if table full, upstream_id invalid, or path too long.
     bool add_proxy(const char* path, u8 method, u16 upstream_id) {
         if (route_count >= kMaxRoutes) return false;
         if (upstream_id >= upstream_count) return false;
+        if (!is_routable_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -185,6 +199,7 @@ struct RouteConfig {
     // Add a static response route. Returns false if table full or path too long.
     bool add_static(const char* path, u8 method, u16 status) {
         if (route_count >= kMaxRoutes) return false;
+        if (!is_routable_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -211,6 +226,7 @@ struct RouteConfig {
     bool add_jit_handler(const char* path, u8 method, jit::HandlerFn fn) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
+        if (!is_routable_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {

@@ -2349,6 +2349,22 @@ TEST(route, add_response_body_rejects_at_capacity) {
     CHECK_EQ(cfg.add_response_body("x", 1), 0u);  // table full
 }
 
+TEST(route, add_rejects_query_and_fragment_in_path) {
+    // Route paths are static configuration and must not contain '?'
+    // or '#' — those belong to the query / fragment components of a
+    // URI and are never matched against. Accepting them would store
+    // the raw bytes in RouteEntry::path while the trie tokenized
+    // only the pre-'?' prefix, silently broadening the stored route.
+    RouteConfig cfg;
+    (void)cfg.add_upstream("x", 0x7F000001, 80);
+    CHECK(!cfg.add_static("/api?foo=1", 0, 200));
+    CHECK(!cfg.add_static("/api#frag", 0, 200));
+    CHECK(!cfg.add_proxy("/api?x", 0, 0));
+    CHECK(!cfg.add_jit_handler("/api?x", 'G', reinterpret_cast<jit::HandlerFn>(0xdeadbeef)));
+    // Plain paths still work.
+    CHECK(cfg.add_static("/api", 0, 200));
+}
+
 TEST(route, add_route_at_capacity) {
     // Fill up to RouteConfig::kMaxRoutes with a flat topology — all
     // routes as distinct children of root. This is the worst case for

@@ -193,19 +193,40 @@ static bool route_matches(const Engine::CompiledRoute& route, const char* path, 
         ri++;
         pi++;
     }
-    return true;
+    // Segment boundary at the pattern's end: after consuming all of
+    // the pattern, the path must either be fully consumed or the
+    // next byte must be a segment separator ('/' / '?' / '#'). This
+    // matches the runtime RouteTrie's segment-aware prefix rule —
+    // without it, route "/api" would match "/apix" here while the
+    // runtime trie would not, and traffic replay would report
+    // phantom mismatches. Codex flagged the divergence on #41.
+    if (pi == path_len) return true;
+    const char next = path[pi];
+    return next == '/' || next == '?' || next == '#';
 }
 
 static const Engine::CompiledRoute* select_route(const Engine& engine,
                                                  u8 method_char,
                                                  const char* path,
                                                  u32 path_len) {
+    // Longest-matching-pattern wins — matches the runtime trie's
+    // longest-match-wins selection regardless of insertion order.
+    // The first-match-wins scan used to diverge from the trie when
+    // a broader route (e.g. "/api") was registered before a more
+    // specific one ("/api/v1"): the simulator would return the
+    // broader route, the runtime would return the specific one.
+    const Engine::CompiledRoute* best = nullptr;
+    u32 best_len = 0;
     for (u32 i = 0; i < engine.route_count; i++) {
         const auto& route = engine.routes[i];
         if (route.method != 0 && route.method != method_char) continue;
-        if (route_matches(route, path, path_len)) return &route;
+        if (!route_matches(route, path, path_len)) continue;
+        if (best == nullptr || route.pattern_len > best_len) {
+            best = &route;
+            best_len = route.pattern_len;
+        }
     }
-    return nullptr;
+    return best;
 }
 
 static u32 visible_path_len(Str path) {

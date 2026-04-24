@@ -165,6 +165,20 @@ TEST(route_trie, method_specific_beats_any_slot) {
     CHECK_EQ(t.match(S("/x"), 'D'), 10u);  // DELETE → any slot
 }
 
+TEST(route_trie, tokenize_preserves_question_and_hash_bytes) {
+    // tokenize_segments no longer strips '?' or '#' — that's now the
+    // caller's job. match() shortens above '?' / '#' in the incoming
+    // request, but insert() takes paths at face value. RouteConfig's
+    // add_* rejects route paths containing those bytes so production
+    // code can't reach the weird state, but the trie itself treats
+    // "/api" and "/api?x" as distinct keys.
+    RouteTrie t;
+    const Insert items[] = {{"/api", 0, 1}};
+    REQUIRE(build_ok(t, items, 1));
+    CHECK_EQ(t.match(S("/api?x=1"), 0), 1u);
+    CHECK_EQ(t.match(S("/api#frag"), 0), 1u);
+}
+
 TEST(route_trie, rejects_unsupported_method_at_insert) {
     // Codex P2 on #41: the earlier method_slot() mapped unknown method
     // bytes to slot 0 (any), which would silently broaden a typoed

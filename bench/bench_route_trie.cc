@@ -67,6 +67,8 @@ public:
     }
 
     bool insert(Str path, u8 method_char, u16 route_idx) {
+        const u32 s = method_slot(method_char);
+        if (s == kMethodSlotInvalid) return false;  // mirror production reject
         FixedVec<Str, kMaxSegments> segs;
         if (tokenize(path, segs) > kMaxSegments) return false;
         u16 cur = 0;
@@ -84,16 +86,16 @@ public:
             }
             cur = child;
         }
-        const u32 s = method_slot(method_char);
         if (nodes[cur].route_idx_by_method[s] == Node::kInvalid)
             nodes[cur].route_idx_by_method[s] = route_idx;
         return true;
     }
 
     u16 match(Str path, u8 method_char) const {
+        const u32 s = method_slot(method_char);
+        if (s == kMethodSlotInvalid) return Node::kInvalid;  // mirror production reject
         FixedVec<Str, kMaxSegments> segs;
         if (tokenize(path, segs) > kMaxSegments) return Node::kInvalid;
-        const u32 s = method_slot(method_char);
         u16 cur = 0;
         u16 best = pick(nodes[0], s);
         for (u32 i = 0; i < segs.len; i++) {
@@ -175,6 +177,8 @@ public:
     }
 
     bool insert(Str path, u8 method_char, u16 route_idx) {
+        const u32 s = method_slot(method_char);
+        if (s == kMethodSlotInvalid) return false;  // mirror production reject
         FixedVec<Str, kMaxSegments> segs;
         if (tokenize(path, segs) > kMaxSegments) return false;
         u16 cur = 0;
@@ -190,16 +194,16 @@ public:
             }
             cur = child;
         }
-        const u32 s = method_slot(method_char);
         if (nodes[cur].route_idx_by_method[s] == Node::kInvalid)
             nodes[cur].route_idx_by_method[s] = route_idx;
         return true;
     }
 
     u16 match(Str path, u8 method_char) const {
+        const u32 s = method_slot(method_char);
+        if (s == kMethodSlotInvalid) return Node::kInvalid;  // mirror production reject
         FixedVec<Str, kMaxSegments> segs;
         if (tokenize(path, segs) > kMaxSegments) return Node::kInvalid;
-        const u32 s = method_slot(method_char);
         u16 cur = 0;
         u16 best = pick(nodes[0], s);
         for (u32 i = 0; i < segs.len; i++) {

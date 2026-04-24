@@ -16,20 +16,16 @@ namespace rut {
 // sentinel results and emit a clean build-time error.
 
 u32 RouteTrie::tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out) {
-    // Trim the query string / fragment: routing runs on the path component
-    // only (RFC 3986), and the HTTP parser hands us the raw request-target
-    // which may include `?foo=bar` or `#anchor`. Stripping here means
-    // `/health?check=1` matches a route registered as `/health`.
-    u32 end = path.len;
-    for (u32 i = 0; i < end; i++) {
-        if (path.ptr[i] == '?' || path.ptr[i] == '#') {
-            end = i;
-            break;
-        }
-    }
+    // Pure segment split — query/fragment stripping is the caller's
+    // job. Routes arrive here via RouteConfig::add_* which already
+    // rejected inputs containing '?' / '#', so insert() sees a clean
+    // path. Incoming requests go through match(), which shortens the
+    // Str above any '?' / '#' before calling tokenize. Keeping
+    // tokenize pure means the insert-vs-match round-trip always
+    // agrees on what a segment is: bytes between slashes.
     u32 start = 0;
-    for (u32 i = 0; i <= end; i++) {
-        const bool at_sep = (i == end) || (path.ptr[i] == '/');
+    for (u32 i = 0; i <= path.len; i++) {
+        const bool at_sep = (i == path.len) || (path.ptr[i] == '/');
         if (!at_sep) continue;
         if (i > start) {
             if (!out.push(Str{path.ptr + start, i - start})) return kMaxPathSegments + 1;
@@ -121,6 +117,21 @@ u16 RouteTrie::match(Str path, u8 method_char) const {
     // touching the trie. Consistent with the insert-time rejection.
     const u32 want_slot = method_slot(method_char);
     if (want_slot == kMethodSlotInvalid) return TrieNode::kInvalidRoute;
+
+    // Shorten the request path above any '?' (query) or '#' (fragment)
+    // byte so routing uses only the path component (RFC 3986). We do
+    // this at the call site rather than inside tokenize_segments so
+    // insert() stays strict about the bytes it's tokenizing — a route
+    // registered as "/health" never tokenizes to the same key as one
+    // accidentally registered as "/health?x=1".
+    u32 end = path.len;
+    for (u32 i = 0; i < path.len; i++) {
+        if (path.ptr[i] == '?' || path.ptr[i] == '#') {
+            end = i;
+            break;
+        }
+    }
+    path.len = end;
 
     FixedVec<Str, kMaxPathSegments> segs{};
     // Ignore tokenize's return value on overflow: `segs` still holds

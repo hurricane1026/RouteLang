@@ -94,6 +94,12 @@ public:
             last_values_[i] = 0;
             valid_[i] = false;
         }
+        // Clear the snapshot-validity flag too so a failed read from
+        // a previous open/enable cycle can't leak into the new
+        // session. Callers inspecting last_read_ok() before the first
+        // enable() on the re-opened group should see `true`, not a
+        // stale `false` carried over from a prior teardown.
+        last_read_ok_ = true;
 
         // Leader = CPU cycles. Disabled at start; PERF_EVENT_IOC_ENABLE
         // on the leader propagates to the whole group via
@@ -213,7 +219,15 @@ private:
         // otherwise a silent read failure quietly poisons the next
         // accumulate() and the printed cycles-per-iter becomes a
         // phantom from some prior run.
+        //
+        // Also re-optimize on success: start by assuming the read
+        // will succeed and only flip last_read_ok_ false on a
+        // concrete failure path. This way a successful read after a
+        // prior failure clears the sticky flag without requiring a
+        // matching enable() — otherwise a disable()-without-enable()
+        // would keep reporting stale "invalid snapshot".
         for (u32 i = 0; i < kPerfCounterCount; i++) last_values_[i] = 0;
+        last_read_ok_ = true;
 
         // Count how many group members were actually opened so we know
         // the minimum correct read size.

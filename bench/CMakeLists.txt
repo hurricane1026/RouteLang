@@ -28,3 +28,9 @@ target_include_directories(bench_connection PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
 )
+
+add_executable(bench_bench_demo bench_bench_demo.cc)
+target_include_directories(bench_bench_demo PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)

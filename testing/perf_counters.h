@@ -194,12 +194,28 @@ private:
         attr.exclude_kernel = 1;  // measure userspace only — kernel work is noise
         attr.exclude_hv = 1;      // skip hypervisor ticks
         attr.read_format = PERF_FORMAT_GROUP;
+        // Pin the group leader so the kernel either schedules all five
+        // counters together or refuses the open outright. Without
+        // pinning + multiplexing active, the kernel is free to
+        // time-slice counters in and out of hardware slots and
+        // PERF_FORMAT_GROUP alone gives us no way to tell (we'd need
+        // TOTAL_TIME_ENABLED / TOTAL_TIME_RUNNING to scale). Group
+        // members inherit the leader's pinning; `pinned = 1` is only
+        // valid on the leader (group_fd == -1). If pinning fails the
+        // leader open returns EINVAL — fall back to an unpinned open
+        // so benchmarks still run, just with the caveat that
+        // multiplexing (rare at only 5 counters) could bias numbers.
+        if (group_fd == -1) attr.pinned = 1;
         // pid=0 → calling process. cpu=-1 → any CPU (the scheduler may
         // migrate us; caller should pin with taskset for stability).
         // PERF_FLAG_FD_CLOEXEC sets close-on-exec on the perf fd so
         // these handles don't leak into child processes across exec()
         // — benchmarks often fork subprocesses for setup or warmup.
         long fd = perf_event_open_raw(&attr, 0, -1, group_fd, PERF_FLAG_FD_CLOEXEC);
+        if (fd < 0 && attr.pinned) {
+            attr.pinned = 0;
+            fd = perf_event_open_raw(&attr, 0, -1, group_fd, PERF_FLAG_FD_CLOEXEC);
+        }
         if (fd < 0) {
             fds_[idx] = -1;
             valid_[idx] = false;

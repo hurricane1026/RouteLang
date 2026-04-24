@@ -41,6 +41,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/types.h>  // canonical home for pid_t, used below
 #include <unistd.h>
 
 namespace rut::bench {
@@ -211,8 +212,15 @@ private:
         // EINVAL — fall back to an unpinned open so benchmarks still
         // run.
         if (group_fd == -1) attr.pinned = 1;
-        // pid=0 → calling process. cpu=-1 → any CPU (the scheduler may
-        // migrate us; caller should pin with taskset for stability).
+        // pid=0 → calling *task* (thread), not the whole process. If a
+        // benchmark spawns worker threads, their cycles / inst /
+        // cache events are NOT counted here unless inheritance is
+        // enabled or separate perf fds are opened for each worker.
+        // Bench::run runs the measured code on the calling thread so
+        // this is fine in practice, but anyone extending to a
+        // multi-thread workload needs to know.
+        // cpu=-1 → any CPU (the scheduler may migrate us; caller
+        // should pin with taskset for stability).
         // PERF_FLAG_FD_CLOEXEC sets close-on-exec on the perf fd so
         // these handles don't leak into child processes across exec()
         // — benchmarks often fork subprocesses for setup or warmup.

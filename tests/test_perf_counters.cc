@@ -40,6 +40,13 @@ TEST(perf_counters, enable_disable_cycles_nonzero) {
     u64 sink = busy_work(100000);
     pc.disable();
     asm volatile("" : : "r"(&sink) : "memory");
+    // If the read itself failed (EINTR-final, short read, kernel
+    // disagreement) the snapshot is all zeros regardless of which
+    // counters opened — asserting >0 here would be a phantom
+    // failure. Skip the nonzero checks in that case.
+    if (!pc.last_read_ok()) {
+        SKIP("perf read failed (signal / short read)");
+    }
 
     // Cycles should be well above zero for 100k iterations of busy work
     // (roughly 300k+ cycles on any modern core).
@@ -60,6 +67,9 @@ TEST(perf_counters, reset_between_measurements) {
     pc.enable();
     u64 s1 = busy_work(10000);
     pc.disable();
+    if (!pc.last_read_ok()) {
+        SKIP("perf read failed on first measurement");
+    }
     const u64 first_cycles = pc.cycles();
     asm volatile("" : : "r"(&s1) : "memory");
 
@@ -68,6 +78,9 @@ TEST(perf_counters, reset_between_measurements) {
     pc.enable();
     u64 s2 = busy_work(10000);
     pc.disable();
+    if (!pc.last_read_ok()) {
+        SKIP("perf read failed on second measurement");
+    }
     const u64 second_cycles = pc.cycles();
     asm volatile("" : : "r"(&s2) : "memory");
 

@@ -196,7 +196,10 @@ private:
         attr.read_format = PERF_FORMAT_GROUP;
         // pid=0 → calling process. cpu=-1 → any CPU (the scheduler may
         // migrate us; caller should pin with taskset for stability).
-        long fd = perf_event_open_raw(&attr, 0, -1, group_fd, 0);
+        // PERF_FLAG_FD_CLOEXEC matches the rest of the codebase's
+        // policy of setting close-on-exec on every owned fd so perf
+        // handles don't leak into child processes across fork/exec.
+        long fd = perf_event_open_raw(&attr, 0, -1, group_fd, PERF_FLAG_FD_CLOEXEC);
         if (fd < 0) {
             fds_[idx] = -1;
             valid_[idx] = false;

@@ -119,6 +119,15 @@ target_include_directories(test_perf_counters PRIVATE
 add_test(NAME test_perf_counters COMMAND test_perf_counters)
 set_tests_properties(test_perf_counters PROPERTIES LABELS "unit")
 
+add_executable(test_route_trie test_route_trie.cc)
+target_link_libraries(test_route_trie rut_runtime)
+target_include_directories(test_route_trie PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_route_trie COMMAND test_route_trie)
+set_tests_properties(test_route_trie PROPERTIES LABELS "unit")
+
 add_executable(test_rir test_rir.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_link_libraries(test_rir rut_compiler)
 target_include_directories(test_rir PRIVATE

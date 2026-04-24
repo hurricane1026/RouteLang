@@ -121,6 +121,7 @@ add_library(rut_runtime STATIC
     runtime/http_parser.cc
     runtime/chunked_parser.cc
     runtime/access_log.cc
+    runtime/route_trie.cc
     runtime/traffic_capture.cc
     ${SIMD_SOURCE}
 )

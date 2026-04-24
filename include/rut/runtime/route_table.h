@@ -5,6 +5,7 @@
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/route_trie.h"
 
 #include <errno.h>
 #include <netinet/in.h>
@@ -98,6 +99,14 @@ struct RouteConfig {
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
 
+    // Radix trie — parallel lookup structure that replaces the old O(n)
+    // linear scan. Kept in sync with `routes[]` by every add_* method: a
+    // successful route insert also inserts into the trie, and a trie
+    // insert failure rolls back the route. Segment views inside the trie
+    // point into `routes[i].path`, which is stable for the config's RCU
+    // lifetime.
+    RouteTrie trie;
+
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
 
@@ -152,6 +161,9 @@ struct RouteConfig {
         r.upstream_id = upstream_id;
         r.status_code = 0;
         r.fn = nullptr;
+        if (!trie.insert(Str{r.path, r.path_len}, method, static_cast<u16>(route_count))) {
+            return false;  // trie at capacity — refuse the route (don't leave half-added)
+        }
         route_count++;
         return true;
     }
@@ -172,6 +184,9 @@ struct RouteConfig {
         r.upstream_id = 0;
         r.status_code = status;
         r.fn = nullptr;
+        if (!trie.insert(Str{r.path, r.path_len}, method, static_cast<u16>(route_count))) {
+            return false;
+        }
         route_count++;
         return true;
     }
@@ -195,6 +210,9 @@ struct RouteConfig {
         r.upstream_id = 0;
         r.status_code = 0;
         r.fn = fn;
+        if (!trie.insert(Str{r.path, r.path_len}, method, static_cast<u16>(route_count))) {
+            return false;
+        }
         route_count++;
         return true;
     }
@@ -313,26 +331,23 @@ struct RouteConfig {
         return idx;
     }
 
-    // Match a request path (prefix match, first match wins).
-    // method_char: first char of HTTP method ('G'=GET, 'P'=POST, etc.), 0=any.
-    // Returns pointer to matching entry, or nullptr for no match (→ default 200 OK).
+    // Match a request path against the route trie.
+    // Semantics: segment-aware prefix match with longest-match-wins
+    // (routes are split on '/'; empty segments collapse; trailing '/' is
+    // equivalent to no trailing '/'; matching is case-sensitive). See
+    // route_trie.h for the full policy documentation.
+    //
+    // method_char: first char of HTTP method ('G'=GET, 'P'=POST, etc.),
+    // 0=any. A method-specific route takes precedence over an any-method
+    // route at the same path.
+    //
+    // Returns pointer to matching entry, or nullptr for no match (→
+    // default 200 OK).
     const RouteEntry* match(const u8* path_data, u32 path_len, u8 method_char) const {
-        for (u32 i = 0; i < route_count; i++) {
-            auto& r = routes[i];
-            // Method filter: 0 = any
-            if (r.method != 0 && r.method != method_char) continue;
-            // Prefix match
-            if (path_len < r.path_len) continue;
-            bool matched = true;
-            for (u32 j = 0; j < r.path_len; j++) {
-                if (path_data[j] != static_cast<u8>(r.path[j])) {
-                    matched = false;
-                    break;
-                }
-            }
-            if (matched) return &r;
-        }
-        return nullptr;  // no match → default handler
+        const u16 idx =
+            trie.match(Str{reinterpret_cast<const char*>(path_data), path_len}, method_char);
+        if (idx == TrieNode::kInvalidRoute) return nullptr;
+        return &routes[idx];
     }
 };
 

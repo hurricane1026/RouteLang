@@ -34,3 +34,10 @@ target_include_directories(bench_bench_demo PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
 )
+
+add_executable(bench_route_trie bench_route_trie.cc)
+target_link_libraries(bench_route_trie rut_runtime)
+target_include_directories(bench_route_trie PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)

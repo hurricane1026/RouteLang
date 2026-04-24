@@ -211,17 +211,23 @@ static const Engine::CompiledRoute* select_route(const Engine& engine,
                                                  u32 path_len) {
     // Longest-matching-pattern wins — matches the runtime trie's
     // longest-match-wins selection regardless of insertion order.
-    // The first-match-wins scan used to diverge from the trie when
-    // a broader route (e.g. "/api") was registered before a more
-    // specific one ("/api/v1"): the simulator would return the
-    // broader route, the runtime would return the specific one.
+    // Tie-break: when two patterns of equal length both match, a
+    // method-specific route beats an any-method one. The runtime
+    // trie's per-terminal slot table prefers the method-specific
+    // slot over the "any" slot at the same path, and Codex P2
+    // flagged that without this tie-break a `GET /x` request would
+    // diverge from the runtime when both `ANY /x` and `GET /x` are
+    // registered at equal pattern length.
     const Engine::CompiledRoute* best = nullptr;
     u32 best_len = 0;
     for (u32 i = 0; i < engine.route_count; i++) {
         const auto& route = engine.routes[i];
         if (route.method != 0 && route.method != method_char) continue;
         if (!route_matches(route, path, path_len)) continue;
-        if (best == nullptr || route.pattern_len > best_len) {
+        const bool beats_on_length = best == nullptr || route.pattern_len > best_len;
+        const bool beats_on_specificity = best != nullptr && route.pattern_len == best_len &&
+                                          route.method != 0 && best->method == 0;
+        if (beats_on_length || beats_on_specificity) {
             best = &route;
             best_len = route.pattern_len;
         }

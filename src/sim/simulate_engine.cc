@@ -202,12 +202,20 @@ static bool route_matches(const Engine::CompiledRoute& route, const char* path, 
             ri++;
             while (ri < pattern_len && route.pattern[ri] != '/') ri++;
             const u32 param_start = pi;
-            while (pi < path_len && path[pi] != '/' && path[pi] != '?') pi++;
+            // A URI segment is bounded by '/' and by the '?' / '#'
+            // that starts the query / fragment. The runtime trie
+            // strips both before tokenizing; the simulator needs to
+            // stop the param scan at the same boundary or the
+            // captured value will include "?foo=1" bytes.
+            while (pi < path_len && path[pi] != '/' && path[pi] != '?' && path[pi] != '#') pi++;
             if (pi == param_start) return false;
             continue;
         }
         if (pi >= path_len) return false;
-        if (path[pi] == '?') return false;
+        // Query / fragment begins: stop matching the pattern against
+        // the literal path component. If the pattern still has bytes
+        // to consume past this point, it can't be a match.
+        if (path[pi] == '?' || path[pi] == '#') return false;
         if (route.pattern[ri] != path[pi]) return false;
         ri++;
         pi++;

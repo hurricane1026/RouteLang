@@ -171,7 +171,15 @@ struct RouteConfig {
     }
 
     // Add a proxy route: path prefix → upstream target.
-    // Returns false if table full, upstream_id invalid, or path too long.
+    // Returns false if:
+    //   - the route table is full (route_count at kMaxRoutes),
+    //   - upstream_id is out of range,
+    //   - the path is too long to fit RouteEntry::path,
+    //   - the path contains '?' or '#' (reserved for query /
+    //     fragment, not routed on),
+    //   - the method byte is unsupported (see method_slot()),
+    //   - the path would have more than kMaxPathSegments segments,
+    //   - or the trie has run out of node / children capacity.
     bool add_proxy(const char* path, u8 method, u16 upstream_id) {
         if (route_count >= kMaxRoutes) return false;
         if (upstream_id >= upstream_count) return false;
@@ -196,7 +204,10 @@ struct RouteConfig {
         return true;
     }
 
-    // Add a static response route. Returns false if table full or path too long.
+    // Add a static response route. Returns false for the same set of
+    // failure conditions as add_proxy() (route-table / path-length /
+    // '?' / '#' / method / trie-capacity), ignoring the upstream-id
+    // check that only applies to proxy routes.
     bool add_static(const char* path, u8 method, u16 status) {
         if (route_count >= kMaxRoutes) return false;
         if (!is_routable_path(path)) return false;
@@ -222,7 +233,14 @@ struct RouteConfig {
 
     // Add a JIT-handler route. Handler is invoked on match; its HandlerResult
     // tells the runtime what to do next (return status, forward, or yield).
-    // Returns false if table full, path too long, or fn is null.
+    // Returns false if:
+    //   - the route table is full,
+    //   - fn is null,
+    //   - the path is too long for RouteEntry::path,
+    //   - the path contains '?' or '#',
+    //   - the method byte is unsupported,
+    //   - the path would exceed kMaxPathSegments,
+    //   - or the trie has run out of node / children capacity.
     bool add_jit_handler(const char* path, u8 method, jit::HandlerFn fn) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;

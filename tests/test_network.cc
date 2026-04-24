@@ -2350,24 +2350,23 @@ TEST(route, add_response_body_rejects_at_capacity) {
 }
 
 TEST(route, add_route_at_capacity) {
-    // Fill up to RouteConfig::kMaxRoutes with a nested topology — a flat
-    // sibling structure ("/000", "/001", …) would overflow the trie's
-    // per-node child cap (TrieNode::kMaxChildren = 32) long before
-    // hitting the route-count cap. A realistic gateway never has
-    // that many flat siblings anyway; distribute across a few top-level
-    // groups so the trie can hold all 128 and the route-count check is
-    // what actually fires.
+    // Fill up to RouteConfig::kMaxRoutes with a flat topology — all
+    // routes as distinct children of root. This is the worst case for
+    // the per-node children cap, and with TrieNode::kMaxChildren ==
+    // RouteConfig::kMaxRoutes the trie must accept the whole
+    // configuration without rejecting on topology. If a future change
+    // narrows kMaxChildren, this test catches the behavioral
+    // regression immediately — the earlier pre-trie linear scan
+    // accepted this shape fine.
     RouteConfig cfg;
     (void)cfg.add_upstream("x", 0x7F000001, 80);
-    const char group_letters[] = "abcdefgh";  // 8 groups × 16 subpaths = 128
     for (u32 i = 0; i < RouteConfig::kMaxRoutes; i++) {
         char path[8];
         path[0] = '/';
-        path[1] = group_letters[i / 16];
-        path[2] = '/';
-        path[3] = static_cast<char>('0' + (i / 10) % 10);
-        path[4] = static_cast<char>('0' + i % 10);
-        path[5] = '\0';
+        path[1] = static_cast<char>('0' + (i / 100) % 10);
+        path[2] = static_cast<char>('0' + (i / 10) % 10);
+        path[3] = static_cast<char>('0' + i % 10);
+        path[4] = '\0';
         CHECK(cfg.add_proxy(path, 0, 0));
     }
     CHECK(!cfg.add_proxy("/overflow", 0, 0));  // full — route_count cap hit

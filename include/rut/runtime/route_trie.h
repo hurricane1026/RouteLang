@@ -85,12 +85,16 @@ inline u32 method_slot(u8 method_char) {
 // `segment` is the non-empty text of the path segment leading into it.
 
 struct TrieNode {
-    // 32 covers realistic gateway fan-outs: even a root that holds every
-    // top-level API segment ("/api", "/auth", "/admin", health/metrics/…)
-    // plus a handful of static paths fits cleanly. Per-node child
-    // storage is 32 × 2B child idx (plus FixedVec length overhead) —
-    // well under a cacheline even for the widest realistic parent.
-    static constexpr u32 kMaxChildren = 32;
+    // Sized to match RouteConfig::kMaxRoutes exactly. A config that
+    // declares 128 routes all as distinct children of the same parent
+    // (e.g. 128 top-level paths under root) must not be rejected on
+    // topology alone — that would narrow the capacity contract the
+    // pre-trie linear scan already honored (Codex P1 on #41). Most
+    // inner nodes use very little of this (gateway routes rarely
+    // have wide fan-out past root); the wasted-slots memory is
+    // 128 × 2B − actual_children × 2B per node, tolerable at 512
+    // nodes total.
+    static constexpr u32 kMaxChildren = 128;
 
     // Edge label: the path segment that leads INTO this node. Non-owning,
     // points into the original RouteEntry::path buffer on RouteConfig.

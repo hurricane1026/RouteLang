@@ -240,19 +240,21 @@ TEST(route_trie, insert_atomic_on_child_cap_overflow) {
     // and all children would collapse onto the same segment.
     RouteTrie t;
     static constexpr u32 kN = TrieNode::kMaxChildren;
+    // 3-digit decimal encoding (/000../127) — fits kMaxChildren up to
+    // 999 and keeps every segment's bytes distinct so find_child can't
+    // coincidentally match two of our fill paths onto the same child.
     char paths[kN][8] = {};
     for (u32 i = 0; i < kN; i++) {
         paths[i][0] = '/';
-        u32 n = 1;
-        const u32 d0 = i / 10;
-        const u32 d1 = i % 10;
-        if (d0 > 0) paths[i][n++] = static_cast<char>('0' + d0);
-        paths[i][n++] = static_cast<char>('0' + d1);
-        REQUIRE(t.insert(Str{paths[i], n}, 0, static_cast<u16>(i)));
+        paths[i][1] = static_cast<char>('0' + (i / 100) % 10);
+        paths[i][2] = static_cast<char>('0' + (i / 10) % 10);
+        paths[i][3] = static_cast<char>('0' + i % 10);
+        REQUIRE(t.insert(Str{paths[i], 4}, 0, static_cast<u16>(i)));
     }
     const u32 saturated_count = t.node_count();
     // Every insert from here on must hit root's child cap. None
-    // should grow node_count (what the old insert() leaked).
+    // should grow node_count (what the old insert() used to leak).
+    // Use /zXX segments that can't collide with any /NNN above.
     char overflow_paths[100][4] = {};
     for (u32 i = 0; i < 100; i++) {
         overflow_paths[i][0] = '/';

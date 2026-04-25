@@ -97,6 +97,16 @@ struct RouteConfig {
     // by handle_jit_outcome in callbacks_impl.h.
     static constexpr u32 kMaxHeadersPerSet = 32;
 
+    // Non-copyable: the embedded `trie` stores non-owning Str views
+    // pointing into routes[].path. A by-value copy would leave the
+    // copy's trie referencing the original's path buffers — a use-
+    // after-free as soon as the original is modified or destroyed.
+    // RouteConfig is published via `const RouteConfig*` for RCU swap;
+    // there's no production codepath that needs to copy one.
+    RouteConfig() = default;
+    RouteConfig(const RouteConfig&) = delete;
+    RouteConfig& operator=(const RouteConfig&) = delete;
+
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
 
@@ -130,9 +140,10 @@ struct RouteConfig {
     // configs); the linear-scan default tolerates any string but
     // applying the same gate uniformly keeps add_* semantics
     // consistent across dispatch choices.
-    //   - Must be non-null and start with '/'. Empty path normalizes
-    //     to the root catchall under the trie; "api" without leading
-    //     slash collides with "/api" the same way.
+    //   - Must be non-null, non-empty, and start with '/'. An empty
+    //     string and "api" without a leading slash are rejected
+    //     rather than implicitly normalized — the trie's root and
+    //     "/api" terminal would otherwise collide silently.
     //   - Must not contain '?' or '#': those mark query/fragment in a
     //     URI and routing doesn't match on them. RouteTrie::match()
     //     strips them from incoming requests.
@@ -180,6 +191,28 @@ struct RouteConfig {
     char header_bytes_pool[kResponseHeaderBytesPoolBytes];
     u32 header_bytes_pool_used = 0;
 
+    // Populate the active dispatch's state with a newly-written
+    // routes[route_count] entry. Returns false on a structural
+    // capacity hit in that dispatch's data structure (e.g., trie
+    // node-pool exhaustion). NOOP when the active dispatch reads
+    // routes[] directly (linear scan), so route admission for the
+    // default dispatch is never gated on a non-active impl's limits
+    // — matches the documented "pay only for the active dispatch"
+    // contract that the storage refactor will make literal.
+    //
+    // Per-impl branches stay narrow: the body of each branch is
+    // exactly the call to that impl's `insert`. As more dispatches
+    // land we add a branch here; the rest of add_* doesn't change.
+    bool populate_dispatch_state(const RouteEntry& r) {
+        const Str path_view{r.path, r.path_len};
+        const u16 idx = static_cast<u16>(route_count);
+        if (dispatch == &kSegmentTrieDispatch) {
+            return trie.insert(path_view, r.method, idx);
+        }
+        // kLinearScanDispatch: routes[] IS the data.
+        return true;
+    }
+
     // Add a proxy route: path prefix → upstream target.
     // Returns false if:
     //   - the route table is full,
@@ -187,7 +220,7 @@ struct RouteConfig {
     //   - the path is malformed (see is_routable_path),
     //   - the path is too long for RouteEntry::path,
     //   - the method byte isn't recognized,
-    //   - the trie has run out of node / children capacity.
+    //   - the active dispatch's state ran out of capacity.
     bool add_proxy(const char* path, u8 method, u16 upstream_id) {
         if (route_count >= kMaxRoutes) return false;
         if (upstream_id >= upstream_count) return false;
@@ -205,8 +238,8 @@ struct RouteConfig {
         r.upstream_id = upstream_id;
         r.status_code = 0;
         r.fn = nullptr;
-        if (!trie.insert(Str{r.path, r.path_len}, method, static_cast<u16>(route_count))) {
-            return false;  // trie at capacity — refuse the route, leave nothing half-added
+        if (!populate_dispatch_state(r)) {
+            return false;  // active dispatch at capacity — fail loud
         }
         route_count++;
         return true;
@@ -230,7 +263,7 @@ struct RouteConfig {
         r.upstream_id = 0;
         r.status_code = status;
         r.fn = nullptr;
-        if (!trie.insert(Str{r.path, r.path_len}, method, static_cast<u16>(route_count))) {
+        if (!populate_dispatch_state(r)) {
             return false;
         }
         route_count++;
@@ -257,7 +290,7 @@ struct RouteConfig {
         r.upstream_id = 0;
         r.status_code = 0;
         r.fn = fn;
-        if (!trie.insert(Str{r.path, r.path_len}, method, static_cast<u16>(route_count))) {
+        if (!populate_dispatch_state(r)) {
             return false;
         }
         route_count++;

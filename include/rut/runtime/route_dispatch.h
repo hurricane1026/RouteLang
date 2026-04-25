@@ -45,13 +45,20 @@ struct RouteConfig;
 constexpr u16 kRouteIdxInvalid = 0xffffu;
 
 struct RouteDispatch {
-    // Look up `path` (the request-target path, NOT including any '?'
-    // query or '#' fragment — the caller is expected to have stripped
-    // those if the impl doesn't strip internally; see linear_scan_match
-    // for the byte-prefix semantics this impl uses).
+    // Look up the request-target `path` and resolve to a route index.
     //
-    // `method` is the first byte of the HTTP method (G/P/D/H/O/C/T) or
-    // 0 for "any". 0 in a route entry matches any request method.
+    // Path bytes: `path` is the raw request-target as parsed (the bytes
+    // between method and HTTP/version). It MAY contain a '?' query
+    // string and/or '#' fragment — each impl is responsible for any
+    // stripping its matching policy needs. The default linear scan
+    // matches by byte prefix and so naturally handles "/api?q=1" via
+    // a route at "/api" (the route's bytes match the leading bytes of
+    // the request, regardless of what follows). The segment trie
+    // strips '?' / '#' explicitly before tokenizing. New impls should
+    // declare and uphold whichever policy is right for their shape.
+    //
+    // `method`: first byte of the HTTP method (G/P/D/H/O/C/T) or 0
+    // for "any". 0 in a route entry matches any request method.
     //
     // Returns the route index in RouteConfig::routes[], or
     // kRouteIdxInvalid on no match. Callers (RouteConfig::match) turn

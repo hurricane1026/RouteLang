@@ -2310,6 +2310,87 @@ TEST(route, add_upstream_at_capacity) {
     CHECK(!cfg.add_upstream("overflow", 0x7F000001, 9999).has_value());  // full
 }
 
+// ============================================================================
+// is_routable_path rejection — PR-A added a uniform path-validation gate
+// to add_*. These tests pin the rejected shapes so a regression doesn't
+// silently relax the contract.
+// ============================================================================
+
+TEST(route, add_rejects_null_path) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_static(nullptr, 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_rejects_empty_path) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_static("", 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_rejects_path_without_leading_slash) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_static("api", 0, 200));
+    CHECK(!cfg.add_static("api/v1", 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_rejects_path_with_query) {
+    // '?' belongs to the query component of a URI; matching is on path
+    // only. Routing on a path with '?' would be surprising — at match
+    // time the segment trie strips it from the request, so the route
+    // would be effectively unmatchable.
+    RouteConfig cfg;
+    (void)cfg.add_upstream("u", 0x7F000001, 80);
+    CHECK(!cfg.add_static("/api?foo=1", 0, 200));
+    CHECK(!cfg.add_proxy("/api?x", 0, 0));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_rejects_path_with_fragment) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_static("/api#frag", 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_accepts_well_formed_path_after_rejection) {
+    // A previous rejected add_* must not poison route_count or leave
+    // partial state — a follow-up valid add_* should succeed.
+    RouteConfig cfg;
+    CHECK(!cfg.add_static("api", 0, 200));    // missing leading '/'
+    CHECK(!cfg.add_static("/x?y", 0, 200));   // has '?'
+    CHECK(!cfg.add_static(nullptr, 0, 200));  // null
+    CHECK_EQ(cfg.route_count, 0u);
+    CHECK(cfg.add_static("/api", 0, 200));  // valid
+    CHECK_EQ(cfg.route_count, 1u);
+}
+
+TEST(route, default_dispatch_admits_route_when_trie_would_fail) {
+    // The default linear-scan dispatch reads routes[] directly; a trie
+    // capacity exhaustion must NOT reject the route. The PR-A reviewer
+    // flagged that add_* used to gate on trie.insert() unconditionally,
+    // so configs whose paths are linear-scan-fine but trie-unfriendly
+    // would be wrongly rejected. This test pins the fix.
+    //
+    // We can't easily exhaust the trie at kMaxNodes=4097 in a unit
+    // test without making it absurdly long, so instead we verify the
+    // smaller observable: when dispatch == kLinearScanDispatch (the
+    // default), populate_dispatch_state is a no-op and add_* always
+    // succeeds for any well-formed path within RouteEntry::kMaxPathLen.
+    RouteConfig cfg;
+    REQUIRE(&kLinearScanDispatch == cfg.dispatch);
+    for (u32 i = 0; i < RouteConfig::kMaxRoutes; i++) {
+        char path[8];
+        path[0] = '/';
+        path[1] = static_cast<char>('a' + (i / 100) % 26);
+        path[2] = static_cast<char>('a' + (i / 10) % 26);
+        path[3] = static_cast<char>('a' + i % 26);
+        path[4] = '\0';
+        CHECK(cfg.add_static(path, 0, 200));
+    }
+    CHECK_EQ(cfg.route_count, RouteConfig::kMaxRoutes);
+}
+
 TEST(route, add_response_body_basic) {
     RouteConfig cfg;
     const u16 idx = cfg.add_response_body("Hello", 5);

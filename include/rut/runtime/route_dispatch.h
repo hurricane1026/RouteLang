@@ -94,4 +94,12 @@ extern const RouteDispatch kHashFullPathDispatch;
 // route_hash_first_seg.h.
 extern const RouteDispatch kHashFirstSegmentDispatch;
 
+// Byte-level edge-compressed radix trie (RouteConfig::byte_radix_state).
+// Longest-prefix-match in BYTES, not segments — so the selector picks
+// this only for configs without segment-boundary semantics (no
+// `:param`, no overlapping segment-distinguished routes). See
+// route_byte_radix.h for the contract and the bench data behind the
+// choice.
+extern const RouteDispatch kByteRadixDispatch;
+
 }  // namespace rut

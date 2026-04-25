@@ -5,6 +5,7 @@
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/route_byte_radix.h"
 #include "rut/runtime/route_dispatch.h"
 #include "rut/runtime/route_hash_first_seg.h"
 #include "rut/runtime/route_hash_full.h"
@@ -143,7 +144,8 @@ struct RouteConfig {
     // and state-build gate).
     static bool is_canonical_dispatch(const RouteDispatch* d) {
         return d == &kLinearScanDispatch || d == &kSegmentTrieDispatch ||
-               d == &kHashFullPathDispatch || d == &kHashFirstSegmentDispatch;
+               d == &kHashFullPathDispatch || d == &kHashFirstSegmentDispatch ||
+               d == &kByteRadixDispatch;
     }
 
     // Segment-aware radix trie. Populated by add_* only when the
@@ -175,6 +177,13 @@ struct RouteConfig {
     // a first segment with another (otherwise plain linear scan is
     // just as fast and uses no per-impl memory).
     HashFirstSegmentTable hash_first_seg_state;
+
+    // Byte-level edge-compressed radix trie. ~18 KB inline (256
+    // nodes × ~70 B). Selected by the picker when the route set
+    // benefits from byte-level prefix sharing AND doesn't depend
+    // on segment-boundary precedence — see route_byte_radix.h for
+    // the contract distinction from SegmentTrie.
+    ByteRadixTrie byte_radix_state;
 
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
@@ -264,6 +273,9 @@ struct RouteConfig {
         }
         if (dispatch_ == &kHashFirstSegmentDispatch) {
             return hash_first_seg_state.insert(path_view, r.method, idx);
+        }
+        if (dispatch_ == &kByteRadixDispatch) {
+            return byte_radix_state.insert(path_view, r.method, idx);
         }
         if (dispatch_ == &kLinearScanDispatch) {
             // routes[] IS the data — nothing else to populate.

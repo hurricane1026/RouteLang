@@ -2365,6 +2365,19 @@ TEST(route, add_accepts_well_formed_path_after_rejection) {
     CHECK_EQ(cfg.route_count, 1u);
 }
 
+TEST(route, add_rejects_unknown_dispatch) {
+    // Copilot P2 on #43 round 2: set_dispatch() accepts any non-null
+    // RouteDispatch*, so a caller could install a copy of (or a custom)
+    // vtable. populate_dispatch_state() must fail-closed for unknown
+    // dispatch pointers — otherwise routes are admitted with no state
+    // built and match() systematically misses.
+    RouteDispatch fake_vtable = kLinearScanDispatch;  // structural copy
+    RouteConfig cfg;
+    REQUIRE(cfg.set_dispatch(&fake_vtable));  // accepted (any non-null)
+    CHECK(!cfg.add_static("/api", 0, 200));   // refused at populate
+    CHECK_EQ(cfg.route_count, 0u);            // no half-added entry
+}
+
 TEST(route, set_dispatch_refuses_after_first_add) {
     // Codex P1 on #43 round 2: flipping dispatch after add_* would
     // leave earlier routes invisible to the new dispatch's data

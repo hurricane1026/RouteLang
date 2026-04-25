@@ -195,25 +195,33 @@ struct RouteConfig {
     u32 header_bytes_pool_used = 0;
 
     // Populate the active dispatch's state with a newly-written
-    // routes[route_count] entry. Returns false on a structural
-    // capacity hit in that dispatch's data structure (e.g., trie
-    // node-pool exhaustion). NOOP when the active dispatch reads
-    // routes[] directly (linear scan), so route admission for the
-    // default dispatch is never gated on a non-active impl's limits
-    // — matches the documented "pay only for the active dispatch"
-    // contract that the storage refactor will make literal.
+    // routes[route_count] entry. Returns false on:
+    //   - a structural capacity hit in that dispatch's data
+    //     structure (e.g., trie node-pool exhaustion),
+    //   - an unknown / non-canonical dispatch pointer.
     //
-    // Per-impl branches stay narrow: the body of each branch is
-    // exactly the call to that impl's `insert`. As more dispatches
-    // land we add a branch here; the rest of add_* doesn't change.
+    // The fail-closed default is deliberate (Copilot P2 on #43
+    // round 2): set_dispatch() accepts any non-null
+    // RouteDispatch*, so a caller could in principle install a
+    // copy of one of the canonical vtables (or a custom one).
+    // Without explicit per-impl handling the state for that
+    // dispatch wouldn't be built, and match() would systematically
+    // miss. Refusing add_* in that case keeps the failure loud.
+    //
+    // Branches are narrow — body of each is exactly that impl's
+    // `insert`. New impls add a branch here; the rest of add_*
+    // doesn't change.
     bool populate_dispatch_state(const RouteEntry& r) {
         const Str path_view{r.path, r.path_len};
         const u16 idx = static_cast<u16>(route_count);
         if (dispatch_ == &kSegmentTrieDispatch) {
             return trie.insert(path_view, r.method, idx);
         }
-        // kLinearScanDispatch: routes[] IS the data.
-        return true;
+        if (dispatch_ == &kLinearScanDispatch) {
+            // routes[] IS the data — nothing else to populate.
+            return true;
+        }
+        return false;  // unknown dispatch — refuse so the misroute is loud
     }
 
     // Add a proxy route: path prefix → upstream target.
@@ -222,8 +230,14 @@ struct RouteConfig {
     //   - upstream_id is out of range,
     //   - the path is malformed (see is_routable_path),
     //   - the path is too long for RouteEntry::path,
-    //   - the method byte isn't recognized,
-    //   - the active dispatch's state ran out of capacity.
+    //   - the active dispatch rejects the (path, method) pair while
+    //     populating its state — for example, the segment trie
+    //     refuses unrecognized method bytes. The default linear
+    //     scan accepts any method byte verbatim, so method
+    //     validation is effectively dispatch-dependent here.
+    //   - the active dispatch's state ran out of capacity,
+    //   - the active dispatch is not one of the canonical singletons
+    //     (see populate_dispatch_state).
     bool add_proxy(const char* path, u8 method, u16 upstream_id) {
         if (route_count >= kMaxRoutes) return false;
         if (upstream_id >= upstream_count) return false;

@@ -38,19 +38,36 @@
 // Heuristics implemented (each justified by bench data; see
 // bench/bench_route_trie.cc on closed #41):
 //
-//   `:param` segments        → SegmentTrie (only impl that supports
-//                              segment-bound parameter capture; once
-//                              the .rut frontend grows :param syntax)
-//   route count ≤ 16         → LinearScan (early-exit on hot prefixes
-//                              + zero indirection wins at small N)
-//   prefix-overlap routes    → ByteRadix (longest-prefix in bytes;
-//                              hash variants give up prefix semantics)
+//   `:param` segments         → SegmentTrie (only impl that supports
+//                               segment-bound parameter capture; once
+//                               the .rut frontend grows :param syntax)
+//   route count ≤ 16          → LinearScan (early-exit on hot prefixes
+//                               + zero indirection wins at small N)
+//   segment-boundary-sensitive
+//     prefix overlap          → SegmentTrie (e.g., /api + /apix
+//                               registered together; ByteRadix's
+//                               byte-prefix semantics would mis-handle
+//                               request /apij — Copilot on #47 r1)
+//   segment-aligned prefix
+//     overlap, count fits     → ByteRadix (longest-prefix in bytes;
+//                               hash variants give up prefix semantics)
 //   diverse first segments
-//     + bucket-fit           → HashFirstSegment
-//   otherwise (exact-match)  → HashFullPath
+//     + bucket-fit, no
+//     prefix overlap          → HashFirstSegment (still byte-prefix
+//                               within a bucket, so /api/users matches
+//                               request /api/users/42)
+//   everything else           → SegmentTrie (unconditionally correct;
+//                               HashFullPath is intentionally NOT a
+//                               default fallback — it's exact-match
+//                               only and would silently turn prefix
+//                               hits into misses, Codex P1 on #47 r1)
 //
 // Out of scope here, deferred to follow-up PRs:
-//   - `:param` detection (the .rut DSL doesn't yet emit them)
+//   - `:param`-emitting frontend / parameter capture wired through to
+//     the runtime (RouteAnalysis already detects `:param`-shaped
+//     segments so the picker's branch is correct the moment the
+//     compiler starts emitting them; this bullet refers to the .rut
+//     DSL surface and capture extraction semantics)
 //   - Perfect-hash construction
 //   - Run-time recalibration based on observed traffic shape
 //
@@ -97,17 +114,32 @@ public:
 
     u32 count() const { return n_; }
 
-    // True iff any registered path is a strict prefix of another (in
-    // bytes). Hash variants (HashFullPath / HashFirstSegment exact
-    // mode) can't preserve linear-scan first-match-wins precedence
-    // across overlapping prefixes, so this flag steers the picker
-    // toward longest-prefix-capable impls (SegmentTrie, ByteRadix).
+    // True iff any registered path is a strict byte-prefix of another.
+    // Hash variants (HashFullPath / HashFirstSegment exact mode) can't
+    // preserve linear-scan first-match-wins precedence across
+    // overlapping prefixes, so this flag steers the picker toward
+    // longest-prefix-capable impls (SegmentTrie, ByteRadix).
     bool has_prefix_overlap() const { return has_prefix_overlap_; }
 
-    // True iff any path contains a `:param` segment marker. Currently
-    // always false — the .rut frontend doesn't emit them yet — but
-    // the picker hooks into it so the selector reads correctly when
-    // that work lands.
+    // True iff a strict byte-prefix overlap exists where the first
+    // byte BEYOND the shorter path (in the longer path) is not '/'.
+    // E.g., /api and /apix — the overlap doesn't respect segment
+    // boundaries. ByteRadix matches by bytes only, so for these
+    // configs it would route an intermediate request like /apij to
+    // /api silently — segment-aware tries treat the same request as
+    // a miss. The picker steers boundary-sensitive configs to
+    // SegmentTrie so dispatch behaviour matches segment intent.
+    // Implies has_prefix_overlap() — a config with this flag set
+    // necessarily has a strict prefix pair.
+    bool has_segment_boundary_sensitive_overlap() const {
+        return has_segment_boundary_sensitive_overlap_;
+    }
+
+    // True iff any path contains a `:param` segment marker. The
+    // detection is implemented (path_has_param_segment in the .cc),
+    // but the .rut DSL doesn't emit `:foo` syntax yet — so on real
+    // configs today this stays false. The picker's branch is in place
+    // for the day the frontend grows the syntax.
     bool has_param_segments() const { return has_param_segments_; }
 
     // Largest count of routes sharing a first-segment hash bucket
@@ -125,9 +157,9 @@ public:
 
 private:
     Str paths_[kMaxPaths];
-    u8 methods_[kMaxPaths];
     u32 n_ = 0;
     bool has_prefix_overlap_ = false;
+    bool has_segment_boundary_sensitive_overlap_ = false;
     bool has_param_segments_ = false;
     u32 bucket_counts_[HashFirstSegmentTable::kBuckets];
     // distinct first segments are reconstructed on demand from paths_

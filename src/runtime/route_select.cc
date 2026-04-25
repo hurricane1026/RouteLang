@@ -2,7 +2,6 @@
 
 #include "rut/runtime/route_byte_radix.h"
 #include "rut/runtime/route_hash_first_seg.h"
-#include "rut/runtime/route_hash_full.h"
 
 namespace rut {
 
@@ -59,6 +58,30 @@ bool is_strict_byte_prefix(Str a, Str b) {
     return true;
 }
 
+// Given that `a` is a strict byte-prefix of `b`, returns true iff the
+// next byte in `b` (the byte immediately past the shared prefix) is
+// not '/'. That's the "segment-boundary-sensitive overlap" case —
+// /api vs /apix, where byte-prefix and segment-prefix dispatch would
+// give different answers for an intermediate request like /apij.
+// Caller must establish the strict-prefix relationship; we don't
+// reverify because the call sites already did.
+bool boundary_sensitive_after_prefix(Str shorter, Str longer) {
+    return longer.ptr[shorter.len] != '/';
+}
+
+// Largest route count that ByteRadix can absorb in the worst case
+// without tripping its node-pool cap. Each insert can split an edge
+// (1 new node) and add a leaf (1 more), so the strict upper bound is
+// 1 + 2N nodes. With ByteRadixTrie::kMaxNodes = 256, that admits
+// N ≤ 127. Realistic configs with prefix sharing fit far more, but
+// the picker is the trusted source of dispatch correctness — we keep
+// the conservative bound so a worst-case-shape config can never make
+// it past pick_dispatch and into a partial-build failure during
+// add_*. Codex P1 on #47 round 1 (the round-3 fan-out bump on #46
+// fixed the 16-children failure mode but the total-node ceiling
+// remains a separate constraint).
+constexpr u32 kByteRadixSafeMaxRoutes = (ByteRadixTrie::kMaxNodes - 1) / 2;
+
 }  // namespace
 
 Str RouteAnalysis::first_segment(Str p) {
@@ -82,18 +105,48 @@ u32 RouteAnalysis::first_seg_bucket(Str seg) {
 }
 
 bool RouteAnalysis::note_route(Str path, u8 method) {
+    // method is part of the (path, method) registration key callers
+    // already track; keeping the parameter in the API surface lets a
+    // future method-aware heuristic land without a signature churn.
+    // No current selector signal is method-dependent, so we don't
+    // store it. (Copilot on #47 round 1 flagged dead methods_ storage.)
+    (void)method;
     if (n_ >= kMaxPaths) return false;
 
-    // Update prefix-overlap flag against everything seen so far.
+    // Update prefix-overlap flags against everything seen so far.
     // O(N) per insert; bounded at kMaxPaths so total work is O(N²)
     // in the worst case, ~16K compares for the cap. Cheap relative
     // to the route-build cost the caller's already paying.
-    if (!has_prefix_overlap_) {
+    //
+    // Two flags piggyback on the same scan:
+    //   - has_prefix_overlap: any strict byte-prefix pair.
+    //   - has_segment_boundary_sensitive_overlap: a strict-prefix pair
+    //     whose continuation byte in the longer path is not '/'.
+    //     Boundary-sensitive overlaps disqualify ByteRadix because
+    //     its byte-prefix semantics would diverge from segment-aware
+    //     routing for in-between requests (e.g. /api + /apix → /apij
+    //     hits /api in byte mode, misses in segment mode).
+    if (!has_prefix_overlap_ || !has_segment_boundary_sensitive_overlap_) {
         for (u32 i = 0; i < n_; i++) {
-            if (is_strict_byte_prefix(path, paths_[i]) || is_strict_byte_prefix(paths_[i], path)) {
-                has_prefix_overlap_ = true;
-                break;
+            const Str& other = paths_[i];
+            Str shorter;
+            Str longer;
+            if (is_strict_byte_prefix(path, other)) {
+                shorter = path;
+                longer = other;
+            } else if (is_strict_byte_prefix(other, path)) {
+                shorter = other;
+                longer = path;
+            } else {
+                continue;
             }
+            has_prefix_overlap_ = true;
+            if (!has_segment_boundary_sensitive_overlap_ &&
+                boundary_sensitive_after_prefix(shorter, longer)) {
+                has_segment_boundary_sensitive_overlap_ = true;
+            }
+            // Both flags set → no further information to gather.
+            if (has_segment_boundary_sensitive_overlap_) break;
         }
     }
 
@@ -104,7 +157,6 @@ bool RouteAnalysis::note_route(Str path, u8 method) {
     bucket_counts_[first_seg_bucket(first_segment(path))]++;
 
     paths_[n_] = path;
-    methods_[n_] = method;
     n_++;
     return true;
 }
@@ -145,25 +197,47 @@ const RouteDispatch* pick_dispatch(const RouteAnalysis& a) {
     // indexed alternative.
     if (a.count() <= kLinearScanCutoff) return &kLinearScanDispatch;
 
-    // Routes that overlap as byte prefixes need longest-prefix
-    // matching; hash variants would lose precedence. ByteRadix beats
-    // SegmentTrie on the bench whenever we can use it (no params),
-    // so this branch picks ByteRadix for the prefix-overlap, no-param
-    // case. SegmentTrie is reserved for the param-capture path
-    // exclusively (above).
-    if (a.has_prefix_overlap()) return &kByteRadixDispatch;
+    // Boundary-sensitive overlap (e.g. /api + /apix registered
+    // together) disqualifies ByteRadix — its byte-prefix view would
+    // mis-route intermediate requests. SegmentTrie is the only impl
+    // that gives the segment-aware answer for these configs.
+    // (Copilot on #47 round 1.)
+    if (a.has_segment_boundary_sensitive_overlap()) return &kSegmentTrieDispatch;
 
-    // No prefix overlap, no params — exact-match hash variants are
-    // admissible. Choose HashFirstSegment when (a) the per-bucket
-    // cap holds and (b) first-segment hashing actually distributes
-    // (≥ kMinDistinctFirstSegmentsForFirstSeg). Otherwise
-    // HashFullPath, which is constant-time and unconditionally
-    // applicable.
+    // Pure segment-aligned prefix overlap: ByteRadix beats SegmentTrie
+    // on the bench (closed #41 data) and matches its semantics in this
+    // regime. We additionally gate on count: the trie's node pool
+    // (kMaxNodes = 256) has worst-case 1 + 2N capacity, so we route
+    // configs above the safe bound to SegmentTrie rather than risk an
+    // add_*-time build failure (Codex P1 on #47 round 1; the round-3
+    // fan-out bump on #46 already raised kMaxChildren to kMaxRoutes).
+    if (a.has_prefix_overlap()) {
+        if (a.count() <= kByteRadixSafeMaxRoutes) return &kByteRadixDispatch;
+        return &kSegmentTrieDispatch;
+    }
+
+    // No prefix overlap, no params. HashFirstSegment is the right
+    // pick when (a) the per-bucket cap holds and (b) first-segment
+    // hashing actually partitions the route set
+    // (≥ kMinDistinctFirstSegmentsForFirstSeg). Within a bucket
+    // HashFirstSegment still does a byte-prefix scan, so requests
+    // longer than the registered route (e.g., registered /api/users
+    // matching request /api/users/42) work correctly.
     if (a.max_first_seg_bucket() <= HashFirstSegmentTable::kPerBucket &&
         a.distinct_first_segments() >= kMinDistinctFirstSegmentsForFirstSeg) {
         return &kHashFirstSegmentDispatch;
     }
-    return &kHashFullPathDispatch;
+
+    // Fall through to SegmentTrie, NOT HashFullPath. HashFullPath is
+    // exact-match-only — it would silently turn a registered prefix
+    // (/api/users) into a miss when the request arrives longer
+    // (/api/users/42), breaking the linear-scan baseline contract
+    // even though the picker thought it was a safe choice. SegmentTrie
+    // is unconditionally correct (segment-prefix, longest-match wins)
+    // and stays available for any shape we couldn't route to a faster
+    // impl. Codex P1 on #47 round 1 caught the original
+    // HashFullPath fallback.
+    return &kSegmentTrieDispatch;
 }
 
 }  // namespace rut

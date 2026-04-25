@@ -263,6 +263,33 @@ TEST(route_byte_radix, rejects_non_origin_form_request_targets) {
     CHECK_EQ(t.match(S(""), 0), TrieNode::kInvalidRoute);
 }
 
+TEST(route_byte_radix, accepts_kMaxRoutes_distinct_top_level_prefixes) {
+    // Codex P1 on #46 round 2: per-node fan-out was capped at 16,
+    // which made any config with 17+ distinct top-level prefixes
+    // fail at insert time even though kMaxRoutes is 128. Bumped to
+    // 128 to cover the worst case.
+    //
+    // Worst-case shape: 128 single-byte top-level paths, all sharing
+    // root as their parent. After this fix the trie accepts all of
+    // them.
+    ByteRadixTrie t;
+    char paths[ByteRadixNode::kMaxChildren][4];
+    for (u32 i = 0; i < ByteRadixNode::kMaxChildren; i++) {
+        // /<i>: encode i as 2 bytes (a-z + a-z) so each top-level
+        // path has a distinct first byte after the leading '/'.
+        paths[i][0] = '/';
+        paths[i][1] = static_cast<char>('a' + i / 26);
+        paths[i][2] = static_cast<char>('a' + i % 26);
+        paths[i][3] = '\0';
+        REQUIRE(t.insert(Str{paths[i], 3}, 0, static_cast<u16>(i)));
+    }
+    // Spot-check a few — the first, the middle, and the last.
+    CHECK_EQ(t.match(Str{paths[0], 3}, 0), 0u);
+    CHECK_EQ(t.match(Str{paths[64], 3}, 0), 64u);
+    CHECK_EQ(t.match(Str{paths[ByteRadixNode::kMaxChildren - 1], 3}, 0),
+             static_cast<u16>(ByteRadixNode::kMaxChildren - 1));
+}
+
 TEST(route_byte_radix, root_path_matches_root_terminal) {
     ByteRadixTrie t;
     REQUIRE(t.insert(S("/"), 0, 42));

@@ -203,7 +203,16 @@ u16 ByteRadixTrie::match(Str path, u8 method_char) const {
 namespace {
 
 u16 byte_radix_match(const RouteConfig* cfg, Str path, u8 method) {
-    return cfg->byte_radix_state.match(path, method);
+    // Translate the impl's miss sentinel (TrieNode::kInvalidRoute,
+    // shared with SegmentTrie) into the dispatch interface's miss
+    // sentinel (kRouteIdxInvalid). Both are 0xffffu numerically today,
+    // but the names mean different things — the impl's is a route-
+    // table sentinel scoped to its own match() return; the
+    // interface's is a vtable contract. Codex on #46 caught the
+    // bare passthrough — segment_trie_match in route_dispatch.cc
+    // already does the same translation.
+    const u16 idx = cfg->byte_radix_state.match(path, method);
+    return idx == TrieNode::kInvalidRoute ? kRouteIdxInvalid : idx;
 }
 
 }  // namespace

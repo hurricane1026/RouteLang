@@ -55,10 +55,20 @@
 namespace rut {
 
 struct ByteRadixNode {
-    // Per-node fan-out cap. Realistic configs branch <8 children at most
-    // points; 16 covers shared-byte-then-divergent-tail patterns common
-    // at the root (/, h, a, w, ...).
-    static constexpr u32 kMaxChildren = 16;
+    // Per-node fan-out cap. Sized to RouteConfig::kMaxRoutes (128) so
+    // a worst-case shape — 128 distinct routes that all branch at the
+    // same byte position (e.g., 128 single-byte tails under the same
+    // shared edge, which a `/` catchall plus 127 single-letter
+    // top-level paths would produce) — admits without RouteConfig::
+    // add_* failing partway through. Codex P1 on #46 round 2 caught
+    // an earlier 16-cap that turned 17-top-level-prefix configs into
+    // build failures even with kMaxRoutes headroom unused.
+    //
+    // Memory cost: 128 × u16 = 256 B per node × 256 nodes ≈ 64 KB
+    // total for the children arrays. The trie's overall footprint
+    // grows from ~18 KB to ~85 KB inline — still negligible next to
+    // the segment trie's 1.2 MB.
+    static constexpr u32 kMaxChildren = 128;
 
     // Edge label: the byte run leading INTO this node. Non-owning view
     // into RouteEntry::path; safe for the config's RCU lifetime.

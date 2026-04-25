@@ -157,21 +157,23 @@ struct RouteConfig {
                   "RouteConfig::kMaxRoutes must equal TrieNode::kMaxChildren so a config "
                   "whose routes all share a single parent fits the trie's per-node fan-out.");
 
-    // Exact-match hash table over (path, method). Populated by every
-    // add_* method in lockstep with the trie. ~12 KB (512 slots ×
-    // 24 bytes); negligible next to the trie's 1.2 MB. Only consulted
-    // when dispatch == &kHashFullPathDispatch; the selector landing in
-    // a follow-up PR picks it for configs with no prefix routes
-    // (where exact-match is sufficient and beats the trie on every
-    // dimension we measure).
+    // Exact-match hash table over (path, method). ~12 KB (512 slots ×
+    // 24 bytes); negligible next to the trie's 1.2 MB. Populated by
+    // populate_dispatch_state ONLY when the active dispatch is
+    // &kHashFullPathDispatch — the per-active-dispatch model adopted
+    // in #43 round 2. Selector picks this dispatch for configs with no
+    // prefix routes (where exact-match is sufficient and beats the
+    // trie on every dimension we measure).
     HashFullPathTable hash_full_state;
 
     // First-segment-hashed bucket table. ~24 KB (64 buckets × 16
-    // entries × 24 B). Populated alongside the trie + hash_full_state.
-    // Selector picks this dispatch only when (a) no first-segment
-    // bucket would exceed kPerBucket and (b) at least one configured
-    // route shares a first segment with another (otherwise plain
-    // linear scan is just as fast and uses no per-impl memory).
+    // entries × 24 B). Populated by populate_dispatch_state ONLY when
+    // the active dispatch is &kHashFirstSegmentDispatch (same per-
+    // active-dispatch model as hash_full_state above). Selector picks
+    // this dispatch only when (a) no first-segment bucket would
+    // exceed kPerBucket and (b) at least one configured route shares
+    // a first segment with another (otherwise plain linear scan is
+    // just as fast and uses no per-impl memory).
     HashFirstSegmentTable hash_first_seg_state;
 
     UpstreamTarget upstreams[kMaxUpstreams];

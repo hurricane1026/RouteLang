@@ -70,9 +70,16 @@ public:
 
     // Look up `path` + `method`. Returns kRouteIdxInvalid on miss.
     // Sequence:
-    //   1. hash first_segment(request_path) → bucket → linear scan
-    //   2. if no hit and first_segment is non-empty, fall back to
-    //      the empty-segment bucket (where catchalls at "/" sit)
+    //   1. scan the request's first_segment bucket for the smallest-
+    //      route_idx match (linear scan within the bucket, in insert
+    //      order, so first match returned IS the smallest idx there).
+    //   2. if first_segment is non-empty AND the catchall bucket
+    //      differs, ALSO scan the empty-segment bucket (where
+    //      catchalls at "/" sit) for its smallest-idx match.
+    //   3. if both buckets contain matches, return the smaller
+    //      route_idx of the two — preserves linear-scan first-match-
+    //      wins precedence so a catchall registered before a specific
+    //      route still shadows it (Codex P1 on #45 round 2).
     u16 match(Str path, u8 method) const;
 
     // Introspection.

@@ -140,6 +140,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_sim.profraw ./build/tests/test_sim
           LLVM_PROFILE_FILE=build/test_route_trie.profraw ./build/tests/test_route_trie
           LLVM_PROFILE_FILE=build/test_route_hash_full.profraw ./build/tests/test_route_hash_full
+          LLVM_PROFILE_FILE=build/test_route_hash_first_seg.profraw ./build/tests/test_route_hash_first_seg
 
       - name: Generate coverage report
         run: |
@@ -180,4 +181,5 @@ jobs:
             build/tests/test_chunked_parser \
             build/tests/test_rir \
             build/tests/test_route_trie \
-            build/tests/test_route_hash_full
+            build/tests/test_route_hash_full \
+            build/tests/test_route_hash_first_seg

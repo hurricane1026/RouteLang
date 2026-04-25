@@ -86,4 +86,12 @@ extern const RouteDispatch kSegmentTrieDispatch;
 // those constraints don't hold.
 extern const RouteDispatch kHashFullPathDispatch;
 
+// First-segment-hashed bucket table with byte-prefix scan inside the
+// bucket (RouteConfig::hash_first_seg_state). Preserves linear-scan
+// semantics so prefix routes work, just with O(N/B) average lookup.
+// Selector picks this for configs with diverse first segments and
+// no first-segment bucket exceeding kPerBucket — see
+// route_hash_first_seg.h.
+extern const RouteDispatch kHashFirstSegmentDispatch;
+
 }  // namespace rut

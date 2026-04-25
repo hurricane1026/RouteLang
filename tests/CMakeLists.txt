@@ -129,6 +129,15 @@ target_include_directories(test_route_hash_full PRIVATE
 add_test(NAME test_route_hash_full COMMAND test_route_hash_full)
 set_tests_properties(test_route_hash_full PROPERTIES LABELS "unit")
 
+add_executable(test_route_hash_first_seg test_route_hash_first_seg.cc)
+target_link_libraries(test_route_hash_first_seg rut_runtime)
+target_include_directories(test_route_hash_first_seg PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_route_hash_first_seg COMMAND test_route_hash_first_seg)
+set_tests_properties(test_route_hash_first_seg PROPERTIES LABELS "unit")
+
 add_executable(test_rir test_rir.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_link_libraries(test_rir rut_compiler)
 target_include_directories(test_rir PRIVATE
@@ -265,6 +274,7 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_simulate_engine>
     COMMAND $<TARGET_FILE:test_route_trie>
     COMMAND $<TARGET_FILE:test_route_hash_full>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_hash_full
+    COMMAND $<TARGET_FILE:test_route_hash_first_seg>
+    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_hash_full test_route_hash_first_seg
     COMMENT "Running all tests..."
 )

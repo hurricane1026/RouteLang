@@ -110,23 +110,26 @@ struct RouteConfig {
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
 
-    // Pluggable route lookup. Defaults to the first-match-wins linear
-    // scan over routes[]; future configs (post compiler-side selector)
-    // will swap in alternative impls (segment trie, hashed, byte
-    // radix, ...) by reassigning this pointer at config-build time.
-    // The pointed-to vtable is `static const`, so it's safe to share
-    // across CompiledConfig lifetimes — only the pointer travels with
-    // the RCU swap.
-    const RouteDispatch* dispatch = &kLinearScanDispatch;
+    // Pluggable route lookup. Set BEFORE the first add_* call (ideally
+    // by the compiler-side selector at config-build time); the active
+    // dispatch determines which per-impl state add_* populates. Once
+    // any route has been added, set_dispatch() refuses to swap — the
+    // earlier routes wouldn't be in the new dispatch's data structure
+    // and lookups would silently miss them (Codex P1 caught this on
+    // #43). Build a fresh RouteConfig if you need a different dispatch.
+    const RouteDispatch* dispatch() const { return dispatch_; }
+    bool set_dispatch(const RouteDispatch* d) {
+        if (route_count > 0 || d == nullptr) return false;
+        dispatch_ = d;
+        return true;
+    }
 
-    // Segment-aware radix trie kept in lockstep with routes[] so the
-    // dispatch can be flipped to kSegmentTrieDispatch (or any future
-    // segment-aware impl) without rebuilding the config. Populated by
-    // every add_* method; sized at ~1.2 MB to cover 128 routes × 32
-    // distinct segments at the worst-case (no prefix sharing). When
-    // linear-scan dispatch is selected, this storage is unused — a
-    // follow-up PR will move it (and other impl states) into a tagged
-    // union so only the active impl pays its cost.
+    // Segment-aware radix trie. Populated by add_* only when the
+    // active dispatch is kSegmentTrieDispatch. ~1.2 MB inline; sized
+    // to cover 128 routes × 32 distinct segments at the worst-case
+    // (no prefix sharing). When a different dispatch is selected this
+    // storage sits unused — a follow-up PR will move per-impl state
+    // into a tagged union so only the active impl pays its cost.
     RouteTrie trie;
     static_assert(kMaxRoutes == TrieNode::kMaxChildren,
                   "RouteConfig::kMaxRoutes must equal TrieNode::kMaxChildren so a config "
@@ -206,7 +209,7 @@ struct RouteConfig {
     bool populate_dispatch_state(const RouteEntry& r) {
         const Str path_view{r.path, r.path_len};
         const u16 idx = static_cast<u16>(route_count);
-        if (dispatch == &kSegmentTrieDispatch) {
+        if (dispatch_ == &kSegmentTrieDispatch) {
             return trie.insert(path_view, r.method, idx);
         }
         // kLinearScanDispatch: routes[] IS the data.
@@ -423,10 +426,16 @@ struct RouteConfig {
     // 'C'=CONNECT, 'T'=TRACE) or 0 for "any".
     const RouteEntry* match(const u8* path_data, u32 path_len, u8 method_char) const {
         const Str path{reinterpret_cast<const char*>(path_data), path_len};
-        const u16 idx = dispatch->match(this, path, method_char);
+        const u16 idx = dispatch_->match(this, path, method_char);
         if (idx >= route_count) return nullptr;  // covers kRouteIdxInvalid
         return &routes[idx];
     }
+
+private:
+    // The active dispatch vtable, set via set_dispatch() and read via
+    // dispatch(). Private so callers can't assign past the route_count
+    // == 0 gate — see set_dispatch() doc.
+    const RouteDispatch* dispatch_ = &kLinearScanDispatch;
 };
 
 }  // namespace rut

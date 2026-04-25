@@ -2365,6 +2365,21 @@ TEST(route, add_accepts_well_formed_path_after_rejection) {
     CHECK_EQ(cfg.route_count, 1u);
 }
 
+TEST(route, set_dispatch_refuses_after_first_add) {
+    // Codex P1 on #43 round 2: flipping dispatch after add_* would
+    // leave earlier routes invisible to the new dispatch's data
+    // structure (e.g., trie empty / partial), causing silent misses.
+    // set_dispatch() pins the contract: dispatch is fixed at first
+    // add_*. Build a fresh RouteConfig if you need a different one.
+    RouteConfig cfg;
+    REQUIRE(cfg.set_dispatch(&kSegmentTrieDispatch));  // pre-add_* OK
+    REQUIRE_EQ(cfg.dispatch(), &kSegmentTrieDispatch);
+    REQUIRE(cfg.add_static("/a", 0, 200));
+    CHECK(!cfg.set_dispatch(&kLinearScanDispatch));   // post-add_* refused
+    CHECK_EQ(cfg.dispatch(), &kSegmentTrieDispatch);  // unchanged
+    CHECK(!cfg.set_dispatch(nullptr));                // null also refused
+}
+
 TEST(route, default_dispatch_admits_route_when_trie_would_fail) {
     // The default linear-scan dispatch reads routes[] directly; a trie
     // capacity exhaustion must NOT reject the route. The PR-A reviewer
@@ -2378,7 +2393,7 @@ TEST(route, default_dispatch_admits_route_when_trie_would_fail) {
     // default), populate_dispatch_state is a no-op and add_* always
     // succeeds for any well-formed path within RouteEntry::kMaxPathLen.
     RouteConfig cfg;
-    REQUIRE(&kLinearScanDispatch == cfg.dispatch);
+    REQUIRE(&kLinearScanDispatch == cfg.dispatch());
     for (u32 i = 0; i < RouteConfig::kMaxRoutes; i++) {
         char path[8];
         path[0] = '/';

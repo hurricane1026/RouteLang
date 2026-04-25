@@ -135,17 +135,19 @@ struct TrieNode {
 
 class RouteTrie {
 public:
-    // 128 routes × 16-segment distinct paths (no prefix sharing) need
-    // 1 + 128*16 = 2049 nodes, so 2048 was one short and would reject
-    // a valid worst-case flat config even when every path stays well
-    // under kMaxPathLen (Codex P2 on #41, round 9 — the earlier
-    // comment overclaimed coverage by one). 4096 covers 128 × up to
-    // 32 distinct segments per route with ample margin, which
-    // blankets every realistic gateway layout. Deeper pathological
-    // configs (33-64 segments per route, no sharing) still get
-    // rejected — those are vanishingly rare in practice. Memory
-    // cost: 4096 × ~290 B/node ≈ 1.2 MB per RouteConfig.
-    static constexpr u32 kMaxNodes = 4096;
+    // 128 routes × 32-segment distinct paths (no prefix sharing) need
+    // 1 + 128*32 = 4097 nodes — the +1 covers the root. Earlier
+    // values were off by one at the documented boundary: 2048
+    // rejected a valid 16-seg flat config (Codex P2 on #41 round 9),
+    // and 4096 then rejected the very 32-seg shape its own doc
+    // claimed to cover (Codex P2 on #41 round 13). 4097 is the exact
+    // worst-case for the advertised coverage; we deliberately don't
+    // round up further because deeper "pathological" configs (33-64
+    // segs per route, no sharing) are vanishingly rare and a smaller
+    // pool keeps the inline RouteConfig footprint near the existing
+    // ~1.2 MB. Memory cost: 4097 × ~290 B/node ≈ 1.2 MB per
+    // RouteConfig.
+    static constexpr u32 kMaxNodes = 4097;
     // Sized so any legal request URI or registered route fits without
     // truncation. RouteEntry::kMaxPathLen is 128 bytes, which at a
     // minimum per-segment cost of 2 bytes ('/' + one content byte)

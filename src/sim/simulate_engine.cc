@@ -177,11 +177,44 @@ static bool copy_str_into_arena(MmapArena& arena, const char* src, u32 len, Str*
 // trie treats "/api" and "/api/" as equivalent (tokenize drops the
 // empty trailing segment), and "/" normalizes to the empty-segment
 // root catchall. The simulator walks characters, so we match those
-// semantics by normalizing the pattern length up front.
+// semantics by normalizing the pattern length up front. This is also
+// the byte-count loop bound for route_matches — the matcher walks
+// pattern bytes directly and skips '/' runs explicitly, so it needs
+// the actual byte length (minus trailing '/'), not the segment count.
 static u32 effective_pattern_len(const Engine::CompiledRoute& route) {
     u32 len = route.pattern_len;
     while (len > 0 && route.pattern[len - 1] == '/') len--;
     return len;
+}
+
+// Pattern length after the trie's full P1a normalization: trailing
+// '/' stripped AND interior '/' runs collapsed. Used only by
+// select_route for longest-match-wins ranking, NOT by route_matches.
+// Without this collapse, "/a////b////c" would score 12 bytes while
+// "/a/b/c/d" scores 8 — the slash-heavy pattern would beat the
+// 4-segment route on byte length even though the runtime trie
+// normalizes both and would prefer the deeper one. Codex P2 on #41
+// round 13 caught this divergence: the matcher and ranker had been
+// converged on bytes after round 12 added the '/' run skip, but the
+// rank used the un-collapsed length, so replay still drifted on
+// manifests with redundant slashes and overlapping prefixes.
+static u32 normalized_pattern_len(const Engine::CompiledRoute& route) {
+    const u32 trimmed = effective_pattern_len(route);
+    u32 n = 0;
+    bool in_slash_run = false;
+    for (u32 i = 0; i < trimmed; i++) {
+        const char c = route.pattern[i];
+        if (c == '/') {
+            if (!in_slash_run) {
+                n++;
+                in_slash_run = true;
+            }
+        } else {
+            n++;
+            in_slash_run = false;
+        }
+    }
+    return n;
 }
 
 static bool route_matches(const Engine::CompiledRoute& route, const char* path, u32 path_len) {
@@ -261,12 +294,16 @@ static const Engine::CompiledRoute* select_route(const Engine& engine,
         const auto& route = engine.routes[i];
         if (route.method != 0 && route.method != method_char) continue;
         if (!route_matches(route, path, path_len)) continue;
-        // Rank on the NORMALIZED pattern length — the trie keys off
-        // normalized paths too, so "/api" and "/api/" have the same
-        // effective length there. Using raw pattern_len here would
-        // let "/api/" beat "/api" by one byte despite both keying
-        // the same trie node. Codex P2 on #41.
-        const u32 route_len = effective_pattern_len(route);
+        // Rank on the FULLY NORMALIZED pattern length — the trie keys
+        // off paths with both trailing '/' trimmed and interior '/'
+        // runs collapsed. Using just the trailing-trim length would
+        // let "/a////b" beat "/a/b" on byte count despite both
+        // tokenizing to the same 2-segment key, and would also let
+        // it spuriously beat a real 3-segment route like "/a/b/c"
+        // (Codex P2 on #41 rounds 5 / 13). normalized_pattern_len()
+        // trims AND collapses; route_matches handles the collapse at
+        // walk time, so the ranking and matching policies converge.
+        const u32 route_len = normalized_pattern_len(route);
         const bool beats_on_length = best == nullptr || route_len > best_len;
         const bool beats_on_specificity =
             best != nullptr && route_len == best_len && route.method != 0 && best->method == 0;

@@ -143,7 +143,7 @@ struct RouteConfig {
     // and state-build gate).
     static bool is_canonical_dispatch(const RouteDispatch* d) {
         return d == &kLinearScanDispatch || d == &kSegmentTrieDispatch ||
-               d == &kHashFullPathDispatch;
+               d == &kHashFullPathDispatch || d == &kHashFirstSegmentDispatch;
     }
 
     // Segment-aware radix trie. Populated by add_* only when the

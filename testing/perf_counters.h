@@ -127,20 +127,40 @@ public:
     }
 
     // Reset and enable the whole group. Must be called after open();
-    // sampling starts immediately.
+    // sampling starts immediately. RESET / ENABLE ioctl failures are
+    // captured in ioctl_ok_ and folded into last_read_ok_ when
+    // disable() finishes, so callers can't be fooled into printing
+    // phantom zeros from a counter that never started: read() on a
+    // never-enabled group is `nr` zero values with no error, which
+    // would otherwise pass last_read_ok() with last_values_ all zero.
     void enable() {
         if (fds_[kPerfCycles] < 0) return;
-        ::ioctl(fds_[kPerfCycles], PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
-        ::ioctl(fds_[kPerfCycles], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
         last_read_ok_ = true;
+        ioctl_ok_ = true;
+        if (::ioctl(fds_[kPerfCycles], PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) < 0) {
+            ioctl_ok_ = false;
+        }
+        if (::ioctl(fds_[kPerfCycles], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP) < 0) {
+            ioctl_ok_ = false;
+        }
     }
 
     // Disable the group and pull the counter values. Subsequent has() /
-    // cycles() / etc. reads see the snapshot taken here.
+    // cycles() / etc. reads see the snapshot taken here. If any of the
+    // RESET / ENABLE / DISABLE ioctls failed, last_read_ok_ is forced
+    // false and last_values_ are zeroed even when the read syscall
+    // itself succeeded — the read just reflects whatever (possibly
+    // stale, possibly never-counted) state the group was left in.
     void disable() {
         if (fds_[kPerfCycles] < 0) return;
-        ::ioctl(fds_[kPerfCycles], PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+        if (::ioctl(fds_[kPerfCycles], PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP) < 0) {
+            ioctl_ok_ = false;
+        }
         read_all();
+        if (!ioctl_ok_) {
+            for (u32 i = 0; i < kPerfCounterCount; i++) last_values_[i] = 0;
+            last_read_ok_ = false;
+        }
     }
 
     // True iff the most recent disable()'s read_all() returned a
@@ -184,6 +204,10 @@ private:
     u64 last_values_[kPerfCounterCount];
     bool valid_[kPerfCounterCount];
     bool last_read_ok_ = true;
+    // Tracks whether the RESET/ENABLE/DISABLE ioctls in the most
+    // recent enable()/disable() pair all succeeded. Reset to true on
+    // each enable(); ANDed into last_read_ok_ at the end of disable().
+    bool ioctl_ok_ = true;
 
     bool open_counter(u32 idx, u32 type, u64 config, int group_fd, bool disabled) {
         struct perf_event_attr attr;

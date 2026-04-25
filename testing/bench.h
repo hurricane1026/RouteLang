@@ -247,8 +247,20 @@ struct Bench {
         // Per-run perf counters. If the user asked for them but the
         // kernel refuses (perf_event_paranoid too high), silently fall
         // back to wall-clock only — the measurement still happens.
+        // `perf_open` is sticky for the whole run: once we decide to
+        // run the enable/disable ioctls, we keep doing them in every
+        // epoch so the per-epoch ioctl overhead stays uniform across
+        // the timing sample. Mixing epochs that paid that overhead
+        // with epochs that didn't would skew median/MAD against runs
+        // where perf was invalidated mid-way.
+        // `perf_valid` controls whether we keep accumulating perf
+        // totals and report perf data in the Result. It can flip to
+        // false mid-run on a short/interrupted read, on a multiplexed
+        // group, or on an ioctl failure inside enable()/disable() —
+        // but the ioctls themselves keep firing.
         PerfCounters pc;
-        bool perf_ok = perf_counters_ && pc.open();
+        const bool perf_open = perf_counters_ && pc.open();
+        bool perf_valid = perf_open;
 
         // Collect epoch timings + cumulative perf totals.
         u64 epoch_ns[kMaxEpochs];
@@ -256,36 +268,39 @@ struct Bench {
         u64 total_cycles = 0, total_inst = 0, total_bmiss = 0, total_cref = 0, total_cmiss = 0;
 
         for (u32 e = 0; e < epochs_; e++) {
-            if (perf_ok) pc.enable();
+            if (perf_open) pc.enable();
             u64 t0 = now_ns();
             for (u64 i = 0; i < iters_per_epoch; i++) {
                 fn();
                 clobber();
             }
             u64 t1 = now_ns();
-            if (perf_ok) {
+            if (perf_open) {
                 pc.disable();
-                if (!pc.last_read_ok()) {
-                    // A short/interrupted read means this epoch's
-                    // counters are zero rather than real. Rolling it
-                    // into the totals would bias the per-iteration
-                    // averages; flip perf_ok off for the whole run so
-                    // the output section is suppressed, and zero out
-                    // any totals accumulated from earlier epochs so
-                    // the returned Result doesn't carry partial data
-                    // from an invalidated measurement window.
-                    perf_ok = false;
-                    total_cycles = 0;
-                    total_inst = 0;
-                    total_bmiss = 0;
-                    total_cref = 0;
-                    total_cmiss = 0;
-                } else {
-                    total_cycles += pc.cycles();
-                    total_inst += pc.instructions();
-                    total_bmiss += pc.branch_misses();
-                    total_cref += pc.cache_refs();
-                    total_cmiss += pc.cache_misses();
+                if (perf_valid) {
+                    if (!pc.last_read_ok()) {
+                        // A short/interrupted read or detected
+                        // multiplexing means this epoch's counters
+                        // are zero rather than real. Rolling that
+                        // into the totals would bias the per-
+                        // iteration averages; flip perf_valid off so
+                        // the output section is suppressed and zero
+                        // out any totals accumulated from earlier
+                        // epochs so the returned Result doesn't carry
+                        // partial data from an invalidated window.
+                        perf_valid = false;
+                        total_cycles = 0;
+                        total_inst = 0;
+                        total_bmiss = 0;
+                        total_cref = 0;
+                        total_cmiss = 0;
+                    } else {
+                        total_cycles += pc.cycles();
+                        total_inst += pc.instructions();
+                        total_bmiss += pc.branch_misses();
+                        total_cref += pc.cache_refs();
+                        total_cmiss += pc.cache_misses();
+                    }
                 }
             }
             epoch_ns[e] = (t1 - t0) / iters_per_epoch;  // ns per iteration
@@ -326,7 +341,7 @@ struct Bench {
 
         r.iterations = iters_per_epoch * epochs_;
         r.bytes_per_op = bytes_per_op_;
-        r.perf_valid = perf_ok;
+        r.perf_valid = perf_valid;
         r.perf_cycles = total_cycles;
         r.perf_instructions = total_inst;
         r.perf_branch_misses = total_bmiss;
@@ -336,7 +351,7 @@ struct Bench {
         // so a caller that only inspects the mask still sees "no
         // data", matching the zeroed totals.
         u32 available = 0;
-        if (perf_ok) {
+        if (perf_valid) {
             for (u32 i = 0; i < kPerfCounterCount; i++) {
                 if (pc.has(i)) available |= (1u << i);
             }
@@ -372,7 +387,7 @@ struct Bench {
         out_u64_comma(r.iterations);
         out(" iters)\n");
 
-        if (perf_ok) {
+        if (perf_valid) {
             // Per-iteration perf metrics — the numbers that actually
             // explain WHY something is faster or slower.
             // Gate each line on whether the underlying counter

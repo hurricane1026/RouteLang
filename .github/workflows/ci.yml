@@ -141,6 +141,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_route_trie.profraw ./build/tests/test_route_trie
           LLVM_PROFILE_FILE=build/test_route_hash_full.profraw ./build/tests/test_route_hash_full
           LLVM_PROFILE_FILE=build/test_route_hash_first_seg.profraw ./build/tests/test_route_hash_first_seg
+          LLVM_PROFILE_FILE=build/test_route_byte_radix.profraw ./build/tests/test_route_byte_radix
 
       - name: Generate coverage report
         run: |
@@ -182,4 +183,5 @@ jobs:
             build/tests/test_rir \
             build/tests/test_route_trie \
             build/tests/test_route_hash_full \
-            build/tests/test_route_hash_first_seg
+            build/tests/test_route_hash_first_seg \
+            build/tests/test_route_byte_radix

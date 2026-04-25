@@ -5,6 +5,7 @@
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/route_dispatch.h"
 
 #include <errno.h>
 #include <netinet/in.h>
@@ -97,6 +98,15 @@ struct RouteConfig {
 
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
+
+    // Pluggable route lookup. Defaults to the first-match-wins linear
+    // scan over routes[]; future configs (post compiler-side selector)
+    // will swap in alternative impls (segment trie, hashed, byte
+    // radix, ...) by reassigning this pointer at config-build time.
+    // The pointed-to vtable is `static const`, so it's safe to share
+    // across CompiledConfig lifetimes — only the pointer travels with
+    // the RCU swap.
+    const RouteDispatch* dispatch = &kLinearScanDispatch;
 
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
@@ -313,26 +323,21 @@ struct RouteConfig {
         return idx;
     }
 
-    // Match a request path (prefix match, first match wins).
-    // method_char: first char of HTTP method ('G'=GET, 'P'=POST, etc.), 0=any.
-    // Returns pointer to matching entry, or nullptr for no match (→ default 200 OK).
+    // Match a request path. Semantics depend on the chosen dispatch
+    // (`this->dispatch`), but the default linear-scan dispatch keeps
+    // the historical contract: first-match-wins byte-prefix scan,
+    // method 0 in a route entry matches any request method, and
+    // unmatched requests return nullptr (callers fall back to the
+    // default 200 OK handler).
+    //
+    // `method_char` is the first byte of the HTTP method ('G'=GET,
+    // 'P'=POST/PUT/PATCH, 'D'=DELETE, 'H'=HEAD, 'O'=OPTIONS,
+    // 'C'=CONNECT, 'T'=TRACE) or 0 for "any".
     const RouteEntry* match(const u8* path_data, u32 path_len, u8 method_char) const {
-        for (u32 i = 0; i < route_count; i++) {
-            auto& r = routes[i];
-            // Method filter: 0 = any
-            if (r.method != 0 && r.method != method_char) continue;
-            // Prefix match
-            if (path_len < r.path_len) continue;
-            bool matched = true;
-            for (u32 j = 0; j < r.path_len; j++) {
-                if (path_data[j] != static_cast<u8>(r.path[j])) {
-                    matched = false;
-                    break;
-                }
-            }
-            if (matched) return &r;
-        }
-        return nullptr;  // no match → default handler
+        const Str path{reinterpret_cast<const char*>(path_data), path_len};
+        const u16 idx = dispatch->match(this, path, method_char);
+        if (idx >= route_count) return nullptr;  // covers kRouteIdxInvalid
+        return &routes[idx];
     }
 };
 

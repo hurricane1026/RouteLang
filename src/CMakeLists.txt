@@ -122,6 +122,7 @@ add_library(rut_runtime STATIC
     runtime/chunked_parser.cc
     runtime/access_log.cc
     runtime/traffic_capture.cc
+    runtime/route_dispatch.cc
     ${SIMD_SOURCE}
 )
 

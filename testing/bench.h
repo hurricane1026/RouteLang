@@ -21,8 +21,11 @@
 //       b.run("llhttp_parse", [&] { ... });
 //   }
 
+#include "perf_counters.h"
 #include "rut/common/types.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <time.h>    // clock_gettime, CLOCK_MONOTONIC
 #include <unistd.h>  // write
 
@@ -164,11 +167,39 @@ static constexpr u32 kMaxEpochs = 64;
 
 struct Result {
     const char* name;
-    u64 median_ns;     // median time per iteration
-    u64 min_ns;        // minimum time per iteration
-    u64 mean_ns;       // mean time per iteration
+    u64 median_ns;  // median time per iteration
+    u64 min_ns;     // minimum time per iteration
+    u64 mean_ns;    // mean time per iteration
+    // MAD = median of |epoch_ns - median_ns|. A robust-to-outliers
+    // dispersion measure (see nanobench). err_pct = MAD / median × 100
+    // — anything > 5% means the benchmark isn't measuring cleanly
+    // (CPU frequency scaling, thermal throttling, context switches,
+    // other cores touching shared caches).
+    u64 mad_ns;
+    u32 err_pct;       // MAD / median × 100, rounded
     u64 iterations;    // total iterations run
     u64 bytes_per_op;  // bytes processed per operation (for throughput)
+    // Hardware perf counters, totalled across all epochs. Zero when
+    // counters weren't enabled or when the kernel refused access.
+    u64 perf_cycles;
+    u64 perf_instructions;
+    u64 perf_branch_misses;
+    u64 perf_cache_refs;
+    u64 perf_cache_misses;
+    bool perf_valid;
+    // Bitmask of PerfCounterIndex entries that the kernel actually
+    // granted. On a partial-PMU box the kernel may open cycles /
+    // instructions but refuse cache events (or vice versa); without
+    // this mask, a total of `0` in perf_cache_misses is ambiguous
+    // between "counter unavailable" and "legitimate zero" (a tiny
+    // hot dataset on a correctly opened counter). Downstream
+    // consumers should gate per-counter reads on has_perf_counter()
+    // rather than peeking at perf_valid alone.
+    u32 perf_available_mask;
+
+    bool has_perf_counter(u32 idx) const {
+        return perf_valid && idx < kPerfCounterCount && ((perf_available_mask >> idx) & 1u) != 0;
+    }
 };
 
 struct Bench {
@@ -178,6 +209,7 @@ struct Bench {
     u32 epochs_ = 11;      // odd number for clean median
     u64 epoch_iters_ = 0;  // 0 = auto (min_iters / epochs)
     u64 bytes_per_op_ = 0;
+    bool perf_counters_ = false;
 
     Result results_[32];
     u32 result_count_ = 0;
@@ -187,9 +219,19 @@ struct Bench {
     void warmup(u64 n) { warmup_iters_ = n; }
     void epochs(u32 n) {
         epochs_ = n < 1 ? 1 : (n > kMaxEpochs ? kMaxEpochs : n);
-        if (epochs_ % 2 == 0) epochs_++;  // keep odd for clean median
+        if (epochs_ % 2 == 0) {
+            // Keep odd for clean median — but if we're already at the
+            // fixed-size array cap, stepping up would overrun
+            // epoch_ns[] / sorted[] / abs_dev[]. Step down instead.
+            epochs_ = (epochs_ == kMaxEpochs) ? (epochs_ - 1) : (epochs_ + 1);
+        }
     }
     void bytes_per_op(u64 n) { bytes_per_op_ = n; }
+    // Enable hardware perf counters (cycles, instructions, branch-misses,
+    // cache refs, cache misses) for each subsequent run(). No-op if the
+    // kernel refuses access (perf_event_paranoid too high); the benchmark
+    // still runs, just without PMU data.
+    void perf_counters(bool enable) { perf_counters_ = enable; }
 
     template <typename Fn>
     Result run(const char* name, Fn&& fn) {
@@ -202,17 +244,65 @@ struct Bench {
             clobber();
         }
 
-        // Collect epoch timings
+        // Per-run perf counters. If the user asked for them but the
+        // kernel refuses (perf_event_paranoid too high), silently fall
+        // back to wall-clock only — the measurement still happens.
+        // `perf_open` is sticky for the whole run: once we decide to
+        // run the enable/disable ioctls, we keep doing them in every
+        // epoch so the per-epoch ioctl overhead stays uniform across
+        // the timing sample. Mixing epochs that paid that overhead
+        // with epochs that didn't would skew median/MAD against runs
+        // where perf was invalidated mid-way.
+        // `perf_valid` controls whether we keep accumulating perf
+        // totals and report perf data in the Result. It can flip to
+        // false mid-run on a short/interrupted read, on a multiplexed
+        // group, or on an ioctl failure inside enable()/disable() —
+        // but the ioctls themselves keep firing.
+        PerfCounters pc;
+        const bool perf_open = perf_counters_ && pc.open();
+        bool perf_valid = perf_open;
+
+        // Collect epoch timings + cumulative perf totals.
         u64 epoch_ns[kMaxEpochs];
         u64 total_ns = 0;
+        u64 total_cycles = 0, total_inst = 0, total_bmiss = 0, total_cref = 0, total_cmiss = 0;
 
         for (u32 e = 0; e < epochs_; e++) {
+            if (perf_open) pc.enable();
             u64 t0 = now_ns();
             for (u64 i = 0; i < iters_per_epoch; i++) {
                 fn();
                 clobber();
             }
             u64 t1 = now_ns();
+            if (perf_open) {
+                pc.disable();
+                if (perf_valid) {
+                    if (!pc.last_read_ok()) {
+                        // A short/interrupted read or detected
+                        // multiplexing means this epoch's counters
+                        // are zero rather than real. Rolling that
+                        // into the totals would bias the per-
+                        // iteration averages; flip perf_valid off so
+                        // the output section is suppressed and zero
+                        // out any totals accumulated from earlier
+                        // epochs so the returned Result doesn't carry
+                        // partial data from an invalidated window.
+                        perf_valid = false;
+                        total_cycles = 0;
+                        total_inst = 0;
+                        total_bmiss = 0;
+                        total_cref = 0;
+                        total_cmiss = 0;
+                    } else {
+                        total_cycles += pc.cycles();
+                        total_inst += pc.instructions();
+                        total_bmiss += pc.branch_misses();
+                        total_cref += pc.cache_refs();
+                        total_cmiss += pc.cache_misses();
+                    }
+                }
+            }
             epoch_ns[e] = (t1 - t0) / iters_per_epoch;  // ns per iteration
             total_ns += (t1 - t0);
         }
@@ -227,8 +317,46 @@ struct Bench {
         r.min_ns = sorted[0];
         r.median_ns = sorted[epochs_ / 2];
         r.mean_ns = total_ns / (iters_per_epoch * epochs_);
+
+        // Median Absolute Deviation: median of |epoch - median|. More
+        // robust to outliers than stddev. err_pct is how noisy this
+        // run was; > 5% means the numbers probably can't be trusted
+        // for tight comparisons.
+        u64 abs_dev[kMaxEpochs];
+        for (u32 i = 0; i < epochs_; i++) {
+            const u64 v = sorted[i];
+            abs_dev[i] = v >= r.median_ns ? v - r.median_ns : r.median_ns - v;
+        }
+        sort_u64(abs_dev, epochs_);
+        r.mad_ns = abs_dev[epochs_ / 2];
+        // Widen to __int128 for the multiply so multi-second per-iter
+        // benchmarks (mad_ns above ~1.8e17) don't overflow u64 and
+        // wrap to a nonsense err_pct. __int128 is a compiler builtin
+        // on every x86_64 clang/gcc we target — no stdlib dep.
+        r.err_pct = r.median_ns > 0
+                        ? static_cast<u32>(((static_cast<unsigned __int128>(r.mad_ns) * 100) +
+                                            (static_cast<unsigned __int128>(r.median_ns) / 2)) /
+                                           static_cast<unsigned __int128>(r.median_ns))
+                        : 0;
+
         r.iterations = iters_per_epoch * epochs_;
         r.bytes_per_op = bytes_per_op_;
+        r.perf_valid = perf_valid;
+        r.perf_cycles = total_cycles;
+        r.perf_instructions = total_inst;
+        r.perf_branch_misses = total_bmiss;
+        r.perf_cache_refs = total_cref;
+        r.perf_cache_misses = total_cmiss;
+        // Snapshot per-counter availability. Zero on invalidated runs
+        // so a caller that only inspects the mask still sees "no
+        // data", matching the zeroed totals.
+        u32 available = 0;
+        if (perf_valid) {
+            for (u32 i = 0; i < kPerfCounterCount; i++) {
+                if (pc.has(i)) available |= (1u << i);
+            }
+        }
+        r.perf_available_mask = available;
 
         // Print result
         out("  ");
@@ -241,11 +369,13 @@ struct Bench {
         out("  median: ");
         out_duration_ns(r.median_ns);
 
+        out("  ±");
+        out_u64(r.err_pct);
+        out("%");
+        if (r.err_pct > 5) out("!");  // flag noisy measurements
+
         out("  min: ");
         out_duration_ns(r.min_ns);
-
-        out("  mean: ");
-        out_duration_ns(r.mean_ns);
 
         if (bytes_per_op_ > 0 && r.median_ns > 0) {
             u64 bytes_per_sec = (bytes_per_op_ * 1000000000ULL) / r.median_ns;
@@ -256,6 +386,61 @@ struct Bench {
         out("  (");
         out_u64_comma(r.iterations);
         out(" iters)\n");
+
+        if (perf_valid) {
+            // Per-iteration perf metrics — the numbers that actually
+            // explain WHY something is faster or slower.
+            // Gate each line on whether the underlying counter
+            // actually opened — not just on "sum > 0". An unopened
+            // counter's value() returns 0, which is indistinguishable
+            // from a legitimate zero count, and on partial-PMU
+            // configurations (some kernels refuse cache events while
+            // granting cycles/instructions) we were printing
+            // "cache-miss: 0.0%" and "IPC: 0.00" as if they were real
+            // measurements (Codex P2 on #42).
+            const u64 it = r.iterations;
+            if (pc.has(kPerfCycles)) {
+                out("                              cycles/iter: ");
+                out_u64(total_cycles / it);
+            }
+            if (pc.has(kPerfInstructions)) {
+                out("  inst/iter: ");
+                out_u64(total_inst / it);
+            }
+            if (pc.has(kPerfCycles) && pc.has(kPerfInstructions) && total_cycles > 0) {
+                // IPC × 100 (fixed-point 2 decimals). Widen to
+                // __int128 for the multiply so long benches where
+                // total_inst exceeds ~1.8e17 don't overflow u64 and
+                // wrap to a nonsense IPC. Same pattern as err_pct.
+                const u64 ipc100 = static_cast<u64>(
+                    (static_cast<unsigned __int128>(total_inst) * 100) / total_cycles);
+                out("  IPC: ");
+                out_u64(ipc100 / 100);
+                out(".");
+                const u64 frac = ipc100 % 100;
+                if (frac < 10) out("0");
+                out_u64(frac);
+            }
+            if (pc.has(kPerfCacheRefs) && pc.has(kPerfCacheMisses) && total_cref > 0) {
+                // PERF_COUNT_HW_CACHE_MISSES / _REFERENCES are the
+                // generic hardware cache events. On most x86 machines
+                // the kernel maps these to last-level-cache (LLC)
+                // counters, not L1 — label accordingly to avoid a
+                // misleading "L1-miss" attribution.
+                const u64 miss_thou = static_cast<u64>(
+                    (static_cast<unsigned __int128>(total_cmiss) * 1000) / total_cref);
+                out("  cache-miss: ");
+                out_u64(miss_thou / 10);
+                out(".");
+                out_u64(miss_thou % 10);
+                out("%");
+            }
+            if (pc.has(kPerfBranchMisses)) {
+                out("  br-miss/iter: ");
+                out_u64(total_bmiss / it);
+            }
+            out("\n");
+        }
 
         if (result_count_ < 32) {
             results_[result_count_++] = r;
@@ -317,5 +502,105 @@ struct Bench {
         out(" ===\n");
     }
 };
+
+// ============================================================================
+// Environment checks
+// ============================================================================
+//
+// Microbenchmarks are only as reliable as the system they run on.
+// print_environment_warnings() reads /sys and /proc to flag the
+// well-known foot-guns it can actually detect from file state:
+//   - CPU governor != performance  (frequency varies during the run)
+//   - Intel turbo boost on         (same — amplified)
+//   - perf_event_paranoid > 2      (perf counters will be unavailable)
+//
+// It also prints a `taskset -c N` hint so the user remembers to pin
+// the benchmark to one core, but it does NOT currently detect the
+// process's actual CPU affinity — that would need a sched_getaffinity
+// probe and is deferred. Call print_environment_warnings() once at
+// the start of main() so the user sees the flags before reading
+// numbers they might otherwise trust.
+
+// Read up to `cap-1` bytes from `path` into `buf`, zero-terminate. Returns
+// the count read, or 0 on any error. Trims a single trailing newline.
+// Requires `cap >= 2` (one byte of payload + the trailing nul); smaller
+// caps are a caller bug and would underflow `cap - 1`. Retries `read()`
+// on EINTR so the env-warning path isn't silently defeated by a signal.
+inline u32 read_small_file(const char* path, char* buf, u32 cap) {
+    if (cap < 2) return 0;
+    int fd = ::open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n;
+    do {
+        n = ::read(fd, buf, cap - 1);
+    } while (n < 0 && errno == EINTR);
+    ::close(fd);
+    if (n <= 0) return 0;
+    u32 len = static_cast<u32>(n);
+    if (buf[len - 1] == '\n') len--;
+    buf[len] = '\0';
+    return len;
+}
+
+inline bool str_eq_cstr(const char* a, const char* b) {
+    u32 i = 0;
+    while (a[i] && b[i] && a[i] == b[i]) i++;
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+inline void print_environment_warnings() {
+    char buf[128];
+
+    out("--- Environment ---\n");
+
+    // CPU governor.
+    if (read_small_file(
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", buf, sizeof(buf))) {
+        out("  governor: ");
+        out(buf);
+        if (!str_eq_cstr(buf, "performance")) {
+            out("  [!]  (expected 'performance' for stable measurements)");
+        }
+        out("\n");
+    }
+
+    // Intel no_turbo flag: "1" = turbo disabled (stable), "0" = turbo on.
+    if (read_small_file("/sys/devices/system/cpu/intel_pstate/no_turbo", buf, sizeof(buf))) {
+        out("  intel turbo: ");
+        if (str_eq_cstr(buf, "1")) {
+            out("OFF");
+        } else {
+            out("ON  [!]  (frequency will vary)");
+        }
+        out("\n");
+    }
+
+    // perf_event_paranoid — gate on PMU access. `perf_event_open`
+    // allows unprivileged hardware-event counting up to and including
+    // paranoid=2; above that (newer kernels default to 4) the group
+    // open fails with EACCES. Parse as an integer so multi-digit
+    // values like "10" aren't misread via buf[0].
+    if (read_small_file("/proc/sys/kernel/perf_event_paranoid", buf, sizeof(buf))) {
+        out("  perf_event_paranoid: ");
+        out(buf);
+        // Accept a leading '-' for defensive parsing (kernel allows -1).
+        int paranoid = 0;
+        u32 i = (buf[0] == '-') ? 1 : 0;
+        bool valid = i < sizeof(buf) && buf[i] != '\0';
+        while (valid && buf[i] >= '0' && buf[i] <= '9') {
+            paranoid = paranoid * 10 + (buf[i] - '0');
+            i++;
+        }
+        if (buf[0] == '-') paranoid = -paranoid;
+        if (paranoid > 2) {
+            out("  [!]  (perf counters will be unavailable; sudo sysctl "
+                "kernel.perf_event_paranoid=2)");
+        }
+        out("\n");
+    }
+
+    out("  suggestion: taskset -c 0 ./bench_...    # pin to one core\n");
+    out("\n");
+}
 
 }  // namespace rut::bench

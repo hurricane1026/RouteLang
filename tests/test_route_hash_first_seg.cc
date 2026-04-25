@@ -174,6 +174,19 @@ TEST(route_hash_first_seg, distinct_first_segments_distribute_well) {
     }
 }
 
+TEST(route_hash_first_seg, first_segment_stops_at_query_and_fragment) {
+    // Codex P2 on #45: requests arrive with raw query / fragment bytes.
+    // first_segment must stop at '?' / '#' so /health?check=1 buckets
+    // the same as /health, otherwise registered routes would miss.
+    HashFirstSegmentTable t;
+    REQUIRE(t.insert(S("/health"), 0, 7));
+    REQUIRE(t.insert(S("/api/users"), 0, 12));
+    CHECK_EQ(t.match(S("/health?check=1"), 0), 7u);
+    CHECK_EQ(t.match(S("/health?"), 0), 7u);
+    CHECK_EQ(t.match(S("/health#frag"), 0), 7u);
+    CHECK_EQ(t.match(S("/api/users?page=3"), 0), 12u);
+}
+
 TEST(route_hash_first_seg, clear_resets_state) {
     HashFirstSegmentTable t;
     REQUIRE(t.insert(S("/a/x"), 0, 1));

@@ -260,6 +260,9 @@ struct RouteConfig {
         if (dispatch_ == &kHashFullPathDispatch) {
             return hash_full_state.insert(path_view, r.method, idx);
         }
+        if (dispatch_ == &kHashFirstSegmentDispatch) {
+            return hash_first_seg_state.insert(path_view, r.method, idx);
+        }
         if (dispatch_ == &kLinearScanDispatch) {
             // routes[] IS the data — nothing else to populate.
             return true;
@@ -301,9 +304,6 @@ struct RouteConfig {
         if (!populate_dispatch_state(r)) {
             return false;  // active dispatch at capacity — fail loud
         }
-        if (!hash_first_seg_state.insert(path_view, method, static_cast<u16>(route_count))) {
-            return false;  // first-seg bucket overflow; reject for consistency
-        }
         route_count++;
         return true;
     }
@@ -327,9 +327,6 @@ struct RouteConfig {
         r.status_code = status;
         r.fn = nullptr;
         if (!populate_dispatch_state(r)) {
-            return false;
-        }
-        if (!hash_first_seg_state.insert(path_view, method, static_cast<u16>(route_count))) {
             return false;
         }
         route_count++;
@@ -357,9 +354,6 @@ struct RouteConfig {
         r.status_code = 0;
         r.fn = fn;
         if (!populate_dispatch_state(r)) {
-            return false;
-        }
-        if (!hash_first_seg_state.insert(path_view, method, static_cast<u16>(route_count))) {
             return false;
         }
         route_count++;

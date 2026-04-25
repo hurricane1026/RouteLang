@@ -23,7 +23,12 @@ u64 fnv1a(const char* p, u32 len) {
 Str HashFirstSegmentTable::first_segment(Str p) {
     u32 start = (p.len > 0 && p.ptr[0] == '/') ? 1 : 0;
     u32 end = start;
-    while (end < p.len && p.ptr[end] != '/') end++;
+    // Stop at '/' AND at '?' / '#' — request-targets from the parser
+    // arrive raw, so /health?check=1 must produce first_segment "health"
+    // not "health?check=1". Without this, request and route would
+    // bucket differently and a registered /health route would miss.
+    // Codex P2 on #45.
+    while (end < p.len && p.ptr[end] != '/' && p.ptr[end] != '?' && p.ptr[end] != '#') end++;
     return Str{p.ptr + start, end - start};
 }
 

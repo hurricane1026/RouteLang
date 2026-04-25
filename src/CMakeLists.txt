@@ -126,6 +126,7 @@ add_library(rut_runtime STATIC
     runtime/route_dispatch.cc
     runtime/route_hash_first_seg.cc
     runtime/route_hash_full.cc
+    runtime/route_select.cc
     runtime/route_trie.cc
     ${SIMD_SOURCE}
 )

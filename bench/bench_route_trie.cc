@@ -472,6 +472,12 @@ static void bench_scale(u32 n_routes, bool cold_cache) {
     b.min_iterations(cold_cache ? 50000 : 500000);
     b.warmup(cold_cache ? 500 : 10000);
     b.epochs(7);
+    // Enable hardware perf counters so the output reports cycles/iter,
+    // IPC, and cache-miss% alongside wall time. The four approaches
+    // run on identical inputs, so the perf numbers explain WHY one
+    // wins or loses — not just that it does. No-op on hosts where
+    // perf_event_paranoid > 2 or the PMU is unavailable.
+    b.perf_counters(true);
     b.print_header();
 
     b.run("linear_scan (pre-PR)", [&] {
@@ -507,6 +513,7 @@ static void bench_scale(u32 n_routes, bool cold_cache) {
 }
 
 int main() {
+    bench::print_environment_warnings();
     const u32 sizes[] = {32, 64, 128};
     for (u32 si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++) {
         bench_scale(sizes[si], /*cold_cache=*/false);

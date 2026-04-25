@@ -219,13 +219,14 @@ struct RouteConfig {
     //     structure (e.g., trie node-pool exhaustion),
     //   - an unknown / non-canonical dispatch pointer.
     //
-    // The fail-closed default is deliberate (Copilot P2 on #43
-    // round 2): set_dispatch() accepts any non-null
-    // RouteDispatch*, so a caller could in principle install a
-    // copy of one of the canonical vtables (or a custom one).
-    // Without explicit per-impl handling the state for that
-    // dispatch wouldn't be built, and match() would systematically
-    // miss. Refusing add_* in that case keeps the failure loud.
+    // The fail-closed default is deliberate. Round-4 of #43
+    // tightened set_dispatch() to admit only canonical singleton
+    // dispatch pointers, so the "unknown dispatch" branch should
+    // not occur in normal use. We still reject it here as defense
+    // in depth: without explicit per-impl handling the auxiliary
+    // state for that dispatch would not be built, and match()
+    // would systematically miss. Refusing add_* keeps the failure
+    // loud rather than silent.
     //
     // Branches are narrow — body of each is exactly that impl's
     // `insert`. New impls add a branch here; the rest of add_*

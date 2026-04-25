@@ -116,6 +116,14 @@ struct TrieNode {
     // node is not terminal for that method". Slot 0 is "any"; other slots
     // are per-method (see method_slot()).
     static constexpr u16 kInvalidRoute = 0xffffu;
+    // "No child found" sentinel returned by find_child(). Numerically
+    // equal to kInvalidRoute (both are 0xffffu — u16's max value used
+    // as a "missing" sentinel) but kept as a distinct constant so
+    // call sites read clearly: a node-pool index lookup is not the
+    // same kind of thing as a route-table index lookup, even though
+    // u16 happens to carry both. Copilot caught the conflation on
+    // #43 round 4.
+    static constexpr u16 kInvalidNodeIdx = 0xffffu;
     u16 route_idx_by_method[kMethodSlots] = {kInvalidRoute,
                                              kInvalidRoute,
                                              kInvalidRoute,
@@ -209,9 +217,9 @@ private:
     static u32 tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out);
 
     // Linear-scan child lookup: walks `children` and compares the full
-    // segment via Str::eq. Returns the child's node index, or
-    // TrieNode::kInvalidRoute if no child matches. See the comment at
-    // the top of this file for why we don't layer a u8 first-byte
+    // segment via Str::eq. Returns the child's node-pool index, or
+    // TrieNode::kInvalidNodeIdx if no child matches. See the comment
+    // at the top of this file for why we don't layer a u8 first-byte
     // index on top — at our segment-length distribution it's a net
     // cost, not a savings.
     u16 find_child(u16 parent, Str segment) const;

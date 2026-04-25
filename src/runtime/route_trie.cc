@@ -12,8 +12,16 @@ namespace rut {
 //   P3a: case-sensitive — bytes are preserved verbatim, no tolower
 //
 // Returns the segment count, or kMaxPathSegments + 1 as a sentinel when the
-// path would produce more segments than `out` can hold. Callers reject
-// sentinel results and emit a clean build-time error.
+// path would produce more segments than `out` can hold. The two callers
+// treat the sentinel differently:
+//   - insert() rejects sentinel results at build time (registering a
+//     truncated path would land the route at the wrong depth relative
+//     to what the user wrote).
+//   - match() ignores the sentinel and routes using whatever segment
+//     prefix `out` does hold, so a request that exceeds the cap still
+//     hits the deepest applicable terminal — preserving catchall and
+//     longest-prefix semantics rather than failing-closed on input
+//     length alone (Codex P1 caught the earlier fail-closed match()).
 
 u32 RouteTrie::tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out) {
     // Pure segment split — query/fragment stripping is the caller's
@@ -47,7 +55,7 @@ void RouteTrie::clear() {
 }
 
 u16 RouteTrie::find_child(u16 parent, Str segment) const {
-    if (segment.len == 0) return TrieNode::kInvalidRoute;
+    if (segment.len == 0) return TrieNode::kInvalidNodeIdx;
     const auto& p = nodes[parent];
     // Linear scan with full segment compare. Str::eq short-circuits on
     // length mismatch (usually the common case for heterogeneous
@@ -60,7 +68,7 @@ u16 RouteTrie::find_child(u16 parent, Str segment) const {
         const u16 child_idx = p.children[i];
         if (nodes[child_idx].segment.eq(segment)) return child_idx;
     }
-    return TrieNode::kInvalidRoute;
+    return TrieNode::kInvalidNodeIdx;
 }
 
 bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
@@ -102,7 +110,7 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     u16 cur = 0;  // root
     for (u32 i = 0; i < n; i++) {
         u16 child = find_child(cur, segs[i]);
-        if (child == TrieNode::kInvalidRoute) {
+        if (child == TrieNode::kInvalidNodeIdx) {
             // Capacity pre-flight — no mutation if either cap would
             // be exceeded. This avoids the usual "push succeeded,
             // dangling node left behind" leak on a same-iteration
@@ -199,7 +207,7 @@ u16 RouteTrie::match(Str path, u8 method_char) const {
 
     for (u32 i = 0; i < segs.len; i++) {
         const u16 child = find_child(cur, segs[i]);
-        if (child == TrieNode::kInvalidRoute) break;
+        if (child == TrieNode::kInvalidNodeIdx) break;
         cur = child;
         const u16 candidate = pick_terminal(nodes[cur], want_slot);
         if (candidate != TrieNode::kInvalidRoute) best = candidate;

@@ -2310,6 +2310,136 @@ TEST(route, add_upstream_at_capacity) {
     CHECK(!cfg.add_upstream("overflow", 0x7F000001, 9999).has_value());  // full
 }
 
+// ============================================================================
+// is_routable_path rejection — PR-A added a uniform path-validation gate
+// to add_*. These tests pin the rejected shapes so a regression doesn't
+// silently relax the contract.
+// ============================================================================
+
+TEST(route, add_rejects_null_path) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_static(nullptr, 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_rejects_empty_path) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_static("", 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_rejects_path_without_leading_slash) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_static("api", 0, 200));
+    CHECK(!cfg.add_static("api/v1", 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_rejects_path_with_query) {
+    // '?' belongs to the query component of a URI; matching is on path
+    // only. Routing on a path with '?' would be surprising — at match
+    // time the segment trie strips it from the request, so the route
+    // would be effectively unmatchable.
+    RouteConfig cfg;
+    (void)cfg.add_upstream("u", 0x7F000001, 80);
+    CHECK(!cfg.add_static("/api?foo=1", 0, 200));
+    CHECK(!cfg.add_proxy("/api?x", 0, 0));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_rejects_path_with_fragment) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_static("/api#frag", 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_accepts_well_formed_path_after_rejection) {
+    // A previous rejected add_* must not poison route_count or leave
+    // partial state — a follow-up valid add_* should succeed.
+    RouteConfig cfg;
+    CHECK(!cfg.add_static("api", 0, 200));    // missing leading '/'
+    CHECK(!cfg.add_static("/x?y", 0, 200));   // has '?'
+    CHECK(!cfg.add_static(nullptr, 0, 200));  // null
+    CHECK_EQ(cfg.route_count, 0u);
+    CHECK(cfg.add_static("/api", 0, 200));  // valid
+    CHECK_EQ(cfg.route_count, 1u);
+}
+
+TEST(route, set_dispatch_rejects_unknown_pointer) {
+    // Codex P2 on #43 round 3: set_dispatch() must refuse any pointer
+    // that isn't one of the canonical static singletons. Allowing an
+    // ephemeral / stack-local vtable to be installed lets the
+    // dispatch_ pointer dangle once the caller's frame returns; even
+    // a structural copy of a real singleton (the natural way a caller
+    // might "construct" one) would be a stack-local. Lifetime hazard
+    // closed at the install gate; populate_dispatch_state's fail-
+    // closed branch from round 3 stays as defense-in-depth.
+    RouteDispatch fake_vtable = kLinearScanDispatch;  // structural copy
+    RouteConfig cfg;
+    CHECK(!cfg.set_dispatch(&fake_vtable));          // refused
+    CHECK_EQ(cfg.dispatch(), &kLinearScanDispatch);  // unchanged
+    // The default dispatch still works — the failed install left the
+    // config in its initial state, not a half-broken one.
+    CHECK(cfg.add_static("/api", 0, 200));
+    CHECK_EQ(cfg.route_count, 1u);
+}
+
+TEST(route, set_dispatch_accepts_canonical_singletons) {
+    // Positive-path coverage of the whitelist: each canonical
+    // singleton known to this PR must be installable on a fresh
+    // config. Future impl PRs add their singleton + a line here.
+    RouteConfig a;
+    CHECK(a.set_dispatch(&kLinearScanDispatch));
+    RouteConfig b;
+    CHECK(b.set_dispatch(&kSegmentTrieDispatch));
+    RouteConfig c;
+    CHECK(c.set_dispatch(&kHashFullPathDispatch));
+    // Null is still refused (no dispatch == no match).
+    RouteConfig d;
+    CHECK(!d.set_dispatch(nullptr));
+}
+
+TEST(route, set_dispatch_refuses_after_first_add) {
+    // Codex P1 on #43 round 2: flipping dispatch after add_* would
+    // leave earlier routes invisible to the new dispatch's data
+    // structure (e.g., trie empty / partial), causing silent misses.
+    // set_dispatch() pins the contract: dispatch is fixed at first
+    // add_*. Build a fresh RouteConfig if you need a different one.
+    RouteConfig cfg;
+    REQUIRE(cfg.set_dispatch(&kSegmentTrieDispatch));  // pre-add_* OK
+    REQUIRE_EQ(cfg.dispatch(), &kSegmentTrieDispatch);
+    REQUIRE(cfg.add_static("/a", 0, 200));
+    CHECK(!cfg.set_dispatch(&kLinearScanDispatch));   // post-add_* refused
+    CHECK_EQ(cfg.dispatch(), &kSegmentTrieDispatch);  // unchanged
+    CHECK(!cfg.set_dispatch(nullptr));                // null also refused
+}
+
+TEST(route, default_dispatch_admits_route_when_trie_would_fail) {
+    // The default linear-scan dispatch reads routes[] directly; a trie
+    // capacity exhaustion must NOT reject the route. The PR-A reviewer
+    // flagged that add_* used to gate on trie.insert() unconditionally,
+    // so configs whose paths are linear-scan-fine but trie-unfriendly
+    // would be wrongly rejected. This test pins the fix.
+    //
+    // We can't easily exhaust the trie at kMaxNodes=4097 in a unit
+    // test without making it absurdly long, so instead we verify the
+    // smaller observable: when dispatch == kLinearScanDispatch (the
+    // default), populate_dispatch_state is a no-op and add_* always
+    // succeeds for any well-formed path within RouteEntry::kMaxPathLen.
+    RouteConfig cfg;
+    REQUIRE(&kLinearScanDispatch == cfg.dispatch());
+    for (u32 i = 0; i < RouteConfig::kMaxRoutes; i++) {
+        char path[8];
+        path[0] = '/';
+        path[1] = static_cast<char>('a' + (i / 100) % 26);
+        path[2] = static_cast<char>('a' + (i / 10) % 26);
+        path[3] = static_cast<char>('a' + i % 26);
+        path[4] = '\0';
+        CHECK(cfg.add_static(path, 0, 200));
+    }
+    CHECK_EQ(cfg.route_count, RouteConfig::kMaxRoutes);
+}
+
 TEST(route, add_response_body_basic) {
     RouteConfig cfg;
     const u16 idx = cfg.add_response_body("Hello", 5);

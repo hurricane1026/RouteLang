@@ -67,19 +67,31 @@ u16 HashFirstSegmentTable::scan_bucket(u32 b, Str path, u8 method) const {
 }
 
 u16 HashFirstSegmentTable::match(Str path, u8 method) const {
+    // First-match-wins across the GLOBAL insert order (Codex P1 on
+    // #45). Each bucket scans in local insert order, so its first
+    // match is the smallest route_idx that bucket holds. To preserve
+    // linear-scan precedence — where a "/" catchall registered before
+    // a specific route MUST shadow the specific one — we look at both
+    // candidate buckets (request's first-segment bucket + the empty-
+    // segment bucket where catchalls live) and return the smaller
+    // route_idx of the two.
+    //
+    // Cost: at most two bucket scans per match. The catchall bucket
+    // typically holds 0-1 entries (only "/" routes hash there) so
+    // it's nearly free; we early-exit for the cases where there's
+    // nothing meaningful to merge.
     const Str first = first_segment(path);
     const u32 primary_bucket = bucket_for(first);
     const u16 primary_hit = scan_bucket(primary_bucket, path, method);
-    if (primary_hit != kRouteIdxInvalid) return primary_hit;
-    // Catchall fallback — routes registered at "/" hash into the
-    // empty-segment bucket. If the request's own first-segment
-    // bucket missed, check the catchall bucket. Skip when the
-    // request itself has an empty first segment (we'd be probing
-    // the same bucket twice).
-    if (first.len == 0) return kRouteIdxInvalid;
+    // If the request itself has empty first segment, primary_bucket
+    // already IS the catchall bucket — we'd just rescan it.
+    if (first.len == 0) return primary_hit;
     const u32 catchall_bucket = bucket_for(Str{nullptr, 0});
-    if (catchall_bucket == primary_bucket) return kRouteIdxInvalid;
-    return scan_bucket(catchall_bucket, path, method);
+    if (catchall_bucket == primary_bucket) return primary_hit;
+    const u16 catchall_hit = scan_bucket(catchall_bucket, path, method);
+    if (primary_hit == kRouteIdxInvalid) return catchall_hit;
+    if (catchall_hit == kRouteIdxInvalid) return primary_hit;
+    return primary_hit < catchall_hit ? primary_hit : catchall_hit;
 }
 
 namespace {

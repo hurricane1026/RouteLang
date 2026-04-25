@@ -58,9 +58,14 @@ public:
     //     pick this dispatch for a config that triggers this; we
     //     return false defensively so a wrong selector choice is
     //     loud rather than silent).
-    // Within a bucket entries are kept in insert order so the linear
-    // scan inside match() preserves the linear scan's first-match-wins
-    // semantics.
+    //
+    // CONTRACT: route_idx must be assigned monotonically in insertion
+    // order (route N gets idx N). RouteConfig::add_* guarantees this
+    // via route_count++. match() relies on `smaller route_idx == older
+    // insert` to preserve linear-scan's first-match-wins precedence
+    // across the request's first-segment bucket and the catchall
+    // bucket — without monotonicity, an older catchall would not
+    // correctly shadow a newer specific route (Codex P1 on #45).
     bool insert(Str path, u8 method, u16 route_idx);
 
     // Look up `path` + `method`. Returns kRouteIdxInvalid on miss.

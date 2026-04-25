@@ -57,17 +57,39 @@ TEST(route_hash_first_seg, byte_prefix_match_within_bucket) {
 // configs that depend on a "/" route)
 // ============================================================================
 
-TEST(route_hash_first_seg, catchall_root_matches_any_request) {
+// route_idx is monotonically assigned in insertion order (RouteConfig
+// guarantees this via route_count++); tests must mirror that contract
+// because the cross-bucket precedence in match() relies on it. The
+// tests below use idx == insertion sequence so the assertions reflect
+// what real configs see.
+
+TEST(route_hash_first_seg, catchall_inserted_after_specific) {
+    // Specific route at idx 0 (first), catchall at idx 1 (second).
+    // Linear-scan first-match-wins: /health hits idx 0, /missing
+    // falls back to idx 1.
     HashFirstSegmentTable t;
-    REQUIRE(t.insert(S("/"), 0, 99));
-    REQUIRE(t.insert(S("/health"), 0, 7));
-    // Specific route still wins on its own bucket.
-    CHECK_EQ(t.match(S("/health"), 0), 7u);
-    // Unmatched first-segment falls back to the catchall bucket.
-    CHECK_EQ(t.match(S("/missing"), 0), 99u);
-    CHECK_EQ(t.match(S("/random/deep/path"), 0), 99u);
-    // The root path itself hits the catchall.
-    CHECK_EQ(t.match(S("/"), 0), 99u);
+    REQUIRE(t.insert(S("/health"), 0, 0));
+    REQUIRE(t.insert(S("/"), 0, 1));
+    CHECK_EQ(t.match(S("/health"), 0), 0u);
+    CHECK_EQ(t.match(S("/missing"), 0), 1u);
+    CHECK_EQ(t.match(S("/random/deep/path"), 0), 1u);
+    CHECK_EQ(t.match(S("/"), 0), 1u);
+}
+
+TEST(route_hash_first_seg, catchall_inserted_first_shadows_specific) {
+    // Codex P1 on #45: catchall at idx 0, specific at idx 1. Linear
+    // scan returns the catchall (first match in routes[]); the old
+    // hash-first-seg impl returned the specific because the primary
+    // bucket hit shadowed the catchall fallback. Cross-bucket
+    // precedence (smaller route_idx wins) restores parity.
+    HashFirstSegmentTable t;
+    REQUIRE(t.insert(S("/"), 0, 0));
+    REQUIRE(t.insert(S("/health"), 0, 1));
+    // /health: primary bucket has route 1, catchall has route 0 — 0
+    // is older, so 0 wins. Same as linear scan would do.
+    CHECK_EQ(t.match(S("/health"), 0), 0u);
+    CHECK_EQ(t.match(S("/missing"), 0), 0u);
+    CHECK_EQ(t.match(S("/"), 0), 0u);
 }
 
 TEST(route_hash_first_seg, catchall_only_config_serves_everything) {

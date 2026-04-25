@@ -6,6 +6,7 @@
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/route_dispatch.h"
+#include "rut/runtime/route_hash_first_seg.h"
 #include "rut/runtime/route_hash_full.h"
 #include "rut/runtime/route_trie.h"
 
@@ -165,6 +166,14 @@ struct RouteConfig {
     // dimension we measure).
     HashFullPathTable hash_full_state;
 
+    // First-segment-hashed bucket table. ~24 KB (64 buckets × 16
+    // entries × 24 B). Populated alongside the trie + hash_full_state.
+    // Selector picks this dispatch only when (a) no first-segment
+    // bucket would exceed kPerBucket and (b) at least one configured
+    // route shares a first segment with another (otherwise plain
+    // linear scan is just as fast and uses no per-impl memory).
+    HashFirstSegmentTable hash_first_seg_state;
+
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
 
@@ -292,6 +301,9 @@ struct RouteConfig {
         if (!populate_dispatch_state(r)) {
             return false;  // active dispatch at capacity — fail loud
         }
+        if (!hash_first_seg_state.insert(path_view, method, static_cast<u16>(route_count))) {
+            return false;  // first-seg bucket overflow; reject for consistency
+        }
         route_count++;
         return true;
     }
@@ -315,6 +327,9 @@ struct RouteConfig {
         r.status_code = status;
         r.fn = nullptr;
         if (!populate_dispatch_state(r)) {
+            return false;
+        }
+        if (!hash_first_seg_state.insert(path_view, method, static_cast<u16>(route_count))) {
             return false;
         }
         route_count++;
@@ -342,6 +357,9 @@ struct RouteConfig {
         r.status_code = 0;
         r.fn = fn;
         if (!populate_dispatch_state(r)) {
+            return false;
+        }
+        if (!hash_first_seg_state.insert(path_view, method, static_cast<u16>(route_count))) {
             return false;
         }
         route_count++;

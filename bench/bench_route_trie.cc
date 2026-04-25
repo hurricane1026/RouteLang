@@ -1072,8 +1072,30 @@ private:
 }  // namespace aho_corasick
 
 // ---------------------------------------------------------------------------
-// Route set generator — scales up synthetic API-gateway loads.
+// Realistic route corpus — modeled on a typical SaaS API gateway.
 // ---------------------------------------------------------------------------
+//
+// Production gateway configs cluster sharply, not uniformly. The earlier
+// synthetic generator permuted across arbitrary {tld, resource, sub}
+// triples that don't exist in any real config — which let segment hashes
+// and prefix tries look better or worse depending on coincidence rather
+// than realism. This corpus mirrors what we see in the wild:
+//
+//   - Heavy clustering at /api/v1/<resource>/... (the dominant subtree).
+//     A handful of REST resources (users, orders, products, etc.) each
+//     contribute the canonical CRUD shape: list, create, get-by-id,
+//     update, delete = 5 routes per resource.
+//   - Operational endpoints at the root: /health, /metrics, /_status,
+//     /_ready, /_live. High-volume in production (load balancer probes
+//     hit them every few seconds) but tiny in count.
+//   - Admin surface under /admin/...: low volume but always present.
+//   - OAuth and webhooks at fixed paths.
+//   - Some /api/v2/<resource> routes for partial-version overlap (real
+//     gateways gradually migrate; v1 and v2 coexist for months).
+//
+// At small N the route mix tilts toward fixed (~25%); at N=128 the API
+// surface dominates (~85%) — matching how real configs grow (ops + admin
+// scale slowly while API surface grows linearly with feature count).
 
 struct RouteSpec {
     char path[128];
@@ -1081,81 +1103,168 @@ struct RouteSpec {
     u8 method;
 };
 
-// Generate N routes with a realistic shape:
-//   - every 7th is a shallow top-level like "/health_i"
-//   - the rest are 3-4 deep like "/api/v{1|2|3}/res_i/sub_j"
-// Mix of GET and POST so method-slot is exercised.
-static void generate_routes(RouteSpec* out, u32 n) {
-    const char* tlds[] = {"api", "service", "v1", "v2", "internal", "public", "admin"};
-    const char* resources[] = {
-        "users", "orders", "products", "search", "items", "sessions", "events", "metrics"};
-    const char* subs[] = {"list", "detail", "summary", "export", "batch", "stats", "featured"};
-    const u32 n_tlds = sizeof(tlds) / sizeof(tlds[0]);
-    const u32 n_res = sizeof(resources) / sizeof(resources[0]);
-    const u32 n_subs = sizeof(subs) / sizeof(subs[0]);
+static const char* kResources[] = {
+    "users",     "accounts",     "subscriptions", "orders",   "invoices", "products",
+    "customers", "payments",     "refunds",       "sessions", "events",   "webhooks",
+    "projects",  "tasks",        "comments",      "tags",     "files",    "notifications",
+    "teams",     "integrations", "channels",      "messages", "members",  "policies",
+};
 
-    auto write_str = [](char*& p, const char* s) {
+static const struct {
+    const char* path;
+    u8 method;
+} kFixedRoutes[] = {
+    // Operational (high-volume in production: LB probes, scrapers).
+    {"/health", 'G'},
+    {"/metrics", 'G'},
+    {"/_status", 'G'},
+    {"/_ready", 'G'},
+    {"/_live", 'G'},
+    // Admin (low volume, always present).
+    {"/admin/users", 'G'},
+    {"/admin/audit", 'G'},
+    {"/admin/audit/recent", 'G'},
+    {"/admin/users/u_42", 'G'},
+    {"/admin/users/u_42/sessions", 'G'},
+    // OAuth.
+    {"/oauth/authorize", 'G'},
+    {"/oauth/token", 'P'},
+    {"/oauth/revoke", 'P'},
+    // Webhooks.
+    {"/webhooks/stripe", 'P'},
+    {"/webhooks/github", 'P'},
+    {"/webhooks/twilio", 'P'},
+};
+
+// Generate up to N routes using the realistic schema. Allocates ~12 fixed
+// routes (capped at the table size), then fills the remainder with REST
+// CRUD per resource (5 routes each), then v2 endpoints as overflow.
+static void generate_routes(RouteSpec* out, u32 n) {
+    auto write = [](char*& p, const char* s) {
         while (*s) *p++ = *s++;
     };
-    auto write_u32 = [](char*& p, u32 v) {
-        char buf[12];
-        u32 bi = 0;
-        if (v == 0) buf[bi++] = '0';
-        while (v > 0) {
-            buf[bi++] = static_cast<char>('0' + v % 10);
-            v /= 10;
-        }
-        while (bi > 0) *p++ = buf[--bi];
-    };
 
-    for (u32 i = 0; i < n; i++) {
-        char* p = out[i].path;
-        if (i % 7 == 0) {
-            *p++ = '/';
-            write_str(p, "endpoint_");
-            write_u32(p, i);
-        } else {
-            *p++ = '/';
-            write_str(p, tlds[i % n_tlds]);
-            *p++ = '/';
-            write_str(p, resources[(i / 3) % n_res]);
-            *p++ = '/';
-            write_str(p, subs[(i / 5) % n_subs]);
-            *p++ = '_';
-            write_u32(p, i);
-        }
-        out[i].path_len = static_cast<u32>(p - out[i].path);
+    const u32 n_fixed_avail = sizeof(kFixedRoutes) / sizeof(kFixedRoutes[0]);
+    const u32 n_resources = sizeof(kResources) / sizeof(kResources[0]);
+    const u32 n_fixed = (n / 4 < n_fixed_avail) ? (n / 4) : n_fixed_avail;
+    u32 emitted = 0;
+
+    // Phase 1 — fixed (ops + admin + oauth + webhooks).
+    for (u32 i = 0; i < n_fixed && emitted < n; i++) {
+        char* p = out[emitted].path;
+        write(p, kFixedRoutes[i].path);
+        out[emitted].path_len = static_cast<u32>(p - out[emitted].path);
         *p = '\0';
-        out[i].method = (i % 3 == 0) ? 'G' : (i % 3 == 1 ? 'P' : 0);
+        out[emitted].method = kFixedRoutes[i].method;
+        emitted++;
+    }
+
+    // Phase 2 — REST CRUD per resource: 5 routes each
+    //   GET    /api/v1/<res>           list
+    //   POST   /api/v1/<res>           create
+    //   GET    /api/v1/<res>/i_42      get item
+    //   PUT    /api/v1/<res>/i_42      update item   (P slot)
+    //   DELETE /api/v1/<res>/i_42      delete item
+    // (the 'P' method-slot is shared by POST/PUT/PATCH per the runtime's
+    // first-byte scheme, so collection-POST and item-PUT are at distinct
+    // paths and don't collide.)
+    static const struct {
+        const char* tail;
+        u8 method;
+    } kOps[] = {
+        {"", 'G'},
+        {"", 'P'},
+        {"/i_42", 'G'},
+        {"/i_42", 'P'},
+        {"/i_42", 'D'},
+    };
+    constexpr u32 kOpsPerResource = sizeof(kOps) / sizeof(kOps[0]);
+    for (u32 r = 0; r < n_resources && emitted < n; r++) {
+        for (u32 op = 0; op < kOpsPerResource && emitted < n; op++) {
+            char* p = out[emitted].path;
+            write(p, "/api/v1/");
+            write(p, kResources[r]);
+            write(p, kOps[op].tail);
+            out[emitted].path_len = static_cast<u32>(p - out[emitted].path);
+            *p = '\0';
+            out[emitted].method = kOps[op].method;
+            emitted++;
+        }
+    }
+
+    // Phase 3 — overflow: /api/v2/<res> for partial-version overlap, then
+    // /api/v2/<res>/i_42. Real configs always have a few v2 paths even
+    // when v1 is dominant.
+    u32 overflow_idx = 0;
+    while (emitted < n) {
+        const char* res = kResources[overflow_idx % n_resources];
+        const bool item = (overflow_idx / n_resources) % 2 == 1;
+        char* p = out[emitted].path;
+        write(p, "/api/v2/");
+        write(p, res);
+        if (item) write(p, "/i_42");
+        out[emitted].path_len = static_cast<u32>(p - out[emitted].path);
+        *p = '\0';
+        out[emitted].method = item ? 'P' : 'G';
+        emitted++;
+        overflow_idx++;
     }
 }
 
-// Build a request set — half are hits (sampling the route set), half are
-// misses (randomized near-miss paths). Permuted to defeat branch prediction.
+// Build a request set with realistic distribution:
+//   - 90% hits, of which 80% target the "hot" top-20% routes (Pareto
+//     bias). The fixed ops/admin routes emit first so they sit in the
+//     hot set, matching how /health and /metrics dominate real traffic.
+//   - 5% near-miss: a real route mutated (e.g., /api/v1/... → /api/v3/...
+//     where v3 doesn't exist). Stresses prefix-walk + sentinel return.
+//   - 5% pure miss: random /unk_xxx — bot scanning shape.
 static constexpr u32 kNumRequests = 64;
 
 static void build_requests(
     const RouteSpec* routes, u32 nroutes, char (*paths)[128], Str* strs, u8* methods) {
-    // Simple LCG for deterministic-but-spread sampling.
     u64 seed = 0x9E3779B97F4A7C15ULL;
     auto next = [&]() -> u32 {
         seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
         return static_cast<u32>(seed >> 32);
     };
 
+    const u32 hot_pop = nroutes / 5 == 0 ? 1 : nroutes / 5;  // top 20%
+
     for (u32 i = 0; i < kNumRequests; i++) {
-        if (i % 2 == 0 && nroutes > 0) {
-            // Hit: pick a random route and copy its path verbatim.
-            const u32 r = next() % nroutes;
-            u32 len = routes[r].path_len;
-            for (u32 k = 0; k < len; k++) paths[i][k] = routes[r].path[k];
+        const u32 roll = next() % 100;
+        if (roll < 90 && nroutes > 0) {
+            // Hit — 80% from the hot 20%, 20% from the cold tail.
+            const bool hot = (next() % 10) < 8;
+            const u32 idx = hot ? (next() % hot_pop) : (next() % nroutes);
+            u32 len = routes[idx].path_len;
+            for (u32 k = 0; k < len; k++) paths[i][k] = routes[idx].path[k];
             strs[i] = Str{paths[i], len};
-            methods[i] = routes[r].method;
+            methods[i] = routes[idx].method;
+        } else if (roll < 95 && nroutes > 0) {
+            // Near-miss — copy a real route then mutate.
+            const u32 idx = next() % nroutes;
+            u32 len = routes[idx].path_len;
+            for (u32 k = 0; k < len; k++) paths[i][k] = routes[idx].path[k];
+            // Bump the version digit if present (/api/v1/... → /api/v3/...).
+            // Otherwise tack on an unknown segment so it doesn't accidentally
+            // match a prefix.
+            if (len > 7 && paths[i][1] == 'a' && paths[i][6] >= '0' && paths[i][6] <= '9') {
+                paths[i][6] = '3';
+            } else if (len + 8 < 128) {
+                paths[i][len++] = '/';
+                paths[i][len++] = 'X';
+                paths[i][len++] = 'M';
+                paths[i][len++] = 'I';
+                paths[i][len++] = 'S';
+                paths[i][len++] = 'S';
+            }
+            strs[i] = Str{paths[i], len};
+            methods[i] = routes[idx].method;
         } else {
-            // Miss: synthesize a path that won't hit anything.
+            // Pure miss (bot scan).
             char* p = paths[i];
             *p++ = '/';
-            *p++ = 'u';  // "unknown_<i>"
+            *p++ = 'u';
             *p++ = 'n';
             *p++ = 'k';
             *p++ = '_';

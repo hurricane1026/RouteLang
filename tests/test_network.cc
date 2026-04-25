@@ -2392,9 +2392,11 @@ TEST(route, set_dispatch_accepts_canonical_singletons) {
     CHECK(a.set_dispatch(&kLinearScanDispatch));
     RouteConfig b;
     CHECK(b.set_dispatch(&kSegmentTrieDispatch));
-    // Null is still refused (no dispatch == no match).
     RouteConfig c;
-    CHECK(!c.set_dispatch(nullptr));
+    CHECK(c.set_dispatch(&kHashFullPathDispatch));
+    // Null is still refused (no dispatch == no match).
+    RouteConfig d;
+    CHECK(!d.set_dispatch(nullptr));
 }
 
 TEST(route, set_dispatch_refuses_after_first_add) {

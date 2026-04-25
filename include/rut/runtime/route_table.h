@@ -141,7 +141,8 @@ struct RouteConfig {
     // contract explicit at the two places that matter (install gate
     // and state-build gate).
     static bool is_canonical_dispatch(const RouteDispatch* d) {
-        return d == &kLinearScanDispatch || d == &kSegmentTrieDispatch;
+        return d == &kLinearScanDispatch || d == &kSegmentTrieDispatch ||
+               d == &kHashFullPathDispatch;
     }
 
     // Segment-aware radix trie. Populated by add_* only when the

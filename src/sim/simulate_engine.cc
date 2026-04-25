@@ -316,8 +316,14 @@ static const Engine::CompiledRoute* select_route(const Engine& engine,
 }
 
 static u32 visible_path_len(Str path) {
+    // Stop at '?' AND '#': the matcher treats both as the start of
+    // the query / fragment components and ignores them, so the bytes
+    // after that don't participate in routing decisions. Stopping
+    // only at '?' here let "/api#frag" log differently than the
+    // route lookup actually saw — Codex P2 on #41 round 14, after
+    // round 12 added '#' handling to the matcher.
     u32 n = 0;
-    while (n < path.len && path.ptr[n] != '?') n++;
+    while (n < path.len && path.ptr[n] != '?' && path.ptr[n] != '#') n++;
     return n;
 }
 

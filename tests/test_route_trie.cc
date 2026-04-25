@@ -288,21 +288,53 @@ TEST(route_trie, node_count_shows_prefix_sharing) {
 TEST(route_trie, deep_path_still_falls_through_to_catchall_or_prefix) {
     // Regression guard (Codex P1): an earlier match() returned
     // kInvalidRoute the moment tokenize reported segment-count
-    // overflow, letting requests with >16 segments bypass a '/'
-    // catchall or a matching prefix route. ConnectionBase::
-    // kMaxReqPathLen is 64 bytes — enough for 30+ two-byte segments
-    // — so the overflow is reachable from a single valid request.
-    // match() must walk as deep as the trie has data for and return
-    // the longest-match terminal it saw.
+    // overflow, letting requests with > kMaxPathSegments segments
+    // bypass a '/' catchall or a matching prefix route. match() must
+    // walk as deep as the trie has data for and return the longest-
+    // match terminal it saw, not bail when tokenize trips its cap.
+    //
+    // Although a real request hits ConnectionBase::kMaxReqPathLen
+    // (64 bytes → at most 32 segments) before the trie ever sees
+    // it, match() is also called from tests, replay capture, and
+    // future tooling that may legitimately feed paths past the
+    // segment cap; the contract here is robustness, not coverage of
+    // every wire shape. Build the over-cap path at runtime so the
+    // assertion remains tight as kMaxPathSegments evolves
+    // (Codex P2 on #41 round 14 — 17 segments stopped exercising
+    // the overflow path the moment kMaxPathSegments grew to 64).
     RouteTrie t;
     const Insert items[] = {{"/", 0, 42}, {"/api", 0, 7}};
     REQUIRE(build_ok(t, items, 2));
-    // 17 single-char segments — exceeds kMaxPathSegments=16, but
-    // starts with /api, so the /api terminal must still win.
-    CHECK_EQ(t.match(S("/api/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p"), 0), 7u);
-    // All-unknown deep path — catchall '/' must still fire instead
-    // of a spurious no-match.
-    CHECK_EQ(t.match(S("/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q"), 0), 42u);
+
+    // /api + (kMaxPathSegments + 1) "/a" segments = guaranteed
+    // overflow regardless of how the cap is retuned later. Buffer
+    // is sized statically since constexpr u32 mul is fine in this
+    // no-stdlib code; the path doesn't need a NUL terminator (Str
+    // carries length).
+    constexpr u32 kSegs = RouteTrie::kMaxPathSegments + 1;
+    char prefixed[4 + kSegs * 2];
+    u32 n = 0;
+    prefixed[n++] = '/';
+    prefixed[n++] = 'a';
+    prefixed[n++] = 'p';
+    prefixed[n++] = 'i';
+    for (u32 i = 0; i < kSegs; i++) {
+        prefixed[n++] = '/';
+        prefixed[n++] = 'a';
+    }
+    // Starts with /api — the /api terminal must win even though
+    // tokenize will overflow before reaching the deepest segment.
+    CHECK_EQ(t.match(Str{prefixed, n}, 0), 7u);
+
+    // Same depth, no /api prefix — catchall '/' must still fire
+    // instead of a spurious no-match.
+    char unprefixed[kSegs * 2];
+    n = 0;
+    for (u32 i = 0; i < kSegs; i++) {
+        unprefixed[n++] = '/';
+        unprefixed[n++] = 'a';
+    }
+    CHECK_EQ(t.match(Str{unprefixed, n}, 0), 42u);
 }
 
 TEST(route_trie, insert_atomic_on_node_pool_exhaustion_midpath) {

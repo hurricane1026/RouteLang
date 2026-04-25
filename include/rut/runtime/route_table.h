@@ -117,11 +117,30 @@ struct RouteConfig {
     // earlier routes wouldn't be in the new dispatch's data structure
     // and lookups would silently miss them (Codex P1 caught this on
     // #43). Build a fresh RouteConfig if you need a different dispatch.
+    //
+    // set_dispatch() also refuses any pointer that isn't one of the
+    // canonical static singletons declared in route_dispatch.h. The
+    // pointer is borrowed across the config's lifetime, so accepting
+    // an arbitrary `RouteDispatch*` would let a caller install an
+    // ephemeral / stack-local vtable that dangles once the caller's
+    // frame returns (Codex P2 on #43 round 3). Limiting the input to
+    // singletons whose addresses are stable for the program's
+    // lifetime closes the lifetime hazard at the gate.
     const RouteDispatch* dispatch() const { return dispatch_; }
     bool set_dispatch(const RouteDispatch* d) {
-        if (route_count > 0 || d == nullptr) return false;
+        if (route_count > 0) return false;
+        if (!is_canonical_dispatch(d)) return false;
         dispatch_ = d;
         return true;
+    }
+
+    // Whitelist of canonical dispatch singletons. Each new impl PR
+    // adds its singleton here; a custom dispatch needs both an entry
+    // here AND a branch in populate_dispatch_state() — keeps the
+    // contract explicit at the two places that matter (install gate
+    // and state-build gate).
+    static bool is_canonical_dispatch(const RouteDispatch* d) {
+        return d == &kLinearScanDispatch || d == &kSegmentTrieDispatch;
     }
 
     // Segment-aware radix trie. Populated by add_* only when the

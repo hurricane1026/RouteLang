@@ -2365,17 +2365,36 @@ TEST(route, add_accepts_well_formed_path_after_rejection) {
     CHECK_EQ(cfg.route_count, 1u);
 }
 
-TEST(route, add_rejects_unknown_dispatch) {
-    // Copilot P2 on #43 round 2: set_dispatch() accepts any non-null
-    // RouteDispatch*, so a caller could install a copy of (or a custom)
-    // vtable. populate_dispatch_state() must fail-closed for unknown
-    // dispatch pointers — otherwise routes are admitted with no state
-    // built and match() systematically misses.
+TEST(route, set_dispatch_rejects_unknown_pointer) {
+    // Codex P2 on #43 round 3: set_dispatch() must refuse any pointer
+    // that isn't one of the canonical static singletons. Allowing an
+    // ephemeral / stack-local vtable to be installed lets the
+    // dispatch_ pointer dangle once the caller's frame returns; even
+    // a structural copy of a real singleton (the natural way a caller
+    // might "construct" one) would be a stack-local. Lifetime hazard
+    // closed at the install gate; populate_dispatch_state's fail-
+    // closed branch from round 3 stays as defense-in-depth.
     RouteDispatch fake_vtable = kLinearScanDispatch;  // structural copy
     RouteConfig cfg;
-    REQUIRE(cfg.set_dispatch(&fake_vtable));  // accepted (any non-null)
-    CHECK(!cfg.add_static("/api", 0, 200));   // refused at populate
-    CHECK_EQ(cfg.route_count, 0u);            // no half-added entry
+    CHECK(!cfg.set_dispatch(&fake_vtable));          // refused
+    CHECK_EQ(cfg.dispatch(), &kLinearScanDispatch);  // unchanged
+    // The default dispatch still works — the failed install left the
+    // config in its initial state, not a half-broken one.
+    CHECK(cfg.add_static("/api", 0, 200));
+    CHECK_EQ(cfg.route_count, 1u);
+}
+
+TEST(route, set_dispatch_accepts_canonical_singletons) {
+    // Positive-path coverage of the whitelist: each canonical
+    // singleton known to this PR must be installable on a fresh
+    // config. Future impl PRs add their singleton + a line here.
+    RouteConfig a;
+    CHECK(a.set_dispatch(&kLinearScanDispatch));
+    RouteConfig b;
+    CHECK(b.set_dispatch(&kSegmentTrieDispatch));
+    // Null is still refused (no dispatch == no match).
+    RouteConfig c;
+    CHECK(!c.set_dispatch(nullptr));
 }
 
 TEST(route, set_dispatch_refuses_after_first_add) {

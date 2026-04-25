@@ -6,6 +6,7 @@
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/route_dispatch.h"
+#include "rut/runtime/route_hash_full.h"
 #include "rut/runtime/route_trie.h"
 
 #include <errno.h>
@@ -154,6 +155,15 @@ struct RouteConfig {
                   "RouteConfig::kMaxRoutes must equal TrieNode::kMaxChildren so a config "
                   "whose routes all share a single parent fits the trie's per-node fan-out.");
 
+    // Exact-match hash table over (path, method). Populated by every
+    // add_* method in lockstep with the trie. ~12 KB (512 slots ×
+    // 24 bytes); negligible next to the trie's 1.2 MB. Only consulted
+    // when dispatch == &kHashFullPathDispatch; the selector landing in
+    // a follow-up PR picks it for configs with no prefix routes
+    // (where exact-match is sufficient and beats the trie on every
+    // dimension we measure).
+    HashFullPathTable hash_full_state;
+
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
 
@@ -236,6 +246,9 @@ struct RouteConfig {
         const u16 idx = static_cast<u16>(route_count);
         if (dispatch_ == &kSegmentTrieDispatch) {
             return trie.insert(path_view, r.method, idx);
+        }
+        if (dispatch_ == &kHashFullPathDispatch) {
+            return hash_full_state.insert(path_view, r.method, idx);
         }
         if (dispatch_ == &kLinearScanDispatch) {
             // routes[] IS the data — nothing else to populate.

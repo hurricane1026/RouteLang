@@ -78,4 +78,12 @@ extern const RouteDispatch kLinearScanDispatch;
 // beats an "any" route at the same path.
 extern const RouteDispatch kSegmentTrieDispatch;
 
+// Exact-match hash table on the entire path
+// (RouteConfig::hash_full_state). Constant-time per match, but ONLY
+// admissible when no route is a prefix of another and no `:param`
+// segments are present — see route_hash_full.h. The selector
+// (follow-up PR) is responsible for never picking this dispatch when
+// those constraints don't hold.
+extern const RouteDispatch kHashFullPathDispatch;
+
 }  // namespace rut

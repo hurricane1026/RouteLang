@@ -36,8 +36,20 @@ u16 linear_scan_match(const RouteConfig* cfg, Str path, u8 method) {
     return kRouteIdxInvalid;
 }
 
+// Segment trie adapter — RouteConfig::trie has its own match() that
+// returns the route_idx, so this is a one-line forward through the
+// dispatch interface. The trie internally handles normalization
+// (collapse consecutive '/', strip trailing '/', strip '?' / '#'
+// from request paths) and longest-prefix selection with method-slot
+// tie-breaking — see route_trie.h for the full semantics.
+u16 segment_trie_match(const RouteConfig* cfg, Str path, u8 method) {
+    const u16 idx = cfg->trie.match(path, method);
+    return idx == TrieNode::kInvalidRoute ? kRouteIdxInvalid : idx;
+}
+
 }  // namespace
 
 const RouteDispatch kLinearScanDispatch = {&linear_scan_match};
+const RouteDispatch kSegmentTrieDispatch = {&segment_trie_match};
 
 }  // namespace rut

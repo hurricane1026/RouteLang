@@ -64,4 +64,11 @@ struct RouteDispatch {
 // prefixes — a behavior callers have relied on since the pre-trie days.
 extern const RouteDispatch kLinearScanDispatch;
 
+// Segment-aware radix trie (RouteConfig::trie). Longest-prefix match,
+// segment-boundary aware, normalizes consecutive '/' and trailing '/'.
+// Strips '?' / '#' from incoming requests before tokenizing. Reads
+// route_idx_by_method[] at every terminal so a method-specific route
+// beats an "any" route at the same path.
+extern const RouteDispatch kSegmentTrieDispatch;
+
 }  // namespace rut

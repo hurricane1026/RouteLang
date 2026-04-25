@@ -123,6 +123,7 @@ add_library(rut_runtime STATIC
     runtime/access_log.cc
     runtime/traffic_capture.cc
     runtime/route_dispatch.cc
+    runtime/route_trie.cc
     ${SIMD_SOURCE}
 )
 

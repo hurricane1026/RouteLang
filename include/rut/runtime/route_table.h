@@ -6,6 +6,7 @@
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/route_dispatch.h"
+#include "rut/runtime/route_trie.h"
 
 #include <errno.h>
 #include <netinet/in.h>
@@ -108,8 +109,43 @@ struct RouteConfig {
     // the RCU swap.
     const RouteDispatch* dispatch = &kLinearScanDispatch;
 
+    // Segment-aware radix trie kept in lockstep with routes[] so the
+    // dispatch can be flipped to kSegmentTrieDispatch (or any future
+    // segment-aware impl) without rebuilding the config. Populated by
+    // every add_* method; sized at ~1.2 MB to cover 128 routes × 32
+    // distinct segments at the worst-case (no prefix sharing). When
+    // linear-scan dispatch is selected, this storage is unused — a
+    // follow-up PR will move it (and other impl states) into a tagged
+    // union so only the active impl pays its cost.
+    RouteTrie trie;
+    static_assert(kMaxRoutes == TrieNode::kMaxChildren,
+                  "RouteConfig::kMaxRoutes must equal TrieNode::kMaxChildren so a config "
+                  "whose routes all share a single parent fits the trie's per-node fan-out.");
+
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
+
+    // Reject route paths that aren't in origin-form. Required by the
+    // segment trie (which would otherwise silently mismatch malformed
+    // configs); the linear-scan default tolerates any string but
+    // applying the same gate uniformly keeps add_* semantics
+    // consistent across dispatch choices.
+    //   - Must be non-null and start with '/'. Empty path normalizes
+    //     to the root catchall under the trie; "api" without leading
+    //     slash collides with "/api" the same way.
+    //   - Must not contain '?' or '#': those mark query/fragment in a
+    //     URI and routing doesn't match on them. RouteTrie::match()
+    //     strips them from incoming requests.
+    //   - Must terminate within kMaxPathLen.
+    static bool is_routable_path(const char* path) {
+        if (path == nullptr || path[0] != '/') return false;
+        for (u32 i = 0; i < RouteEntry::kMaxPathLen; i++) {
+            const char ch = path[i];
+            if (ch == '\0') return true;
+            if (ch == '?' || ch == '#') return false;
+        }
+        return false;
+    }
 
     // Body entries point into body_pool; pool is a bump-allocated char
     // buffer so body bytes live alongside the config and get reclaimed
@@ -145,10 +181,17 @@ struct RouteConfig {
     u32 header_bytes_pool_used = 0;
 
     // Add a proxy route: path prefix → upstream target.
-    // Returns false if table full, upstream_id invalid, or path too long.
+    // Returns false if:
+    //   - the route table is full,
+    //   - upstream_id is out of range,
+    //   - the path is malformed (see is_routable_path),
+    //   - the path is too long for RouteEntry::path,
+    //   - the method byte isn't recognized,
+    //   - the trie has run out of node / children capacity.
     bool add_proxy(const char* path, u8 method, u16 upstream_id) {
         if (route_count >= kMaxRoutes) return false;
         if (upstream_id >= upstream_count) return false;
+        if (!is_routable_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -162,13 +205,18 @@ struct RouteConfig {
         r.upstream_id = upstream_id;
         r.status_code = 0;
         r.fn = nullptr;
+        if (!trie.insert(Str{r.path, r.path_len}, method, static_cast<u16>(route_count))) {
+            return false;  // trie at capacity — refuse the route, leave nothing half-added
+        }
         route_count++;
         return true;
     }
 
-    // Add a static response route. Returns false if table full or path too long.
+    // Add a static response route. Same failure modes as add_proxy(),
+    // minus the upstream-id check that doesn't apply here.
     bool add_static(const char* path, u8 method, u16 status) {
         if (route_count >= kMaxRoutes) return false;
+        if (!is_routable_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -182,16 +230,20 @@ struct RouteConfig {
         r.upstream_id = 0;
         r.status_code = status;
         r.fn = nullptr;
+        if (!trie.insert(Str{r.path, r.path_len}, method, static_cast<u16>(route_count))) {
+            return false;
+        }
         route_count++;
         return true;
     }
 
     // Add a JIT-handler route. Handler is invoked on match; its HandlerResult
     // tells the runtime what to do next (return status, forward, or yield).
-    // Returns false if table full, path too long, or fn is null.
+    // Same failure modes as add_proxy() plus null-fn check.
     bool add_jit_handler(const char* path, u8 method, jit::HandlerFn fn) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
+        if (!is_routable_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -205,6 +257,9 @@ struct RouteConfig {
         r.upstream_id = 0;
         r.status_code = 0;
         r.fn = fn;
+        if (!trie.insert(Str{r.path, r.path_len}, method, static_cast<u16>(route_count))) {
+            return false;
+        }
         route_count++;
         return true;
     }

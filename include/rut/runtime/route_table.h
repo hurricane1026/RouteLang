@@ -5,6 +5,8 @@
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/route_dispatch.h"
+#include "rut/runtime/route_trie.h"
 
 #include <errno.h>
 #include <netinet/in.h>
@@ -95,11 +97,88 @@ struct RouteConfig {
     // by handle_jit_outcome in callbacks_impl.h.
     static constexpr u32 kMaxHeadersPerSet = 32;
 
+    // Non-copyable: the embedded `trie` stores non-owning Str views
+    // pointing into routes[].path. A by-value copy would leave the
+    // copy's trie referencing the original's path buffers — a use-
+    // after-free as soon as the original is modified or destroyed.
+    // RouteConfig is published via `const RouteConfig*` for RCU swap;
+    // there's no production codepath that needs to copy one.
+    RouteConfig() = default;
+    RouteConfig(const RouteConfig&) = delete;
+    RouteConfig& operator=(const RouteConfig&) = delete;
+
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
 
+    // Pluggable route lookup. Set BEFORE the first add_* call (ideally
+    // by the compiler-side selector at config-build time); the active
+    // dispatch determines which per-impl state add_* populates. Once
+    // any route has been added, set_dispatch() refuses to swap — the
+    // earlier routes wouldn't be in the new dispatch's data structure
+    // and lookups would silently miss them (Codex P1 caught this on
+    // #43). Build a fresh RouteConfig if you need a different dispatch.
+    //
+    // set_dispatch() also refuses any pointer that isn't one of the
+    // canonical static singletons declared in route_dispatch.h. The
+    // pointer is borrowed across the config's lifetime, so accepting
+    // an arbitrary `RouteDispatch*` would let a caller install an
+    // ephemeral / stack-local vtable that dangles once the caller's
+    // frame returns (Codex P2 on #43 round 3). Limiting the input to
+    // singletons whose addresses are stable for the program's
+    // lifetime closes the lifetime hazard at the gate.
+    const RouteDispatch* dispatch() const { return dispatch_; }
+    bool set_dispatch(const RouteDispatch* d) {
+        if (route_count > 0) return false;
+        if (!is_canonical_dispatch(d)) return false;
+        dispatch_ = d;
+        return true;
+    }
+
+    // Whitelist of canonical dispatch singletons. Each new impl PR
+    // adds its singleton here; a custom dispatch needs both an entry
+    // here AND a branch in populate_dispatch_state() — keeps the
+    // contract explicit at the two places that matter (install gate
+    // and state-build gate).
+    static bool is_canonical_dispatch(const RouteDispatch* d) {
+        return d == &kLinearScanDispatch || d == &kSegmentTrieDispatch;
+    }
+
+    // Segment-aware radix trie. Populated by add_* only when the
+    // active dispatch is kSegmentTrieDispatch. ~1.2 MB inline; sized
+    // to cover 128 routes × 32 distinct segments at the worst-case
+    // (no prefix sharing). When a different dispatch is selected this
+    // storage sits unused — a follow-up PR will move per-impl state
+    // into a tagged union so only the active impl pays its cost.
+    RouteTrie trie;
+    static_assert(kMaxRoutes == TrieNode::kMaxChildren,
+                  "RouteConfig::kMaxRoutes must equal TrieNode::kMaxChildren so a config "
+                  "whose routes all share a single parent fits the trie's per-node fan-out.");
+
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
+
+    // Reject route paths that aren't in origin-form. Required by the
+    // segment trie (which would otherwise silently mismatch malformed
+    // configs); the linear-scan default tolerates any string but
+    // applying the same gate uniformly keeps add_* semantics
+    // consistent across dispatch choices.
+    //   - Must be non-null, non-empty, and start with '/'. An empty
+    //     string and "api" without a leading slash are rejected
+    //     rather than implicitly normalized — the trie's root and
+    //     "/api" terminal would otherwise collide silently.
+    //   - Must not contain '?' or '#': those mark query/fragment in a
+    //     URI and routing doesn't match on them. RouteTrie::match()
+    //     strips them from incoming requests.
+    //   - Must terminate within kMaxPathLen.
+    static bool is_routable_path(const char* path) {
+        if (path == nullptr || path[0] != '/') return false;
+        for (u32 i = 0; i < RouteEntry::kMaxPathLen; i++) {
+            const char ch = path[i];
+            if (ch == '\0') return true;
+            if (ch == '?' || ch == '#') return false;
+        }
+        return false;
+    }
 
     // Body entries point into body_pool; pool is a bump-allocated char
     // buffer so body bytes live alongside the config and get reclaimed
@@ -134,11 +213,55 @@ struct RouteConfig {
     char header_bytes_pool[kResponseHeaderBytesPoolBytes];
     u32 header_bytes_pool_used = 0;
 
+    // Populate the active dispatch's state with a newly-written
+    // routes[route_count] entry. Returns false on:
+    //   - a structural capacity hit in that dispatch's data
+    //     structure (e.g., trie node-pool exhaustion),
+    //   - an unknown / non-canonical dispatch pointer.
+    //
+    // The fail-closed default is deliberate. Round-4 of #43
+    // tightened set_dispatch() to admit only canonical singleton
+    // dispatch pointers, so the "unknown dispatch" branch should
+    // not occur in normal use. We still reject it here as defense
+    // in depth: without explicit per-impl handling the auxiliary
+    // state for that dispatch would not be built, and match()
+    // would systematically miss. Refusing add_* keeps the failure
+    // loud rather than silent.
+    //
+    // Branches are narrow — body of each is exactly that impl's
+    // `insert`. New impls add a branch here; the rest of add_*
+    // doesn't change.
+    bool populate_dispatch_state(const RouteEntry& r) {
+        const Str path_view{r.path, r.path_len};
+        const u16 idx = static_cast<u16>(route_count);
+        if (dispatch_ == &kSegmentTrieDispatch) {
+            return trie.insert(path_view, r.method, idx);
+        }
+        if (dispatch_ == &kLinearScanDispatch) {
+            // routes[] IS the data — nothing else to populate.
+            return true;
+        }
+        return false;  // unknown dispatch — refuse so the misroute is loud
+    }
+
     // Add a proxy route: path prefix → upstream target.
-    // Returns false if table full, upstream_id invalid, or path too long.
+    // Returns false if:
+    //   - the route table is full,
+    //   - upstream_id is out of range,
+    //   - the path is malformed (see is_routable_path),
+    //   - the path is too long for RouteEntry::path,
+    //   - the active dispatch rejects the (path, method) pair while
+    //     populating its state — for example, the segment trie
+    //     refuses unrecognized method bytes. The default linear
+    //     scan accepts any method byte verbatim, so method
+    //     validation is effectively dispatch-dependent here.
+    //   - the active dispatch's state ran out of capacity,
+    //   - the active dispatch is not one of the canonical singletons
+    //     (see populate_dispatch_state).
     bool add_proxy(const char* path, u8 method, u16 upstream_id) {
         if (route_count >= kMaxRoutes) return false;
         if (upstream_id >= upstream_count) return false;
+        if (!is_routable_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -152,13 +275,18 @@ struct RouteConfig {
         r.upstream_id = upstream_id;
         r.status_code = 0;
         r.fn = nullptr;
+        if (!populate_dispatch_state(r)) {
+            return false;  // active dispatch at capacity — fail loud
+        }
         route_count++;
         return true;
     }
 
-    // Add a static response route. Returns false if table full or path too long.
+    // Add a static response route. Same failure modes as add_proxy(),
+    // minus the upstream-id check that doesn't apply here.
     bool add_static(const char* path, u8 method, u16 status) {
         if (route_count >= kMaxRoutes) return false;
+        if (!is_routable_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -172,16 +300,20 @@ struct RouteConfig {
         r.upstream_id = 0;
         r.status_code = status;
         r.fn = nullptr;
+        if (!populate_dispatch_state(r)) {
+            return false;
+        }
         route_count++;
         return true;
     }
 
     // Add a JIT-handler route. Handler is invoked on match; its HandlerResult
     // tells the runtime what to do next (return status, forward, or yield).
-    // Returns false if table full, path too long, or fn is null.
+    // Same failure modes as add_proxy() plus null-fn check.
     bool add_jit_handler(const char* path, u8 method, jit::HandlerFn fn) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
+        if (!is_routable_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -195,6 +327,9 @@ struct RouteConfig {
         r.upstream_id = 0;
         r.status_code = 0;
         r.fn = fn;
+        if (!populate_dispatch_state(r)) {
+            return false;
+        }
         route_count++;
         return true;
     }
@@ -313,27 +448,28 @@ struct RouteConfig {
         return idx;
     }
 
-    // Match a request path (prefix match, first match wins).
-    // method_char: first char of HTTP method ('G'=GET, 'P'=POST, etc.), 0=any.
-    // Returns pointer to matching entry, or nullptr for no match (→ default 200 OK).
+    // Match a request path. Semantics depend on the chosen dispatch
+    // (`this->dispatch`), but the default linear-scan dispatch keeps
+    // the historical contract: first-match-wins byte-prefix scan,
+    // method 0 in a route entry matches any request method, and
+    // unmatched requests return nullptr (callers fall back to the
+    // default 200 OK handler).
+    //
+    // `method_char` is the first byte of the HTTP method ('G'=GET,
+    // 'P'=POST/PUT/PATCH, 'D'=DELETE, 'H'=HEAD, 'O'=OPTIONS,
+    // 'C'=CONNECT, 'T'=TRACE) or 0 for "any".
     const RouteEntry* match(const u8* path_data, u32 path_len, u8 method_char) const {
-        for (u32 i = 0; i < route_count; i++) {
-            auto& r = routes[i];
-            // Method filter: 0 = any
-            if (r.method != 0 && r.method != method_char) continue;
-            // Prefix match
-            if (path_len < r.path_len) continue;
-            bool matched = true;
-            for (u32 j = 0; j < r.path_len; j++) {
-                if (path_data[j] != static_cast<u8>(r.path[j])) {
-                    matched = false;
-                    break;
-                }
-            }
-            if (matched) return &r;
-        }
-        return nullptr;  // no match → default handler
+        const Str path{reinterpret_cast<const char*>(path_data), path_len};
+        const u16 idx = dispatch_->match(this, path, method_char);
+        if (idx >= route_count) return nullptr;  // covers kRouteIdxInvalid
+        return &routes[idx];
     }
+
+private:
+    // The active dispatch vtable, set via set_dispatch() and read via
+    // dispatch(). Private so callers can't assign past the route_count
+    // == 0 gate — see set_dispatch() doc.
+    const RouteDispatch* dispatch_ = &kLinearScanDispatch;
 };
 
 }  // namespace rut

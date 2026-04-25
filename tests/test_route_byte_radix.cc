@@ -244,6 +244,25 @@ TEST(route_byte_radix, clear_resets_state) {
 // Empty / root path
 // ============================================================================
 
+TEST(route_byte_radix, rejects_non_origin_form_request_targets) {
+    // Codex P1 on #46: with a configured "/" catchall, match() seeded
+    // `best` from the root terminal regardless of whether the request
+    // was origin-form. Asterisk-form ("*"), authority-form ("host:port"),
+    // and empty targets must NOT match any route — the linear-scan
+    // dispatch never matches them either, and HTTP/1.1 doesn't define
+    // path routing for them.
+    ByteRadixTrie t;
+    REQUIRE(t.insert(S("/"), 0, 99));    // catchall
+    REQUIRE(t.insert(S("/api"), 0, 7));  // specific
+    // Origin-form still works.
+    CHECK_EQ(t.match(S("/api"), 0), 7u);
+    CHECK_EQ(t.match(S("/anything"), 0), 99u);
+    // Non-origin-form: NO match, even though "/" is registered.
+    CHECK_EQ(t.match(S("*"), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(t.match(S("example.com:443"), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(t.match(S(""), 0), TrieNode::kInvalidRoute);
+}
+
 TEST(route_byte_radix, root_path_matches_root_terminal) {
     ByteRadixTrie t;
     REQUIRE(t.insert(S("/"), 0, 42));

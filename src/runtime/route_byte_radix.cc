@@ -170,6 +170,15 @@ u16 ByteRadixTrie::match(Str path, u8 method_char) const {
     const u32 want_slot = method_slot(method_char);
     if (want_slot == kMethodSlotInvalid) return TrieNode::kInvalidRoute;
 
+    // Reject non-origin-form request targets BEFORE seeding `best`
+    // from the root terminal. Otherwise a configured "/" catchall
+    // would silently match HTTP/1.1 asterisk-form ("*"), authority-
+    // form ("host:port"), or empty targets — none of which are path-
+    // routable and the linear-scan dispatch never returns a route for
+    // them. RouteTrie::match applies the same guard (Codex P2 caught
+    // it there originally, P1 reapplied here on #46 round 1).
+    if (path.len == 0 || path.ptr[0] != '/') return TrieNode::kInvalidRoute;
+
     const Str p = canonicalize_request(path);
     u16 cur = 0;
     u16 best = pick_terminal(nodes[0], want_slot);

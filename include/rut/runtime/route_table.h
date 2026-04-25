@@ -110,6 +110,24 @@ struct RouteConfig {
     // changes. Segment views inside the trie point into
     // `routes[i].path`, which is stable for the config's RCU
     // lifetime.
+    //
+    // Footprint: this field embeds the trie's node pool by value and
+    // is the dominant contributor to sizeof(RouteConfig) — roughly
+    // 1.2 MB at the current kMaxNodes × kMaxChildren caps. We keep
+    // the pool inline rather than out-of-line because the whole
+    // RouteConfig is the RCU-swapped unit: production owners hold a
+    // `const RouteConfig*` (e.g. `Shard::active_config`,
+    // `Shard::pending_config`) and heap- or mmap-allocate it, so the
+    // 1.2 MB lives in the same allocation that gets atomically
+    // republished. Splitting the node pool into its own buffer would
+    // double the lifetime-management surface (separate allocation,
+    // separate free) for no production saving. Tests stack-allocate
+    // `RouteConfig cfg;` for convenience; on the default 8 MB Linux
+    // thread stack, two configs side-by-side (~2.4 MB total) sit
+    // comfortably under the limit. If a future caller needs a much
+    // smaller footprint (sidecar mode, embedded), revisit by either
+    // shrinking the caps or moving the pool out-of-line under a
+    // separate type (e.g. RouteConfigLite).
     RouteTrie trie;
 
     // Keep the two caps locked together. If either side is retuned,
@@ -158,10 +176,12 @@ struct RouteConfig {
     u32 header_bytes_pool_used = 0;
 
     // Reject route paths that aren't in origin-form:
-    //   - must be non-null and start with '/'. An empty path or one
-    //     without a leading slash like "api" would tokenize to the
-    //     same key as "/api" under the trie's segment normalization,
-    //     silently matching real traffic — Codex P2 on #41 round 10.
+    //   - must be non-null and start with '/'. An empty path would
+    //     normalize/tokenize like the root path, while one without a
+    //     leading slash like "api" would normalize to the same key
+    //     as "/api" under the trie's segment normalization, so
+    //     malformed configuration could silently match real traffic
+    //     — Codex P2 on #41 round 10.
     //   - must not contain '?' or '#'. Those belong to the query /
     //     fragment components of a URI; RouteTrie::match() strips
     //     them from the incoming request target before tokenizing,

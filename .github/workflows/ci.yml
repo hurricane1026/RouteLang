@@ -140,7 +140,13 @@ jobs:
             case $arch in
               sse2)    needs="sse2" ;;
               avx2)    needs="avx2" ;;
-              avx512)  needs="avx512f" ;;
+              # avx512: gate on AVX512BW (byte/word ops), not just F.
+              # avx512.cc uses _mm512_cmpeq_epi8_mask / cmplt_epu8_mask /
+              # movepi8_mask, all of which require BW. Knights Landing /
+              # Mill expose F+ER+CD+PF but not BW; SkyLake-X and onward
+              # have BW. Gating on F alone would let a KNL runner build
+              # with -mavx512bw and SIGILL at runtime.
+              avx512)  needs="avx512bw" ;;
               scalar)  needs="" ;;
             esac
             if [ -n "$needs" ] && ! grep -qE "^flags.*\b$needs\b" /proc/cpuinfo; then

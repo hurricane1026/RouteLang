@@ -28,3 +28,15 @@ target_include_directories(bench_connection PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
 )
+
+# JIT-specialized ART vs scalar ART, exercising both the direct JIT
+# function pointer and the productized RouteConfig dispatch paths.
+add_executable(bench_art_jit_spike bench_art_jit_spike.cc)
+target_link_libraries(bench_art_jit_spike rut_runtime rut_jit)
+target_include_directories(bench_art_jit_spike PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+    ${LLVM_INCLUDE_DIRS}
+)
+target_compile_definitions(bench_art_jit_spike PRIVATE ${LLVM_DEFINITIONS})
+target_compile_options(bench_art_jit_spike PRIVATE -O3 -DNDEBUG)

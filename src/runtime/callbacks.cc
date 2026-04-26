@@ -8,6 +8,7 @@
 #include "rut/runtime/epoll_event_loop.h"  // IWYU pragma: keep
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/iouring_event_loop.h"  // IWYU pragma: keep
+#include "rut/runtime/route_canon.h"
 #include "rut/runtime/traffic_capture.h"
 
 namespace rut {
@@ -91,6 +92,15 @@ void capture_request_metadata(Connection& conn) {
     conn.req_size = conn.recv_buf.len();
     conn.req_path[0] = '/';
     conn.req_path[1] = '\0';
+    // Default canonical view = "" pointing into req_path[] (the canon of
+    // origin-form "/"). If neither the strict parser nor the fallback
+    // path-extractor recover anything, dispatch still gets a chance to
+    // hit a configured "/" catchall — matches pre-round-7 behavior
+    // where the dispatch site canonicalized the default conn.req_path
+    // on the fly. Parser overrides this with a real canon for origin-
+    // form, or clears it to {nullptr, 0} for non-origin-form so those
+    // targets cannot fall into the catchall.
+    conn.req_path_canon = Str{conn.req_path + 1, 0};
     conn.upstream_us = 0;
     conn.upstream_name[0] = '\0';
     conn.capture_header_len = 0;
@@ -118,6 +128,35 @@ void capture_request_metadata(Connection& conn) {
         if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;
         for (u32 i = 0; i < copy_len; i++) conn.req_path[i] = req.path.ptr[i];
         conn.req_path[copy_len] = '\0';
+        // Translate the parser's path_canon (a view into recv_buf) into a
+        // view over conn.req_path, which has the same byte layout for
+        // [0, copy_len). On truncation, clamp so canon stays in-bounds.
+        // If the parser left path_canon null (non-origin-form request-
+        // target like "*" or "host:port"), clear conn.req_path_canon so
+        // dispatch returns null (security: those targets must not fall
+        // into a configured "/" catchall via the fast path).
+        if (req.path_canon.ptr != nullptr) {
+            // canon_off is computed from the FULL parser-input path, but
+            // we only mirrored [0, copy_len) into conn.req_path[]. If the
+            // URI is longer than kMaxReqPathLen and the leading-slash run
+            // is long enough, canon_off can exceed copy_len — forming
+            // conn.req_path + canon_off would be out-of-bounds pointer
+            // arithmetic (UB sanitizers flag it, and the resulting
+            // non-null pointer would then enter routing). Clamp to
+            // copy_len so the pointer always lands in [conn.req_path,
+            // conn.req_path + copy_len], the range we wrote bytes into.
+            u32 canon_off = static_cast<u32>(req.path_canon.ptr - req.path.ptr);
+            u32 canon_len = req.path_canon.len;
+            if (canon_off >= copy_len) {
+                canon_off = copy_len;
+                canon_len = 0;
+            } else if (canon_off + canon_len > copy_len) {
+                canon_len = copy_len - canon_off;
+            }
+            conn.req_path_canon = Str{conn.req_path + canon_off, canon_len};
+        } else {
+            conn.req_path_canon = {nullptr, 0};
+        }
         u32 chunk_consumed = 0;
         if (req.chunked) {
             conn.req_body_mode = BodyMode::Chunked;
@@ -178,12 +217,31 @@ void capture_request_metadata(Connection& conn) {
         path_len++;
     }
 
-    if (path_len == 0 || data[kPathStart] != '/') return;
+    if (path_len == 0 || data[kPathStart] != '/') {
+        // Recognized method + space + something, but the something isn't
+        // origin-form (asterisk-form "*", authority-form "host:port",
+        // empty path, etc.). Clear the default canon-of-"/" view so the
+        // dispatch fast path returns nullptr — non-origin-form targets
+        // must not fall into a "/" catchall via the fast path. We
+        // intentionally do NOT clear in the earlier method_len==0 case:
+        // pure-junk requests with no recognizable structure default to
+        // routing the configured "/" route (matches pre-round-7 fail-
+        // open behavior; covered by test_traffic_replay's
+        // malformed_request_hits_catchall).
+        conn.req_path_canon = {nullptr, 0};
+        return;
+    }
 
     u32 copy_len = path_len;
     if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;
     for (u32 i = 0; i < copy_len; i++) conn.req_path[i] = static_cast<char>(data[kPathStart + i]);
     conn.req_path[copy_len] = '\0';
+    // The strict parser failed (no path_canon emitted), but we recovered
+    // a valid origin-form request-target. Synthesize a canonical view
+    // over conn.req_path[] so the dispatch hot path can route this
+    // request — matches the pre-round-7 behavior where the dispatch
+    // site canonicalized conn.req_path on the fly.
+    conn.req_path_canon = canonicalize_request(Str{conn.req_path, copy_len});
 }
 
 u32 pipeline_leftover(const Connection& conn) {

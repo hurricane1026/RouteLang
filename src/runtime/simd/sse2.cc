@@ -69,31 +69,55 @@ u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
     return end;
 }
 
-u32 scan_uri(const u8* buf, u32 pos, u32 end) {
+u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
     const __m128i vsp = _mm_set1_epi8(' ');
     const __m128i v21 = _mm_set1_epi8(0x21);
     const __m128i v7f = _mm_set1_epi8(0x7F);
+    const __m128i vq = _mm_set1_epi8('?');
+    const __m128i vh = _mm_set1_epi8('#');
+
+    u32 canon_end = end;  // sentinel: '?'/'#' not yet found
 
     while (pos + 16 <= end) {
         __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + pos));
         int sp_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, vsp));
         int bad_mask =
             _mm_movemask_epi8(_mm_or_si128(_mm_cmplt_epi8(chunk, v21), _mm_cmpeq_epi8(chunk, v7f)));
+        int qf_mask =
+            _mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(chunk, vq), _mm_cmpeq_epi8(chunk, vh)));
 
         if (sp_mask) {
             u32 sp_pos = static_cast<u32>(__builtin_ctz(static_cast<u32>(sp_mask)));
-            int real_bad = (bad_mask & ((1 << sp_pos) - 1)) & ~sp_mask;
+            int pre_sp = (1 << sp_pos) - 1;
+            int real_bad = (bad_mask & pre_sp) & ~sp_mask;
             if (real_bad) return static_cast<u32>(-1);
+            if (canon_end == end) {
+                int qf_before_sp = qf_mask & pre_sp;
+                canon_end =
+                    qf_before_sp
+                        ? (pos + static_cast<u32>(__builtin_ctz(static_cast<u32>(qf_before_sp))))
+                        : (pos + sp_pos);
+            }
+            *canon_end_out = canon_end;
             return pos + sp_pos;
         }
         if (bad_mask) return static_cast<u32>(-1);
+        if (qf_mask && canon_end == end) {
+            canon_end = pos + static_cast<u32>(__builtin_ctz(static_cast<u32>(qf_mask)));
+        }
         pos += 16;
     }
     while (pos < end) {
-        if (buf[pos] == ' ') return pos;
-        if (!kUriTable[buf[pos]]) return static_cast<u32>(-1);
+        u8 b = buf[pos];
+        if (b == ' ') {
+            *canon_end_out = (canon_end != end) ? canon_end : pos;
+            return pos;
+        }
+        if (!kUriTable[b]) return static_cast<u32>(-1);
+        if ((b == '?' || b == '#') && canon_end == end) canon_end = pos;
         pos++;
     }
+    *canon_end_out = canon_end;
     return end;
 }
 

@@ -9,12 +9,23 @@
 // indirectly, while dedicated tests below pin the policy at the
 // per-path level.
 
+#include "rut/runtime/route_canon.h"
 #include "rut/runtime/route_trie.h"
 #include "test.h"
 
 using namespace rut;
 
 namespace {
+
+// PR #50 round 6 lifted canonicalization out of RouteTrie::match.
+// Tests that exercise the public match() contract through RouteConfig
+// still get canonicalization for free, but these direct-trie tests
+// pre-canonicalize so we're testing the trie's behavior on canonical
+// input (its actual contract).
+inline u16 canon_match(const RouteTrie& t, Str raw, u8 method) {
+    if (raw.len == 0 || raw.ptr[0] != '/') return TrieNode::kInvalidRoute;
+    return t.match(canonicalize_request(raw), method);
+}
 
 constexpr Str S(const char* s) {
     u32 n = 0;
@@ -49,15 +60,15 @@ TEST(route_trie, exact_match_single_route) {
     RouteTrie t;
     const Insert items[] = {{"/health", 0, 7}};
     REQUIRE(build_ok(t, items, 1));
-    CHECK_EQ(t.match(S("/health"), 0), 7u);
+    CHECK_EQ(canon_match(t, S("/health"), 0), 7u);
 }
 
 TEST(route_trie, no_match_returns_sentinel_when_no_catchall) {
     RouteTrie t;
     const Insert items[] = {{"/health", 0, 7}};
     REQUIRE(build_ok(t, items, 1));
-    CHECK_EQ(t.match(S("/missing"), 0), TrieNode::kInvalidRoute);
-    CHECK_EQ(t.match(S("/"), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(canon_match(t, S("/missing"), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(canon_match(t, S("/"), 0), TrieNode::kInvalidRoute);
 }
 
 TEST(route_trie, rejects_non_origin_form_request_targets) {
@@ -71,21 +82,21 @@ TEST(route_trie, rejects_non_origin_form_request_targets) {
     const Insert items[] = {{"/", 0, 99}};
     REQUIRE(build_ok(t, items, 1));
     // Origin-form paths still hit the catchall.
-    CHECK_EQ(t.match(S("/"), 0), 99u);
-    CHECK_EQ(t.match(S("/deep/path"), 0), 99u);
+    CHECK_EQ(canon_match(t, S("/"), 0), 99u);
+    CHECK_EQ(canon_match(t, S("/deep/path"), 0), 99u);
     // Non-origin-form request targets — no leading '/', no match.
-    CHECK_EQ(t.match(S("*"), 0), TrieNode::kInvalidRoute);
-    CHECK_EQ(t.match(S("example.com:443"), 0), TrieNode::kInvalidRoute);
-    CHECK_EQ(t.match(S(""), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(canon_match(t, S("*"), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(canon_match(t, S("example.com:443"), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(canon_match(t, S(""), 0), TrieNode::kInvalidRoute);
 }
 
 TEST(route_trie, catchall_root_matches_unrouted_paths) {
     RouteTrie t;
     const Insert items[] = {{"/health", 0, 7}, {"/", 0, 99}};
     REQUIRE(build_ok(t, items, 2));
-    CHECK_EQ(t.match(S("/health"), 0), 7u);    // specific wins over catchall
-    CHECK_EQ(t.match(S("/missing"), 0), 99u);  // falls through to catchall
-    CHECK_EQ(t.match(S("/"), 0), 99u);         // root path hits catchall
+    CHECK_EQ(canon_match(t, S("/health"), 0), 7u);    // specific wins over catchall
+    CHECK_EQ(canon_match(t, S("/missing"), 0), 99u);  // falls through to catchall
+    CHECK_EQ(canon_match(t, S("/"), 0), 99u);         // root path hits catchall
 }
 
 TEST(route_trie, longest_match_wins_regardless_of_insert_order) {
@@ -99,17 +110,18 @@ TEST(route_trie, longest_match_wins_regardless_of_insert_order) {
     const char* reqs[] = {
         "/api", "/api/", "/api/v2", "/api/v1", "/api/v1/users", "/api/v1/users/42"};
     for (const char* req : reqs) {
-        const u16 a = ta.match(S(req), 0);
-        const u16 b = tb.match(S(req), 0);
+        const u16 a = canon_match(ta, S(req), 0);
+        const u16 b = canon_match(tb, S(req), 0);
         CHECK_EQ(a, b);
     }
     // Spot-check expectations:
-    CHECK_EQ(ta.match(S("/api"), 0), 1u);
-    CHECK_EQ(ta.match(S("/api/"), 0), 1u);    // P2a: trailing slash ≡ no slash
-    CHECK_EQ(ta.match(S("/api/v2"), 0), 1u);  // deeper sibling not in trie → fall back
-    CHECK_EQ(ta.match(S("/api/v1"), 0), 2u);  // exact intermediate
-    CHECK_EQ(ta.match(S("/api/v1/users"), 0), 3u);
-    CHECK_EQ(ta.match(S("/api/v1/users/42"), 0), 3u);  // deeper request → longest prefix wins
+    CHECK_EQ(canon_match(ta, S("/api"), 0), 1u);
+    CHECK_EQ(canon_match(ta, S("/api/"), 0), 1u);    // P2a: trailing slash ≡ no slash
+    CHECK_EQ(canon_match(ta, S("/api/v2"), 0), 1u);  // deeper sibling not in trie → fall back
+    CHECK_EQ(canon_match(ta, S("/api/v1"), 0), 2u);  // exact intermediate
+    CHECK_EQ(canon_match(ta, S("/api/v1/users"), 0), 3u);
+    CHECK_EQ(canon_match(ta, S("/api/v1/users/42"), 0),
+             3u);  // deeper request → longest prefix wins
 }
 
 // ============================================================================
@@ -120,10 +132,11 @@ TEST(route_trie, P1a_consecutive_slashes_collapse) {
     RouteTrie t;
     const Insert items[] = {{"/api/v1", 0, 10}};
     REQUIRE(build_ok(t, items, 1));
-    CHECK_EQ(t.match(S("/api//v1"), 0), 10u);                 // client double-slash → normalize
-    CHECK_EQ(t.match(S("//api/v1"), 0), 10u);                 // leading double-slash
-    CHECK_EQ(t.match(S("/api///v1"), 0), 10u);                // triple
-    CHECK_EQ(t.match(S("///"), 0), TrieNode::kInvalidRoute);  // all-slash path has no segments
+    CHECK_EQ(canon_match(t, S("/api//v1"), 0), 10u);   // client double-slash → normalize
+    CHECK_EQ(canon_match(t, S("//api/v1"), 0), 10u);   // leading double-slash
+    CHECK_EQ(canon_match(t, S("/api///v1"), 0), 10u);  // triple
+    CHECK_EQ(canon_match(t, S("///"), 0),
+             TrieNode::kInvalidRoute);  // all-slash path has no segments
 }
 
 TEST(route_trie, P1a_insert_path_with_extra_slashes_normalizes) {
@@ -131,17 +144,17 @@ TEST(route_trie, P1a_insert_path_with_extra_slashes_normalizes) {
     RouteTrie t;
     const Insert items[] = {{"/api//v1", 0, 10}};
     REQUIRE(build_ok(t, items, 1));
-    CHECK_EQ(t.match(S("/api/v1"), 0), 10u);
-    CHECK_EQ(t.match(S("/api//v1"), 0), 10u);
+    CHECK_EQ(canon_match(t, S("/api/v1"), 0), 10u);
+    CHECK_EQ(canon_match(t, S("/api//v1"), 0), 10u);
 }
 
 TEST(route_trie, P2a_trailing_slash_equivalent) {
     RouteTrie t;
     const Insert items[] = {{"/api", 0, 5}};
     REQUIRE(build_ok(t, items, 1));
-    CHECK_EQ(t.match(S("/api"), 0), 5u);
-    CHECK_EQ(t.match(S("/api/"), 0), 5u);
-    CHECK_EQ(t.match(S("/api//"), 0), 5u);
+    CHECK_EQ(canon_match(t, S("/api"), 0), 5u);
+    CHECK_EQ(canon_match(t, S("/api/"), 0), 5u);
+    CHECK_EQ(canon_match(t, S("/api//"), 0), 5u);
 }
 
 TEST(route_trie, strips_query_string_before_matching) {
@@ -152,21 +165,22 @@ TEST(route_trie, strips_query_string_before_matching) {
     RouteTrie t;
     const Insert items[] = {{"/health", 0, 1}, {"/api/users", 0, 2}};
     REQUIRE(build_ok(t, items, 2));
-    CHECK_EQ(t.match(S("/health?check=1"), 0), 1u);
-    CHECK_EQ(t.match(S("/health?"), 0), 1u);
-    CHECK_EQ(t.match(S("/health#frag"), 0), 1u);
-    CHECK_EQ(t.match(S("/api/users?page=3&limit=10"), 0), 2u);
+    CHECK_EQ(canon_match(t, S("/health?check=1"), 0), 1u);
+    CHECK_EQ(canon_match(t, S("/health?"), 0), 1u);
+    CHECK_EQ(canon_match(t, S("/health#frag"), 0), 1u);
+    CHECK_EQ(canon_match(t, S("/api/users?page=3&limit=10"), 0), 2u);
     // Query on a miss still falls through cleanly (no match).
-    CHECK_EQ(t.match(S("/unknown?x=1"), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(canon_match(t, S("/unknown?x=1"), 0), TrieNode::kInvalidRoute);
 }
 
 TEST(route_trie, P3a_case_sensitive) {
     RouteTrie t;
     const Insert items[] = {{"/api", 0, 1}, {"/API", 0, 2}};
     REQUIRE(build_ok(t, items, 2));
-    CHECK_EQ(t.match(S("/api"), 0), 1u);
-    CHECK_EQ(t.match(S("/API"), 0), 2u);
-    CHECK_EQ(t.match(S("/Api"), 0), TrieNode::kInvalidRoute);  // different case, different route
+    CHECK_EQ(canon_match(t, S("/api"), 0), 1u);
+    CHECK_EQ(canon_match(t, S("/API"), 0), 2u);
+    CHECK_EQ(canon_match(t, S("/Api"), 0),
+             TrieNode::kInvalidRoute);  // different case, different route
 }
 
 // ============================================================================
@@ -179,9 +193,9 @@ TEST(route_trie, method_specific_beats_any_slot) {
     RouteTrie t;
     const Insert items[] = {{"/x", 0, 10}, {"/x", 'G', 20}};
     REQUIRE(build_ok(t, items, 2));
-    CHECK_EQ(t.match(S("/x"), 'G'), 20u);
-    CHECK_EQ(t.match(S("/x"), 'P'), 10u);  // POST → any slot
-    CHECK_EQ(t.match(S("/x"), 'D'), 10u);  // DELETE → any slot
+    CHECK_EQ(canon_match(t, S("/x"), 'G'), 20u);
+    CHECK_EQ(canon_match(t, S("/x"), 'P'), 10u);  // POST → any slot
+    CHECK_EQ(canon_match(t, S("/x"), 'D'), 10u);  // DELETE → any slot
 }
 
 TEST(route_trie, match_strips_query_and_fragment) {
@@ -195,8 +209,8 @@ TEST(route_trie, match_strips_query_and_fragment) {
     RouteTrie t;
     const Insert items[] = {{"/api", 0, 1}};
     REQUIRE(build_ok(t, items, 1));
-    CHECK_EQ(t.match(S("/api?x=1"), 0), 1u);
-    CHECK_EQ(t.match(S("/api#frag"), 0), 1u);
+    CHECK_EQ(canon_match(t, S("/api?x=1"), 0), 1u);
+    CHECK_EQ(canon_match(t, S("/api#frag"), 0), 1u);
 }
 
 TEST(route_trie, rejects_unsupported_method_at_insert) {
@@ -222,9 +236,9 @@ TEST(route_trie, rejects_unsupported_method_at_match) {
     RouteTrie t;
     const Insert items[] = {{"/x", 0, 10}, {"/x", 'G', 20}};
     REQUIRE(build_ok(t, items, 2));
-    CHECK_EQ(t.match(S("/x"), 'G'), 20u);
-    CHECK_EQ(t.match(S("/x"), 'g'), TrieNode::kInvalidRoute);  // typo
-    CHECK_EQ(t.match(S("/x"), 'X'), TrieNode::kInvalidRoute);  // unknown verb
+    CHECK_EQ(canon_match(t, S("/x"), 'G'), 20u);
+    CHECK_EQ(canon_match(t, S("/x"), 'g'), TrieNode::kInvalidRoute);  // typo
+    CHECK_EQ(canon_match(t, S("/x"), 'X'), TrieNode::kInvalidRoute);  // unknown verb
 }
 
 TEST(route_trie, admits_routes_with_more_than_16_segments) {
@@ -236,14 +250,14 @@ TEST(route_trie, admits_routes_with_more_than_16_segments) {
     RouteTrie t;
     const char* deep = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q";  // 17 segments
     CHECK(t.insert(S(deep), 0, 99));
-    CHECK_EQ(t.match(S(deep), 0), 99u);
+    CHECK_EQ(canon_match(t, S(deep), 0), 99u);
 }
 
 TEST(route_trie, method_first_insert_wins_on_exact_dup) {
     RouteTrie t;
     const Insert items[] = {{"/x", 'G', 1}, {"/x", 'G', 2}};  // same method-slot, duplicate
     REQUIRE(build_ok(t, items, 2));
-    CHECK_EQ(t.match(S("/x"), 'G'), 1u);  // first insert pins the slot
+    CHECK_EQ(canon_match(t, S("/x"), 'G'), 1u);  // first insert pins the slot
 }
 
 TEST(route_trie, method_post_put_patch_ambiguity_preserved) {
@@ -252,8 +266,8 @@ TEST(route_trie, method_post_put_patch_ambiguity_preserved) {
     RouteTrie t;
     const Insert items[] = {{"/x", 'P', 99}};
     REQUIRE(build_ok(t, items, 1));
-    CHECK_EQ(t.match(S("/x"), 'P'), 99u);
-    CHECK_EQ(t.match(S("/x"), 'G'), TrieNode::kInvalidRoute);
+    CHECK_EQ(canon_match(t, S("/x"), 'P'), 99u);
+    CHECK_EQ(canon_match(t, S("/x"), 'G'), TrieNode::kInvalidRoute);
 }
 
 // ============================================================================
@@ -267,12 +281,12 @@ TEST(route_trie, empty_path_inserts_at_root) {
     // Inserting "" is semantically the same as inserting "/" — both
     // tokenize to the empty-segment root terminal, so the slot is
     // populated and origin-form requests hit it.
-    CHECK_EQ(t.match(S("/"), 0), 42u);          // "/" normalizes to root
-    CHECK_EQ(t.match(S("/anything"), 0), 42u);  // catchall
+    CHECK_EQ(canon_match(t, S("/"), 0), 42u);          // "/" normalizes to root
+    CHECK_EQ(canon_match(t, S("/anything"), 0), 42u);  // catchall
     // An empty request target is NOT origin-form and must not match
     // path-based routing (Codex P2 on #41 — don't let a catchall
     // swallow asterisk-form / authority-form / empty targets).
-    CHECK_EQ(t.match(S(""), 0), TrieNode::kInvalidRoute);
+    CHECK_EQ(canon_match(t, S(""), 0), TrieNode::kInvalidRoute);
 }
 
 TEST(route_trie, node_count_shows_prefix_sharing) {
@@ -416,7 +430,7 @@ TEST(route_trie, insert_atomic_on_node_pool_exhaustion_midpath) {
     // A short route must still fit. If rollback leaked, we'd have
     // burned through the remaining headroom and this would fail.
     CHECK(t.insert(S("/ok"), 0, 500));
-    CHECK_EQ(t.match(S("/ok"), 0), 500u);
+    CHECK_EQ(canon_match(t, S("/ok"), 0), 500u);
 }
 
 TEST(route_trie, insert_atomic_on_child_cap_overflow) {

@@ -3,11 +3,11 @@
 #include "core/expected.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
+#include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
-#include "rut/runtime/route_dispatch.h"
-#include "rut/runtime/route_hash_first_seg.h"
-#include "rut/runtime/route_hash_full.h"
+#include "rut/runtime/route_art.h"
+#include "rut/runtime/route_canon.h"  // canonicalize_request
 #include "rut/runtime/route_trie.h"
 
 #include <errno.h>
@@ -112,69 +112,65 @@ struct RouteConfig {
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
 
-    // Pluggable route lookup. Set BEFORE the first add_* call (ideally
-    // by the compiler-side selector at config-build time); the active
-    // dispatch determines which per-impl state add_* populates. Once
-    // any route has been added, set_dispatch() refuses to swap — the
-    // earlier routes wouldn't be in the new dispatch's data structure
-    // and lookups would silently miss them (Codex P1 caught this on
-    // #43). Build a fresh RouteConfig if you need a different dispatch.
+    // Phase 2 dispatch — 2-way tagged union.
     //
-    // set_dispatch() also refuses any pointer that isn't one of the
-    // canonical static singletons declared in route_dispatch.h. The
-    // pointer is borrowed across the config's lifetime, so accepting
-    // an arbitrary `RouteDispatch*` would let a caller install an
-    // ephemeral / stack-local vtable that dangles once the caller's
-    // frame returns (Codex P2 on #43 round 3). Limiting the input to
-    // singletons whose addresses are stable for the program's
-    // lifetime closes the lifetime hazard at the gate.
-    const RouteDispatch* dispatch() const { return dispatch_; }
-    bool set_dispatch(const RouteDispatch* d) {
+    // Pre-add_*: caller picks ArtJit (default) or SegmentTrie via
+    // use_art() / use_segment_trie(). Refused once route_count > 0
+    // (the chosen state struct's already been populated, swapping
+    // would leave the new state empty).
+    //
+    // Post-add_* for ArtJit configs: caller calls install_art_jit_fn
+    // with a JIT-specialized match function (see
+    // jit/art_jit_codegen.h). Until installed, ArtJit dispatch falls
+    // back to scalar ART::match — slower but correct.
+    //
+    // For SegmentTrie configs no install step is needed; trie.match
+    // runs as soon as add_* finishes populating the trie.
+    enum class DispatchKind : u8 {
+        ArtJit,       // ART byte-prefix trie, optionally JIT-specialized
+        SegmentTrie,  // segment-aware trie (handles `:param` + boundary-
+                      //   sensitive overlap; the only correct choice when
+                      //   needs_segment_aware() returns true).
+    };
+
+    DispatchKind dispatch_kind() const { return dispatch_kind_; }
+
+    // Caller-side dispatch picker. Must be called BEFORE the first
+    // add_*. Returns false if a route has already been added (the
+    // existing state would be lost on a swap).
+    bool use_art() {
         if (route_count > 0) return false;
-        if (!is_canonical_dispatch(d)) return false;
-        dispatch_ = d;
+        dispatch_kind_ = DispatchKind::ArtJit;
+        return true;
+    }
+    bool use_segment_trie() {
+        if (route_count > 0) return false;
+        dispatch_kind_ = DispatchKind::SegmentTrie;
         return true;
     }
 
-    // Whitelist of canonical dispatch singletons. Each new impl PR
-    // adds its singleton here; a custom dispatch needs both an entry
-    // here AND a branch in populate_dispatch_state() — keeps the
-    // contract explicit at the two places that matter (install gate
-    // and state-build gate).
-    static bool is_canonical_dispatch(const RouteDispatch* d) {
-        return d == &kLinearScanDispatch || d == &kSegmentTrieDispatch ||
-               d == &kHashFullPathDispatch || d == &kHashFirstSegmentDispatch;
-    }
+    // Install a JIT-specialized match function. Caller invokes
+    // jit::art_jit_specialize(engine, cfg.art_state, name) after
+    // all add_* calls have populated art_state, then passes the
+    // returned function pointer here. After install, RouteConfig::
+    // match() calls the JIT'd function directly instead of ART's
+    // scalar descent. Idempotent: replaces any previously-installed
+    // pointer.
+    void install_art_jit_fn(jit::ArtJitMatchFn fn) { art_jit_fn_ = fn; }
 
-    // Segment-aware radix trie. Populated by add_* only when the
-    // active dispatch is kSegmentTrieDispatch. ~1.2 MB inline; sized
-    // to cover 128 routes × 32 distinct segments at the worst-case
-    // (no prefix sharing). When a different dispatch is selected this
-    // storage sits unused — a follow-up PR will move per-impl state
-    // into a tagged union so only the active impl pays its cost.
+    // Segment-aware radix trie. Populated by add_* when dispatch_kind_
+    // == SegmentTrie. ~1.2 MB inline.
     RouteTrie trie;
     static_assert(kMaxRoutes == TrieNode::kMaxChildren,
                   "RouteConfig::kMaxRoutes must equal TrieNode::kMaxChildren so a config "
                   "whose routes all share a single parent fits the trie's per-node fan-out.");
 
-    // Exact-match hash table over (path, method). ~12 KB (512 slots ×
-    // 24 bytes); negligible next to the trie's 1.2 MB. Populated by
-    // populate_dispatch_state ONLY when the active dispatch is
-    // &kHashFullPathDispatch — the per-active-dispatch model adopted
-    // in #43 round 2. Selector picks this dispatch for configs with no
-    // prefix routes (where exact-match is sufficient and beats the
-    // trie on every dimension we measure).
-    HashFullPathTable hash_full_state;
-
-    // First-segment-hashed bucket table. ~24 KB (64 buckets × 16
-    // entries × 24 B). Populated by populate_dispatch_state ONLY when
-    // the active dispatch is &kHashFirstSegmentDispatch (same per-
-    // active-dispatch model as hash_full_state above). Selector picks
-    // this dispatch only when (a) no first-segment bucket would
-    // exceed kPerBucket and (b) at least one configured route shares
-    // a first segment with another (otherwise plain linear scan is
-    // just as fast and uses no per-impl memory).
-    HashFirstSegmentTable hash_first_seg_state;
+    // Adaptive Radix Tree — byte-prefix matching with adaptive node
+    // sizing (Node4/16/48/256). ~26 KB inline. Populated by add_*
+    // when dispatch_kind_ == ArtJit. After population, caller can
+    // JIT-specialize match() via install_art_jit_fn for a ~5x
+    // speedup on saas-shaped configs (PR #50 round 2 bench).
+    ArtTrie art_state;
 
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
@@ -256,20 +252,13 @@ struct RouteConfig {
     bool populate_dispatch_state(const RouteEntry& r) {
         const Str path_view{r.path, r.path_len};
         const u16 idx = static_cast<u16>(route_count);
-        if (dispatch_ == &kSegmentTrieDispatch) {
-            return trie.insert(path_view, r.method, idx);
+        switch (dispatch_kind_) {
+            case DispatchKind::ArtJit:
+                return art_state.insert(path_view, r.method, idx);
+            case DispatchKind::SegmentTrie:
+                return trie.insert(path_view, r.method, idx);
         }
-        if (dispatch_ == &kHashFullPathDispatch) {
-            return hash_full_state.insert(path_view, r.method, idx);
-        }
-        if (dispatch_ == &kHashFirstSegmentDispatch) {
-            return hash_first_seg_state.insert(path_view, r.method, idx);
-        }
-        if (dispatch_ == &kLinearScanDispatch) {
-            // routes[] IS the data — nothing else to populate.
-            return true;
-        }
-        return false;  // unknown dispatch — refuse so the misroute is loud
+        __builtin_unreachable();
     }
 
     // Add a proxy route: path prefix → upstream target.
@@ -487,17 +476,68 @@ struct RouteConfig {
     // 'P'=POST/PUT/PATCH, 'D'=DELETE, 'H'=HEAD, 'O'=OPTIONS,
     // 'C'=CONNECT, 'T'=TRACE) or 0 for "any".
     const RouteEntry* match(const u8* path_data, u32 path_len, u8 method_char) const {
-        const Str path{reinterpret_cast<const char*>(path_data), path_len};
-        const u16 idx = dispatch_->match(this, path, method_char);
-        if (idx >= route_count) return nullptr;  // covers kRouteIdxInvalid
+        // Reject non-origin-form request targets (asterisk-form `*`,
+        // authority-form `host:port`, empty). Origin-form must start
+        // with '/'. Done here at dispatch entry so the inner match()
+        // functions can assume canonical input shape; the previous
+        // per-impl checks (ArtTrie::match, RouteTrie::match) are
+        // gone in PR #50 round 6.
+        if (path_len == 0 || path_data[0] != '/') return nullptr;
+
+        // Canonicalize once at dispatch entry. The JIT'd function and
+        // scalar match() inner functions both consume canonical input,
+        // so the canon scan happens exactly once per request
+        // regardless of dispatch kind. Convenience wrapper for callers
+        // that don't have a parser-produced path_canon (tests,
+        // integration helpers); the production hot path goes through
+        // match_canonical which skips this scan entirely.
+        const Str raw{reinterpret_cast<const char*>(path_data), path_len};
+        return match_canonical(canonicalize_request(raw), method_char);
+    }
+
+    // Fast path for callers with a pre-canonicalized path. PR #50
+    // round 7 (path A): the HTTP parser populates ParsedRequest::path_canon
+    // as a free byproduct of the URI SIMD scan, so the production hot
+    // path (callbacks_impl.h dispatch) calls this directly and avoids
+    // re-scanning the same bytes. Caller MUST guarantee canon shape:
+    // no leading '/', no trailing '/', no '?'/'#' bytes.
+    //
+    // canon.ptr == nullptr is a "no canonical view available" sentinel
+    // (parser left path_canon zero-init'd because the URI was not
+    // origin-form, or capture_request_metadata couldn't parse). Treat
+    // it as a miss so non-origin-form targets cannot fall into a
+    // configured "/" catchall. canon.len == 0 with non-null ptr is
+    // legitimate (origin-form root "/") and dispatches normally.
+    const RouteEntry* match_canonical(Str canon, u8 method_char) const {
+        if (canon.ptr == nullptr) return nullptr;
+        u16 idx;
+        switch (dispatch_kind_) {
+            case DispatchKind::ArtJit:
+                idx = art_jit_fn_ ? art_jit_fn_(canon.ptr, canon.len, method_char)
+                                  : art_state.match_canonical(canon, method_char);
+                break;
+            case DispatchKind::SegmentTrie:
+                idx = trie.match(canon, method_char);
+                break;
+            default:
+                __builtin_unreachable();
+        }
+        if (idx >= route_count) return nullptr;  // covers TrieNode::kInvalidRoute
         return &routes[idx];
     }
 
 private:
-    // The active dispatch vtable, set via set_dispatch() and read via
-    // dispatch(). Private so callers can't assign past the route_count
-    // == 0 gate — see set_dispatch() doc.
-    const RouteDispatch* dispatch_ = &kLinearScanDispatch;
+    // Tagged-union discriminator. Default is ArtJit since most
+    // configs land there post-#41 picker reduction; tests and
+    // tooling that call use_segment_trie() before add_* swap
+    // explicitly. ArtJit before install_art_jit_fn falls back to
+    // scalar ArtTrie::match — slower but always correct.
+    DispatchKind dispatch_kind_ = DispatchKind::ArtJit;
+
+    // JIT'd match function pointer (used when dispatch_kind_ ==
+    // ArtJit and install_art_jit_fn has been called). nullptr means
+    // use scalar fallback.
+    jit::ArtJitMatchFn art_jit_fn_ = nullptr;
 };
 
 }  // namespace rut

@@ -2365,81 +2365,48 @@ TEST(route, add_accepts_well_formed_path_after_rejection) {
     CHECK_EQ(cfg.route_count, 1u);
 }
 
-TEST(route, set_dispatch_rejects_unknown_pointer) {
-    // Codex P2 on #43 round 3: set_dispatch() must refuse any pointer
-    // that isn't one of the canonical static singletons. Allowing an
-    // ephemeral / stack-local vtable to be installed lets the
-    // dispatch_ pointer dangle once the caller's frame returns; even
-    // a structural copy of a real singleton (the natural way a caller
-    // might "construct" one) would be a stack-local. Lifetime hazard
-    // closed at the install gate; populate_dispatch_state's fail-
-    // closed branch from round 3 stays as defense-in-depth.
-    RouteDispatch fake_vtable = kLinearScanDispatch;  // structural copy
+TEST(route, default_dispatch_kind_is_art_jit) {
+    // Phase 2 default: ArtJit. Until install_art_jit_fn is called,
+    // match() falls back to scalar ArtTrie::match — slower but
+    // correct. SegmentTrie is opt-in via use_segment_trie().
     RouteConfig cfg;
-    CHECK(!cfg.set_dispatch(&fake_vtable));          // refused
-    CHECK_EQ(cfg.dispatch(), &kLinearScanDispatch);  // unchanged
-    // The default dispatch still works — the failed install left the
-    // config in its initial state, not a half-broken one.
-    CHECK(cfg.add_static("/api", 0, 200));
-    CHECK_EQ(cfg.route_count, 1u);
+    CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::ArtJit);
 }
 
-TEST(route, set_dispatch_accepts_canonical_singletons) {
-    // Positive-path coverage of the whitelist: each canonical
-    // singleton known to this PR must be installable on a fresh
-    // config. Future impl PRs add their singleton + a line here.
-    RouteConfig a;
-    CHECK(a.set_dispatch(&kLinearScanDispatch));
-    RouteConfig b;
-    CHECK(b.set_dispatch(&kSegmentTrieDispatch));
-    RouteConfig c;
-    CHECK(c.set_dispatch(&kHashFullPathDispatch));
-    RouteConfig d;
-    CHECK(d.set_dispatch(&kHashFirstSegmentDispatch));
-    // Null is still refused (no dispatch == no match).
-    RouteConfig e;
-    CHECK(!e.set_dispatch(nullptr));
+TEST(route, use_segment_trie_swaps_dispatch_pre_add) {
+    RouteConfig cfg;
+    CHECK(cfg.use_segment_trie());
+    CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::SegmentTrie);
+    CHECK(cfg.use_art());
+    CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::ArtJit);
 }
 
-TEST(route, set_dispatch_refuses_after_first_add) {
-    // Codex P1 on #43 round 2: flipping dispatch after add_* would
-    // leave earlier routes invisible to the new dispatch's data
-    // structure (e.g., trie empty / partial), causing silent misses.
-    // set_dispatch() pins the contract: dispatch is fixed at first
-    // add_*. Build a fresh RouteConfig if you need a different one.
+TEST(route, use_dispatch_refuses_after_first_add) {
+    // Same contract as the retired set_dispatch: once a route is
+    // added, the chosen state struct has been populated; swapping
+    // would leave the new state empty and silently mismatch.
     RouteConfig cfg;
-    REQUIRE(cfg.set_dispatch(&kSegmentTrieDispatch));  // pre-add_* OK
-    REQUIRE_EQ(cfg.dispatch(), &kSegmentTrieDispatch);
+    REQUIRE(cfg.use_segment_trie());
     REQUIRE(cfg.add_static("/a", 0, 200));
-    CHECK(!cfg.set_dispatch(&kLinearScanDispatch));   // post-add_* refused
-    CHECK_EQ(cfg.dispatch(), &kSegmentTrieDispatch);  // unchanged
-    CHECK(!cfg.set_dispatch(nullptr));                // null also refused
+    CHECK(!cfg.use_art());           // post-add_* refused
+    CHECK(!cfg.use_segment_trie());  // also refused (no-op swap)
+    CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::SegmentTrie);
 }
 
-TEST(route, default_dispatch_admits_route_when_trie_would_fail) {
-    // The default linear-scan dispatch reads routes[] directly; a trie
-    // capacity exhaustion must NOT reject the route. The PR-A reviewer
-    // flagged that add_* used to gate on trie.insert() unconditionally,
-    // so configs whose paths are linear-scan-fine but trie-unfriendly
-    // would be wrongly rejected. This test pins the fix.
-    //
-    // We can't easily exhaust the trie at kMaxNodes=4097 in a unit
-    // test without making it absurdly long, so instead we verify the
-    // smaller observable: when dispatch == kLinearScanDispatch (the
-    // default), populate_dispatch_state is a no-op and add_* always
-    // succeeds for any well-formed path within RouteEntry::kMaxPathLen.
+TEST(route, art_jit_default_falls_back_to_scalar_when_no_install) {
+    // ArtJit kind without install_art_jit_fn means art_jit_fn_ is
+    // null; match() must transparently fall back to scalar ART
+    // descent. Verifies the default config can route correctly
+    // without the JIT pipeline being wired up.
     RouteConfig cfg;
-    REQUIRE(&kLinearScanDispatch == cfg.dispatch());
-    for (u32 i = 0; i < RouteConfig::kMaxRoutes; i++) {
-        char path[8];
-        path[0] = '/';
-        path[1] = static_cast<char>('a' + (i / 100) % 26);
-        path[2] = static_cast<char>('a' + (i / 10) % 26);
-        path[3] = static_cast<char>('a' + i % 26);
-        path[4] = '\0';
-        CHECK(cfg.add_static(path, 0, 200));
-    }
-    CHECK_EQ(cfg.route_count, RouteConfig::kMaxRoutes);
+    REQUIRE(cfg.add_static("/api/v1/users", 0, 200));
+    REQUIRE(cfg.add_static("/admin", 0, 200));
+    const RouteEntry* r1 = cfg.match(reinterpret_cast<const u8*>("/api/v1/users"), 13, 0);
+    REQUIRE(r1 != nullptr);
+    CHECK_EQ(r1->status_code, 200u);
+    const RouteEntry* r2 = cfg.match(reinterpret_cast<const u8*>("/admin"), 6, 0);
+    REQUIRE(r2 != nullptr);
+    CHECK_EQ(r2->status_code, 200u);
 }
 
 TEST(route, add_response_body_basic) {
@@ -5831,6 +5798,64 @@ TEST(metadata, empty_recv_buf) {
     capture_request_metadata(c);
     CHECK_EQ(c.req_method, static_cast<u8>(LogHttpMethod::Other));
     CHECK_EQ(c.req_path[0], '/');
+}
+
+TEST(metadata, fallback_non_origin_form_clears_canon) {
+    // Round 21 security fix: when the strict parser fails but the
+    // fallback path-extractor recognizes a method+space+target, AND
+    // that target isn't origin-form (e.g. "*", "host:port"), the
+    // fallback's early-return path used to leave req_path_canon at
+    // its default canon-of-"/" view — letting non-origin-form
+    // targets fall into a "/" catchall via match_canonical. This
+    // verifies the fallback now explicitly clears the canon view.
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    // Malformed asterisk-form (CR without LF — strict parser rejects).
+    static const char malformed[] = "GET *\rXX";
+    const u32 mlen = sizeof(malformed) - 1;
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < mlen; j++) dst[j] = static_cast<u8>(malformed[j]);
+    c->recv_buf.commit(mlen);
+    capture_request_metadata(*c);
+
+    // Method recovered by fallback…
+    CHECK_EQ(c->req_method, static_cast<u8>(LogHttpMethod::Get));
+    // …but canon view cleared because the target wasn't origin-form.
+    CHECK_EQ(c->req_path_canon.ptr, static_cast<const char*>(nullptr));
+    CHECK_EQ(c->req_path_canon.len, 0u);
+}
+
+TEST(metadata, total_garbage_keeps_default_root_canon) {
+    // Counterpoint to fallback_non_origin_form_clears_canon — pure
+    // junk that the fallback can't pick a method out of should leave
+    // the default canon-of-"/" view intact, so a configured "/"
+    // catchall still matches (preserves pre-round-7 fail-open
+    // behavior; covered end-to-end by replay_gap's
+    // malformed_request_hits_catchall).
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    static const char junk[] = "GARBAGE\r\n\r\n";
+    const u32 jlen = sizeof(junk) - 1;
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < jlen; j++) dst[j] = static_cast<u8>(junk[j]);
+    c->recv_buf.commit(jlen);
+    capture_request_metadata(*c);
+
+    // Default state preserved: req_path = "/", canon view non-null,
+    // len 0 (the canonical view of "/").
+    CHECK_EQ(c->req_path[0], '/');
+    CHECK(c->req_path_canon.ptr != nullptr);
+    CHECK_EQ(c->req_path_canon.len, 0u);
 }
 
 TEST(metadata, various_http_methods) {

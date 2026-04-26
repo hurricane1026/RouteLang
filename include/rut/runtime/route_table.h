@@ -146,9 +146,7 @@ struct RouteConfig {
     static bool is_canonical_dispatch(const RouteDispatch* d) {
         return d == &kLinearScanDispatch || d == &kSegmentTrieDispatch ||
                d == &kHashFullPathDispatch || d == &kHashFirstSegmentDispatch ||
-               d == &kByteRadixDispatch || d == &kArtDispatch ||
-               d == &kSimdLsSse2Dispatch || d == &kSimdLsAvx2Dispatch ||
-               d == &kSimdLsAvx512Dispatch || d == &kSimdLsNeonDispatch;
+               d == &kByteRadixDispatch || d == &kArtDispatch;
     }
 
     // Segment-aware radix trie. Populated by add_* only when the
@@ -295,12 +293,8 @@ struct RouteConfig {
         if (dispatch_ == &kArtDispatch) {
             return art_state.insert(path_view, r.method, idx);
         }
-        if (dispatch_ == &kLinearScanDispatch || dispatch_ == &kSimdLsSse2Dispatch ||
-            dispatch_ == &kSimdLsAvx2Dispatch || dispatch_ == &kSimdLsAvx512Dispatch ||
-            dispatch_ == &kSimdLsNeonDispatch) {
-            // routes[] IS the data — SIMD variants scan the same
-            // array as the scalar dispatch, just with vectorized
-            // byte compares. No extra state to populate.
+        if (dispatch_ == &kLinearScanDispatch) {
+            // routes[] IS the data — nothing else to populate.
             return true;
         }
         return false;  // unknown dispatch — refuse so the misroute is loud

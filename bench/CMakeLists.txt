@@ -44,3 +44,11 @@ target_include_directories(bench_first_byte_filter PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 target_compile_options(bench_first_byte_filter PRIVATE -O3 -DNDEBUG)
+
+add_executable(bench_simd_linear bench_simd_linear.cc)
+target_link_libraries(bench_simd_linear rut_runtime)
+target_include_directories(bench_simd_linear PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+target_compile_options(bench_simd_linear PRIVATE -O3 -DNDEBUG)

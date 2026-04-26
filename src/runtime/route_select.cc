@@ -21,6 +21,20 @@ constexpr u64 kFnvPrime = 0x100000001b3ULL;
 // about for tiny configs.
 constexpr u32 kLinearScanCutoff = 16;
 
+// SIMD LinearScan extends the scalar LinearScan's reach: vectorized
+// byte compares amortize the per-route cost so the linear-scan
+// regime can absorb more routes before a trie wins. Cutoffs are
+// per-vector-width: wider SIMD = more routes can stay on the
+// linear path. These are conservative defaults; the bench
+// (bench/bench_simd_linear.cc) finds the empirical crossover for
+// each ISA. We err generous below the ART/ByteRadix threshold so
+// no regression is possible — if the SIMD variant ties scalar
+// LinearScan, it still wins over a trie on small N.
+constexpr u32 kSimdLsSse2Cutoff = 32;     // 16-byte vectors, ~2x reach over scalar
+constexpr u32 kSimdLsAvx2Cutoff = 48;     // 32-byte vectors
+constexpr u32 kSimdLsAvx512Cutoff = 64;   // 64-byte vectors + masked tail
+constexpr u32 kSimdLsNeonCutoff = 32;     // 16-byte vectors (same as SSE2)
+
 // Min distinct first segments to consider HashFirstSegment over
 // HashFullPath. With ≤4 distinct first segments and N>16, most routes
 // pile into a few buckets — the bucketing buys little over hashing
@@ -217,12 +231,29 @@ u32 RouteAnalysis::distinct_first_segments() const {
     return distinct;
 }
 
+namespace {
+
+// Pick the widest SIMD LinearScan variant the host CPU supports
+// whose cutoff still admits this route count. Returns nullptr if
+// the host has no useful SIMD or if N exceeds every cutoff. The
+// scalar LinearScan path remains the floor — only invoke this for
+// N > kLinearScanCutoff so we never regress small configs.
+const RouteDispatch* pick_simd_linear_scan(u32 n, const CpuCaps& caps) {
+    // Priority order: AVX-512 > AVX2 > SSE2 (x86), NEON (ARM). The
+    // AVX-512 path's masked tail makes it competitive even at small
+    // N, so we always prefer the widest available.
+    if (caps.has_avx512f && caps.has_avx512bw && n <= kSimdLsAvx512Cutoff) {
+        return &kSimdLsAvx512Dispatch;
+    }
+    if (caps.has_avx2 && n <= kSimdLsAvx2Cutoff) return &kSimdLsAvx2Dispatch;
+    if (caps.has_sse2 && n <= kSimdLsSse2Cutoff) return &kSimdLsSse2Dispatch;
+    if (caps.has_neon && n <= kSimdLsNeonCutoff) return &kSimdLsNeonDispatch;
+    return nullptr;
+}
+
+}  // namespace
+
 const RouteDispatch* pick_dispatch(const RouteAnalysis& a, const CpuCaps& caps) {
-    // caps unused while no SIMD-enabled dispatch is wired in yet.
-    // Reserving the parameter keeps the picker contract stable so
-    // SIMD LinearScan (next PR in this series) lands as a single
-    // additive change — no signature churn at the call site.
-    (void)caps;
     // Param segments require segment-bound parameter capture; only
     // SegmentTrie supports that.
     if (a.has_param_segments()) return &kSegmentTrieDispatch;
@@ -230,6 +261,14 @@ const RouteDispatch* pick_dispatch(const RouteAnalysis& a, const CpuCaps& caps) 
     // Tiny configs: linear scan beats the bookkeeping cost of any
     // indexed alternative.
     if (a.count() <= kLinearScanCutoff) return &kLinearScanDispatch;
+
+    // Medium configs: SIMD LinearScan extends the linear-scan reach.
+    // Only activated when the host has applicable SIMD; otherwise
+    // we fall through to the trie path the same way as without
+    // SIMD support.
+    if (const RouteDispatch* simd_ls = pick_simd_linear_scan(a.count(), caps)) {
+        return simd_ls;
+    }
 
     // Boundary-sensitive overlap (e.g. /api + /apix registered
     // together) disqualifies ByteRadix — its byte-prefix view would

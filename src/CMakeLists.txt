@@ -130,6 +130,19 @@ add_library(rut_runtime STATIC
     runtime/route_hash_full.cc
     runtime/route_select.cc
     runtime/route_trie.cc
+    # SIMD LinearScan variants — ALL four are always compiled
+    # regardless of host arch. Each .cc file has a #if-guard around
+    # the SIMD intrinsics; on non-applicable hosts (e.g. AVX-512 on
+    # ARM, NEON on x86) the file compiles to a delegating stub. The
+    # picker uses runtime CpuCaps to install the right one. This is
+    # different from the parser-side ${SIMD_SOURCE} pattern (which
+    # picks one ISA at build time) — route dispatch needs runtime
+    # selection because the SAME binary may be distributed to many
+    # different CPUs in mesh mode.
+    runtime/simd/route_linear_sse2.cc
+    runtime/simd/route_linear_avx2.cc
+    runtime/simd/route_linear_avx512.cc
+    runtime/simd/route_linear_neon.cc
     ${SIMD_SOURCE}
 )
 
@@ -155,6 +168,27 @@ if(SIMD_FLAGS)
         PROPERTIES COMPILE_OPTIONS "${SIMD_FLAGS}"
     )
 endif()
+
+# Per-arch flags for the runtime-selected SIMD LinearScan dispatches.
+# On x86_64 we hand each .cc the matching `-m<isa>` flag so its
+# intrinsics compile; the .cc itself has a `#if defined(__ISA__)`
+# guard so that non-applicable hosts (where the flag has no effect
+# or is rejected) fall through to a stub.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    set_source_files_properties(runtime/simd/route_linear_sse2.cc
+        PROPERTIES COMPILE_OPTIONS "-msse2"
+    )
+    set_source_files_properties(runtime/simd/route_linear_avx2.cc
+        PROPERTIES COMPILE_OPTIONS "-mavx2"
+    )
+    set_source_files_properties(runtime/simd/route_linear_avx512.cc
+        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw"
+    )
+endif()
+# NEON is mandatory in the ARMv8 baseline — no extra flag needed on
+# aarch64. The route_linear_neon.cc file's #ifdef __aarch64__ does
+# the right thing on x86 hosts (compiles as stub, no NEON intrinsics
+# referenced).
 
 # Compiler library
 add_library(rut_compiler STATIC

@@ -110,4 +110,26 @@ extern const RouteDispatch kByteRadixDispatch;
 // proves it dominates across the picker's eligibility range.
 extern const RouteDispatch kArtDispatch;
 
+// SIMD-vectorized LinearScan variants. Same first-match-wins byte-
+// prefix semantics as kLinearScanDispatch — they only differ in how
+// the per-route byte compare is implemented:
+//
+//   kSimdLsSse2Dispatch    — 16-byte chunks via PCMPEQB (x86_64)
+//   kSimdLsAvx2Dispatch    — 32-byte chunks via VPCMPEQB
+//   kSimdLsAvx512Dispatch  — 64-byte chunks + mask registers (no
+//                             scalar tail loop needed)
+//   kSimdLsNeonDispatch    — 16-byte chunks via vceqq_u8 (ARM64)
+//
+// All four are compiled into every binary; runtime CpuCaps in the
+// picker selects which one to install based on the executing CPU's
+// capabilities. Each variant's match() is a no-op stub on the
+// non-applicable arch (e.g., kSimdLsAvx2Dispatch on ARM64) — the
+// picker is the trusted source that never selects an unsupported
+// dispatch, so the stubs are unreachable in practice but preserve
+// the canonical-singleton whitelist contract.
+extern const RouteDispatch kSimdLsSse2Dispatch;
+extern const RouteDispatch kSimdLsAvx2Dispatch;
+extern const RouteDispatch kSimdLsAvx512Dispatch;
+extern const RouteDispatch kSimdLsNeonDispatch;
+
 }  // namespace rut

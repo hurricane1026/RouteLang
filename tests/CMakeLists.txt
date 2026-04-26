@@ -156,6 +156,15 @@ target_include_directories(test_route_art PRIVATE
 add_test(NAME test_route_art COMMAND test_route_art)
 set_tests_properties(test_route_art PROPERTIES LABELS "unit")
 
+add_executable(test_route_simd_linear test_route_simd_linear.cc)
+target_link_libraries(test_route_simd_linear rut_runtime)
+target_include_directories(test_route_simd_linear PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_route_simd_linear COMMAND test_route_simd_linear)
+set_tests_properties(test_route_simd_linear PROPERTIES LABELS "unit")
+
 add_executable(test_route_select test_route_select.cc)
 target_link_libraries(test_route_select rut_runtime)
 target_include_directories(test_route_select PRIVATE

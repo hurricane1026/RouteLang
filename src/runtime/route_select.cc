@@ -1,5 +1,6 @@
 #include "rut/runtime/route_select.h"
 
+#include "rut/runtime/route_art.h"
 #include "rut/runtime/route_byte_radix.h"
 #include "rut/runtime/route_hash_first_seg.h"
 
@@ -26,6 +27,16 @@ constexpr u32 kLinearScanCutoff = 16;
 // the full path, while HashFullPath's per-match cost is identical and
 // it sidesteps the per-bucket-cap selector check entirely.
 constexpr u32 kMinDistinctFirstSegmentsForFirstSeg = 4;
+
+// First-byte fan-out at which ART starts beating ByteRadix. Bench
+// data (bench/bench_route_art.cc fan-out sweep) shows the crossover
+// at exactly 17 — that's the threshold where ART's Node48 (byte-
+// indexed O(1) lookup) replaces Node16 (16-key linear scan). Below
+// 17, ByteRadix's homogeneous tight loop wins by 5-30%; from 17 up
+// ART wins by 50-85%. The "low side" matters: routing typical SaaS
+// to ART would cost ~25% latency in exchange for ~3× memory. Stick
+// with ByteRadix below the threshold.
+constexpr u32 kArtFanoutThreshold = 17;
 
 // Detect `:param` style segments in a path. Format expected (when the
 // frontend grows the syntax): a segment that begins with ':' marks
@@ -156,6 +167,18 @@ bool RouteAnalysis::note_route(Str path, u8 method) {
     // HashFirstSegment would compute at insert time.
     bucket_counts_[first_seg_bucket(first_segment(path))]++;
 
+    // Update the first-byte set for distinct_first_bytes(). The
+    // "first byte" is the byte immediately after a leading '/' if
+    // present, otherwise the first byte of the path. Empty paths
+    // contribute nothing.
+    if (path.len > 0) {
+        const u32 lo = (path.ptr[0] == '/') ? 1 : 0;
+        if (lo < path.len) {
+            const u8 b = static_cast<u8>(path.ptr[lo]);
+            first_byte_seen_[b >> 6] |= (1ULL << (b & 63));
+        }
+    }
+
     paths_[n_] = path;
     n_++;
     return true;
@@ -167,6 +190,12 @@ u32 RouteAnalysis::max_first_seg_bucket() const {
         if (bucket_counts_[i] > max) max = bucket_counts_[i];
     }
     return max;
+}
+
+u32 RouteAnalysis::distinct_first_bytes() const {
+    return static_cast<u32>(
+        __builtin_popcountll(first_byte_seen_[0]) + __builtin_popcountll(first_byte_seen_[1]) +
+        __builtin_popcountll(first_byte_seen_[2]) + __builtin_popcountll(first_byte_seen_[3]));
 }
 
 u32 RouteAnalysis::distinct_first_segments() const {
@@ -204,14 +233,25 @@ const RouteDispatch* pick_dispatch(const RouteAnalysis& a) {
     // (Copilot on #47 round 1.)
     if (a.has_segment_boundary_sensitive_overlap()) return &kSegmentTrieDispatch;
 
-    // Pure segment-aligned prefix overlap: ByteRadix beats SegmentTrie
-    // on the bench (closed #41 data) and matches its semantics in this
-    // regime. We additionally gate on count: the trie's node pool
+    // Pure segment-aligned prefix overlap. Choose between ART and
+    // ByteRadix by the byte-level fan-out at the trie root:
+    //   - High fan-out (≥ kArtFanoutThreshold): ART's Node48/256
+    //     byte-indexed lookup beats ByteRadix's linear scan over
+    //     the children array. Bench shows +50-85% on dense top-
+    //     level configs.
+    //   - Low fan-out: ByteRadix's homogeneous tight loop wins —
+    //     ART's polymorphic dispatch tax (one indirect branch per
+    //     descent step) costs more than its node-type savings buy
+    //     when most nodes are Node4. Bench: ByteRadix is ~5-30%
+    //     faster on saas-like configs in this regime.
+    //
+    // count gate (kByteRadixSafeMaxRoutes): ByteRadix's node pool
     // (kMaxNodes = 256) has worst-case 1 + 2N capacity, so we route
-    // configs above the safe bound to SegmentTrie rather than risk an
-    // add_*-time build failure (Codex P1 on #47 round 1; the round-3
-    // fan-out bump on #46 already raised kMaxChildren to kMaxRoutes).
+    // configs above the safe bound to SegmentTrie rather than risk
+    // an add_*-time build failure. ART has its own pool budget and
+    // can absorb up to kMaxRoutes regardless of fan-out shape.
     if (a.has_prefix_overlap()) {
+        if (a.distinct_first_bytes() >= kArtFanoutThreshold) return &kArtDispatch;
         if (a.count() <= kByteRadixSafeMaxRoutes) return &kByteRadixDispatch;
         return &kSegmentTrieDispatch;
     }

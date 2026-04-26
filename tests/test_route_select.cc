@@ -326,6 +326,120 @@ TEST(route_select, boundary_sensitive_flag_detected_either_insertion_order) {
 }
 
 // ============================================================================
+// ART branch — high first-byte fan-out
+// ============================================================================
+
+TEST(route_select, distinct_first_bytes_strips_leading_slash) {
+    RouteAnalysis a;
+    REQUIRE(a.note_route(S("/api"), 0));
+    REQUIRE(a.note_route(S("/admin"), 0));
+    REQUIRE(a.note_route(S("/oauth"), 0));
+    // First bytes after '/' are 'a', 'a', 'o' → 2 distinct.
+    CHECK_EQ(a.distinct_first_bytes(), 2u);
+}
+
+TEST(route_select, distinct_first_bytes_counts_all_registered_bytes) {
+    RouteAnalysis a;
+    const char* paths[] = {"/a", "/b", "/c", "/d", "/e", "/f"};
+    for (u32 i = 0; i < 6; i++) REQUIRE(a.note_route(S(paths[i]), 0));
+    CHECK_EQ(a.distinct_first_bytes(), 6u);
+}
+
+TEST(route_select, picks_art_when_prefix_overlap_with_high_first_byte_fanout) {
+    // 18 distinct first bytes (≥ kArtFanoutThreshold = 17), plus
+    // /<byte>/x deeper paths so prefix overlap is set. Picker must
+    // route this to ART instead of ByteRadix because Node48's
+    // byte-indexed lookup wins decisively at this fan-out.
+    RouteAnalysis a;
+    const char* roots[] = {"/a",
+                           "/b",
+                           "/c",
+                           "/d",
+                           "/e",
+                           "/f",
+                           "/g",
+                           "/h",
+                           "/i",
+                           "/j",
+                           "/k",
+                           "/l",
+                           "/m",
+                           "/n",
+                           "/o",
+                           "/p",
+                           "/q",
+                           "/r"};
+    const char* deeps[] = {"/a/x",
+                           "/b/x",
+                           "/c/x",
+                           "/d/x",
+                           "/e/x",
+                           "/f/x",
+                           "/g/x",
+                           "/h/x",
+                           "/i/x",
+                           "/j/x",
+                           "/k/x",
+                           "/l/x",
+                           "/m/x",
+                           "/n/x",
+                           "/o/x",
+                           "/p/x",
+                           "/q/x",
+                           "/r/x"};
+    for (u32 i = 0; i < 18; i++) REQUIRE(a.note_route(S(roots[i]), 0));
+    for (u32 i = 0; i < 18; i++) REQUIRE(a.note_route(S(deeps[i]), 0));
+    REQUIRE(a.has_prefix_overlap());
+    REQUIRE(!a.has_segment_boundary_sensitive_overlap());
+    REQUIRE_EQ(a.distinct_first_bytes(), 18u);
+    CHECK_EQ(pick_dispatch(a), &kArtDispatch);
+}
+
+TEST(route_select, picks_byte_radix_when_prefix_overlap_with_low_first_byte_fanout) {
+    // 16 distinct first bytes (just below the ART threshold of 17).
+    // Bench shows ByteRadix's homogeneous loop beats ART's
+    // polymorphic descent in this regime — picker must NOT pick ART.
+    RouteAnalysis a;
+    const char* roots[] = {"/a",
+                           "/b",
+                           "/c",
+                           "/d",
+                           "/e",
+                           "/f",
+                           "/g",
+                           "/h",
+                           "/i",
+                           "/j",
+                           "/k",
+                           "/l",
+                           "/m",
+                           "/n",
+                           "/o",
+                           "/p"};
+    const char* deeps[] = {"/a/x",
+                           "/b/x",
+                           "/c/x",
+                           "/d/x",
+                           "/e/x",
+                           "/f/x",
+                           "/g/x",
+                           "/h/x",
+                           "/i/x",
+                           "/j/x",
+                           "/k/x",
+                           "/l/x",
+                           "/m/x",
+                           "/n/x",
+                           "/o/x",
+                           "/p/x"};
+    for (u32 i = 0; i < 16; i++) REQUIRE(a.note_route(S(roots[i]), 0));
+    for (u32 i = 0; i < 16; i++) REQUIRE(a.note_route(S(deeps[i]), 0));
+    REQUIRE(a.has_prefix_overlap());
+    REQUIRE_EQ(a.distinct_first_bytes(), 16u);
+    CHECK_EQ(pick_dispatch(a), &kByteRadixDispatch);
+}
+
+// ============================================================================
 // Picker stability — never returns nullptr or an unknown pointer
 // ============================================================================
 

@@ -5,6 +5,7 @@
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/route_art.h"
 #include "rut/runtime/route_byte_radix.h"
 #include "rut/runtime/route_dispatch.h"
 #include "rut/runtime/route_hash_first_seg.h"
@@ -145,7 +146,7 @@ struct RouteConfig {
     static bool is_canonical_dispatch(const RouteDispatch* d) {
         return d == &kLinearScanDispatch || d == &kSegmentTrieDispatch ||
                d == &kHashFullPathDispatch || d == &kHashFirstSegmentDispatch ||
-               d == &kByteRadixDispatch;
+               d == &kByteRadixDispatch || d == &kArtDispatch;
     }
 
     // Segment-aware radix trie. Populated by add_* only when the
@@ -186,6 +187,16 @@ struct RouteConfig {
     // precedence — see route_byte_radix.h for the contract
     // distinction from SegmentTrie.
     ByteRadixTrie byte_radix_state;
+
+    // Adaptive Radix Tree — same byte-level longest-prefix semantics
+    // as ByteRadixTrie but with adaptive node sizing. ~26 KB inline
+    // (Node4/16/48/256 pools sized for kMaxRoutes worst case). The
+    // picker chooses ART over ByteRadix when distinct_first_bytes
+    // ≥ 17 (kArtFanoutThreshold) — Node48's byte-indexed lookup
+    // beats ByteRadix's linear scan from that point up by 50-85%.
+    // Below the threshold ByteRadix's homogeneous loop wins (5-30%),
+    // so the two coexist rather than ART replacing ByteRadix.
+    ArtTrie art_state;
 
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
@@ -278,6 +289,9 @@ struct RouteConfig {
         }
         if (dispatch_ == &kByteRadixDispatch) {
             return byte_radix_state.insert(path_view, r.method, idx);
+        }
+        if (dispatch_ == &kArtDispatch) {
+            return art_state.insert(path_view, r.method, idx);
         }
         if (dispatch_ == &kLinearScanDispatch) {
             // routes[] IS the data — nothing else to populate.

@@ -102,4 +102,12 @@ extern const RouteDispatch kHashFirstSegmentDispatch;
 // choice.
 extern const RouteDispatch kByteRadixDispatch;
 
+// Adaptive Radix Tree dispatch (RouteConfig::art_state). Same byte-
+// level longest-prefix semantics as kByteRadixDispatch but with
+// node-type adaptive sizing (Node4/16/48/256) for ~3x lower inline
+// memory and better cache behavior on realistic SaaS shapes. PR-F:
+// will replace kByteRadixDispatch in pick_dispatch once bench data
+// proves it dominates across the picker's eligibility range.
+extern const RouteDispatch kArtDispatch;
+
 }  // namespace rut

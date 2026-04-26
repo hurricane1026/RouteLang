@@ -49,8 +49,14 @@
 //                               byte-prefix semantics would mis-handle
 //                               request /apij — Copilot on #47 r1)
 //   segment-aligned prefix
-//     overlap, count fits     → ByteRadix (longest-prefix in bytes;
-//                               hash variants give up prefix semantics)
+//     overlap, low fan-out    → ByteRadix (homogeneous-node tight
+//                               loop wins for fan-out ≤16; bench
+//                               crossover at 17 — see PR-F bench)
+//   segment-aligned prefix
+//     overlap, high fan-out   → ART (Node48/Node256 byte-indexed
+//                               lookup beats ByteRadix's O(N) scan
+//                               from fan-out 17 up; +50-85% faster
+//                               + 3× smaller inline memory)
 //   diverse first segments
 //     + bucket-fit, no
 //     prefix overlap          → HashFirstSegment (still byte-prefix
@@ -155,6 +161,17 @@ public:
     // hash isn't paid back.
     u32 distinct_first_segments() const;
 
+    // Number of distinct FIRST BYTES (the byte right after the
+    // leading '/'). This is the byte-level fan-out at the trie root —
+    // exactly what ART's Node48/Node256 specializations win on, and
+    // what ByteRadix's homogeneous linear scan loses to. Bench
+    // (bench/bench_route_art.cc fan-out sweep) shows the crossover
+    // at 17: below that ByteRadix's tight loop wins; from 17 up
+    // ART's byte-indexed Node48 lookup dominates by 50-85%. The
+    // picker uses this signal to choose ART vs ByteRadix in the
+    // prefix-overlap branch.
+    u32 distinct_first_bytes() const;
+
 private:
     Str paths_[kMaxPaths];
     u32 n_ = 0;
@@ -162,6 +179,9 @@ private:
     bool has_segment_boundary_sensitive_overlap_ = false;
     bool has_param_segments_ = false;
     u32 bucket_counts_[HashFirstSegmentTable::kBuckets];
+    // 256-bit set of seen first-bytes (one bit per byte value 0..255).
+    // Updated incrementally in note_route; popcount on read.
+    u64 first_byte_seen_[4] = {0, 0, 0, 0};
     // distinct first segments are reconstructed on demand from paths_
     // — they're only consulted in pick_dispatch, not on every
     // note_route, so we don't pay an extra hash table here.

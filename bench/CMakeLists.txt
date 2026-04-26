@@ -28,3 +28,11 @@ target_include_directories(bench_connection PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
 )
+
+add_executable(bench_route_art bench_route_art.cc)
+target_link_libraries(bench_route_art rut_runtime)
+target_include_directories(bench_route_art PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+target_compile_options(bench_route_art PRIVATE -O3 -DNDEBUG)

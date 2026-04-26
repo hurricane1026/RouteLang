@@ -147,6 +147,15 @@ target_include_directories(test_route_byte_radix PRIVATE
 add_test(NAME test_route_byte_radix COMMAND test_route_byte_radix)
 set_tests_properties(test_route_byte_radix PROPERTIES LABELS "unit")
 
+add_executable(test_route_art test_route_art.cc)
+target_link_libraries(test_route_art rut_runtime)
+target_include_directories(test_route_art PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_route_art COMMAND test_route_art)
+set_tests_properties(test_route_art PROPERTIES LABELS "unit")
+
 add_executable(test_route_select test_route_select.cc)
 target_link_libraries(test_route_select rut_runtime)
 target_include_directories(test_route_select PRIVATE
@@ -294,7 +303,8 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_route_hash_full>
     COMMAND $<TARGET_FILE:test_route_hash_first_seg>
     COMMAND $<TARGET_FILE:test_route_byte_radix>
+    COMMAND $<TARGET_FILE:test_route_art>
     COMMAND $<TARGET_FILE:test_route_select>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_hash_full test_route_hash_first_seg test_route_byte_radix test_route_select
+    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_hash_full test_route_hash_first_seg test_route_byte_radix test_route_art test_route_select
     COMMENT "Running all tests..."
 )

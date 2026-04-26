@@ -2388,19 +2388,41 @@ TEST(route, set_dispatch_accepts_canonical_singletons) {
     // Positive-path coverage of the whitelist: each canonical
     // singleton known to this PR must be installable on a fresh
     // config. Future impl PRs add their singleton + a line here.
-    RouteConfig a;
-    CHECK(a.set_dispatch(&kLinearScanDispatch));
-    RouteConfig b;
-    CHECK(b.set_dispatch(&kSegmentTrieDispatch));
-    RouteConfig c;
-    CHECK(c.set_dispatch(&kHashFullPathDispatch));
-    RouteConfig d;
-    CHECK(d.set_dispatch(&kHashFirstSegmentDispatch));
-    RouteConfig e;
-    CHECK(e.set_dispatch(&kByteRadixDispatch));
+    //
+    // sizeof(RouteConfig) ≈ 1.4 MB (the segment trie alone is 1.2 MB);
+    // a default 8 MB pthread stack only fits ~5 simultaneously, so
+    // each check goes in its own scope to release before the next
+    // alloc. PR-F (ART) was the trigger — adding a 6th canonical
+    // dispatch tipped the test into stack-overflow territory.
+    {
+        RouteConfig a;
+        CHECK(a.set_dispatch(&kLinearScanDispatch));
+    }
+    {
+        RouteConfig a;
+        CHECK(a.set_dispatch(&kSegmentTrieDispatch));
+    }
+    {
+        RouteConfig a;
+        CHECK(a.set_dispatch(&kHashFullPathDispatch));
+    }
+    {
+        RouteConfig a;
+        CHECK(a.set_dispatch(&kHashFirstSegmentDispatch));
+    }
+    {
+        RouteConfig a;
+        CHECK(a.set_dispatch(&kByteRadixDispatch));
+    }
+    {
+        RouteConfig a;
+        CHECK(a.set_dispatch(&kArtDispatch));
+    }
     // Null is still refused (no dispatch == no match).
-    RouteConfig f;
-    CHECK(!f.set_dispatch(nullptr));
+    {
+        RouteConfig a;
+        CHECK(!a.set_dispatch(nullptr));
+    }
 }
 
 TEST(route, set_dispatch_refuses_after_first_add) {

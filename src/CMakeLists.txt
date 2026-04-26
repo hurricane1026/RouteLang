@@ -174,6 +174,7 @@ target_include_directories(rut_compiler PUBLIC
 add_library(rut_jit STATIC
     jit/jit_engine.cc
     jit/codegen.cc
+    jit/art_jit_codegen.cc
     jit/runtime_helpers.cc
 )
 

@@ -96,6 +96,47 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
 
+  test-arm:
+    # Native ARM64 runner (GA on GitHub-hosted runners since 2024).
+    # Backed by Ampere Altra or Microsoft Cobalt 100 — both expose
+    # NEON, only Cobalt has SVE. We test correctness on whatever the
+    # pool gives us; SIMD code paths gate on runtime CpuCaps anyway.
+    # clang-18 + Release only — gcc + Debug coverage already comes
+    # from the x86 matrix; this job is targeted at "does the same
+    # code run correctly on ARM64".
+    name: Build & Test (ARM64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 cmake ninja-build llvm-18-dev
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
+
+      - name: Detect CPU caps
+        run: |
+          # Quick visibility into which CPU class the runner gave us
+          # (Ampere Altra = no SVE, Cobalt 100 = SVE 256-bit).
+          grep -m1 "CPU implementer\|CPU part" /proc/cpuinfo || true
+          grep -m1 "Features" /proc/cpuinfo || true
+
+      - name: Configure
+        run: |
+          CC=clang CXX=clang++ cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-24.04

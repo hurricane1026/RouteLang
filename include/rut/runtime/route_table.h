@@ -178,11 +178,13 @@ struct RouteConfig {
     // just as fast and uses no per-impl memory).
     HashFirstSegmentTable hash_first_seg_state;
 
-    // Byte-level edge-compressed radix trie. ~18 KB inline (256
-    // nodes × ~70 B). Selected by the picker when the route set
-    // benefits from byte-level prefix sharing AND doesn't depend
-    // on segment-boundary precedence — see route_byte_radix.h for
-    // the contract distinction from SegmentTrie.
+    // Byte-level edge-compressed radix trie. ~75 KB inline (256
+    // nodes × ~290 B; per-node cost dominated by the 260-B children
+    // FixedVec sized to kMaxRoutes after the #46-r3 fan-out bump).
+    // Selected by the picker when the route set benefits from byte-
+    // level prefix sharing AND doesn't depend on segment-boundary
+    // precedence — see route_byte_radix.h for the contract
+    // distinction from SegmentTrie.
     ByteRadixTrie byte_radix_state;
 
     UpstreamTarget upstreams[kMaxUpstreams];

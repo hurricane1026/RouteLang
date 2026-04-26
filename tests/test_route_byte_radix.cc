@@ -185,44 +185,68 @@ TEST(route_byte_radix, rejects_unsupported_method_byte_at_match) {
 // ============================================================================
 
 TEST(route_byte_radix, atomic_insert_on_node_pool_exhaustion) {
-    // Fill the pool to within 1 of kMaxNodes with single-byte distinct
-    // routes (each takes ~1 node). The next insert that needs more
-    // than 1 node — a deeper distinct path — must fail and leave the
-    // pool unchanged.
+    // Drive the pool to exactly kMaxNodes - 1 with a deterministic
+    // sequence, then attempt an insert that demands 2 new nodes.
+    // With only 1 slot left the second allocation must fail and the
+    // rollback must restore the pre-insert pool exactly.
+    //
+    // The earlier shape used "if (!t.insert(...)) break;" plus a
+    // best-effort deep insert and accepted EITHER success or failure;
+    // Copilot on #46 round 3 flagged that the rollback path was
+    // never actually exercised. The new shape is fully deterministic.
     ByteRadixTrie t;
-    char paths[ByteRadixTrie::kMaxNodes][8];
-    u32 admitted = 0;
-    for (u32 i = 0; i + 2 < ByteRadixTrie::kMaxNodes; i++) {
-        paths[i][0] = '/';
-        paths[i][1] = static_cast<char>('a' + (i / 26 / 26) % 26);
-        paths[i][2] = static_cast<char>('a' + (i / 26) % 26);
-        paths[i][3] = static_cast<char>('a' + i % 26);
-        paths[i][4] = '\0';
-        if (!t.insert(Str{paths[i], 4}, 0, static_cast<u16>(i))) break;
-        admitted++;
+
+    // Phase 1 — fill root to kMaxChildren with 2-byte-edge leaves.
+    // Each insert: first byte unseen at root → add one leaf with a
+    // 2-byte edge. +1 node per insert. After kMaxChildren inserts:
+    // root + kMaxChildren leaves = 1 + kMaxChildren nodes.
+    //
+    // Each path needs its own backing buffer because the trie stores
+    // non-owning Str views into the path bytes; reusing one buffer
+    // across inserts would have every previously-inserted edge alias
+    // the latest write and collapse all leaves into one (subtle, and
+    // the in-place mutation of buffer contents would even change
+    // later find_child_by_first_byte lookups).
+    char p1_buf[ByteRadixNode::kMaxChildren][3];
+    for (u32 i = 0; i < ByteRadixNode::kMaxChildren; i++) {
+        p1_buf[i][0] = '/';
+        p1_buf[i][1] = static_cast<char>(0x40 + i);
+        p1_buf[i][2] = 'x';
+        REQUIRE(t.insert(Str{p1_buf[i], 3}, 0, static_cast<u16>(i)));
     }
-    REQUIRE(admitted > 4);
+    REQUIRE_EQ(t.node_count(), 1u + ByteRadixNode::kMaxChildren);
+
+    // Phase 2 — extend leaves with a 1-byte tail. Each descendant
+    // insert: full edge match on the 2-byte parent edge, then add
+    // one leaf for the trailing 'y'. +1 node per insert. Stop one
+    // short of kMaxNodes so phase 3 has exactly 1 free slot.
+    constexpr u32 phase2 =
+        ByteRadixTrie::kMaxNodes - 2u - ByteRadixNode::kMaxChildren;  // 126 with 256/128
+    static_assert(phase2 < ByteRadixNode::kMaxChildren,
+                  "phase2 must consume at most kMaxChildren leaves");
+    char p2_buf[phase2][4];
+    for (u32 i = 0; i < phase2; i++) {
+        p2_buf[i][0] = '/';
+        p2_buf[i][1] = static_cast<char>(0x40 + i);
+        p2_buf[i][2] = 'x';
+        p2_buf[i][3] = 'y';
+        REQUIRE(t.insert(Str{p2_buf[i], 4}, 0, static_cast<u16>(1000 + i)));
+    }
+    REQUIRE_EQ(t.node_count(), ByteRadixTrie::kMaxNodes - 1);
+
+    // Phase 3 — an insert that splits a 2-byte parent edge AND adds
+    // a sibling leaf. Needs 2 new nodes (split-tail + leaf); only 1
+    // slot remains, so rollback must fire. We split the edge of the
+    // 0th leaf ("/<0x40>x") with a fresh tail "z" via path "/<0x40>z".
+    const char split_path[3] = {'/', static_cast<char>(0x40), 'z'};
     const u32 nodes_before = t.node_count();
-    // Now insert a deep brand-new path that requires more nodes than
-    // are left. If the pre-flight allowed it to start, the rollback
-    // must restore the pool exactly.
-    char deep[64];
-    deep[0] = '/';
-    for (u32 i = 1; i < 60; i++) deep[i] = static_cast<char>('a' + i % 26);
-    deep[60] = '\0';
-    // The deep path may succeed or fail depending on remaining space;
-    // either way the post-state must be consistent — node_count is
-    // either unchanged (failure rolled back) or grew by exactly the
-    // number of new nodes the path actually allocated.
-    const bool ok = t.insert(Str{deep, 60}, 0, 9999);
-    if (!ok) {
-        CHECK_EQ(t.node_count(), nodes_before);  // rollback
-    } else {
-        CHECK(t.node_count() >= nodes_before);
-    }
-    // All previously-admitted routes still match correctly.
-    for (u32 i = 0; i < admitted; i++) {
-        CHECK_EQ(t.match(Str{paths[i], 4}, 0), static_cast<u16>(i));
+    CHECK(!t.insert(Str{split_path, 3}, 0, 9999));
+    CHECK_EQ(t.node_count(), nodes_before);  // rollback restored exactly
+
+    // All phase-1 routes still match correctly — rollback didn't
+    // corrupt their terminals or edges.
+    for (u32 i = 0; i < ByteRadixNode::kMaxChildren; i++) {
+        CHECK_EQ(t.match(Str{p1_buf[i], 3}, 0), static_cast<u16>(i));
     }
 }
 
@@ -269,24 +293,30 @@ TEST(route_byte_radix, accepts_kMaxRoutes_distinct_top_level_prefixes) {
     // fail at insert time even though kMaxRoutes is 128. Bumped to
     // 128 to cover the worst case.
     //
-    // Worst-case shape: 128 single-byte top-level paths, all sharing
-    // root as their parent. After this fix the trie accepts all of
-    // them.
+    // Worst-case shape: 128 paths whose first byte after the leading
+    // '/' is unique across the set, so they all become direct children
+    // of root and force the children FixedVec to its cap.
+    //
+    // Earlier r3 version used "/aa", "/ab", ... for 128 paths but
+    // collapsed all 128 to only 5 distinct first bytes — the root
+    // never actually grew past ~5 children, so the test passed even
+    // with the old kMaxChildren=16. Copilot on #46 round 3 caught
+    // it. We now use a contiguous run of 128 unique non-special
+    // bytes (0x40..0xbf, none of which are '/', '?', '#', or NUL).
     ByteRadixTrie t;
-    char paths[ByteRadixNode::kMaxChildren][4];
+    char paths[ByteRadixNode::kMaxChildren][2];
     for (u32 i = 0; i < ByteRadixNode::kMaxChildren; i++) {
-        // /<i>: encode i as 2 bytes (a-z + a-z) so each top-level
-        // path has a distinct first byte after the leading '/'.
         paths[i][0] = '/';
-        paths[i][1] = static_cast<char>('a' + i / 26);
-        paths[i][2] = static_cast<char>('a' + i % 26);
-        paths[i][3] = '\0';
-        REQUIRE(t.insert(Str{paths[i], 3}, 0, static_cast<u16>(i)));
+        paths[i][1] = static_cast<char>(0x40 + i);
+        REQUIRE(t.insert(Str{paths[i], 2}, 0, static_cast<u16>(i)));
     }
+    // Root must hold exactly kMaxChildren leaves now — verify via
+    // node_count (1 root + kMaxChildren leaves).
+    CHECK_EQ(t.node_count(), 1u + ByteRadixNode::kMaxChildren);
     // Spot-check a few — the first, the middle, and the last.
-    CHECK_EQ(t.match(Str{paths[0], 3}, 0), 0u);
-    CHECK_EQ(t.match(Str{paths[64], 3}, 0), 64u);
-    CHECK_EQ(t.match(Str{paths[ByteRadixNode::kMaxChildren - 1], 3}, 0),
+    CHECK_EQ(t.match(Str{paths[0], 2}, 0), 0u);
+    CHECK_EQ(t.match(Str{paths[64], 2}, 0), 64u);
+    CHECK_EQ(t.match(Str{paths[ByteRadixNode::kMaxChildren - 1], 2}, 0),
              static_cast<u16>(ByteRadixNode::kMaxChildren - 1));
 }
 

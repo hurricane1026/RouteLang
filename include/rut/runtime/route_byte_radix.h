@@ -35,7 +35,11 @@
 //   IPC 4.25 (highest in the table): the compressed edges fit more
 //   routes in fewer cache lines, descent is straight-line work.
 //
-// Storage: ~256 nodes × ~70 bytes/node ≈ 18 KB inline.
+// Storage: ~256 nodes × ~290 bytes/node ≈ 75 KB inline. Each node
+// carries a 16-B Str edge view, a 260-B FixedVec<u16, 128> children
+// buffer (the post-#46-r3 fan-out cap that admits 128 distinct
+// next-bytes), and 16 B of per-method terminal slots. Still small
+// next to the segment trie's ~1.2 MB.
 //
 // Build-time canonicalization: insert strips a leading '/' and any
 // trailing '/'. The match path strips '?' / '#' suffix in addition,
@@ -64,10 +68,11 @@ struct ByteRadixNode {
     // an earlier 16-cap that turned 17-top-level-prefix configs into
     // build failures even with kMaxRoutes headroom unused.
     //
-    // Memory cost: 128 × u16 = 256 B per node × 256 nodes ≈ 64 KB
-    // total for the children arrays. The trie's overall footprint
-    // grows from ~18 KB to ~85 KB inline — still negligible next to
-    // the segment trie's 1.2 MB.
+    // Memory cost: 128 × u16 = 256 B per node for the children
+    // buffer alone × 256 nodes ≈ 64 KB just for fan-out arrays. The
+    // node-summary at the top of this header (~75 KB total) accounts
+    // for that plus the per-node Str + terminal slots. Still
+    // negligible next to the segment trie's ~1.2 MB.
     static constexpr u32 kMaxChildren = 128;
 
     // Edge label: the byte run leading INTO this node. Non-owning view

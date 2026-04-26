@@ -69,12 +69,19 @@ bool ByteRadixTrie::insert(Str path, u8 method_char, u16 route_idx) {
     // capacity failure rolls back to pre-insert state. Edge fields are
     // non-owning Str views (16 B each) and the FixedVec child arrays
     // are POD u16 buffers, so a memcpy-style snapshot is cheap. Worst
-    // case ~256 × ~70 B ≈ 18 KB copied, dwarfed by the trie's overall
-    // build cost on configs that even hit the pool cap.
+    // case after the #46-r3 fan-out bump (kMaxChildren=128): ~256 ×
+    // ~290 B ≈ 75 KB copied, plus the same on the stack as
+    // saved_nodes[]. The build cost is dominated by parser /
+    // RouteConfig::add_* setup at this scale, so the snapshot is
+    // still cheap; the stack draw fits easily under the default
+    // 8 MB pthread stack.
     //
     // Per-step pre-flight isn't sufficient on its own: a same-step
     // edge split allocates one node and would leave the parent's
     // edge truncated even if the subsequent leaf-allocation failed.
+    // A mutation-log rollback (reverse-apply each step on failure)
+    // would lower peak memory but adds bookkeeping; left for follow-up
+    // if profiles ever show this snapshot becoming a bottleneck.
     const u32 saved_len = nodes.len;
     ByteRadixNode saved_nodes[kMaxNodes];
     for (u32 i = 0; i < saved_len; i++) saved_nodes[i] = nodes[i];

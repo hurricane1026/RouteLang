@@ -24,11 +24,16 @@ unset(_BORINGSSL_PREV_BUILD_TESTING_DEFINED)
 unset(_BORINGSSL_PREV_BUILD_TESTING)
 foreach(BORINGSSL_TARGET fipsmodule crypto ssl decrepit pki)
     if(TARGET ${BORINGSSL_TARGET})
+        # BoringSSL is third-party; silence its warning noise entirely
+        # rather than just demoting from error to warning. Earlier we
+        # only had -Wno-error=... which still printed thousands of
+        # -Wunused-parameter lines on every build (4000+ in CI logs,
+        # mostly from internal.h macro expansions). The full -Wno-...
+        # form suppresses the warning, not just the error promotion.
         target_compile_options(${BORINGSSL_TARGET} PRIVATE
             -Wno-error
-            -Wno-error=pedantic
-            -Wno-error=unused-parameter
             -Wno-pedantic
+            -Wno-unused-parameter
         )
     endif()
 endforeach()
@@ -37,7 +42,15 @@ if(SIMD_ARCH STREQUAL "auto")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         set(SIMD_ARCH "neon")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
-        set(SIMD_ARCH "sse2")
+        # Auto-default to AVX2 on x86_64. Haswell (2013) and later
+        # support it, which covers every server-class CPU we'd
+        # actually deploy on. AVX2 wins SSE2 by 2-4x on scan_uri
+        # across URI lengths (DISPATCH_PERF.md), with no downclock
+        # penalty. AVX-512 is opt-in only — see DISPATCH_PERF.md
+        # caveats: frequency throttling on Skylake-X/Cascade Lake +
+        # marginal-to-negative wins on typical URI lengths make it
+        # a poor production default.
+        set(SIMD_ARCH "avx2")
     else()
         set(SIMD_ARCH "scalar")
     endif()
@@ -69,11 +82,10 @@ endif()
 
 # Propagate the resolved SIMD configuration to the parent scope so
 # sibling subdirectories (bench/, tests/) can compile against the same
-# backend. bench_scan_uri and bench_dispatch_compare both pass these
-# through.
+# backend — bench_scan_uri specifically needs SIMD_FLAGS so the
+# __AVX2__/__AVX512F__ predefines match the rut_runtime build.
 set(SIMD_ARCH "${SIMD_ARCH}" PARENT_SCOPE)
 set(SIMD_FLAGS "${SIMD_FLAGS}" PARENT_SCOPE)
-set(SIMD_SOURCE "${SIMD_SOURCE}" PARENT_SCOPE)
 
 find_package(Threads REQUIRED)
 

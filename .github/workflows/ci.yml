@@ -307,14 +307,6 @@ jobs:
         with:
           submodules: recursive
       - name: Install tools
-  coverage:
-    name: Code Coverage
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-18 llvm-18 llvm-18-dev cmake ninja-build

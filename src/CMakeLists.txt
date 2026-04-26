@@ -122,6 +122,7 @@ add_library(rut_runtime STATIC
     runtime/chunked_parser.cc
     runtime/access_log.cc
     runtime/traffic_capture.cc
+    runtime/cpu_caps.cc
     runtime/route_art.cc
     runtime/route_byte_radix.cc
     runtime/route_dispatch.cc

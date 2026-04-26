@@ -36,3 +36,11 @@ target_include_directories(bench_route_art PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 target_compile_options(bench_route_art PRIVATE -O3 -DNDEBUG)
+
+add_executable(bench_first_byte_filter bench_first_byte_filter.cc)
+target_link_libraries(bench_first_byte_filter rut_runtime)
+target_include_directories(bench_first_byte_filter PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+target_compile_options(bench_first_byte_filter PRIVATE -O3 -DNDEBUG)

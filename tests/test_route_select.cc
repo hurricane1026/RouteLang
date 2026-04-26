@@ -129,7 +129,7 @@ TEST(route_select, picks_segment_trie_when_param_segments_present) {
     RouteAnalysis a;
     REQUIRE(a.note_route(S("/api/:id"), 0));
     REQUIRE(a.note_route(S("/users/:user_id/posts"), 0));
-    CHECK_EQ(pick_dispatch(a), &kSegmentTrieDispatch);
+    CHECK_EQ(pick_dispatch(a, CpuCaps::scalar_only()), &kSegmentTrieDispatch);
 }
 
 TEST(route_select, picks_linear_scan_for_tiny_configs) {
@@ -146,7 +146,7 @@ TEST(route_select, picks_linear_scan_for_tiny_configs) {
     REQUIRE(a.note_route(S("/f"), 0));
     REQUIRE(a.note_route(S("/g"), 0));
     REQUIRE(a.note_route(S("/h"), 0));
-    CHECK_EQ(pick_dispatch(a), &kLinearScanDispatch);
+    CHECK_EQ(pick_dispatch(a, CpuCaps::scalar_only()), &kLinearScanDispatch);
 }
 
 TEST(route_select, picks_byte_radix_when_prefix_overlap_no_params) {
@@ -177,7 +177,7 @@ TEST(route_select, picks_byte_radix_when_prefix_overlap_no_params) {
     REQUIRE(a.note_route(S("/h/k"), 0));
     CHECK(a.has_prefix_overlap());
     CHECK(!a.has_segment_boundary_sensitive_overlap());
-    CHECK_EQ(pick_dispatch(a), &kByteRadixDispatch);
+    CHECK_EQ(pick_dispatch(a, CpuCaps::scalar_only()), &kByteRadixDispatch);
 }
 
 TEST(route_select, picks_hash_first_segment_when_diverse_segments_no_overlap) {
@@ -203,7 +203,7 @@ TEST(route_select, picks_hash_first_segment_when_diverse_segments_no_overlap) {
     REQUIRE(a.note_route(S("/internal/dump"), 0));
     REQUIRE(!a.has_prefix_overlap());
     REQUIRE(a.distinct_first_segments() >= 4u);
-    CHECK_EQ(pick_dispatch(a), &kHashFirstSegmentDispatch);
+    CHECK_EQ(pick_dispatch(a, CpuCaps::scalar_only()), &kHashFirstSegmentDispatch);
 }
 
 TEST(route_select, picks_segment_trie_when_first_segments_concentrated) {
@@ -242,7 +242,7 @@ TEST(route_select, picks_segment_trie_when_first_segments_concentrated) {
     }
     REQUIRE(!a.has_prefix_overlap());
     REQUIRE_EQ(a.distinct_first_segments(), 1u);
-    CHECK_EQ(pick_dispatch(a), &kSegmentTrieDispatch);
+    CHECK_EQ(pick_dispatch(a, CpuCaps::scalar_only()), &kSegmentTrieDispatch);
 }
 
 TEST(route_select, falls_back_to_segment_trie_on_first_seg_bucket_overflow) {
@@ -267,7 +267,7 @@ TEST(route_select, falls_back_to_segment_trie_on_first_seg_bucket_overflow) {
     // HashFirstSegment and fall through to SegmentTrie (NOT
     // HashFullPath, which would silently break prefix routing).
     REQUIRE(a.max_first_seg_bucket() > HashFirstSegmentTable::kPerBucket);
-    CHECK_EQ(pick_dispatch(a), &kSegmentTrieDispatch);
+    CHECK_EQ(pick_dispatch(a, CpuCaps::scalar_only()), &kSegmentTrieDispatch);
 }
 
 TEST(route_select, picks_segment_trie_for_boundary_sensitive_overlap) {
@@ -299,7 +299,7 @@ TEST(route_select, picks_segment_trie_for_boundary_sensitive_overlap) {
     REQUIRE(a.note_route(S("/r15"), 0));
     REQUIRE(a.has_prefix_overlap());
     REQUIRE(a.has_segment_boundary_sensitive_overlap());
-    CHECK_EQ(pick_dispatch(a), &kSegmentTrieDispatch);
+    CHECK_EQ(pick_dispatch(a, CpuCaps::scalar_only()), &kSegmentTrieDispatch);
 }
 
 TEST(route_select, segment_aligned_overlap_does_not_set_boundary_sensitive_flag) {
@@ -392,7 +392,7 @@ TEST(route_select, picks_art_when_prefix_overlap_with_high_first_byte_fanout) {
     REQUIRE(a.has_prefix_overlap());
     REQUIRE(!a.has_segment_boundary_sensitive_overlap());
     REQUIRE_EQ(a.distinct_first_bytes(), 18u);
-    CHECK_EQ(pick_dispatch(a), &kArtDispatch);
+    CHECK_EQ(pick_dispatch(a, CpuCaps::scalar_only()), &kArtDispatch);
 }
 
 TEST(route_select, picks_byte_radix_when_prefix_overlap_with_low_first_byte_fanout) {
@@ -436,7 +436,7 @@ TEST(route_select, picks_byte_radix_when_prefix_overlap_with_low_first_byte_fano
     for (u32 i = 0; i < 16; i++) REQUIRE(a.note_route(S(deeps[i]), 0));
     REQUIRE(a.has_prefix_overlap());
     REQUIRE_EQ(a.distinct_first_bytes(), 16u);
-    CHECK_EQ(pick_dispatch(a), &kByteRadixDispatch);
+    CHECK_EQ(pick_dispatch(a, CpuCaps::scalar_only()), &kByteRadixDispatch);
 }
 
 // ============================================================================
@@ -445,7 +445,7 @@ TEST(route_select, picks_byte_radix_when_prefix_overlap_with_low_first_byte_fano
 
 TEST(route_select, picker_returns_canonical_singleton_for_empty_analysis) {
     RouteAnalysis a;
-    const RouteDispatch* d = pick_dispatch(a);
+    const RouteDispatch* d = pick_dispatch(a, CpuCaps::scalar_only());
     // Empty analysis: count == 0 ≤ 16, so LinearScan.
     CHECK_EQ(d, &kLinearScanDispatch);
 }

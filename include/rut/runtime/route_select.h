@@ -81,6 +81,7 @@
 // `tests/test_route_select.cc`.
 
 #include "rut/common/types.h"
+#include "rut/runtime/cpu_caps.h"
 #include "rut/runtime/route_dispatch.h"
 #include "rut/runtime/route_hash_first_seg.h"  // for kBuckets / kPerBucket
 
@@ -196,6 +197,13 @@ private:
 // route_dispatch.h — never nullptr, never an unknown pointer (the
 // canonical-singleton whitelist in RouteConfig::set_dispatch checks
 // for this; the picker is the trusted source of those pointers).
-const RouteDispatch* pick_dispatch(const RouteAnalysis& analysis);
+//
+// `caps` controls SIMD-enabled dispatch admissibility. Caller is
+// responsible for the singleton (typically rutproxy::main probes
+// once via CpuCaps::detect() and threads the result through). For
+// tests / config validation that don't care about SIMD selection,
+// passing CpuCaps::scalar_only() forces the picker through the
+// scalar code paths only.
+const RouteDispatch* pick_dispatch(const RouteAnalysis& analysis, const CpuCaps& caps);
 
 }  // namespace rut

@@ -217,7 +217,12 @@ u32 RouteAnalysis::distinct_first_segments() const {
     return distinct;
 }
 
-const RouteDispatch* pick_dispatch(const RouteAnalysis& a) {
+const RouteDispatch* pick_dispatch(const RouteAnalysis& a, const CpuCaps& caps) {
+    // caps unused while no SIMD-enabled dispatch is wired in yet.
+    // Reserving the parameter keeps the picker contract stable so
+    // SIMD LinearScan (next PR in this series) lands as a single
+    // additive change — no signature churn at the call site.
+    (void)caps;
     // Param segments require segment-bound parameter capture; only
     // SegmentTrie supports that.
     if (a.has_param_segments()) return &kSegmentTrieDispatch;

@@ -67,6 +67,14 @@ else()
     message(FATAL_ERROR "Unknown SIMD_ARCH '${SIMD_ARCH}'. Valid options: auto, scalar, sse2, avx2, avx512, neon, sve")
 endif()
 
+# Propagate the resolved SIMD configuration to the parent scope so
+# sibling subdirectories (bench/, tests/) can compile against the same
+# backend. bench_scan_uri and bench_dispatch_compare both pass these
+# through.
+set(SIMD_ARCH "${SIMD_ARCH}" PARENT_SCOPE)
+set(SIMD_FLAGS "${SIMD_FLAGS}" PARENT_SCOPE)
+set(SIMD_SOURCE "${SIMD_SOURCE}" PARENT_SCOPE)
+
 find_package(Threads REQUIRED)
 
 # zstd — vendored, compress only, stripped strategies (fast + doubleFast only).

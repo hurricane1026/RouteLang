@@ -229,10 +229,10 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
 
     // Atomic insert — snapshot all four pools + the root_ref_ so any
     // allocation failure during descent rolls the trie back to pre-
-    // insert state. Snapshot cost equals the sum of the four pool
-    // arrays at full kMax* capacity (computed via sizeof() below) —
-    // ~35 KB at the current cap configuration documented in
-    // route_art.h. Tiny next to a default 8 MB pthread stack;
+    // insert state. Snapshot stack reservation equals the sum of the
+    // four full-capacity pool arrays — ~35 KB at the current cap
+    // configuration documented in route_art.h. Tiny next to a default
+    // 8 MB pthread stack;
     // dominated by the live data we'd need to copy out anyway if we
     // tried to shrink the snapshot to live-prefix only.
     const u32 saved_n4_len = n4_pool_len_;

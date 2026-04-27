@@ -185,7 +185,7 @@ public:
     //   Node4   × 256 × 48  B = 12.3 KB
     //   Node16  ×  64 × 88  B =  5.6 KB
     //   Node48  ×  32 × 392 B = 12.5 KB
-    //   Node256 ×   8 × 532 B =  4.3 KB
+    //   Node256 ×   8 × 552 B =  4.3 KB
     //   plus per-pool len / index overhead                ~ <1 KB
     //   ≈ 35 KB total inline — vs ByteRadixTrie's ~75 KB.
     static constexpr u32 kMaxN4 = 256;

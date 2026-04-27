@@ -7,7 +7,8 @@
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/route_art.h"
-#include "rut/runtime/route_canon.h"  // canonicalize_request
+#include "rut/runtime/route_canon.h"   // canonicalize_request
+#include "rut/runtime/route_select.h"  // path_has_param_segment
 #include "rut/runtime/route_trie.h"
 
 #include <errno.h>
@@ -166,7 +167,9 @@ struct RouteConfig {
                   "whose routes all share a single parent fits the trie's per-node fan-out.");
 
     // Adaptive Radix Tree — byte-prefix matching with adaptive node
-    // sizing (Node4/16/48/256). ~26 KB inline. Populated by add_*
+    // sizing (Node4/16/48/256). ~35 KB inline at the current pool
+    // caps — see route_art.h's pool-cap comment for the breakdown.
+    // Populated by add_*
     // when dispatch_kind_ == ArtJit. After population, caller can
     // JIT-specialize match() via install_art_jit_fn for a ~5x
     // speedup on saas-shaped configs (PR #50 round 2 bench).
@@ -279,6 +282,7 @@ struct RouteConfig {
         if (route_count >= kMaxRoutes) return false;
         if (upstream_id >= upstream_count) return false;
         if (!is_routable_path(path)) return false;
+        if (!reject_param_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -304,6 +308,7 @@ struct RouteConfig {
     bool add_static(const char* path, u8 method, u16 status) {
         if (route_count >= kMaxRoutes) return false;
         if (!is_routable_path(path)) return false;
+        if (!reject_param_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -331,6 +336,7 @@ struct RouteConfig {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
         if (!is_routable_path(path)) return false;
+        if (!reject_param_path(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -527,6 +533,25 @@ struct RouteConfig {
     }
 
 private:
+    // Called from each add_*() to refuse paths whose shape neither
+    // current dispatcher actually supports — specifically ":param"
+    // segments. Both ArtJit (byte-prefix) and SegmentTrie (literal-
+    // segment) match strings byte-by-byte / segment-by-segment, so a
+    // registered "/users/:id" gets stored under the literal ":id"
+    // segment and "/users/42" misses silently. Runtime parameter
+    // capture is a future feature; refusing param paths at add_*
+    // time surfaces the misconfiguration loudly at startup instead
+    // of producing missed routes at request time.
+    //
+    // (route_select.h's path_has_param_segment helper detects the
+    // shape; the picker that pairs with it is documentation-only
+    // until a dispatcher learns ":param" semantics.)
+    bool reject_param_path(const char* path) const {
+        u32 plen = 0;
+        while (path[plen]) plen++;
+        return !path_has_param_segment(Str{path, plen});
+    }
+
     // Tagged-union discriminator. Default is ArtJit since most
     // configs land there post-#41 picker reduction; tests and
     // tooling that call use_segment_trie() before add_* swap

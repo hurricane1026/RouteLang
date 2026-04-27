@@ -127,7 +127,10 @@ jobs:
       - name: Report CPU capabilities
         run: |
           grep -m1 '^model name' /proc/cpuinfo
-          grep -m1 -oE '(avx[0-9a-z_]*|sse[0-9_]*)' /proc/cpuinfo | sort -u | tr '\n' ' '
+          # Use only the first 'flags' line (one CPU's-worth) and
+          # extract every avx*/sse* token from it. -m1 alone on the
+          # outer grep would only print the first matched flag.
+          grep -m1 '^flags' /proc/cpuinfo | grep -oE '(avx[0-9a-z_]*|sse[0-9_]*)' | sort -u | tr '\n' ' '
           echo
 
       - name: Bench across x86 SIMD ISAs

@@ -93,10 +93,15 @@ elsewhere. Two structural reasons:
 
 Practical recommendation:
 
-- **Default to AVX2 for x86_64 server deployments.** This is what
-  `SIMD_ARCH=auto` now picks (CMakeLists.txt as of round 26).
-  Haswell (2013) and later support AVX2; covers every cloud
-  instance type in current use.
+- **Default `SIMD_ARCH=auto` stays at the SSE2 baseline on x86_64**
+  so the build is portable across mixed fleets, cross-compile, and
+  feature-masked / VM-restricted deployments. Every x86_64 CPU has
+  SSE2.
+- **Server deployments should set `-DSIMD_ARCH=avx2` explicitly.**
+  Haswell (2013) and later support AVX2, covering every contemporary
+  cloud instance type. AVX2 wins SSE2 by 2-4x on `scan_uri` with no
+  downclock penalty; the dispatch comparison numbers above use AVX2
+  as the recommended baseline.
 - **AVX-512 stays as opt-in** (`-DSIMD_ARCH=avx512`) for users with
   niche workloads (e.g. CDN edge handling 1KB+ canonical paths)
   who measure that the SIMD width gain outweighs the downclock.

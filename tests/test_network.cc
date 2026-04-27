@@ -2381,6 +2381,27 @@ TEST(route, use_segment_trie_swaps_dispatch_pre_add) {
     CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::ArtJit);
 }
 
+TEST(route, add_refuses_param_path) {
+    // Neither ArtJit (byte-prefix) nor SegmentTrie (literal-segment)
+    // currently implements runtime ":param" capture — a registered
+    // "/users/:id" would be stored under the literal ":id" segment
+    // in either dispatcher and "/users/42" would silently miss.
+    // add_*() refuses param paths so the misconfiguration surfaces
+    // at startup instead of at request time.
+    RouteConfig cfg;
+    CHECK(!cfg.add_static("/users/:id", 0, 200));
+    // Refusal is consistent under explicit SegmentTrie too — it
+    // stores ":v" literally, so "/api/v1/users" still wouldn't
+    // match.
+    RouteConfig cfg2;
+    REQUIRE(cfg2.use_segment_trie());
+    CHECK(!cfg2.add_static("/api/:v/users", 0, 200));
+    // Routes without ":param" segments are unaffected.
+    RouteConfig cfg3;
+    CHECK(cfg3.add_static("/users/me", 0, 200));
+    CHECK(cfg3.add_static("/api/v1/users", 0, 200));
+}
+
 TEST(route, use_dispatch_refuses_after_first_add) {
     // Same contract as the retired set_dispatch: once a route is
     // added, the chosen state struct has been populated; swapping
@@ -5801,13 +5822,13 @@ TEST(metadata, empty_recv_buf) {
 }
 
 TEST(metadata, fallback_non_origin_form_clears_canon) {
-    // Round 21 security fix: when the strict parser fails but the
-    // fallback path-extractor recognizes a method+space+target, AND
-    // that target isn't origin-form (e.g. "*", "host:port"), the
-    // fallback's early-return path used to leave req_path_canon at
-    // its default canon-of-"/" view — letting non-origin-form
-    // targets fall into a "/" catchall via match_canonical. This
-    // verifies the fallback now explicitly clears the canon view.
+    // When the strict parser fails but the fallback path-extractor
+    // recognizes a method+space+target where that target isn't
+    // origin-form (e.g. "*", "host:port"), capture_request_metadata
+    // must explicitly clear req_path_canon — otherwise the default
+    // canon-of-"/" view would let non-origin-form targets fall into
+    // a "/" catchall via match_canonical (defeats the origin-form
+    // guard the canonicalizing match() entry enforces).
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));

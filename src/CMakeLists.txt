@@ -42,15 +42,15 @@ if(SIMD_ARCH STREQUAL "auto")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         set(SIMD_ARCH "neon")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
-        # Auto-default to AVX2 on x86_64. Haswell (2013) and later
-        # support it, which covers every server-class CPU we'd
-        # actually deploy on. AVX2 wins SSE2 by 2-4x on scan_uri
-        # across URI lengths (DISPATCH_PERF.md), with no downclock
-        # penalty. AVX-512 is opt-in only — see DISPATCH_PERF.md
-        # caveats: frequency throttling on Skylake-X/Cascade Lake +
-        # marginal-to-negative wins on typical URI lengths make it
-        # a poor production default.
-        set(SIMD_ARCH "avx2")
+        # SSE2 is the x86_64 ISA baseline — every x86_64 CPU has it,
+        # so a binary built with auto stays portable across mixed
+        # fleets and cross-compile scenarios. Production server
+        # deployments should set -DSIMD_ARCH=avx2 explicitly: AVX2
+        # wins SSE2 by 2-4x on scan_uri (see DISPATCH_PERF.md), and
+        # every server-class CPU since Haswell (2013) supports it.
+        # AVX-512 is opt-in only — see DISPATCH_PERF.md for the
+        # frequency-throttling caveats that make it a poor default.
+        set(SIMD_ARCH "sse2")
     else()
         set(SIMD_ARCH "scalar")
     endif()

@@ -238,10 +238,15 @@ public:
     u32 n48_count() const { return n48_pool_len_; }
     u32 n256_count() const { return n256_pool_len_; }
 
-    // SPIKE: pools made public so JIT codegen can read trie state
-    // directly at IR-emission time. Productized version would
-    // expose this via a stable accessor API; kept public here for
-    // experiment velocity.
+    // Pools are intentionally public, not behind accessor methods:
+    // the JIT codegen in src/jit/art_jit_codegen.cc walks the trie
+    // depth-first at IR-emission time and needs random access to the
+    // node arrays. An accessor API would add either virtual dispatch
+    // (rejected by -fno-rtti / -fno-exceptions style) or a header-
+    // bloat surface that exposes the same fields anyway. Layout
+    // stability is enforced by tests + the JIT's bench parity gate;
+    // changes to these fields are an acknowledged ABI change between
+    // rut_runtime and rut_jit.
     ArtNode4 n4_pool_[kMaxN4];
     ArtNode16 n16_pool_[kMaxN16];
     ArtNode48 n48_pool_[kMaxN48];

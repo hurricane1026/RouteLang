@@ -72,12 +72,17 @@ TEST(route_trie, no_match_returns_sentinel_when_no_catchall) {
 }
 
 TEST(route_trie, rejects_non_origin_form_request_targets) {
-    // Codex P2 on #41: match() used to seed `best` from the root
-    // terminal unconditionally, so a configured "/" catchall would
-    // match HTTP/1.1 non-origin-form request targets like "*"
-    // (OPTIONS asterisk-form) or "example.com:443" (CONNECT
-    // authority-form). Path-based routing shouldn't apply to those;
-    // the pre-trie byte-prefix matcher rejected them implicitly.
+    // Verifies the contract enforced by the canon_match wrapper (and
+    // by RouteConfig::match / match_canonical in production): non-
+    // origin-form request-targets — "*" (OPTIONS asterisk-form),
+    // "host:port" (CONNECT authority-form), the empty string —
+    // never reach RouteTrie::match. The wrapper canonicalizes raw
+    // input and short-circuits to kInvalidRoute when path[0] != '/'.
+    //
+    // RouteTrie::match itself assumes canonical input as of #50
+    // round 6 — it doesn't have its own origin-form guard anymore;
+    // this test exercises the wrapper that *is* the guard for raw-
+    // input callers.
     RouteTrie t;
     const Insert items[] = {{"/", 0, 99}};
     REQUIRE(build_ok(t, items, 1));

@@ -24,14 +24,14 @@ bool is_strict_byte_prefix(Str a, Str b) {
 // /api vs /apix, where byte-prefix and segment-prefix matching
 // would diverge for in-between requests like /apij.
 //
-// Exception: the root "/" catchall (shorter.len == 1, shorter == "/")
-// is itself a complete path segment, so any byte that follows it in a
-// longer sibling path is always a new segment start — there is no
-// mid-segment overlap possible, and no ambiguity with any sibling
-// route. Exempting "/" avoids spuriously forcing SegmentTrie whenever
-// a root catchall is registered alongside other routes.
+// Exception: a shorter route ending in '/' is already segment-aligned
+// after dispatch canonicalization trims trailing slash runs. This
+// includes the root "/" catchall, where any following byte in a
+// longer sibling path is necessarily a new segment start. Exempting
+// these paths avoids spuriously forcing SegmentTrie for "/" + "/api"
+// or "/api/" + "/api/v1".
 bool boundary_sensitive_after_prefix(Str shorter, Str longer) {
-    if (shorter.len == 1 && shorter.ptr[0] == '/') return false;
+    if (shorter.len > 0 && shorter.ptr[shorter.len - 1] == '/') return false;
     return longer.ptr[shorter.len] != '/';
 }
 

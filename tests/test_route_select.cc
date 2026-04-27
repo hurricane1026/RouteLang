@@ -48,6 +48,13 @@ TEST(route_select, has_boundary_sensitive_overlap_rejects_segment_aligned_pair) 
     CHECK(!has_boundary_sensitive_overlap(paths, 2));
 }
 
+TEST(route_select, has_boundary_sensitive_overlap_rejects_trailing_slash_prefix) {
+    // /api/ canonicalizes to /api, so /api/ + /api/v1 is segment-
+    // aligned and should not force SegmentTrie.
+    Str paths[] = {S("/api/"), S("/api/v1")};
+    CHECK(!has_boundary_sensitive_overlap(paths, 2));
+}
+
 TEST(route_select, has_boundary_sensitive_overlap_handles_either_order) {
     // Reverse insert order: /apix first, /api second.
     Str paths[] = {S("/apix"), S("/api")};

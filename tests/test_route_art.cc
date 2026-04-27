@@ -306,12 +306,12 @@ TEST(route_art, atomic_insert_on_pool_exhaustion) {
     // Node16 retains the old Node4, etc) — let's keep things simple
     // by capping fan-out at 4 to avoid root upgrades, then add
     // enough depth to fill N4.
-    char p1[3];
-    p1[0] = '/';
+    char p1_paths[5][3];
     for (u32 i = 0; i < 4; i++) {
-        p1[1] = static_cast<char>('a' + i);
-        p1[2] = '\0';
-        REQUIRE(t.insert(Str{p1, 2}, 0, static_cast<u16>(i)));
+        p1_paths[i][0] = '/';
+        p1_paths[i][1] = static_cast<char>('a' + i);
+        p1_paths[i][2] = '\0';
+        REQUIRE(t.insert(Str{p1_paths[i], 2}, 0, static_cast<u16>(i)));
     }
     REQUIRE_EQ(t.n4_count(), 5u);  // root + 4 leaves
 
@@ -344,9 +344,10 @@ TEST(route_art, atomic_insert_on_pool_exhaustion) {
     // leaf with multi-byte edge first... actually let's simplify: the
     // pool has 1 free slot, so we attempt to add 2 new top-level
     // bytes — first succeeds (1 leaf), second must fail.
-    p1[1] = static_cast<char>('e');
-    p1[2] = '\0';
-    REQUIRE(t.insert(Str{p1, 2}, 0, 9000));  // succeeds, fills last slot
+    p1_paths[4][0] = '/';
+    p1_paths[4][1] = static_cast<char>('e');
+    p1_paths[4][2] = '\0';
+    REQUIRE(t.insert(Str{p1_paths[4], 2}, 0, 9000));  // succeeds, fills last slot
     REQUIRE_EQ(t.n4_count(), ArtTrie::kMaxN4);
 
     const u32 nodes_before = t.n4_count();
@@ -355,8 +356,7 @@ TEST(route_art, atomic_insert_on_pool_exhaustion) {
     CHECK_EQ(t.n4_count(), nodes_before);          // rollback restored
 
     // Originals still match.
-    p1[1] = 'e';
-    CHECK_EQ(t.match(Str{p1, 2}, 0), 9000u);
+    CHECK_EQ(t.match(Str{p1_paths[4], 2}, 0), 9000u);
 }
 
 TEST(route_art, fills_max_routes_under_node48_pressure) {

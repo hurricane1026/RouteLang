@@ -227,14 +227,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.request_config = config;
     const RouteEntry* route = nullptr;
     if (config) {
-        // Map LogHttpMethod back to RouteConfig's method_char format.
-        // RouteConfig::match() uses first-char matching ('G'=GET, etc.).
-        // This is still ambiguous for POST/PUT/PATCH (all 'P'), which
-        // is a known limitation of RouteConfig — JIT routing will use
-        // the full HttpMethod enum.
-        static constexpr u8 kMethodChars[] = {'G', 'P', 'P', 'D', 'P', 'H', 'O', 'C', 'T', 0};
-        const u8 kMethodChar =
-            conn.req_method < sizeof(kMethodChars) ? kMethodChars[conn.req_method] : 0;
+        const u8 kMethodKey = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
         // Use the parser-supplied canonical view (PR #50 round 7 path A)
         // to skip the redundant canon scan and the strlen-style scan
         // over conn.req_path. The parser only populates path_canon for
@@ -244,7 +237,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // nullptr (miss) so those targets cannot fall into a "/" catchall.
         // {non-null ptr, len=0} remains a legitimate canonical view of
         // the origin-form root "/" and dispatches normally.
-        route = config->match_canonical(conn.req_path_canon, kMethodChar);
+        route = config->match_canonical(conn.req_path_canon, kMethodKey);
     }
 
     if (route && route->action == RouteAction::Proxy) {

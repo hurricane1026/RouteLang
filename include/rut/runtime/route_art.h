@@ -117,6 +117,8 @@ struct ArtNodeHeader {
                                              TrieNode::kInvalidRoute,
                                              TrieNode::kInvalidRoute,
                                              TrieNode::kInvalidRoute,
+                                             TrieNode::kInvalidRoute,
+                                             TrieNode::kInvalidRoute,
                                              TrieNode::kInvalidRoute};
 };
 
@@ -229,6 +231,11 @@ public:
     // both scalar and JIT'd paths can share a single canon scan.
     u16 match(Str path, u8 method_char) const;
     u16 match_canonical(Str canon_path, u8 method_char) const;
+
+    // Same as match_canonical(), but `method_key` must already be a
+    // canonical route method key. Used by RouteConfig's production hot
+    // path to keep legacy first-char compatibility out of dispatch.
+    u16 match_canonical_key(Str canon_path, u8 method_key) const;
 
     // Introspection (tests / bench). node_count returns the sum
     // across pools (root included).

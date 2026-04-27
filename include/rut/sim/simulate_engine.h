@@ -24,7 +24,7 @@ enum class ManifestAction : u8 {
 };
 
 struct ManifestRoute {
-    u8 method = 0;  // 0 = any, otherwise RouteConfig-style first-char match.
+    u8 method = 0;  // route method key: 0 = any, 1..9 = full HTTP method.
     char pattern[128]{};
     ManifestAction action = ManifestAction::ReturnStatus;
     u16 status_code = 200;
@@ -60,7 +60,7 @@ struct ModuleContext {
 //
 // Tokens are whitespace-separated; blank lines and '#' comments are ignored.
 // Route matching uses the request path only and ignores any query string.
-// METHOD is matched RouteConfig-style by first character; ANY matches any method.
+// METHOD is matched by full HTTP method; ANY matches any method.
 // <pattern> is prefix-matched and may include ':param' segments.
 // Each ':param' matches exactly one non-empty path segment and never crosses '/'.
 bool load_manifest(const char* path, Manifest& out);

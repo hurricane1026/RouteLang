@@ -135,6 +135,34 @@ TEST(route_art, method_specific_beats_any_at_same_path) {
     CHECK_EQ(t.match(S("/x"), 0), 1u);
 }
 
+TEST(route_art, method_post_put_patch_are_distinct) {
+    ArtTrie t;
+    REQUIRE(t.insert(S("/x"), kRouteMethodPost, 10));
+    REQUIRE(t.insert(S("/x"), kRouteMethodPut, 20));
+    REQUIRE(t.insert(S("/x"), kRouteMethodPatch, 30));
+    CHECK_EQ(t.match(S("/x"), kRouteMethodPost), 10u);
+    CHECK_EQ(t.match(S("/x"), kRouteMethodPut), 20u);
+    CHECK_EQ(t.match(S("/x"), kRouteMethodPatch), 30u);
+    CHECK_EQ(t.match(S("/x"), 'G'), TrieNode::kInvalidRoute);
+}
+
+TEST(route_config, post_put_patch_are_distinct_on_art_dispatch) {
+    RouteConfig cfg;
+    REQUIRE(cfg.use_art());
+    REQUIRE(cfg.add_static("/x", kRouteMethodPost, 201));
+    REQUIRE(cfg.add_static("/x", kRouteMethodPut, 202));
+    REQUIRE(cfg.add_static("/x", kRouteMethodPatch, 203));
+    const auto* post = cfg.match(reinterpret_cast<const u8*>("/x"), 2, kRouteMethodPost);
+    const auto* put = cfg.match(reinterpret_cast<const u8*>("/x"), 2, kRouteMethodPut);
+    const auto* patch = cfg.match(reinterpret_cast<const u8*>("/x"), 2, kRouteMethodPatch);
+    REQUIRE(post != nullptr);
+    REQUIRE(put != nullptr);
+    REQUIRE(patch != nullptr);
+    CHECK_EQ(post->status_code, 201u);
+    CHECK_EQ(put->status_code, 202u);
+    CHECK_EQ(patch->status_code, 203u);
+}
+
 TEST(route_art, first_insert_wins_on_dup_method_slot) {
     ArtTrie t;
     REQUIRE(t.insert(S("/x"), 'G', 0));

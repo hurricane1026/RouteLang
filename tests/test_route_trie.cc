@@ -265,13 +265,14 @@ TEST(route_trie, method_first_insert_wins_on_exact_dup) {
     CHECK_EQ(canon_match(t, S("/x"), 'G'), 1u);  // first insert pins the slot
 }
 
-TEST(route_trie, method_post_put_patch_ambiguity_preserved) {
-    // The current first-char method scheme collapses POST/PUT/PATCH → 'P'.
-    // Preserve that here until a follow-up PR introduces a proper enum.
+TEST(route_trie, method_post_put_patch_are_distinct) {
     RouteTrie t;
-    const Insert items[] = {{"/x", 'P', 99}};
-    REQUIRE(build_ok(t, items, 1));
-    CHECK_EQ(canon_match(t, S("/x"), 'P'), 99u);
+    const Insert items[] = {
+        {"/x", kRouteMethodPost, 10}, {"/x", kRouteMethodPut, 20}, {"/x", kRouteMethodPatch, 30}};
+    REQUIRE(build_ok(t, items, 3));
+    CHECK_EQ(canon_match(t, S("/x"), kRouteMethodPost), 10u);
+    CHECK_EQ(canon_match(t, S("/x"), kRouteMethodPut), 20u);
+    CHECK_EQ(canon_match(t, S("/x"), kRouteMethodPatch), 30u);
     CHECK_EQ(canon_match(t, S("/x"), 'G'), TrieNode::kInvalidRoute);
 }
 

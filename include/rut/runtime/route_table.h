@@ -58,7 +58,7 @@ struct RouteEntry {
     // Match criteria
     char path[kMaxPathLen];  // path prefix (e.g., "/api/v1/")
     u32 path_len;
-    u8 method;  // 0 = any, 'G' = GET, 'P' = POST, etc. (first char)
+    u8 method;  // route method key: 0 = any, 1..9 = full HTTP method
 
     // Action
     RouteAction action;
@@ -273,11 +273,8 @@ struct RouteConfig {
     //   - upstream_id is out of range,
     //   - the path is malformed (see is_routable_path),
     //   - the path is too long for RouteEntry::path,
-    //   - the active dispatch rejects the (path, method) pair while
-    //     populating its state — for example, the segment trie
-    //     refuses unrecognized method bytes. The default linear
-    //     scan accepts any method byte verbatim, so method
-    //     validation is effectively dispatch-dependent here.
+    //   - the method key is not recognized (legacy first-char method
+    //     bytes are normalized before insertion),
     //   - the active dispatch's state ran out of capacity,
     //   - the active dispatch is not one of the canonical singletons
     //     (see populate_dispatch_state).
@@ -286,6 +283,8 @@ struct RouteConfig {
         if (upstream_id >= upstream_count) return false;
         if (!is_routable_path(path)) return false;
         if (!has_no_param_segment(path)) return false;
+        const u8 method_key = route_method_key_from_legacy_char(method);
+        if (route_method_slot(method_key) == kMethodSlotInvalid) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -294,7 +293,7 @@ struct RouteConfig {
         }
         if (path[r.path_len] != '\0') return false;  // path too long (truncated)
         r.path[r.path_len] = '\0';
-        r.method = method;
+        r.method = method_key;
         r.action = RouteAction::Proxy;
         r.upstream_id = upstream_id;
         r.status_code = 0;
@@ -312,6 +311,8 @@ struct RouteConfig {
         if (route_count >= kMaxRoutes) return false;
         if (!is_routable_path(path)) return false;
         if (!has_no_param_segment(path)) return false;
+        const u8 method_key = route_method_key_from_legacy_char(method);
+        if (route_method_slot(method_key) == kMethodSlotInvalid) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -320,7 +321,7 @@ struct RouteConfig {
         }
         if (path[r.path_len] != '\0') return false;  // path too long
         r.path[r.path_len] = '\0';
-        r.method = method;
+        r.method = method_key;
         r.action = RouteAction::Static;
         r.upstream_id = 0;
         r.status_code = status;
@@ -340,6 +341,8 @@ struct RouteConfig {
         if (fn == nullptr) return false;
         if (!is_routable_path(path)) return false;
         if (!has_no_param_segment(path)) return false;
+        const u8 method_key = route_method_key_from_legacy_char(method);
+        if (route_method_slot(method_key) == kMethodSlotInvalid) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -348,7 +351,7 @@ struct RouteConfig {
         }
         if (path[r.path_len] != '\0') return false;  // path too long
         r.path[r.path_len] = '\0';
-        r.method = method;
+        r.method = method_key;
         r.action = RouteAction::JitHandler;
         r.upstream_id = 0;
         r.status_code = 0;
@@ -481,10 +484,11 @@ struct RouteConfig {
     // unmatched requests return nullptr (callers fall back to the
     // default 200 OK handler).
     //
-    // `method_char` is the first byte of the HTTP method ('G'=GET,
-    // 'P'=POST/PUT/PATCH, 'D'=DELETE, 'H'=HEAD, 'O'=OPTIONS,
-    // 'C'=CONNECT, 'T'=TRACE) or 0 for "any".
-    const RouteEntry* match(const u8* path_data, u32 path_len, u8 method_char) const {
+    // `method` is a route method key (0 = any, 1..9 = full HTTP
+    // method), or a legacy first-char method byte accepted for
+    // hand-built configs. This compatibility wrapper canonicalizes
+    // before entering the dispatch hot path.
+    const RouteEntry* match(const u8* path_data, u32 path_len, u8 method) const {
         // Reject non-origin-form request targets (asterisk-form `*`,
         // authority-form `host:port`, empty). Origin-form must start
         // with '/'. Done here at dispatch entry so the inner match()
@@ -501,7 +505,8 @@ struct RouteConfig {
         // integration helpers); the production hot path goes through
         // match_canonical which skips this scan entirely.
         const Str raw{reinterpret_cast<const char*>(path_data), path_len};
-        return match_canonical(canonicalize_request(raw), method_char);
+        return match_canonical(canonicalize_request(raw),
+                               route_method_key_from_legacy_char(method));
     }
 
     // Fast path for callers with a pre-canonicalized path. PR #50
@@ -517,16 +522,18 @@ struct RouteConfig {
     // it as a miss so non-origin-form targets cannot fall into a
     // configured "/" catchall. canon.len == 0 with non-null ptr is
     // legitimate (origin-form root "/") and dispatches normally.
-    const RouteEntry* match_canonical(Str canon, u8 method_char) const {
+    // `method` must be a canonical route method key. Compatibility
+    // callers with legacy first-char bytes should use match().
+    const RouteEntry* match_canonical(Str canon, u8 method) const {
         if (canon.ptr == nullptr) return nullptr;
         u16 idx;
         switch (dispatch_kind_) {
             case DispatchKind::ArtJit:
-                idx = art_jit_fn_ ? art_jit_fn_(canon.ptr, canon.len, method_char)
-                                  : art_state.match_canonical(canon, method_char);
+                idx = art_jit_fn_ ? art_jit_fn_(canon.ptr, canon.len, method)
+                                  : art_state.match_canonical_key(canon, method);
                 break;
             case DispatchKind::SegmentTrie:
-                idx = trie.match(canon, method_char);
+                idx = trie.match_key(canon, method);
                 break;
             default:
                 __builtin_unreachable();

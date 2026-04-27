@@ -10,6 +10,7 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/route_method.h"
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/traffic_replay.h"
 
@@ -62,50 +63,32 @@ static bool parse_u32_token(const char* s, u32 len, u32* out) {
 
 static u8 parse_method_token(const char* s, u32 len, bool* ok) {
     *ok = true;
-    if (len == 3 && s[0] == 'A' && s[1] == 'N' && s[2] == 'Y') return 0;
-    if (len == 3 && s[0] == 'G' && s[1] == 'E' && s[2] == 'T') return 'G';
-    if (len == 4 && s[0] == 'P' && s[1] == 'O' && s[2] == 'S' && s[3] == 'T') return 'P';
-    if (len == 3 && s[0] == 'P' && s[1] == 'U' && s[2] == 'T') return 'P';
+    if (len == 3 && s[0] == 'A' && s[1] == 'N' && s[2] == 'Y') return kRouteMethodAny;
+    if (len == 3 && s[0] == 'G' && s[1] == 'E' && s[2] == 'T') return kRouteMethodGet;
+    if (len == 4 && s[0] == 'P' && s[1] == 'O' && s[2] == 'S' && s[3] == 'T')
+        return kRouteMethodPost;
+    if (len == 3 && s[0] == 'P' && s[1] == 'U' && s[2] == 'T') return kRouteMethodPut;
     if (len == 6 && s[0] == 'D' && s[1] == 'E' && s[2] == 'L' && s[3] == 'E' && s[4] == 'T' &&
         s[5] == 'E')
-        return 'D';
+        return kRouteMethodDelete;
     if (len == 5 && s[0] == 'P' && s[1] == 'A' && s[2] == 'T' && s[3] == 'C' && s[4] == 'H')
-        return 'P';
-    if (len == 4 && s[0] == 'H' && s[1] == 'E' && s[2] == 'A' && s[3] == 'D') return 'H';
+        return kRouteMethodPatch;
+    if (len == 4 && s[0] == 'H' && s[1] == 'E' && s[2] == 'A' && s[3] == 'D')
+        return kRouteMethodHead;
     if (len == 7 && s[0] == 'O' && s[1] == 'P' && s[2] == 'T' && s[3] == 'I' && s[4] == 'O' &&
         s[5] == 'N' && s[6] == 'S')
-        return 'O';
+        return kRouteMethodOptions;
     if (len == 7 && s[0] == 'C' && s[1] == 'O' && s[2] == 'N' && s[3] == 'N' && s[4] == 'E' &&
         s[5] == 'C' && s[6] == 'T')
-        return 'C';
+        return kRouteMethodConnect;
     if (len == 5 && s[0] == 'T' && s[1] == 'R' && s[2] == 'A' && s[3] == 'C' && s[4] == 'E')
-        return 'T';
+        return kRouteMethodTrace;
     *ok = false;
     return 0;
 }
 
-static u8 http_method_char(HttpMethod method) {
-    switch (method) {
-        case HttpMethod::GET:
-            return 'G';
-        case HttpMethod::POST:
-        case HttpMethod::PUT:
-        case HttpMethod::PATCH:
-            return 'P';
-        case HttpMethod::DELETE:
-            return 'D';
-        case HttpMethod::HEAD:
-            return 'H';
-        case HttpMethod::OPTIONS:
-            return 'O';
-        case HttpMethod::CONNECT:
-            return 'C';
-        case HttpMethod::TRACE:
-            return 'T';
-        case HttpMethod::Unknown:
-            return 0;
-    }
-    return 0;
+static u8 http_route_method_key(HttpMethod method) {
+    return route_method_key(method);
 }
 
 static u8 log_method(HttpMethod method) {
@@ -197,12 +180,12 @@ static bool route_matches(const Engine::CompiledRoute& route, const char* path, 
 }
 
 static const Engine::CompiledRoute* select_route(const Engine& engine,
-                                                 u8 method_char,
+                                                 u8 method_key,
                                                  const char* path,
                                                  u32 path_len) {
     for (u32 i = 0; i < engine.route_count; i++) {
         const auto& route = engine.routes[i];
-        if (route.method != 0 && route.method != method_char) continue;
+        if (route.method != 0 && route.method != method_key) continue;
         if (route_matches(route, path, path_len)) return &route;
     }
     return nullptr;
@@ -548,7 +531,7 @@ bool Engine::init(const rir::Module& module,
         if (fn.route_pattern.len >= sizeof(next_routes[0].pattern)) return fail();
 
         auto& route = next_routes[next_route_count++];
-        route.method = fn.http_method;
+        route.method = route_method_key_from_legacy_char(fn.http_method);
         route.pattern_len = fn.route_pattern.len;
         for (u32 j = 0; j < route.pattern_len; j++) route.pattern[j] = fn.route_pattern.ptr[j];
         route.pattern[route.pattern_len] = '\0';
@@ -589,7 +572,8 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     for (u32 i = 0; i < copy_len; i++) result.path[i] = req.path.ptr[i];
     result.path[copy_len] = '\0';
 
-    const auto* route = select_route(engine, http_method_char(req.method), req.path.ptr, kPathLen);
+    const auto* route =
+        select_route(engine, http_route_method_key(req.method), req.path.ptr, kPathLen);
     if (!route) {
         result.action = jit::HandlerAction::ReturnStatus;
         result.actual_status = 200;

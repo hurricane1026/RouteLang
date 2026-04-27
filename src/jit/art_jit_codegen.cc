@@ -18,7 +18,7 @@
 // body is therefore pure trie descent with no canon stage.
 //
 // Generated stages:
-//   1. Method-byte → slot-index translation (matches method_slot()
+//   1. Route-method key → slot-index translation (matches method_slot()
 //      from route_trie.h). Unknown methods short-circuit to
 //      kInvalidRoute.
 //   2. Recursive descent emitter — depth-first walk over ArtTrie
@@ -60,7 +60,7 @@ struct EmitCtx {
     LLVMValueRef eff_ptr;
     LLVMValueRef eff_len;
 
-    // Per-call method slot: result of mapping method_byte → 0..7.
+    // Per-call method slot: result of mapping method key → 0..9.
     // Unknown methods produce kMethodSlotInvalid — we short-circuit
     // to return_invalid_bb in that case so the descent never runs.
     LLVMValueRef method_slot;
@@ -289,23 +289,33 @@ void emit_node_dispatch(EmitCtx& c, ArtChildRef node_ref, u32 depth) {
     }
 }
 
-// Map method byte (0/G/P/D/H/O/C/T) to slot 0..7. Unknown methods
-// → kMethodSlotInvalid. Mirrors the C++ method_slot() in route_trie.h.
+// Map canonical route method key (0..9) to slot 0..9. Unknown methods
+// short-circuit to kInvalidRoute. Mirrors method_key_slot() in
+// route_trie.h.
 //
-// The IR is a big switch with the method byte as the discriminator;
+// The IR is a big switch with the method key as the discriminator;
 // LLVM's optimizer turns this into a jump table or compact branch
 // tree depending on target.
-LLVMValueRef emit_method_to_slot(EmitCtx& c, LLVMValueRef method_byte) {
+LLVMValueRef emit_method_to_slot(EmitCtx& c, LLVMValueRef method_key) {
     LLVMBasicBlockRef invalid_bb = LLVMAppendBasicBlockInContext(c.ctx, c.fn, "method_invalid");
     LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(c.ctx, c.fn, "method_done");
 
     static const struct {
         u8 byte;
         u32 slot;
-    } kCases[] = {{0, 0}, {'G', 1}, {'P', 2}, {'D', 3}, {'H', 4}, {'O', 5}, {'C', 6}, {'T', 7}};
+    } kCases[] = {{kRouteMethodAny, kRouteMethodAny},
+                  {kRouteMethodGet, kRouteMethodGet},
+                  {kRouteMethodPost, kRouteMethodPost},
+                  {kRouteMethodPut, kRouteMethodPut},
+                  {kRouteMethodDelete, kRouteMethodDelete},
+                  {kRouteMethodPatch, kRouteMethodPatch},
+                  {kRouteMethodHead, kRouteMethodHead},
+                  {kRouteMethodOptions, kRouteMethodOptions},
+                  {kRouteMethodConnect, kRouteMethodConnect},
+                  {kRouteMethodTrace, kRouteMethodTrace}};
     constexpr u32 ncases = sizeof(kCases) / sizeof(kCases[0]);
 
-    LLVMValueRef sw = LLVMBuildSwitch(c.builder, method_byte, invalid_bb, ncases);
+    LLVMValueRef sw = LLVMBuildSwitch(c.builder, method_key, invalid_bb, ncases);
 
     LLVMBasicBlockRef case_bbs[ncases];
     LLVMValueRef case_slot_vals[ncases];
@@ -319,8 +329,8 @@ LLVMValueRef emit_method_to_slot(EmitCtx& c, LLVMValueRef method_byte) {
 
     // Invalid method: short-circuit the whole match() to return
     // kInvalidRoute. The route_trie.h contract is that an unknown
-    // method byte means "no route can match" — we honor that here
-    // by branching directly to return_invalid_bb.
+    // method key means "no route can match" — we honor that here by
+    // branching directly to return_invalid_bb.
     LLVMPositionBuilderAtEnd(c.builder, invalid_bb);
     LLVMBuildBr(c.builder, c.return_invalid_bb);
 
@@ -358,7 +368,7 @@ ArtJitMatchFn art_jit_specialize(JitEngine& engine, const ArtTrie& trie, const c
     // names are kept inside descent code for clarity.
     c.eff_ptr = LLVMGetParam(c.fn, 0);
     c.eff_len = LLVMGetParam(c.fn, 1);
-    LLVMValueRef method_byte = LLVMGetParam(c.fn, 2);
+    LLVMValueRef method_key = LLVMGetParam(c.fn, 2);
 
     LLVMBasicBlockRef entry_bb = LLVMAppendBasicBlockInContext(c.ctx, c.fn, "entry");
     c.return_best_bb = LLVMAppendBasicBlockInContext(c.ctx, c.fn, "return_best");
@@ -372,9 +382,9 @@ ArtJitMatchFn art_jit_specialize(JitEngine& engine, const ArtTrie& trie, const c
     c.best_alloca = LLVMBuildAlloca(c.builder, c.i16_ty, "best");
     LLVMBuildStore(c.builder, LLVMConstInt(c.i16_ty, TrieNode::kInvalidRoute, 0), c.best_alloca);
 
-    // Method byte → slot index. Unknown methods short-circuit to
+    // Method key → slot index. Unknown methods short-circuit to
     // return_invalid_bb.
-    c.method_slot = emit_method_to_slot(c, method_byte);
+    c.method_slot = emit_method_to_slot(c, method_key);
 
     // Root terminal pickup (root is always at art_pack(kArtN4, 0) /
     // initially, but root_ref_ may have been upgraded — read it).

@@ -2,6 +2,7 @@
 
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
+#include "rut/runtime/route_method.h"
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -2843,20 +2844,22 @@ static FrontendResult<HirExpr> analyze_match_pattern(const AstExpr& pattern_expr
     return analyze_expr(pattern_expr, route, mod, locals, local_count, nullptr);
 }
 
-static u8 method_char(u8 token_type) {
+static u8 route_method_key_from_token(u8 token_type) {
     switch (static_cast<TokenType>(token_type)) {
         case TokenType::KwGet:
-            return 'G';
+            return kRouteMethodGet;
         case TokenType::KwPost:
+            return kRouteMethodPost;
         case TokenType::KwPut:
+            return kRouteMethodPut;
         case TokenType::KwPatch:
-            return 'P';
+            return kRouteMethodPatch;
         case TokenType::KwDelete:
-            return 'D';
+            return kRouteMethodDelete;
         case TokenType::KwHead:
-            return 'H';
+            return kRouteMethodHead;
         case TokenType::KwOptions:
-            return 'O';
+            return kRouteMethodOptions;
         default:
             return 0;
     }
@@ -9775,7 +9778,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         HirRoute route{};
         route.span = item.route.span;
         route.path = item.route.path;
-        route.method = method_char(item.route.method);
+        route.method = route_method_key_from_token(item.route.method);
         if (route.method == 0)
             return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
 

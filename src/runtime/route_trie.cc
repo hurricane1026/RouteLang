@@ -155,6 +155,11 @@ u16 RouteTrie::match(Str path, u8 method_char) const {
     // Unsupported method bytes can't match anything — bail before
     // touching the trie. Consistent with the insert-time rejection.
     const u32 want_slot = method_slot(method_char);
+    return match_key(path, static_cast<u8>(want_slot));
+}
+
+u16 RouteTrie::match_key(Str path, u8 method_key) const {
+    const u32 want_slot = method_key_slot(method_key);
     if (want_slot == kMethodSlotInvalid) return TrieNode::kInvalidRoute;
 
     // Caller passes canonical input (PR #50 round 6 — RouteConfig::

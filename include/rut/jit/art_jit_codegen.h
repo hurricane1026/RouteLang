@@ -4,8 +4,8 @@
 // LLVM IR function for a populated ArtTrie. The generated code has:
 //   - zero runtime type switch (each node's type/edge/terminals
 //     emitted as IR constants at codegen time)
-//   - per-method-slot terminal pickup (slot 0 = "any", plus G/P/D/H/
-//     O/C/T as in route_trie.h's method_slot)
+//   - per-method-slot terminal pickup (slot 0 = "any", plus one slot
+//     for each known HttpMethod as in route_trie.h's method_slot)
 //   - first-match-wins via deepest-terminal-seen tracking
 //
 // The JIT'd function expects pre-canonicalized input (no leading '/',

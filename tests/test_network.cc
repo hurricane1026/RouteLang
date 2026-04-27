@@ -1585,6 +1585,24 @@ TEST(route, method_filter) {
     CHECK(cfg.match(path, sizeof(path) - 1, 'P') == nullptr);
 }
 
+TEST(route, post_put_patch_method_filter) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/write", kRouteMethodPost, 201));
+    REQUIRE(cfg.add_static("/write", kRouteMethodPut, 202));
+    REQUIRE(cfg.add_static("/write", kRouteMethodPatch, 203));
+
+    const u8 path[] = "/write";
+    const RouteEntry* post = cfg.match(path, sizeof(path) - 1, kRouteMethodPost);
+    const RouteEntry* put = cfg.match(path, sizeof(path) - 1, kRouteMethodPut);
+    const RouteEntry* patch = cfg.match(path, sizeof(path) - 1, kRouteMethodPatch);
+    REQUIRE(post != nullptr);
+    REQUIRE(put != nullptr);
+    REQUIRE(patch != nullptr);
+    CHECK_EQ(post->status_code, 201u);
+    CHECK_EQ(put->status_code, 202u);
+    CHECK_EQ(patch->status_code, 203u);
+}
+
 TEST(route, first_match_wins) {
     RouteConfig cfg;
     auto up1 = cfg.add_upstream("v1", 0x7F000001, 8081);

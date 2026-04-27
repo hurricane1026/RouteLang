@@ -1593,9 +1593,16 @@ get /users/:name        // compile error: conflicting route patterns
 
 **Current implementation note**
 
-Some current runtime/simulate paths still use reduced method encodings and simpler
-matching than the contract above. Those are implementation limitations, not the
-intended Rutlang semantics.
+Runtime route dispatch uses canonical method keys, not method-name first bytes:
+`0` is the any-method slot and `1..9` map to the supported HTTP methods. Each
+terminal stores `route_idx_by_method[method_key]`, so `POST`, `PUT`, and `PATCH`
+are distinct even though they share the same first character. Lookup prefers the
+method-specific slot and falls back to the any-method slot.
+
+Method masks are reserved for policy-style checks such as `limit_except`,
+`allowed_methods`, or future `GET|HEAD` grouping. They are not the primary route
+dispatch representation because Rut routes may attach different actions to the
+same path for different methods.
 
 #### 3.4.5 Response Modification
 

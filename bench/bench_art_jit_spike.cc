@@ -151,7 +151,16 @@ bool verify_parity(const ArtTrie& art,
                    jit::ArtJitMatchFn jit_fn,
                    const char* const* probes,
                    u32 nprobes) {
-    static const u8 kMethods[] = {0, 'G', 'P', 'D', 'H', 'O', 'C', 'T'};
+    static const u8 kMethods[] = {kRouteMethodAny,
+                                  kRouteMethodGet,
+                                  kRouteMethodPost,
+                                  kRouteMethodPut,
+                                  kRouteMethodDelete,
+                                  kRouteMethodPatch,
+                                  kRouteMethodHead,
+                                  kRouteMethodOptions,
+                                  kRouteMethodConnect,
+                                  kRouteMethodTrace};
     bool ok = true;
     auto check = [&](const char* p) {
         const u32 plen = static_cast<u32>(strlen(p));

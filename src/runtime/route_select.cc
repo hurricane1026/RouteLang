@@ -4,6 +4,8 @@
 
 #include "rut/runtime/route_select.h"
 
+#include "rut/runtime/route_canon.h"
+
 namespace rut {
 
 namespace {
@@ -18,20 +20,18 @@ bool is_strict_byte_prefix(Str a, Str b) {
     return true;
 }
 
-// Given that `a` is a strict byte-prefix of `b`, returns true iff
-// the next byte in `b` (immediately past the shared prefix) is not
-// '/'. That's the "segment-boundary-sensitive overlap" case —
-// /api vs /apix, where byte-prefix and segment-prefix matching
-// would diverge for in-between requests like /apij.
+// Given that `a` is a strict byte-prefix of `b` after route-path
+// canonicalization, returns true iff the next byte in `b`
+// (immediately past the shared prefix) is not '/'. That's the
+// "segment-boundary-sensitive overlap" case — /api vs /apix, where
+// byte-prefix and segment-prefix matching would diverge for in-
+// between requests like /apij.
 //
-// Exception: a shorter route ending in '/' is already segment-aligned
-// after dispatch canonicalization trims trailing slash runs. This
-// includes the root "/" catchall, where any following byte in a
-// longer sibling path is necessarily a new segment start. Exempting
-// these paths avoids spuriously forcing SegmentTrie for "/" + "/api"
-// or "/api/" + "/api/v1".
+// Exception: the root "/" catchall canonicalizes to the empty
+// string. Any sibling path is a new segment under root, so it is not
+// boundary-sensitive.
 bool boundary_sensitive_after_prefix(Str shorter, Str longer) {
-    if (shorter.len > 0 && shorter.ptr[shorter.len - 1] == '/') return false;
+    if (shorter.len == 0) return false;
     return longer.ptr[shorter.len] != '/';
 }
 
@@ -54,8 +54,8 @@ bool path_has_param_segment(Str path) {
 bool has_boundary_sensitive_overlap(const Str* paths, u32 n) {
     for (u32 i = 0; i < n; i++) {
         for (u32 j = i + 1; j < n; j++) {
-            const Str& a = paths[i];
-            const Str& b = paths[j];
+            const Str a = finalize_path_canonical(paths[i].ptr, paths[i].len);
+            const Str b = finalize_path_canonical(paths[j].ptr, paths[j].len);
             Str shorter;
             Str longer;
             if (is_strict_byte_prefix(a, b)) {

@@ -55,6 +55,17 @@ TEST(route_select, has_boundary_sensitive_overlap_rejects_trailing_slash_prefix)
     CHECK(!has_boundary_sensitive_overlap(paths, 2));
 }
 
+TEST(route_select, has_boundary_sensitive_overlap_detects_canonicalized_apix_pair) {
+    // /api/ canonicalizes to /api, so /api/ + /apix is still the
+    // same boundary-sensitive pair as /api + /apix.
+    Str trailing[] = {S("/api/"), S("/apix")};
+    CHECK(has_boundary_sensitive_overlap(trailing, 2));
+
+    // Leading slash runs are also stripped before runtime matching.
+    Str leading[] = {S("//api"), S("/apix")};
+    CHECK(has_boundary_sensitive_overlap(leading, 2));
+}
+
 TEST(route_select, has_boundary_sensitive_overlap_handles_either_order) {
     // Reverse insert order: /apix first, /api second.
     Str paths[] = {S("/apix"), S("/api")};

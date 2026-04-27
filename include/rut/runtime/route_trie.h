@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/runtime/route_method.h"
 
 namespace rut {
 
@@ -43,42 +44,19 @@ namespace rut {
 // ---------------------------------------------------------------------------
 // Method slot encoding
 // ---------------------------------------------------------------------------
-// The runtime today uses the first byte of the HTTP method as its enum
-// ('G' = GET, 'P' = POST/PUT/PATCH, 'D' = DELETE, ...). That first-byte
-// scheme has a known ambiguity for POST/PUT/PATCH that we preserve here to
-// keep this PR scoped — a proper method enum is a separate change.
-//
-// method_slot() packs the handful of valid first-byte values into a
-// dense [0..kMethodSlots) index for use as an array subscript. Slot 0
-// = "any". Unsupported bytes (typos like 'g', future HTTP verbs, or
-// garbage on the wire) return kMethodSlotInvalid so callers can
-// reject them — an earlier revision mapped them to slot 0 ("any"),
-// which silently widened a method-specific route into all-methods
-// and/or conflated distinct method-specific routes. Codex flagged
-// the silent coalescence (#41 P2); keep failure explicit.
-static constexpr u32 kMethodSlots = 8;
-static constexpr u32 kMethodSlotInvalid = 0xffffffffu;
-inline u32 method_slot(u8 method_char) {
-    switch (method_char) {
-        case 0:
-            return 0;  // any
-        case 'G':
-            return 1;  // GET
-        case 'P':
-            return 2;  // POST/PUT/PATCH (ambiguous — matches current behavior)
-        case 'D':
-            return 3;  // DELETE
-        case 'H':
-            return 4;  // HEAD
-        case 'O':
-            return 5;  // OPTIONS
-        case 'C':
-            return 6;  // CONNECT
-        case 'T':
-            return 7;  // TRACE
-        default:
-            return kMethodSlotInvalid;
-    }
+// method_slot() packs route-method keys into a dense
+// [0..kMethodSlots) index for use as an array subscript. Slot 0 =
+// "any"; slots 1..9 are the full HTTP methods, so POST/PUT/PATCH no
+// longer collide. Legacy hand-built configs that still pass first
+// chars ('G', 'P', etc.) are normalized by route_method_slot(); legacy
+// 'P' maps to POST only.
+static constexpr u32 kMethodSlots = kRouteMethodSlots;
+static constexpr u32 kMethodSlotInvalid = kRouteMethodSlotInvalid;
+inline u32 method_slot(u8 method_key_or_legacy_char) {
+    return route_method_slot(method_key_or_legacy_char);
+}
+inline u32 method_key_slot(u8 method_key) {
+    return route_method_slot_from_key(method_key);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +109,8 @@ struct TrieNode {
                                              kInvalidRoute,
                                              kInvalidRoute,
                                              kInvalidRoute,
+                                             kInvalidRoute,
+                                             kInvalidRoute,
                                              kInvalidRoute};
 };
 
@@ -172,7 +152,8 @@ public:
 
     // Insert a route. `path` must be a RouteEntry::path view (persistent
     // across the trie's lifetime — we store non-owning segment views into it).
-    // `method_char` is the first byte of the HTTP method (or 0 for any).
+    // `method_char` is a route method key (or a legacy first-char
+    // method byte accepted by method_slot()).
     // `route_idx` is the position in RouteConfig::routes.
     //
     // Returns false if the trie is out of node-pool capacity or a node is
@@ -184,6 +165,11 @@ public:
     // terminal whose method slot is compatible with `method_char`. Returns
     // TrieNode::kInvalidRoute if nothing matches.
     u16 match(Str path, u8 method_char) const;
+
+    // Same as match(), but `method_key` must already be a canonical
+    // route method key. Used by RouteConfig's production hot path so
+    // legacy first-char normalization stays out of request dispatch.
+    u16 match_key(Str path, u8 method_key) const;
 
     // Introspection helpers (for tests / bench).
     u32 node_count() const { return nodes.len; }

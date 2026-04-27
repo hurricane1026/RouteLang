@@ -86,31 +86,53 @@ u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
     return end;
 }
 
-u32 scan_uri(const u8* buf, u32 pos, u32 end) {
+u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
     const __m256i vsp = _mm256_set1_epi8(' ');
     const __m256i v21 = _mm256_set1_epi8(0x21);
     const __m256i v7f = _mm256_set1_epi8(0x7F);
+    const __m256i vq = _mm256_set1_epi8('?');
+    const __m256i vh = _mm256_set1_epi8('#');
+
+    u32 canon_end = end;  // sentinel: '?'/'#' not yet found
 
     while (pos + 32 <= end) {
         __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + pos));
         u32 sp_mask = static_cast<u32>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vsp)));
         u32 bad_mask = static_cast<u32>(_mm256_movemask_epi8(
             _mm256_or_si256(_mm256_cmpgt_epi8(v21, chunk), _mm256_cmpeq_epi8(chunk, v7f))));
+        u32 qf_mask = static_cast<u32>(_mm256_movemask_epi8(
+            _mm256_or_si256(_mm256_cmpeq_epi8(chunk, vq), _mm256_cmpeq_epi8(chunk, vh))));
 
         if (sp_mask) {
             u32 sp_pos = static_cast<u32>(__builtin_ctz(sp_mask));
-            u32 real_bad = (bad_mask & ((1u << sp_pos) - 1)) & ~sp_mask;
+            u32 pre_sp = (1u << sp_pos) - 1;
+            u32 real_bad = (bad_mask & pre_sp) & ~sp_mask;
             if (real_bad) return static_cast<u32>(-1);
+            if (canon_end == end) {
+                u32 qf_before_sp = qf_mask & pre_sp;
+                canon_end = qf_before_sp ? (pos + static_cast<u32>(__builtin_ctz(qf_before_sp)))
+                                         : (pos + sp_pos);
+            }
+            *canon_end_out = canon_end;
             return pos + sp_pos;
         }
         if (bad_mask) return static_cast<u32>(-1);
+        if (qf_mask && canon_end == end) {
+            canon_end = pos + static_cast<u32>(__builtin_ctz(qf_mask));
+        }
         pos += 32;
     }
     while (pos < end) {
-        if (buf[pos] == ' ') return pos;
-        if (!kUriTable[buf[pos]]) return static_cast<u32>(-1);
+        u8 b = buf[pos];
+        if (b == ' ') {
+            *canon_end_out = (canon_end != end) ? canon_end : pos;
+            return pos;
+        }
+        if (!kUriTable[b]) return static_cast<u32>(-1);
+        if ((b == '?' || b == '#') && canon_end == end) canon_end = pos;
         pos++;
     }
+    *canon_end_out = canon_end;
     return end;
 }
 

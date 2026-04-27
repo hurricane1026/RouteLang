@@ -2140,6 +2140,55 @@ TEST(route, multiple_status_codes_real_socket) {
     destroy_real_loop(loop);
 }
 
+TEST(route, post_put_patch_method_filter_real_socket) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/write", kRouteMethodPost, 201));
+    REQUIRE(cfg.add_static("/write", kRouteMethodPut, 202));
+    REQUIRE(cfg.add_static("/write", kRouteMethodPatch, 203));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 50};
+    lt.start();
+
+    struct {
+        const char* req;
+        u32 req_len;
+        const char* expect;
+    } cases[] = {{"POST /write HTTP/1.1\r\nHost: x\r\n\r\n", 33, "201"},
+                 {"PUT /write HTTP/1.1\r\nHost: x\r\n\r\n", 32, "202"},
+                 {"PATCH /write HTTP/1.1\r\nHost: x\r\n\r\n", 34, "203"}};
+    for (auto& tc : cases) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        send_all(c, tc.req, tc.req_len);
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i < n - 2; i++) {
+            if (buf[i] == tc.expect[0] && buf[i + 1] == tc.expect[1] &&
+                buf[i + 2] == tc.expect[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    }
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
 TEST(route, capture_real_socket) {
     RouteConfig cfg;
     cfg.add_static("/", 0, 200);

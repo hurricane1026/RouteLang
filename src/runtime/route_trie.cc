@@ -155,33 +155,17 @@ u16 RouteTrie::match(Str path, u8 method_char) const {
     // Unsupported method bytes can't match anything — bail before
     // touching the trie. Consistent with the insert-time rejection.
     const u32 want_slot = method_slot(method_char);
+    return match_key(path, static_cast<u8>(want_slot));
+}
+
+u16 RouteTrie::match_key(Str path, u8 method_key) const {
+    const u32 want_slot = method_key_slot(method_key);
     if (want_slot == kMethodSlotInvalid) return TrieNode::kInvalidRoute;
 
-    // Shorten the request path above any '?' (query) or '#' (fragment)
-    // byte so routing uses only the path component (RFC 3986). We do
-    // this at the call site rather than inside tokenize_segments so
-    // insert() stays strict about the bytes it's tokenizing — a route
-    // registered as "/health" never tokenizes to the same key as one
-    // accidentally registered as "/health?x=1".
-    u32 end = path.len;
-    for (u32 i = 0; i < path.len; i++) {
-        if (path.ptr[i] == '?' || path.ptr[i] == '#') {
-            end = i;
-            break;
-        }
-    }
-    path.len = end;
-
-    // Require origin-form request target (begins with '/') before
-    // applying any route. Non-origin-form targets — OPTIONS `*`
-    // (asterisk-form), CONNECT `host:port` (authority-form), and
-    // absolute-form URLs — shouldn't route through path-based
-    // matching at all; the pre-trie byte-prefix matcher rejected
-    // them implicitly because pattern "/" failed to match their
-    // first byte. The trie's root-terminal seed was bypassing that
-    // and sending '*' / 'example:443' into a configured `/` catchall
-    // (Codex P2 on #41).
-    if (path.len == 0 || path.ptr[0] != '/') return TrieNode::kInvalidRoute;
+    // Caller passes canonical input (PR #50 round 6 — RouteConfig::
+    // match canonicalizes once at dispatch entry and rejects non-
+    // origin-form targets there). The previous internal
+    // canonicalization scan + origin-form guard moved to the caller.
 
     FixedVec<Str, kMaxPathSegments> segs{};
     // Ignore tokenize's return value on overflow: `segs` still holds

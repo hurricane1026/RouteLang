@@ -338,7 +338,7 @@ struct Function {
 
     // Route metadata.
     Str route_pattern;  // e.g., "/users/:id"
-    u8 http_method;     // HTTP method enum value
+    u8 http_method;     // route method key (0 = any, 1..9 = full HTTP method)
 
     // Blocks: arena-allocated array. blocks[0] is always entry.
     Block* blocks;

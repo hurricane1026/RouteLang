@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "runtime/simd/simd.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/route_canon.h"
 
 namespace rut {
 
@@ -282,14 +283,33 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
     req->method = parse_method_direct(buf, len, pos);
     if (UNLIKELY(req->method == HttpMethod::Unknown)) goto maybe_incomplete;
 
-    // URI — SIMD scan for space within full buffer
+    // URI — SIMD scan for space within full buffer. The same pass also
+    // reports canon_end (first '?' or '#' before the space, or the space
+    // position) so we can populate path_canon without a second scan.
+    //
+    // path_canon is only populated for origin-form request-targets
+    // (i.e. URIs starting with '/'). Asterisk-form ("*", OPTIONS) and
+    // authority-form ("host:port", CONNECT) intentionally leave
+    // path_canon as {nullptr, 0}. Both RouteConfig::match (which
+    // canonicalizes from raw input) and RouteConfig::match_canonical
+    // (the parser-fed fast path) refuse to route non-origin-form
+    // targets — match() rejects on `path[0] != '/'` at entry, and
+    // match_canonical's null-ptr guard returns nullptr for the
+    // sentinel canon. The raw `path` field stays populated so other
+    // request-handling code (logging, OPTIONS responder, CONNECT
+    // tunnel setup) can still see the original target.
     {
         u32 uri_start = pos;
-        u32 uri_end = simd::scan_uri(buf, pos, len);
+        u32 canon_end = 0;
+        u32 uri_end = simd::scan_uri(buf, pos, len, &canon_end);
         if (uri_end == static_cast<u32>(-1)) return ParseStatus::Error;
         if (UNLIKELY(uri_end >= len)) goto maybe_incomplete;
         if (UNLIKELY(uri_end == uri_start)) return ParseStatus::Error;
         req->path = {reinterpret_cast<const char*>(buf + uri_start), uri_end - uri_start};
+        if (buf[uri_start] == '/') {
+            req->path_canon = finalize_path_canonical(
+                reinterpret_cast<const char*>(buf + uri_start), canon_end - uri_start);
+        }
         pos = uri_end + 1;
     }
 

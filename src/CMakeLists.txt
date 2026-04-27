@@ -24,11 +24,16 @@ unset(_BORINGSSL_PREV_BUILD_TESTING_DEFINED)
 unset(_BORINGSSL_PREV_BUILD_TESTING)
 foreach(BORINGSSL_TARGET fipsmodule crypto ssl decrepit pki)
     if(TARGET ${BORINGSSL_TARGET})
+        # BoringSSL is third-party; silence its warning noise entirely
+        # rather than just demoting from error to warning. Earlier we
+        # only had -Wno-error=... which still printed thousands of
+        # -Wunused-parameter lines on every build (4000+ in CI logs,
+        # mostly from internal.h macro expansions). The full -Wno-...
+        # form suppresses the warning, not just the error promotion.
         target_compile_options(${BORINGSSL_TARGET} PRIVATE
             -Wno-error
-            -Wno-error=pedantic
-            -Wno-error=unused-parameter
             -Wno-pedantic
+            -Wno-unused-parameter
         )
     endif()
 endforeach()
@@ -37,6 +42,14 @@ if(SIMD_ARCH STREQUAL "auto")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         set(SIMD_ARCH "neon")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        # SSE2 is the x86_64 ISA baseline — every x86_64 CPU has it,
+        # so a binary built with auto stays portable across mixed
+        # fleets and cross-compile scenarios. Production server
+        # deployments should set -DSIMD_ARCH=avx2 explicitly: AVX2
+        # wins SSE2 by 2-4x on scan_uri (see DISPATCH_PERF.md), and
+        # every server-class CPU since Haswell (2013) supports it.
+        # AVX-512 is opt-in only — see DISPATCH_PERF.md for the
+        # frequency-throttling caveats that make it a poor default.
         set(SIMD_ARCH "sse2")
     else()
         set(SIMD_ARCH "scalar")
@@ -66,6 +79,13 @@ elseif(SIMD_ARCH STREQUAL "scalar")
 else()
     message(FATAL_ERROR "Unknown SIMD_ARCH '${SIMD_ARCH}'. Valid options: auto, scalar, sse2, avx2, avx512, neon, sve")
 endif()
+
+# Propagate the resolved SIMD configuration to the parent scope so
+# sibling subdirectories (bench/, tests/) can compile against the same
+# backend — bench_scan_uri specifically needs SIMD_FLAGS so the
+# __AVX2__/__AVX512F__ predefines match the rut_runtime build.
+set(SIMD_ARCH "${SIMD_ARCH}" PARENT_SCOPE)
+set(SIMD_FLAGS "${SIMD_FLAGS}" PARENT_SCOPE)
 
 find_package(Threads REQUIRED)
 
@@ -122,9 +142,8 @@ add_library(rut_runtime STATIC
     runtime/chunked_parser.cc
     runtime/access_log.cc
     runtime/traffic_capture.cc
-    runtime/route_dispatch.cc
-    runtime/route_hash_first_seg.cc
-    runtime/route_hash_full.cc
+    runtime/route_art.cc
+    runtime/route_select.cc
     runtime/route_trie.cc
     ${SIMD_SOURCE}
 )
@@ -172,6 +191,7 @@ target_include_directories(rut_compiler PUBLIC
 add_library(rut_jit STATIC
     jit/jit_engine.cc
     jit/codegen.cc
+    jit/art_jit_codegen.cc
     jit/runtime_helpers.cc
 )
 

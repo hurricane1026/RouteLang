@@ -44,7 +44,11 @@ enum class ParseStatus : u8 {
 // Zero-copy: no allocations, no memcpy for method/path/headers.
 struct ParsedRequest {
     HttpMethod method;
-    Str path;  // e.g. "/api/users?id=1"
+    Str path;        // raw URI as parsed, e.g. "/api/users?id=1#frag"
+    Str path_canon;  // canonical path for routing — leading '/' and any
+                     // trailing '/' stripped; bytes after first '?' or
+                     // '#' excluded. Free byproduct of the URI SIMD scan;
+                     // RouteConfig::match_canonical consumes this directly.
     HttpVersion version;
 
     Header headers[kMaxHeaders];
@@ -58,6 +62,7 @@ struct ParsedRequest {
     void reset() {
         method = HttpMethod::Unknown;
         path = {nullptr, 0};
+        path_canon = {nullptr, 0};
         version = HttpVersion::Unknown;
         header_count = 0;
         content_length = 0;

@@ -22,12 +22,19 @@ u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
     return end;
 }
 
-u32 scan_uri(const u8* buf, u32 pos, u32 end) {
+u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
+    u32 canon_end = end;
     while (pos < end) {
-        if (buf[pos] == ' ') return pos;
-        if (!kUriTable[buf[pos]]) return static_cast<u32>(-1);
+        u8 b = buf[pos];
+        if (b == ' ') {
+            *canon_end_out = (canon_end != end) ? canon_end : pos;
+            return pos;
+        }
+        if (!kUriTable[b]) return static_cast<u32>(-1);
+        if ((b == '?' || b == '#') && canon_end == end) canon_end = pos;
         pos++;
     }
+    *canon_end_out = canon_end;
     return end;
 }
 

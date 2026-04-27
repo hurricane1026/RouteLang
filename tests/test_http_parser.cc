@@ -3722,6 +3722,149 @@ TEST(response_parser, invalid_header_name_with_full_terminator_errors) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
 }
 
+// ============================================================================
+// TEST SUITE: path_canon — PR #50 round 7 path A
+// The parser now produces path_canon (canonical-for-routing view) as a
+// free byproduct of the URI SIMD scan. RouteConfig::match_canonical
+// consumes it directly. Verify the canon shape for several URI patterns.
+// ============================================================================
+
+namespace {
+
+struct CanonCase {
+    const char* name;
+    const char* raw;        // full request bytes
+    const char* path_exp;   // expected req.path (raw URI as-is)
+    const char* canon_exp;  // expected req.path_canon (post-canon view)
+};
+
+constexpr CanonCase kPathCanonCases[] = {
+    {"plain", "GET /api/v1/users HTTP/1.1\r\n\r\n", "/api/v1/users", "api/v1/users"},
+    {"trailing-slash", "GET /admin/ HTTP/1.1\r\n\r\n", "/admin/", "admin"},
+    {"trailing-slash-run", "GET /a/b/// HTTP/1.1\r\n\r\n", "/a/b///", "a/b"},
+    {"with-query", "GET /search?q=abc HTTP/1.1\r\n\r\n", "/search?q=abc", "search"},
+    {"with-fragment", "GET /page#anchor HTTP/1.1\r\n\r\n", "/page#anchor", "page"},
+    {"query-and-fragment",
+     "GET /forum/1/topic/2?p=3#post-4 HTTP/1.1\r\n\r\n",
+     "/forum/1/topic/2?p=3#post-4",
+     "forum/1/topic/2"},
+    {"query-with-trailing-slash",
+     "GET /admin/?token=x HTTP/1.1\r\n\r\n",
+     "/admin/?token=x",
+     "admin"},
+    {"root-only", "GET / HTTP/1.1\r\n\r\n", "/", ""},
+    {"nested-deep",
+     "GET /api/v1/teams/42/members/alice HTTP/1.1\r\n\r\n",
+     "/api/v1/teams/42/members/alice",
+     "api/v1/teams/42/members/alice"},
+};
+
+}  // namespace
+
+TEST(PathCanon, canonical_view_matches_expected) {
+    HttpParser parser;
+    ParsedRequest req;
+    for (const auto& c : kPathCanonCases) {
+        auto s = parse_one(c.raw, &req, &parser);
+        if (s != ParseStatus::Complete) {
+            rut::test::out("  FAIL canon case: ");
+            rut::test::out(c.name);
+            rut::test::out(" (parse incomplete)\n");
+        }
+        CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+
+        u32 path_len = 0;
+        while (c.path_exp[path_len]) path_len++;
+        u32 canon_len = 0;
+        while (c.canon_exp[canon_len]) canon_len++;
+
+        if (!req.path.eq(Str{c.path_exp, path_len})) {
+            rut::test::out("  FAIL canon case: ");
+            rut::test::out(c.name);
+            rut::test::out(" (raw path mismatch)\n");
+        }
+        CHECK(req.path.eq(Str{c.path_exp, path_len}));
+
+        if (!req.path_canon.eq(Str{c.canon_exp, canon_len})) {
+            rut::test::out("  FAIL canon case: ");
+            rut::test::out(c.name);
+            rut::test::out(" (canon path mismatch)\n");
+        }
+        CHECK(req.path_canon.eq(Str{c.canon_exp, canon_len}));
+    }
+}
+
+TEST(PathCanon, canon_view_lives_inside_recv_buffer) {
+    // path_canon must point into the same buffer as path — no allocations,
+    // no temporaries that go out of scope. Verify the canon Str's bytes
+    // are byte-identical to the corresponding slice of path.
+    HttpParser parser;
+    ParsedRequest req;
+    static const char raw[] = "GET /admin/x?y=1 HTTP/1.1\r\n\r\n";
+    auto s = parse_one(raw, &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    // path = "/admin/x?y=1", path_canon should be "admin/x" — view at
+    // offset 1 (skip leading '/') with len 7 (stop before '?'), and
+    // the bytes must match the corresponding slice of path.
+    CHECK_EQ(req.path_canon.ptr, req.path.ptr + 1);
+    CHECK_EQ(req.path_canon.len, 7u);
+    CHECK(req.path_canon.eq(Str{"admin/x", 7}));
+    for (u32 i = 0; i < req.path_canon.len; i++) {
+        CHECK_EQ(req.path_canon.ptr[i], req.path.ptr[i + 1]);
+    }
+}
+
+TEST(PathCanon, leading_slash_run_collapsed) {
+    // RFC 3986 leaves leading-slash count semantic, but the
+    // match_canonical contract requires "no leading '/'" — so
+    // canonicalize_request strips ALL leading slashes, not just one.
+    HttpParser parser;
+    ParsedRequest req;
+
+    auto s1 = parse_one("GET //api/v1 HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s1), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path_canon.eq(Str{"api/v1", 6}));
+
+    auto s2 = parse_one("GET ///api/v1/ HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s2), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path_canon.eq(Str{"api/v1", 6}));
+
+    // Embedded multi-slashes are preserved (different route).
+    auto s3 = parse_one("GET /api//v1 HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s3), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path_canon.eq(Str{"api//v1", 7}));
+}
+
+TEST(PathCanon, non_origin_form_leaves_canon_null) {
+    // Asterisk-form ("OPTIONS *") and authority-form ("CONNECT host:port")
+    // are valid HTTP/1.1 request-targets that don't represent paths. The
+    // parser must NOT populate path_canon for them, otherwise the routing
+    // hot path (RouteConfig::match_canonical) would route them via a
+    // configured "/" catchall — a security regression that the older
+    // RouteConfig::match() entry guarded against via origin-form rejection.
+    HttpParser parser;
+    ParsedRequest req;
+
+    // asterisk-form
+    auto s1 = parse_one("OPTIONS * HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s1), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path.eq(Str{"*", 1}));
+    CHECK(req.path_canon.ptr == nullptr);
+    CHECK_EQ(req.path_canon.len, 0u);
+
+    // authority-form (CONNECT)
+    auto s2 = parse_one("CONNECT example.com:443 HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s2), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path_canon.ptr == nullptr);
+    CHECK_EQ(req.path_canon.len, 0u);
+
+    // origin-form root "/" — canon is non-null but len 0 (legitimate)
+    auto s3 = parse_one("GET / HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s3), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.path_canon.ptr != nullptr);
+    CHECK_EQ(req.path_canon.len, 0u);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

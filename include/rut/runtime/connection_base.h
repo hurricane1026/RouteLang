@@ -158,6 +158,13 @@ struct ConnectionBase {
     u32 req_size;
     u32 peer_addr;
     char req_path[kMaxReqPathLen];
+    // View into req_path covering the canonical-for-routing path slice
+    // (leading '/' stripped, trailing '/' run trimmed, bytes after first
+    // '?' or '#' excluded). Populated by capture_request_metadata as a
+    // free byproduct of the URI SIMD scan; read by dispatch via
+    // RouteConfig::match_canonical to avoid a redundant canon pass on
+    // the hot path. Valid only for the current request — reset() clears.
+    Str req_path_canon;
 
     // Proxy timing/name for access log.
     u32 upstream_us;
@@ -254,6 +261,7 @@ struct ConnectionBase {
         req_size = 0;
         peer_addr = 0;
         req_path[0] = '\0';
+        req_path_canon = {nullptr, 0};
         upstream_us = 0;
         upstream_name[0] = '\0';
         upstream_start_us = 0;

@@ -290,15 +290,10 @@ TEST(route_art, accepts_kMaxRoutes_distinct_top_level_prefixes) {
 
 TEST(route_art, atomic_insert_on_pool_exhaustion) {
     // Drive the Node4 pool to its cap with single-byte distinct
-    // top-level paths — each insert adds 1 leaf, all Node4. Fill to
-    // exactly kMaxN4 - 1, then insert ONE more path that requires 2
-    // new Node4s (an edge split + new leaf). With only 1 N4 slot
-    // free, the second alloc fails and the rollback must restore
-    // the pool exactly.
-    //
-    // To force a split we first insert a multi-byte-edge leaf
-    // ("/abcd"), then a sibling that diverges at byte 2 ("/ab12") —
-    // the split needs a tail node + a new leaf = 2 N4s.
+    // top-level paths. Each insert adds one Node4 leaf. Fill to
+    // kMaxN4 - 1, add one more leaf to consume the last slot, then
+    // verify the next insert fails cleanly and leaves the pool count
+    // unchanged.
     ArtTrie t;
     // Phase 1 — fill up to kMaxN4 - 2 with single-byte distinct
     // top-level paths under root. Each insert: 1 N4 leaf. Plus the
@@ -335,15 +330,9 @@ TEST(route_art, atomic_insert_on_pool_exhaustion) {
     }
     REQUIRE_EQ(t.n4_count(), ArtTrie::kMaxN4 - 1);
 
-    // Phase 2 — try an insert that needs an edge split (1 N4 tail +
-    // 1 N4 leaf = 2 nodes). Pick the leaf at "/a<some_byte>" and
-    // split it via "/a<same_byte>z" — but actually an edge split
-    // here requires the existing leaf to have a multi-byte edge. The
-    // current leaves have 1-byte edges, so a sibling-add (not split)
-    // would just need 1 N4. To force an actual split, insert a deep
-    // leaf with multi-byte edge first... actually let's simplify: the
-    // pool has 1 free slot, so we attempt to add 2 new top-level
-    // bytes — first succeeds (1 leaf), second must fail.
+    // Phase 2 — consume the last free slot with one more top-level
+    // leaf, then attempt another single-leaf insert. The second insert
+    // must fail without changing the pool count.
     p1_paths[4][0] = '/';
     p1_paths[4][1] = static_cast<char>('e');
     p1_paths[4][2] = '\0';

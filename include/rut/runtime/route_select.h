@@ -5,9 +5,12 @@
 // Phase 2 architecture (PR #50):
 //   - ART (with optional JIT specialization): byte-prefix matching,
 //     covers all configs that don't need segment-aware semantics
-//   - SegmentTrie: segment-aware matching for `:param` capture and
-//     boundary-sensitive overlap (e.g., `/api` registered alongside
-//     `/apix`)
+//   - SegmentTrie: segment-aware matching for boundary-sensitive
+//     overlap (e.g., `/api` registered alongside `/apix`).
+//     Note: `:param`-style route paths are currently rejected at
+//     add_* time — neither ART nor SegmentTrie implements runtime
+//     parameter capture yet. SegmentTrie is not routed to for
+//     `:param` routes; those are a planned future feature.
 //
 // The picker is a single boolean:
 //

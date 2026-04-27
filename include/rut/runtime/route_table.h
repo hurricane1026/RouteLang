@@ -129,9 +129,12 @@ struct RouteConfig {
     // runs as soon as add_* finishes populating the trie.
     enum class DispatchKind : u8 {
         ArtJit,       // ART byte-prefix trie, optionally JIT-specialized
-        SegmentTrie,  // segment-aware trie (handles `:param` + boundary-
-                      //   sensitive overlap; the only correct choice when
+        SegmentTrie,  // segment-aware trie (boundary-sensitive overlap;
+                      //   the only correct choice when
                       //   needs_segment_aware() returns true).
+                      //   Note: `:param` route paths are currently
+                      //   rejected at add_* time — runtime param capture
+                      //   is a future feature.
     };
 
     DispatchKind dispatch_kind() const { return dispatch_kind_; }
@@ -282,7 +285,7 @@ struct RouteConfig {
         if (route_count >= kMaxRoutes) return false;
         if (upstream_id >= upstream_count) return false;
         if (!is_routable_path(path)) return false;
-        if (!reject_param_path(path)) return false;
+        if (!has_no_param_segment(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -308,7 +311,7 @@ struct RouteConfig {
     bool add_static(const char* path, u8 method, u16 status) {
         if (route_count >= kMaxRoutes) return false;
         if (!is_routable_path(path)) return false;
-        if (!reject_param_path(path)) return false;
+        if (!has_no_param_segment(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -336,7 +339,7 @@ struct RouteConfig {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
         if (!is_routable_path(path)) return false;
-        if (!reject_param_path(path)) return false;
+        if (!has_no_param_segment(path)) return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -533,20 +536,17 @@ struct RouteConfig {
     }
 
 private:
-    // Called from each add_*() to refuse paths whose shape neither
-    // current dispatcher actually supports — specifically ":param"
-    // segments. Both ArtJit (byte-prefix) and SegmentTrie (literal-
-    // segment) match strings byte-by-byte / segment-by-segment, so a
-    // registered "/users/:id" gets stored under the literal ":id"
-    // segment and "/users/42" misses silently. Runtime parameter
-    // capture is a future feature; refusing param paths at add_*
-    // time surfaces the misconfiguration loudly at startup instead
-    // of producing missed routes at request time.
-    //
-    // (route_select.h's path_has_param_segment helper detects the
-    // shape; the picker that pairs with it is documentation-only
-    // until a dispatcher learns ":param" semantics.)
-    bool reject_param_path(const char* path) const {
+    // Returns true iff `path` contains no `:param`-style segment (a
+    // segment starting with ':'). Used by add_* to gate registration:
+    // if the path has a param segment the call returns false (the
+    // misconfiguration is surfaced loudly at startup rather than
+    // producing silent route misses at request time, because neither
+    // current dispatcher implements runtime parameter capture —
+    // registered "/users/:id" would store ":id" literally and
+    // "/users/42" would silently miss. Runtime parameter capture is
+    // a future feature; route_select.h's path_has_param_segment
+    // helper detects the shape).
+    bool has_no_param_segment(const char* path) const {
         u32 plen = 0;
         while (path[plen]) plen++;
         return !path_has_param_segment(Str{path, plen});

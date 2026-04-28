@@ -737,6 +737,8 @@ TEST(proxy, connect_fail_502) {
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -111));
     // Should send 502 to client
     CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_EQ(conn->resp_status, kStatusBadGateway);
     CHECK_GT(conn->send_buf.len(), 0u);
     // Verify "502" in send buffer
     bool has_502 = false;
@@ -1680,6 +1682,10 @@ TEST(upstream_pool, find_idle) {
 }
 
 TEST(upstream_pool, create_socket) {
+    i32 fake_fd = dup(2);
+    REQUIRE(fake_fd >= 0);
+    ScopedFakeUpstreamSocket fake_socket(fake_fd);
+
     i32 fd = UpstreamPool::create_socket();
     CHECK(fd >= 0);
     if (fd >= 0) close(fd);
@@ -1690,7 +1696,7 @@ TEST(upstream_pool, shutdown_closes_fds) {
     pool.init();
     auto* c = pool.alloc();
     REQUIRE(c != nullptr);
-    c->fd = UpstreamPool::create_socket();
+    c->fd = dup(2);
     REQUIRE(c->fd >= 0);
     i32 saved_fd = c->fd;
     pool.shutdown();
@@ -2616,13 +2622,10 @@ TEST(slice_conn, buffers_usable_through_request_cycle) {
 }
 
 TEST(slice_conn, real_eventloop_pool_init) {
-    // Verify real EventLoop allocates pool with 2*kMaxConns slices.
+    // Verify real EventLoop allocates pool with 3*kMaxConns slices.
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
-    auto lfd_result = create_listen_socket(0);
-    REQUIRE(lfd_result.has_value());
-    i32 lfd = lfd_result.value();
-    auto rc = loop->init(0, lfd);
+    auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
     // Lazy commit: pool starts empty, max set to 3 * kMaxConns (recv+send+upstream).
@@ -2647,7 +2650,73 @@ TEST(slice_conn, real_eventloop_pool_init) {
 
     loop->free_conn(*c2);
     loop->shutdown();
-    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(slice_conn, real_eventloop_idle_slots_hold_no_buffers) {
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto rc = loop->init(0, -1);
+    REQUIRE(rc.has_value());
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK_EQ(loop->pool.in_use(), 0u);
+    CHECK_EQ(loop->pool.count, 0u);
+    for (u32 i = 0; i < RealLoop::kMaxConns; i++) {
+        CHECK_EQ(loop->conns[i].recv_slice, nullptr);
+        CHECK_EQ(loop->conns[i].send_slice, nullptr);
+        CHECK_EQ(loop->conns[i].upstream_recv_slice, nullptr);
+        CHECK_EQ(loop->conns[i].recv_buf.write_avail(), 0u);
+        CHECK_EQ(loop->conns[i].send_buf.write_avail(), 0u);
+        CHECK_EQ(loop->conns[i].upstream_recv_buf.write_avail(), 0u);
+    }
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    CHECK_EQ(loop->active_count(), 1u);
+    CHECK_EQ(loop->pool.in_use(), 2u);
+    CHECK(c->recv_slice != nullptr);
+    CHECK(c->send_slice != nullptr);
+
+    loop->free_conn(*c);
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK_EQ(loop->pool.in_use(), 0u);
+    CHECK_EQ(loop->pool.available(), loop->pool.count);
+    CHECK_EQ(loop->conns[cid].recv_slice, nullptr);
+    CHECK_EQ(loop->conns[cid].send_slice, nullptr);
+    CHECK_EQ(loop->conns[cid].recv_buf.write_avail(), 0u);
+    CHECK_EQ(loop->conns[cid].send_buf.write_avail(), 0u);
+
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(slice_conn, real_eventloop_upstream_slice_returns_on_free) {
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto rc = loop->init(0, -1);
+    REQUIRE(rc.has_value());
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    CHECK_EQ(loop->pool.in_use(), 2u);
+
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    CHECK(c->upstream_recv_slice != nullptr);
+    CHECK_EQ(loop->pool.in_use(), 3u);
+    CHECK_EQ(c->upstream_recv_buf.write_avail(), SlicePool::kSliceSize);
+
+    loop->free_conn(*c);
+    CHECK_EQ(loop->pool.in_use(), 0u);
+    CHECK_EQ(loop->pool.available(), loop->pool.count);
+    CHECK_EQ(loop->conns[cid].recv_slice, nullptr);
+    CHECK_EQ(loop->conns[cid].send_slice, nullptr);
+    CHECK_EQ(loop->conns[cid].upstream_recv_slice, nullptr);
+    CHECK_EQ(loop->conns[cid].upstream_recv_buf.write_avail(), 0u);
+
+    loop->shutdown();
     destroy_real_loop(loop);
 }
 
@@ -4832,16 +4901,12 @@ TEST(buffer_isolation, client_data_during_proxy_ignored) {
 TEST(buffer_isolation, pool_sized_for_three_slices) {
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
-    auto lfd_result = create_listen_socket(0);
-    REQUIRE(lfd_result.has_value());
-    i32 lfd = lfd_result.value();
-    auto rc = loop->init(0, lfd);
+    auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
     CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 3);
 
     loop->shutdown();
-    close(lfd);
     destroy_real_loop(loop);
 }
 
@@ -5501,6 +5566,7 @@ TEST(streaming, upstream_response_malformed_502) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     // Should send 502
     CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
@@ -5527,6 +5593,7 @@ TEST(streaming, upstream_response_chunked_initial_error_502) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
@@ -7990,6 +8057,8 @@ TEST(slot_state, eof_partial_headers_immediate_502) {
     // UpstreamRecv EOF → no send in-flight, forwards immediately → 502
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 0));
     CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
 // on_early_upstream_recvd (no send in-flight) → immediate forward.
@@ -8905,6 +8974,8 @@ TEST(state_transition, upstream_502_clears_all) {
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
     CHECK_SLOTS(c, nullptr, &on_response_sent<SmallLoop>, nullptr, nullptr);
 }
 
@@ -8919,6 +8990,8 @@ TEST(state_transition, connect_failure_clears_all) {
     c->upstream_fd = 100;
     c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, -111));
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
     CHECK_SLOTS(c, nullptr, &on_response_sent<SmallLoop>, nullptr, nullptr);
 }
 

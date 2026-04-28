@@ -3660,6 +3660,25 @@ TEST(response_parser, invalid_version_digit) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
 }
 
+TEST(response_parser, malformed_status_codes_rejected) {
+    struct Case {
+        const char* raw;
+    };
+    static const Case cases[] = {
+        {"HTTP/1.1 XYZ Bad\r\n\r\n"},
+        {"HTTP/1.1 20X Bad\r\n\r\n"},
+        {"HTTP/1.1 099 Low\r\n\r\n"},
+        {"HTTP/1.1 600 High\r\n\r\n"},
+    };
+
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    for (const auto& tc : cases) {
+        auto s = parse_response(tc.raw, &resp, &parser);
+        CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+    }
+}
+
 TEST(response_parser, empty_content_length_rejected) {
     HttpResponseParser parser;
     ParsedResponse resp;

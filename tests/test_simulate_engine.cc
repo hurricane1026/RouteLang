@@ -908,6 +908,42 @@ TEST(simulate_engine, param_route_matching_matrix) {
     ctx.destroy();
 }
 
+TEST(simulate_engine, simulate_one_rejects_malformed_capture_headers) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = 'G';
+    strcpy(manifest.routes[0].pattern, "/ok");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 200;
+
+    ModuleContext ctx;
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+
+    struct Case {
+        const char* raw;
+        u16 len_override;
+    };
+    static const Case kCases[] = {
+        {"", 0},
+        {"garbage\r\n\r\n", 0},
+        {"GET /ok HTTP/1.1\r\nHost: x\r\n", 0},
+        {"GET /ok HTTP/1.1\r\nBad Header\r\n\r\n", 0},
+        {"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 8},
+    };
+
+    for (const auto& tc : kCases) {
+        CaptureEntry entry = make_entry(tc.raw, 200);
+        if (tc.len_override != 0) entry.raw_header_len = tc.len_override;
+        const auto result = simulate_one(engine, entry);
+        CHECK_EQ(result.verdict, Verdict::Failed);
+        CHECK_EQ(result.actual_status, 0u);
+    }
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
 TEST(simulate_engine, summary_counts_mismatch) {
     Manifest manifest{};
     manifest.upstream_count = 1;
@@ -948,6 +984,45 @@ TEST(simulate_engine, summary_counts_mismatch) {
     CHECK_EQ(summary.matched, 2u);
     CHECK_EQ(summary.mismatched, 1u);
     CHECK_EQ(summary.failed, 0u);
+
+    reader.close();
+    unlink(path);
+    engine.shutdown();
+    ctx.destroy();
+}
+
+TEST(simulate_engine, simulate_file_counts_malformed_entries_as_failed) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = 'G';
+    strcpy(manifest.routes[0].pattern, "/ok");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 200;
+
+    ModuleContext ctx;
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+
+    CaptureEntry entries[] = {
+        make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_entry("GET /ok HTTP/1.1\r\nHost: x\r\n", 200),
+        make_entry("BAD /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+    };
+
+    char path[] = "/tmp/rut_sim_bad_capture_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    REQUIRE(write_capture_file(fd, 3, entries, 3));
+    close(fd);
+
+    ReplayReader reader;
+    REQUIRE(reader.open(path) == 0);
+    const auto summary = simulate_file(engine, reader);
+    CHECK_EQ(summary.total, 3u);
+    CHECK_EQ(summary.matched, 1u);
+    CHECK_EQ(summary.failed, 2u);
+    CHECK_EQ(summary.mismatched, 0u);
+    CHECK_EQ(summary.unsupported, 0u);
 
     reader.close();
     unlink(path);

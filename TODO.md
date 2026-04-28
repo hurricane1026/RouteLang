@@ -43,6 +43,8 @@ Recurring patterns found during code review that automated tests consistently mi
 - Garbage bytes, truncated data, oversized fields, non-ASCII characters.
 - For sim_one: test with a raw TCP server that returns malformed responses (e.g., `"HTTP/1.1 XYZ Bad\r\n"`, empty response, partial response).
 - For capture_read_entry: test with corrupted capture files (wrong magic, truncated entry, zeroed entry).
+- [x] Response parser rejects malformed status codes (`XYZ`, non-digit, `<100`, `>599`).
+- [x] Capture file tests cover invalid header metadata plus truncated and zeroed entries.
 
 ### 3. Unused data region hygiene
 **Pattern**: CaptureEntry raw_headers tail contains uninitialized stack data after memcpy of valid bytes.

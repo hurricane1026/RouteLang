@@ -212,6 +212,20 @@ TEST(capture_file, header_invalid_magic) {
     CHECK(!capture_file_header_valid(&hdr));
 }
 
+TEST(capture_file, header_invalid_version) {
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.version = 2;
+    CHECK(!capture_file_header_valid(&hdr));
+}
+
+TEST(capture_file, header_invalid_entry_size) {
+    CaptureFileHeader hdr;
+    capture_file_header_init(&hdr);
+    hdr.entry_size = sizeof(CaptureEntry) - 1;
+    CHECK(!capture_file_header_valid(&hdr));
+}
+
 // === File I/O round-trip ===
 
 TEST(capture_file, write_read_roundtrip) {
@@ -260,6 +274,51 @@ TEST(capture_file, write_read_roundtrip) {
             CHECK_EQ(out.raw_headers[j], 0u);
         }
     }
+
+    close(fd);
+    unlink(path);
+}
+
+TEST(capture_file, read_truncated_entry_fails) {
+    char path[] = "/tmp/rut_capture_truncated_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+
+    CaptureEntry entry{};
+    entry.resp_status = 200;
+    entry.raw_header_len = 3;
+    entry.raw_headers[0] = 'G';
+    entry.raw_headers[1] = 'E';
+    entry.raw_headers[2] = 'T';
+
+    const u8* bytes = reinterpret_cast<const u8*>(&entry);
+    ssize_t written = write(fd, bytes, sizeof(CaptureEntry) - 1);
+    CHECK_EQ(static_cast<u32>(written), static_cast<u32>(sizeof(CaptureEntry) - 1));
+    lseek(fd, 0, SEEK_SET);
+
+    CaptureEntry out{};
+    CHECK_EQ(capture_read_entry(fd, out), -1);
+
+    close(fd);
+    unlink(path);
+}
+
+TEST(capture_file, read_zeroed_entry_succeeds_as_empty) {
+    char path[] = "/tmp/rut_capture_zeroed_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+
+    CaptureEntry entry{};
+    CHECK_EQ(capture_write_entry(fd, entry), 0);
+    lseek(fd, 0, SEEK_SET);
+
+    CaptureEntry out{};
+    CHECK_EQ(capture_read_entry(fd, out), 0);
+    CHECK_EQ(out.resp_status, 0);
+    CHECK_EQ(out.method, 0);
+    CHECK_EQ(out.raw_header_len, 0);
+    CHECK_EQ(out.raw_headers[0], 0u);
+    CHECK_EQ(out.raw_headers[CaptureEntry::kMaxHeaderLen - 1], 0u);
 
     close(fd);
     unlink(path);

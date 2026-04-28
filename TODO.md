@@ -20,7 +20,7 @@ Outstanding work items, tracked from code TODOs and Copilot review findings.
 - [x] **Shard: route table** — RouteConfig with RouteEntry[] (prefix match) + UpstreamTarget[] (addr:port). Supports Static/Proxy actions, method filter, first-match-wins. Shard holds const RouteConfig* (swappable for hot reload).
 - [x] **SlicePool** — 16KB slice allocator, mmap-backed, O(1) alloc/free via free-stack. Per-shard, for on-demand network I/O buffers (idle connections hold 0 slices).
 - [x] **SlabPool\<T, Cap\>** — generic fixed-size object pool, mmap-backed. alloc/free by pointer or index, index_of, capacity/available/in_use stats. Generalizes EventLoop's Connection free-stack.
-- [ ] **Integration**: replace Connection inline storage with SlicePool slices (idle connections → zero buffer memory)
+- [x] **Integration**: replace Connection inline storage with SlicePool slices (idle connections → zero buffer memory). Production loops allocate recv/send slices on accept, lazily allocate upstream recv for proxying, and release all slices when the connection returns idle.
 
 ## Testing methodology gaps
 

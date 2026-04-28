@@ -6,6 +6,9 @@
 
 namespace rut::test_fault {
 
+inline constexpr int kNoIoFaultFd = -1;
+inline constexpr int kMatchAllIoFds = -2;
+
 struct FaultState {
     int mmap_fail_call = 0;
     int mmap_call_count = 0;
@@ -20,7 +23,7 @@ struct FaultState {
 };
 
 struct IoFaultConfig {
-    int fd = -1;
+    int fd = kNoIoFaultFd;
     int poll_timeouts = 0;
     int poll_eintrs = 0;
     int poll_fatals = 0;

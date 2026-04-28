@@ -4,12 +4,14 @@
 #include "test.h"
 #include "test_helpers.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
 
 using namespace rut;
 using rut::test_fault::IoFaultConfig;
+using rut::test_fault::kMatchAllIoFds;
 using rut::test_fault::ScopedFakeSocket;
 using rut::test_fault::ScopedIoFault;
 using rut::test_fault::ScopedSyscallFault;
@@ -105,13 +107,19 @@ TEST(replay_reader, open_nonexistent_fails) {
 }
 
 TEST(replay_reader, open_injected_failure) {
+    CaptureEntry entry = make_captured_request("GET /open HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(&entry, 1));
+
     SyscallFaultConfig fault_config;
     fault_config.open_errno = EACCES;
     fault_config.open_failures = 1;
     ScopedSyscallFault fault(fault_config);
 
     ReplayReader reader;
-    CHECK_EQ(reader.open("/tmp/rut_replay_injected_open"), -1);
+    CHECK_EQ(reader.open(tmp.path), -1);
+    CHECK_EQ(errno, EACCES);
+    tmp.cleanup();
 }
 
 TEST(replay_reader, open_handles_short_header_read) {
@@ -120,6 +128,7 @@ TEST(replay_reader, open_handles_short_header_read) {
     REQUIRE(tmp.create(&entry, 1));
 
     IoFaultConfig fault_config;
+    fault_config.fd = kMatchAllIoFds;
     fault_config.read_short_len = 7;
     fault_config.read_shorts = 1;
     ScopedIoFault fault(fault_config);

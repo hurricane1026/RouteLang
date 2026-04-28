@@ -252,7 +252,36 @@ int fail_errno_or_default(std::atomic<int>& configured_errno, int default_errno)
 
 bool io_fd_matches(int fd) {
     int fault_fd = g_io_fault_fd.load(std::memory_order_relaxed);
-    return fault_fd < 0 || fd == fault_fd;
+    return fault_fd == kMatchAllIoFds || (fault_fd >= 0 && fd == fault_fd);
+}
+
+bool fcntl_command_takes_arg(int cmd) {
+    switch (cmd) {
+        case F_DUPFD:
+        case F_DUPFD_CLOEXEC:
+        case F_SETFD:
+        case F_SETFL:
+        case F_SETOWN:
+        case F_SETSIG:
+        case F_SETLEASE:
+        case F_NOTIFY:
+        case F_SETPIPE_SZ:
+        case F_GETLK:
+        case F_SETLK:
+        case F_SETLKW:
+#ifdef F_OFD_GETLK
+        case F_OFD_GETLK:
+#endif
+#ifdef F_OFD_SETLK
+        case F_OFD_SETLK:
+#endif
+#ifdef F_OFD_SETLKW
+        case F_OFD_SETLKW:
+#endif
+            return true;
+        default:
+            return false;
+    }
 }
 
 }  // namespace
@@ -484,7 +513,7 @@ extern "C" ssize_t send(int fd, const void* buf, size_t len, int flags) {
         if (rut::test_fault::consume_fault(rut::test_fault::g_send_short_count)) {
             int short_len = rut::test_fault::g_send_short_len.load(std::memory_order_relaxed);
             if (short_len > 0 && len > static_cast<size_t>(short_len)) {
-                return static_cast<ssize_t>(short_len);
+                len = static_cast<size_t>(short_len);
             }
         }
     }
@@ -525,10 +554,9 @@ extern "C" int close(int fd) {
 extern "C" int fcntl(int fd, int cmd, ...) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
     long arg = 0;
+    bool has_arg = rut::test_fault::fcntl_command_takes_arg(cmd);
     va_list ap;
-    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC || cmd == F_SETFD || cmd == F_SETFL ||
-        cmd == F_SETOWN || cmd == F_SETSIG || cmd == F_SETLEASE || cmd == F_NOTIFY ||
-        cmd == F_SETPIPE_SZ) {
+    if (has_arg) {
         va_start(ap, cmd);
         arg = va_arg(ap, long);
         va_end(ap);
@@ -543,6 +571,7 @@ extern "C" int fcntl(int fd, int cmd, ...) {
         errno = ENOSYS;
         return -1;
     }
+    if (!has_arg) return rut::test_fault::g_real_fcntl(fd, cmd);
     return rut::test_fault::g_real_fcntl(fd, cmd, arg);
 }
 

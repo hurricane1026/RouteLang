@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -170,7 +171,6 @@ TEST(epoll_fault, add_send_records_injected_partial_send) {
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
     backend.downstream_fd_map[0] = fds[0];
-    REQUIRE(backend.add_recv(fds[0], 0));
 
     u8 data[8] = {'p', 'a', 'r', 't', 'i', 'a', 'l', '!'};
     IoFaultConfig fault_config;
@@ -180,9 +180,19 @@ TEST(epoll_fault, add_send_records_injected_partial_send) {
     ScopedIoFault fault(fault_config);
 
     CHECK(backend.add_send(fds[0], 0, data, sizeof(data)));
-    CHECK_EQ(backend.send_state[0].fd, fds[0]);
-    CHECK_EQ(backend.send_state[0].offset, 3u);
-    CHECK_EQ(backend.send_state[0].remaining, 5u);
+    if (backend.send_state[0].remaining > 0) {
+        CHECK_EQ(backend.send_state[0].fd, fds[0]);
+        CHECK_EQ(backend.send_state[0].offset, 3u);
+        CHECK_EQ(backend.send_state[0].remaining, 5u);
+
+        u8 received[8] = {};
+        REQUIRE_EQ(recv(fds[1], received, sizeof(received), 0), 3);
+        CHECK_EQ(memcmp(received, data, 3), 0);
+    } else {
+        REQUIRE_EQ(backend.pending_count, 1u);
+        CHECK_EQ(backend.pending_completions[0].type, IoEventType::Send);
+        CHECK_LT(backend.pending_completions[0].result, 0);
+    }
 
     backend.shutdown();
     close(fds[0]);

@@ -236,7 +236,7 @@ TEST(format, includes_upstream_fields) {
 TEST(flusher, flush_empty_rings) {
     AccessLogRing ring;
     ring.init();
-    i32 fd = open("/dev/null", 1);
+    i32 fd = open("/dev/null", O_WRONLY);
     REQUIRE(fd >= 0);
     AccessLogFlusher flusher;
     flusher.init(fd);
@@ -312,7 +312,7 @@ TEST(flusher, flush_multiple_rings) {
     ring1.push(make_entry(200, 0, 0, "/r1"));
     ring2.push(make_entry(500, 0, 1, "/r2"));
 
-    i32 fd = open("/dev/null", 1);
+    i32 fd = open("/dev/null", O_WRONLY);
     REQUIRE(fd >= 0);
     AccessLogFlusher flusher;
     flusher.init(fd);
@@ -641,7 +641,7 @@ TEST(callback_log, no_log_when_ring_null) {
 TEST(flusher, start_returns_ok_on_success) {
     AccessLogRing ring;
     ring.init();
-    i32 fd = open("/dev/null", 1);
+    i32 fd = open("/dev/null", O_WRONLY);
     REQUIRE(fd >= 0);
     AccessLogFlusher flusher;
     flusher.init(fd);
@@ -661,7 +661,7 @@ TEST(flusher, start_on_bad_fd_still_starts) {
 }
 
 TEST(flusher, start_idempotent) {
-    i32 fd = open("/dev/null", 1);
+    i32 fd = open("/dev/null", O_WRONLY);
     REQUIRE(fd >= 0);
     AccessLogFlusher flusher;
     flusher.init(fd);
@@ -678,7 +678,7 @@ TEST(flusher, flush_handles_injected_write_failure) {
     ring.init();
     ring.push(make_entry(200, 100, 0, "/test"));
 
-    i32 fd = open("/dev/null", 1);
+    i32 fd = open("/dev/null", O_WRONLY);
     REQUIRE(fd >= 0);
 
     AccessLogFlusher flusher;
@@ -700,7 +700,7 @@ TEST(flusher, compressed_flush_handles_injected_write_failure) {
     ring.init();
     ring.push(make_entry(200, 100, 0, "/compressed"));
 
-    i32 fd = open("/dev/null", 1);
+    i32 fd = open("/dev/null", O_WRONLY);
     REQUIRE(fd >= 0);
 
     AccessLogFlusher flusher;

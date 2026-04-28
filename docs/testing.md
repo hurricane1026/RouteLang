@@ -47,9 +47,12 @@ Current scopes:
   `socket` call.
 - `ScopedRecvData`: make `recv` for one fd return optional EINTR failures and
   then deterministic bytes.
-- `ScopedIoFault`: make `poll`, `read`, or `write` for one fd return
-  configured transient errors, fatal errors, or short I/O. It also covers
-  fd-scoped `send`, `connect`, `close`, and `fcntl` failures.
+- `ScopedIoFault`: make `poll`, `read`, or `write` for one configured fd
+  return transient errors, fatal errors, or short I/O. It also covers
+  fd-scoped `send`, `connect`, `close`, and `fcntl` failures. Leave
+  `IoFaultConfig::fd` at its default `kNoIoFaultFd` to match no fd, or set it
+  to `kMatchAllIoFds` only when a test explicitly needs process-wide I/O
+  faulting before the fd is known.
 - `ScopedSyscallFault`: inject process-wide failures for initialization or
   path-based syscalls such as `epoll_create1`, `epoll_ctl`, `epoll_wait`,
   `timerfd_create`, `timerfd_settime`, `accept4`, `open`, `mkstemp`, and

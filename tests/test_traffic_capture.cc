@@ -5,7 +5,9 @@
 #include "rut/runtime/traffic_capture.h"
 #include "test.h"
 #include "test_helpers.h"
+#include <atomic>
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -19,6 +21,45 @@ using namespace rut;
 // templates instantiate for MUST have capture_ring and set_capture().
 // If a new loop type is added without these, this file won't compile.
 namespace {
+using ReadFn = ssize_t (*)(int, void*, size_t);
+using WriteFn = ssize_t (*)(int, const void*, size_t);
+
+pthread_once_t g_capture_io_once = PTHREAD_ONCE_INIT;
+ReadFn g_real_read = nullptr;
+WriteFn g_real_write = nullptr;
+std::atomic<int> g_capture_fault_fd{-1};
+std::atomic<int> g_capture_read_eintr_count{0};
+std::atomic<int> g_capture_write_eintr_count{0};
+
+void resolve_capture_io_symbols() {
+    g_real_read = reinterpret_cast<ReadFn>(dlsym(RTLD_NEXT, "read"));
+    g_real_write = reinterpret_cast<WriteFn>(dlsym(RTLD_NEXT, "write"));
+}
+
+bool consume_fault(std::atomic<int>& counter) {
+    int remaining = counter.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (counter.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct ScopedCaptureIoFault {
+    ScopedCaptureIoFault(int fd, int read_eintrs, int write_eintrs) {
+        g_capture_fault_fd.store(fd, std::memory_order_relaxed);
+        g_capture_read_eintr_count.store(read_eintrs, std::memory_order_relaxed);
+        g_capture_write_eintr_count.store(write_eintrs, std::memory_order_relaxed);
+    }
+
+    ~ScopedCaptureIoFault() {
+        g_capture_fault_fd.store(-1, std::memory_order_relaxed);
+        g_capture_read_eintr_count.store(0, std::memory_order_relaxed);
+        g_capture_write_eintr_count.store(0, std::memory_order_relaxed);
+    }
+};
+
 template <typename Loop>
 void verify_capture_interface() {
     Loop* lp = nullptr;
@@ -34,6 +75,34 @@ void verify_capture_interface() {
     // by the concrete loop types above.
 }
 }  // namespace
+
+extern "C" ssize_t read(int fd, void* buf, size_t count) {
+    pthread_once(&g_capture_io_once, resolve_capture_io_symbols);
+    if (fd == g_capture_fault_fd.load(std::memory_order_relaxed) &&
+        consume_fault(g_capture_read_eintr_count)) {
+        errno = EINTR;
+        return -1;
+    }
+    if (!g_real_read) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_real_read(fd, buf, count);
+}
+
+extern "C" ssize_t write(int fd, const void* buf, size_t count) {
+    pthread_once(&g_capture_io_once, resolve_capture_io_symbols);
+    if (fd == g_capture_fault_fd.load(std::memory_order_relaxed) &&
+        consume_fault(g_capture_write_eintr_count)) {
+        errno = EINTR;
+        return -1;
+    }
+    if (!g_real_write) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_real_write(fd, buf, count);
+}
 
 // === CaptureEntry layout ===
 
@@ -319,6 +388,68 @@ TEST(capture_file, read_zeroed_entry_succeeds_as_empty) {
     CHECK_EQ(out.raw_header_len, 0);
     CHECK_EQ(out.raw_headers[0], 0u);
     CHECK_EQ(out.raw_headers[CaptureEntry::kMaxHeaderLen - 1], 0u);
+
+    close(fd);
+    unlink(path);
+}
+
+TEST(capture_file, write_entry_retries_eintr) {
+    char path[] = "/tmp/rut_capture_write_eintr_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+
+    CaptureEntry entry{};
+    entry.resp_status = 204;
+    entry.raw_header_len = 4;
+    entry.raw_headers[0] = 'H';
+    entry.raw_headers[1] = 'E';
+    entry.raw_headers[2] = 'A';
+    entry.raw_headers[3] = 'D';
+
+    {
+        ScopedCaptureIoFault fault(fd, 0, 1);
+        CHECK_EQ(capture_write_entry(fd, entry), 0);
+    }
+    CHECK_EQ(g_capture_write_eintr_count.load(std::memory_order_relaxed), 0);
+
+    lseek(fd, 0, SEEK_SET);
+    CaptureEntry out{};
+    CHECK_EQ(capture_read_entry(fd, out), 0);
+    CHECK_EQ(out.resp_status, 204);
+    CHECK_EQ(out.raw_header_len, 4);
+    CHECK_EQ(out.raw_headers[0], static_cast<u8>('H'));
+
+    close(fd);
+    unlink(path);
+}
+
+TEST(capture_file, read_entry_retries_eintr) {
+    char path[] = "/tmp/rut_capture_read_eintr_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+
+    CaptureEntry entry{};
+    entry.resp_status = 201;
+    entry.method = static_cast<u8>(LogHttpMethod::Post);
+    entry.raw_header_len = 5;
+    entry.raw_headers[0] = 'P';
+    entry.raw_headers[1] = 'O';
+    entry.raw_headers[2] = 'S';
+    entry.raw_headers[3] = 'T';
+    entry.raw_headers[4] = ' ';
+    CHECK_EQ(capture_write_entry(fd, entry), 0);
+
+    lseek(fd, 0, SEEK_SET);
+    CaptureEntry out{};
+    {
+        ScopedCaptureIoFault fault(fd, 1, 0);
+        CHECK_EQ(capture_read_entry(fd, out), 0);
+    }
+    CHECK_EQ(g_capture_read_eintr_count.load(std::memory_order_relaxed), 0);
+    CHECK_EQ(out.resp_status, 201);
+    CHECK_EQ(out.method, static_cast<u8>(LogHttpMethod::Post));
+    CHECK_EQ(out.raw_header_len, 5);
+    CHECK_EQ(out.raw_headers[0], static_cast<u8>('P'));
 
     close(fd);
     unlink(path);

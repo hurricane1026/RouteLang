@@ -737,6 +737,8 @@ TEST(proxy, connect_fail_502) {
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -111));
     // Should send 502 to client
     CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_EQ(conn->resp_status, kStatusBadGateway);
     CHECK_GT(conn->send_buf.len(), 0u);
     // Verify "502" in send buffer
     bool has_502 = false;
@@ -5564,6 +5566,7 @@ TEST(streaming, upstream_response_malformed_502) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     // Should send 502
     CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
@@ -5590,6 +5593,7 @@ TEST(streaming, upstream_response_chunked_initial_error_502) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
     CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
@@ -8053,6 +8057,8 @@ TEST(slot_state, eof_partial_headers_immediate_502) {
     // UpstreamRecv EOF → no send in-flight, forwards immediately → 502
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 0));
     CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
 // on_early_upstream_recvd (no send in-flight) → immediate forward.
@@ -8968,6 +8974,8 @@ TEST(state_transition, upstream_502_clears_all) {
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
     CHECK_SLOTS(c, nullptr, &on_response_sent<SmallLoop>, nullptr, nullptr);
 }
 
@@ -8982,6 +8990,8 @@ TEST(state_transition, connect_failure_clears_all) {
     c->upstream_fd = 100;
     c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, -111));
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
     CHECK_SLOTS(c, nullptr, &on_response_sent<SmallLoop>, nullptr, nullptr);
 }
 

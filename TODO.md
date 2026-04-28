@@ -34,6 +34,7 @@ Recurring patterns found during code review that automated tests consistently mi
 - **EINTR simulation**: Wrap `write()`/`read()`/`send()`/`recv()` to probabilistically return EINTR before the real call. Verifies all I/O loops retry correctly.
 - **mmap failure injection**: Force `mmap()` to return MAP_FAILED on demand. Verifies all allocation paths propagate failure.
 - **Boundary clock**: Provide a `clock_gettime()` shim that returns specific `timespec` values (e.g., `{tv_sec=1, tv_nsec=999999000}` → `{tv_sec=2, tv_nsec=1000}`) to exercise arithmetic edge cases.
+- [x] Capture file read/write tests inject one-shot EINTR and verify `capture_read_entry` / `capture_write_entry` retry.
 
 ### 2. Untrusted/malicious input testing
 **Pattern**: Status code parsing assumes digits, response parsing assumes well-formed HTTP.
@@ -62,6 +63,7 @@ Recurring patterns found during code review that automated tests consistently mi
 **TODO**: For debug-only fields that track state machine position:
 - Add `CHECK_EQ(conn.state, ConnState::Sending)` assertions in tests that verify response paths.
 - Or add a debug-mode invariant checker that validates `state` matches the active callback slot configuration after each dispatch.
+- [x] Add `ConnState::Sending` assertions to proxy connect failure and malformed upstream 502 response paths.
 
 ### 5. Cross-path replay coverage
 **Pattern**: replay_one only tested with static routes. Proxy routes through replay_one produce send_len==0 and bogus results.

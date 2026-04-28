@@ -13,7 +13,8 @@ Outstanding work items, prioritized for the next implementation passes.
 - [x] Response parser rejects malformed status codes (`XYZ`, non-digit, `<100`, `>599`).
 - [x] Simulate engine rejects malformed captured request headers and counts malformed capture entries as failed.
 - [x] Proxy 502 paths assert `ConnState::Sending`; upstream connect failure now sets that state in production.
-- [x] State invariant tests cover representative static, proxy, body-streaming, idle, and 502 dispatch transitions.
+- [x] State invariant tests cover representative static, proxy, body-streaming, JIT-yield, idle, and 502 dispatch transitions.
+- [x] Testing notes document the callback-slot/state invariants and the streaming-body exception.
 
 ## P0: State Invariant Coverage
 

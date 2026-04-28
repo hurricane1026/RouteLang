@@ -25,9 +25,47 @@ struct IoFaultConfig {
     int poll_eintrs = 0;
     int poll_fatals = 0;
     int read_eintrs = 0;
+    int read_fatals = 0;
+    size_t read_short_len = 0;
+    int read_shorts = 0;
     int write_eagains = 0;
     int write_eintrs = 0;
     int write_fatals = 0;
+    size_t write_short_len = 0;
+    int write_shorts = 0;
+    int send_eagains = 0;
+    int send_eintrs = 0;
+    int send_fatals = 0;
+    size_t send_short_len = 0;
+    int send_shorts = 0;
+    int connect_errno = 0;
+    int connect_failures = 0;
+    int close_errno = 0;
+    int close_failures = 0;
+    int fcntl_errno = 0;
+    int fcntl_failures = 0;
+};
+
+struct SyscallFaultConfig {
+    int epoll_create1_errno = 0;
+    int epoll_create1_failures = 0;
+    int epoll_ctl_errno = 0;
+    int epoll_ctl_failures = 0;
+    int epoll_wait_eintrs = 0;
+    int epoll_wait_errno = 0;
+    int epoll_wait_failures = 0;
+    int timerfd_create_errno = 0;
+    int timerfd_create_failures = 0;
+    int timerfd_settime_errno = 0;
+    int timerfd_settime_failures = 0;
+    int accept4_errno = 0;
+    int accept4_failures = 0;
+    int open_errno = 0;
+    int open_failures = 0;
+    int mkstemp_errno = 0;
+    int mkstemp_failures = 0;
+    int unlink_errno = 0;
+    int unlink_failures = 0;
 };
 
 FaultState& state();
@@ -70,9 +108,22 @@ public:
 
     int remaining_read_eintrs() const;
     int remaining_write_eintrs() const;
+    int remaining_send_eagains() const;
+    int remaining_connect_failures() const;
 
 private:
     IoFaultConfig previous_;
+};
+
+class ScopedSyscallFault {
+public:
+    explicit ScopedSyscallFault(const SyscallFaultConfig& config);
+    ScopedSyscallFault(const ScopedSyscallFault&) = delete;
+    ScopedSyscallFault& operator=(const ScopedSyscallFault&) = delete;
+    ~ScopedSyscallFault();
+
+private:
+    SyscallFaultConfig previous_;
 };
 
 }  // namespace rut::test_fault

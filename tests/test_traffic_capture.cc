@@ -395,6 +395,72 @@ TEST(capture_file, read_entry_retries_eintr) {
     unlink(path);
 }
 
+TEST(capture_file, write_entry_handles_short_write) {
+    char path[] = "/tmp/rut_capture_short_write_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+
+    CaptureEntry entry{};
+    entry.resp_status = 206;
+    entry.raw_header_len = 3;
+    entry.raw_headers[0] = 'P';
+    entry.raw_headers[1] = 'A';
+    entry.raw_headers[2] = 'R';
+
+    {
+        IoFaultConfig fault_config;
+        fault_config.fd = fd;
+        fault_config.write_short_len = 17;
+        fault_config.write_shorts = 1;
+        ScopedIoFault fault(fault_config);
+        CHECK_EQ(capture_write_entry(fd, entry), 0);
+    }
+
+    lseek(fd, 0, SEEK_SET);
+    CaptureEntry out{};
+    CHECK_EQ(capture_read_entry(fd, out), 0);
+    CHECK_EQ(out.resp_status, 206);
+    CHECK_EQ(out.raw_header_len, 3);
+    CHECK_EQ(out.raw_headers[0], static_cast<u8>('P'));
+
+    close(fd);
+    unlink(path);
+}
+
+TEST(capture_file, read_entry_handles_short_read) {
+    char path[] = "/tmp/rut_capture_short_read_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+
+    CaptureEntry entry{};
+    entry.resp_status = 207;
+    entry.method = static_cast<u8>(LogHttpMethod::Put);
+    entry.raw_header_len = 4;
+    entry.raw_headers[0] = 'R';
+    entry.raw_headers[1] = 'E';
+    entry.raw_headers[2] = 'A';
+    entry.raw_headers[3] = 'D';
+    CHECK_EQ(capture_write_entry(fd, entry), 0);
+
+    lseek(fd, 0, SEEK_SET);
+    CaptureEntry out{};
+    {
+        IoFaultConfig fault_config;
+        fault_config.fd = fd;
+        fault_config.read_short_len = 19;
+        fault_config.read_shorts = 1;
+        ScopedIoFault fault(fault_config);
+        CHECK_EQ(capture_read_entry(fd, out), 0);
+    }
+    CHECK_EQ(out.resp_status, 207);
+    CHECK_EQ(out.method, static_cast<u8>(LogHttpMethod::Put));
+    CHECK_EQ(out.raw_header_len, 4);
+    CHECK_EQ(out.raw_headers[0], static_cast<u8>('R'));
+
+    close(fd);
+    unlink(path);
+}
+
 // === Integration: capture through mock event loop ===
 
 TEST(capture_integration, basic_request_captured) {

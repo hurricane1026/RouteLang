@@ -48,9 +48,15 @@ Current scopes:
 - `ScopedRecvData`: make `recv` for one fd return optional EINTR failures and
   then deterministic bytes.
 - `ScopedIoFault`: make `poll`, `read`, or `write` for one fd return
-  configured transient or fatal errors.
+  configured transient errors, fatal errors, or short I/O. It also covers
+  fd-scoped `send`, `connect`, `close`, and `fcntl` failures.
+- `ScopedSyscallFault`: inject process-wide failures for initialization or
+  path-based syscalls such as `epoll_create1`, `epoll_ctl`, `epoll_wait`,
+  `timerfd_create`, `timerfd_settime`, `accept4`, `open`, `mkstemp`, and
+  `unlink`.
 
 Memory, socket, and `recv` state is thread-local and restored when the scope
-exits. `ScopedIoFault` uses process-wide atomic counters so it can fault I/O
-performed by helper threads. This keeps fault setup local to a test case while
-allowing one shared interpose layer per test binary.
+exits. `ScopedIoFault` and `ScopedSyscallFault` use process-wide atomic
+counters so they can fault I/O performed by helper threads. This keeps fault
+setup local to a test case while allowing one shared interpose layer per test
+binary.

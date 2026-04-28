@@ -9,7 +9,11 @@
 #include <unistd.h>
 
 using namespace rut;
+using rut::test_fault::IoFaultConfig;
 using rut::test_fault::ScopedFakeSocket;
+using rut::test_fault::ScopedIoFault;
+using rut::test_fault::ScopedSyscallFault;
+using rut::test_fault::SyscallFaultConfig;
 
 // --- Helper: create a capture file with N entries ---
 
@@ -98,6 +102,33 @@ TEST(replay_reader, open_valid_file) {
 TEST(replay_reader, open_nonexistent_fails) {
     ReplayReader reader;
     CHECK_EQ(reader.open("/tmp/rut_does_not_exist_12345"), -1);
+}
+
+TEST(replay_reader, open_injected_failure) {
+    SyscallFaultConfig fault_config;
+    fault_config.open_errno = EACCES;
+    fault_config.open_failures = 1;
+    ScopedSyscallFault fault(fault_config);
+
+    ReplayReader reader;
+    CHECK_EQ(reader.open("/tmp/rut_replay_injected_open"), -1);
+}
+
+TEST(replay_reader, open_handles_short_header_read) {
+    CaptureEntry entry = make_captured_request("GET /short HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(&entry, 1));
+
+    IoFaultConfig fault_config;
+    fault_config.read_short_len = 7;
+    fault_config.read_shorts = 1;
+    ScopedIoFault fault(fault_config);
+
+    ReplayReader reader;
+    CHECK_EQ(reader.open(tmp.path), 0);
+    CHECK_EQ(reader.entry_count(), 1u);
+    reader.close();
+    tmp.cleanup();
 }
 
 TEST(replay_reader, open_invalid_magic_fails) {

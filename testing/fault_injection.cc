@@ -255,7 +255,13 @@ bool io_fd_matches(int fd) {
     return fault_fd == kMatchAllIoFds || (fault_fd >= 0 && fd == fault_fd);
 }
 
-bool fcntl_command_takes_arg(int cmd) {
+enum class FcntlArgKind {
+    None,
+    Int,
+    Pointer,
+};
+
+FcntlArgKind fcntl_arg_kind(int cmd) {
     switch (cmd) {
         case F_DUPFD:
         case F_DUPFD_CLOEXEC:
@@ -266,9 +272,28 @@ bool fcntl_command_takes_arg(int cmd) {
         case F_SETLEASE:
         case F_NOTIFY:
         case F_SETPIPE_SZ:
+            return FcntlArgKind::Int;
         case F_GETLK:
         case F_SETLK:
         case F_SETLKW:
+#ifdef F_GETOWN_EX
+        case F_GETOWN_EX:
+#endif
+#ifdef F_SETOWN_EX
+        case F_SETOWN_EX:
+#endif
+#ifdef F_GET_RW_HINT
+        case F_GET_RW_HINT:
+#endif
+#ifdef F_SET_RW_HINT
+        case F_SET_RW_HINT:
+#endif
+#ifdef F_GET_FILE_RW_HINT
+        case F_GET_FILE_RW_HINT:
+#endif
+#ifdef F_SET_FILE_RW_HINT
+        case F_SET_FILE_RW_HINT:
+#endif
 #ifdef F_OFD_GETLK
         case F_OFD_GETLK:
 #endif
@@ -278,9 +303,9 @@ bool fcntl_command_takes_arg(int cmd) {
 #ifdef F_OFD_SETLKW
         case F_OFD_SETLKW:
 #endif
-            return true;
+            return FcntlArgKind::Pointer;
         default:
-            return false;
+            return FcntlArgKind::None;
     }
 }
 
@@ -553,12 +578,17 @@ extern "C" int close(int fd) {
 
 extern "C" int fcntl(int fd, int cmd, ...) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
-    long arg = 0;
-    bool has_arg = rut::test_fault::fcntl_command_takes_arg(cmd);
+    int int_arg = 0;
+    void* pointer_arg = nullptr;
+    auto arg_kind = rut::test_fault::fcntl_arg_kind(cmd);
     va_list ap;
-    if (has_arg) {
+    if (arg_kind == rut::test_fault::FcntlArgKind::Int) {
         va_start(ap, cmd);
-        arg = va_arg(ap, long);
+        int_arg = va_arg(ap, int);
+        va_end(ap);
+    } else if (arg_kind == rut::test_fault::FcntlArgKind::Pointer) {
+        va_start(ap, cmd);
+        pointer_arg = va_arg(ap, void*);
         va_end(ap);
     }
 
@@ -571,8 +601,13 @@ extern "C" int fcntl(int fd, int cmd, ...) {
         errno = ENOSYS;
         return -1;
     }
-    if (!has_arg) return rut::test_fault::g_real_fcntl(fd, cmd);
-    return rut::test_fault::g_real_fcntl(fd, cmd, arg);
+    if (arg_kind == rut::test_fault::FcntlArgKind::None) {
+        return rut::test_fault::g_real_fcntl(fd, cmd);
+    }
+    if (arg_kind == rut::test_fault::FcntlArgKind::Pointer) {
+        return rut::test_fault::g_real_fcntl(fd, cmd, pointer_arg);
+    }
+    return rut::test_fault::g_real_fcntl(fd, cmd, int_arg);
 }
 
 extern "C" int epoll_create1(int flags) {

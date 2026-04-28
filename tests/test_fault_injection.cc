@@ -45,6 +45,21 @@ TEST(syscall_fault, close_and_fcntl_failures_are_injected) {
     close(fd);
 }
 
+TEST(syscall_fault, fcntl_pointer_args_are_forwarded) {
+    i32 fd = open("/dev/null", O_RDONLY);
+    REQUIRE(fd >= 0);
+
+    struct flock lock;
+    __builtin_memset(&lock, 0, sizeof(lock));
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+
+    CHECK_EQ(fcntl(fd, F_GETLK, &lock), 0);
+    CHECK_NE(lock.l_type, static_cast<short>(0));
+
+    close(fd);
+}
+
 TEST(syscall_fault, timerfd_settime_failure_is_injected) {
     i32 fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     REQUIRE(fd >= 0);

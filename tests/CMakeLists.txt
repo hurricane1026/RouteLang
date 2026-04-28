@@ -6,7 +6,10 @@ target_include_directories(test_framework PRIVATE
 add_test(NAME test_framework COMMAND test_framework)
 set_tests_properties(test_framework PROPERTIES WILL_FAIL TRUE)
 
-add_executable(test_network test_network.cc)
+add_executable(test_network
+    test_network.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
 target_link_libraries(test_network rut_runtime)
 target_include_directories(test_network PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -166,7 +169,10 @@ target_include_directories(test_drain PRIVATE
 add_test(NAME test_drain COMMAND test_drain)
 set_tests_properties(test_drain PROPERTIES LABELS "unit")
 
-add_executable(test_access_log test_access_log.cc)
+add_executable(test_access_log
+    test_access_log.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
 target_link_libraries(test_access_log rut_runtime)
 target_include_directories(test_access_log PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -217,7 +223,10 @@ target_compile_definitions(test_jit PRIVATE ${LLVM_DEFINITIONS})
 add_test(NAME test_jit COMMAND test_jit)
 set_tests_properties(test_jit PROPERTIES LABELS "unit;jit")
 
-add_executable(test_traffic_capture test_traffic_capture.cc)
+add_executable(test_traffic_capture
+    test_traffic_capture.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
 target_link_libraries(test_traffic_capture rut_runtime Threads::Threads)
 target_include_directories(test_traffic_capture PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -227,7 +236,10 @@ target_include_directories(test_traffic_capture PRIVATE
 add_test(NAME test_traffic_capture COMMAND test_traffic_capture)
 set_tests_properties(test_traffic_capture PROPERTIES LABELS "unit")
 
-add_executable(test_traffic_replay test_traffic_replay.cc)
+add_executable(test_traffic_replay
+    test_traffic_replay.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
 target_link_libraries(test_traffic_replay rut_runtime)
 target_include_directories(test_traffic_replay PRIVATE
     ${PROJECT_SOURCE_DIR}/include

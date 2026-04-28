@@ -1,4 +1,5 @@
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
+#include "fault_injection.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/route_table.h"
@@ -8,149 +9,12 @@
 #include "test.h"
 #include "test_helpers.h"
 
-#include <dlfcn.h>
 #include <errno.h>
-#include <pthread.h>
-#include <sys/mman.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 
-namespace {
-
-thread_local int g_slice_pool_fail_mmap_call = 0;
-thread_local int g_slice_pool_mmap_call_count = 0;
-thread_local bool g_slice_pool_fail_mprotect = false;
-thread_local int g_fake_upstream_socket_fd = -1;
-thread_local int g_fake_recv_fd = -1;
-thread_local bool g_fake_recv_eintr_once = false;
-thread_local size_t g_fake_recv_len = 0;
-thread_local u8 g_fake_recv_data[512];
-pthread_once_t g_slice_pool_syscall_once = PTHREAD_ONCE_INIT;
-
-struct ScopedSlicePoolFault {
-    explicit ScopedSlicePoolFault(int fail_mmap_call = 0, bool fail_mprotect = false) {
-        g_slice_pool_fail_mmap_call = fail_mmap_call;
-        g_slice_pool_mmap_call_count = 0;
-        g_slice_pool_fail_mprotect = fail_mprotect;
-    }
-
-    ~ScopedSlicePoolFault() {
-        g_slice_pool_fail_mmap_call = 0;
-        g_slice_pool_mmap_call_count = 0;
-        g_slice_pool_fail_mprotect = false;
-    }
-};
-
-struct ScopedFakeUpstreamSocket {
-    explicit ScopedFakeUpstreamSocket(int fd) : fd_(fd) { g_fake_upstream_socket_fd = fd; }
-
-    ~ScopedFakeUpstreamSocket() { g_fake_upstream_socket_fd = -1; }
-
-    int fd_;
-};
-
-struct ScopedFakeRecv {
-    ScopedFakeRecv(int fd, const char* data, size_t len, bool eintr_once = false) : fd_(fd) {
-        g_fake_recv_fd = fd;
-        g_fake_recv_eintr_once = eintr_once;
-        g_fake_recv_len = len < sizeof(g_fake_recv_data) ? len : sizeof(g_fake_recv_data);
-        for (size_t i = 0; i < g_fake_recv_len; i++) {
-            g_fake_recv_data[i] = static_cast<u8>(data[i]);
-        }
-    }
-
-    ~ScopedFakeRecv() {
-        g_fake_recv_fd = -1;
-        g_fake_recv_eintr_once = false;
-        g_fake_recv_len = 0;
-    }
-
-    int fd_;
-};
-
-using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
-using MprotectFn = int (*)(void*, size_t, int);
-using SocketFn = int (*)(int, int, int);
-using RecvFn = ssize_t (*)(int, void*, size_t, int);
-
-MmapFn g_real_mmap = nullptr;
-MprotectFn g_real_mprotect = nullptr;
-SocketFn g_real_socket = nullptr;
-RecvFn g_real_recv = nullptr;
-
-void resolve_slice_pool_syscalls() {
-    g_real_mmap = reinterpret_cast<MmapFn>(dlsym(RTLD_NEXT, "mmap"));
-    g_real_mprotect = reinterpret_cast<MprotectFn>(dlsym(RTLD_NEXT, "mprotect"));
-    g_real_socket = reinterpret_cast<SocketFn>(dlsym(RTLD_NEXT, "socket"));
-    g_real_recv = reinterpret_cast<RecvFn>(dlsym(RTLD_NEXT, "recv"));
-}
-
-}  // namespace
-
-extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
-    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
-    if (g_slice_pool_fail_mmap_call > 0 &&
-        ++g_slice_pool_mmap_call_count == g_slice_pool_fail_mmap_call) {
-        errno = ENOMEM;
-        return MAP_FAILED;
-    }
-    if (!g_real_mmap) {
-        errno = ENOSYS;
-        return MAP_FAILED;
-    }
-    return g_real_mmap(addr, len, prot, flags, fd, offset);
-}
-
-extern "C" int mprotect(void* addr, size_t len, int prot) {
-    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
-    if (g_slice_pool_fail_mprotect) {
-        errno = ENOMEM;
-        return -1;
-    }
-    if (!g_real_mprotect) {
-        errno = ENOSYS;
-        return -1;
-    }
-    return g_real_mprotect(addr, len, prot);
-}
-
-extern "C" int socket(int domain, int type, int protocol) {
-    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
-    if (g_fake_upstream_socket_fd >= 0 && domain == AF_INET &&
-        (type & SOCK_STREAM) == SOCK_STREAM) {
-        int fd = g_fake_upstream_socket_fd;
-        g_fake_upstream_socket_fd = -1;
-        return fd;
-    }
-    if (!g_real_socket) {
-        errno = ENOSYS;
-        return -1;
-    }
-    return g_real_socket(domain, type, protocol);
-}
-
-extern "C" ssize_t recv(int sockfd, void* buf, size_t len, int flags) {
-    pthread_once(&g_slice_pool_syscall_once, resolve_slice_pool_syscalls);
-    if (g_fake_recv_fd >= 0 && sockfd == g_fake_recv_fd) {
-        if (g_fake_recv_eintr_once) {
-            g_fake_recv_eintr_once = false;
-            errno = EINTR;
-            return -1;
-        }
-        const size_t n = len < g_fake_recv_len ? len : g_fake_recv_len;
-        for (size_t i = 0; i < n; i++) {
-            static_cast<u8*>(buf)[i] = g_fake_recv_data[i];
-        }
-        g_fake_recv_fd = -1;
-        g_fake_recv_len = 0;
-        return static_cast<ssize_t>(n);
-    }
-    if (!g_real_recv) {
-        errno = ENOSYS;
-        return -1;
-    }
-    return g_real_recv(sockfd, buf, len, flags);
-}
+using rut::test_fault::ScopedFakeSocket;
+using rut::test_fault::ScopedMemoryFault;
+using rut::test_fault::ScopedRecvData;
 
 // === Accept ===
 
@@ -1684,7 +1548,7 @@ TEST(upstream_pool, find_idle) {
 TEST(upstream_pool, create_socket) {
     i32 fake_fd = dup(2);
     REQUIRE(fake_fd >= 0);
-    ScopedFakeUpstreamSocket fake_socket(fake_fd);
+    ScopedFakeSocket fake_socket(fake_fd);
 
     i32 fd = UpstreamPool::create_socket();
     CHECK(fd >= 0);
@@ -1897,7 +1761,7 @@ TEST(slice_pool, prealloc_and_invalid_free_guards) {
 }
 
 TEST(slice_pool, init_base_mmap_failure) {
-    ScopedSlicePoolFault fault(1);
+    ScopedMemoryFault fault(1);
     SlicePool pool;
     auto rc = pool.init(4);
     CHECK(!rc.has_value());
@@ -1907,7 +1771,7 @@ TEST(slice_pool, init_base_mmap_failure) {
 }
 
 TEST(slice_pool, init_stack_mmap_failure) {
-    ScopedSlicePoolFault fault(2);
+    ScopedMemoryFault fault(2);
     SlicePool pool;
     auto rc = pool.init(4);
     CHECK(!rc.has_value());
@@ -1917,7 +1781,7 @@ TEST(slice_pool, init_stack_mmap_failure) {
 }
 
 TEST(slice_pool, init_map_mmap_failure) {
-    ScopedSlicePoolFault fault(3);
+    ScopedMemoryFault fault(3);
     SlicePool pool;
     auto rc = pool.init(4);
     CHECK(!rc.has_value());
@@ -1927,7 +1791,7 @@ TEST(slice_pool, init_map_mmap_failure) {
 }
 
 TEST(slice_pool, init_prealloc_grow_failure) {
-    ScopedSlicePoolFault fault(0, true);
+    ScopedMemoryFault fault(0, true);
     SlicePool pool;
     auto rc = pool.init(4, 1);
     CHECK(!rc.has_value());
@@ -2208,7 +2072,7 @@ TEST(slab_pool, invalid_free_guards) {
 
 TEST(slab_pool, init_objects_mmap_failure) {
     SlabPool<TestObj, 4> pool;
-    ScopedSlicePoolFault fault(1);
+    ScopedMemoryFault fault(1);
     auto rc = pool.init();
     CHECK(!rc.has_value());
     CHECK_EQ(pool.objects, nullptr);
@@ -2219,7 +2083,7 @@ TEST(slab_pool, init_objects_mmap_failure) {
 
 TEST(slab_pool, init_stack_mmap_failure) {
     SlabPool<TestObj, 4> pool;
-    ScopedSlicePoolFault fault(2);
+    ScopedMemoryFault fault(2);
     auto rc = pool.init();
     CHECK(!rc.has_value());
     CHECK_EQ(pool.objects, nullptr);
@@ -2230,7 +2094,7 @@ TEST(slab_pool, init_stack_mmap_failure) {
 
 TEST(slab_pool, init_map_mmap_failure) {
     SlabPool<TestObj, 4> pool;
-    ScopedSlicePoolFault fault(3);
+    ScopedMemoryFault fault(3);
     auto rc = pool.init();
     CHECK(!rc.has_value());
     CHECK_EQ(pool.objects, nullptr);
@@ -6466,7 +6330,7 @@ TEST(streaming, request_body_sent_error_sync_recv_real_fd) {
     CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
 
     static constexpr int kFakeFd = 701;
-    ScopedFakeRecv fake_recv(kFakeFd, kMockHttpResponse, kMockHttpResponseLen, true);
+    ScopedRecvData fake_recv(kFakeFd, kMockHttpResponse, kMockHttpResponseLen, true);
     c->upstream_fd = kFakeFd;
     c->upstream_recv_armed = false;
 
@@ -9964,7 +9828,7 @@ TEST(coverage, initial_send_error_sync_recv_with_real_fd) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     static constexpr int kFakeFd = 702;
-    ScopedFakeRecv fake_recv(kFakeFd, kMockHttpResponse, kMockHttpResponseLen, true);
+    ScopedRecvData fake_recv(kFakeFd, kMockHttpResponse, kMockHttpResponseLen, true);
     c->upstream_fd = kFakeFd;
     c->on_upstream_send = &on_upstream_connected<SmallLoop>;
     loop.alloc_upstream_buf(*c);
@@ -9982,7 +9846,7 @@ TEST(coverage, body_send_error_sync_recv_with_real_fd) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
     static constexpr int kFakeFd = 703;
-    ScopedFakeRecv fake_recv(kFakeFd, kMockHttpResponse, kMockHttpResponseLen, true);
+    ScopedRecvData fake_recv(kFakeFd, kMockHttpResponse, kMockHttpResponseLen, true);
     c->upstream_fd = kFakeFd;
     c->upstream_recv_armed = false;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
@@ -10436,7 +10300,7 @@ TEST(route_coverage, proxy_route_creates_socket) {
 
     i32 fds[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-    ScopedFakeUpstreamSocket fake_socket(fds[0]);
+    ScopedFakeSocket fake_socket(fds[0]);
 
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
@@ -10472,7 +10336,7 @@ TEST(async_coverage, proxy_route_creates_socket) {
 
     i32 fds[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-    ScopedFakeUpstreamSocket fake_socket(fds[0]);
+    ScopedFakeSocket fake_socket(fds[0]);
 
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);

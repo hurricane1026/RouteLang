@@ -33,3 +33,24 @@ When adding a callback path that sends a 500/502 response, include a focused
 state-invariant assertion. The expected shape is `ConnState::Sending` with only
 the client send slot active. This catches stale proxy/body-streaming callbacks
 that would otherwise be easy to miss in wire-level tests.
+
+## Fault Injection
+
+Shared syscall fault injection lives in `testing/fault_injection.h` and
+`testing/fault_injection.cc`. Test files should use the RAII scopes there
+instead of defining local `extern "C"` syscall hooks.
+
+Current scopes:
+
+- `ScopedMemoryFault`: fail the Nth `mmap` call, fail `mprotect`, or both.
+- `ScopedFakeSocket`: return a specific fd from the next AF_INET stream
+  `socket` call.
+- `ScopedRecvData`: make `recv` for one fd return optional EINTR failures and
+  then deterministic bytes.
+- `ScopedIoFault`: make `poll`, `read`, or `write` for one fd return
+  configured transient or fatal errors.
+
+Memory, socket, and `recv` state is thread-local and restored when the scope
+exits. `ScopedIoFault` uses process-wide atomic counters so it can fault I/O
+performed by helper threads. This keeps fault setup local to a test case while
+allowing one shared interpose layer per test binary.

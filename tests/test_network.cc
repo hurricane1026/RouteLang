@@ -8804,8 +8804,7 @@ static void check_proxying_upstream_send_only_invariant(rut::test::TestCase* _tc
     CHECK_SLOTS(c, nullptr, nullptr, nullptr, upstream_send);
 }
 
-static void check_sending_waiting_upstream_body_invariant(rut::test::TestCase* _tc,
-                                                          Connection* c) {
+static void check_sending_waiting_upstream_body_invariant(rut::test::TestCase* _tc, Connection* c) {
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK(c->fd >= 0);
     CHECK(c->upstream_fd >= 0);
@@ -8823,11 +8822,7 @@ static void check_exec_handler_yield_invariant(rut::test::TestCase* _tc,
     CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
 }
 
-static u64 state_invariant_wait_then_status(void*,
-                                            jit::HandlerCtx* ctx,
-                                            const u8*,
-                                            u32,
-                                            void*) {
+static u64 state_invariant_wait_then_status(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx && ctx->state == 7) return jit::HandlerResult::make_status(204).pack();
     return jit::HandlerResult::make_yield_payload(7, jit::YieldKind::Timer, 25).pack();
 }
@@ -8871,11 +8866,8 @@ TEST(state_invariant, body_streaming_slots_match_proxying_state) {
     loop.setup();
     auto* c = setup_body_streaming_proxy(loop, 200, 10);
     REQUIRE(c != nullptr);
-    check_proxying_body_stream_invariant(_tc,
-                                         c,
-                                         &on_request_body_recvd<SmallLoop>,
-                                         &on_early_upstream_recvd<SmallLoop>,
-                                         nullptr);
+    check_proxying_body_stream_invariant(
+        _tc, c, &on_request_body_recvd<SmallLoop>, &on_early_upstream_recvd<SmallLoop>, nullptr);
 
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
     check_proxying_body_stream_invariant(_tc,
@@ -8885,11 +8877,8 @@ TEST(state_invariant, body_streaming_slots_match_proxying_state) {
                                          &on_request_body_sent<SmallLoop>);
 
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
-    check_proxying_body_stream_invariant(_tc,
-                                         c,
-                                         &on_request_body_recvd<SmallLoop>,
-                                         &on_early_upstream_recvd<SmallLoop>,
-                                         nullptr);
+    check_proxying_body_stream_invariant(
+        _tc, c, &on_request_body_recvd<SmallLoop>, &on_early_upstream_recvd<SmallLoop>, nullptr);
 }
 
 TEST(state_invariant, error_responses_drop_proxy_slots) {
@@ -8977,9 +8966,8 @@ TEST(state_invariant, early_response_during_body_send_has_one_upstream_slot) {
     c->upstream_recv_buf.commit(rlen);
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
 
-    check_proxying_upstream_send_only_invariant(_tc,
-                                                c,
-                                                &on_body_send_with_early_response<SmallLoop>);
+    check_proxying_upstream_send_only_invariant(
+        _tc, c, &on_body_send_with_early_response<SmallLoop>);
 }
 
 TEST(state_invariant, jit_timer_yield_keeps_exec_handler_slots_clear) {

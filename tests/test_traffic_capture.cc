@@ -8,6 +8,7 @@
 #include <atomic>
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -308,7 +309,8 @@ TEST(capture_file, write_read_roundtrip) {
     capture_file_header_init(&hdr);
     hdr.entry_count = 3;
     ssize_t hw = write(fd, &hdr, sizeof(hdr));
-    CHECK_EQ(static_cast<u32>(hw), static_cast<u32>(sizeof(hdr)));
+    REQUIRE(hw >= 0);
+    CHECK_EQ(hw, static_cast<ssize_t>(sizeof(hdr)));
 
     // Write 3 entries
     for (u32 i = 0; i < 3; i++) {
@@ -329,7 +331,8 @@ TEST(capture_file, write_read_roundtrip) {
 
     CaptureFileHeader read_hdr;
     ssize_t hr = read(fd, &read_hdr, sizeof(read_hdr));
-    CHECK_EQ(static_cast<u32>(hr), static_cast<u32>(sizeof(read_hdr)));
+    REQUIRE(hr >= 0);
+    CHECK_EQ(hr, static_cast<ssize_t>(sizeof(read_hdr)));
     CHECK(capture_file_header_valid(&read_hdr));
     CHECK_EQ(read_hdr.entry_count, 3u);
 
@@ -339,9 +342,6 @@ TEST(capture_file, write_read_roundtrip) {
         CHECK_EQ(out.resp_status, static_cast<u16>(200 + i));
         CHECK_EQ(out.raw_header_len, 5);
         CHECK_EQ(out.raw_headers[0], static_cast<u8>('G'));
-        for (u32 j = out.raw_header_len; j < CaptureEntry::kMaxHeaderLen; j++) {
-            CHECK_EQ(out.raw_headers[j], 0u);
-        }
     }
 
     close(fd);
@@ -362,7 +362,8 @@ TEST(capture_file, read_truncated_entry_fails) {
 
     const u8* bytes = reinterpret_cast<const u8*>(&entry);
     ssize_t written = write(fd, bytes, sizeof(CaptureEntry) - 1);
-    CHECK_EQ(static_cast<u32>(written), static_cast<u32>(sizeof(CaptureEntry) - 1));
+    REQUIRE(written >= 0);
+    CHECK_EQ(written, static_cast<ssize_t>(sizeof(CaptureEntry) - 1));
     lseek(fd, 0, SEEK_SET);
 
     CaptureEntry out{};
@@ -409,8 +410,8 @@ TEST(capture_file, write_entry_retries_eintr) {
     {
         ScopedCaptureIoFault fault(fd, 0, 1);
         CHECK_EQ(capture_write_entry(fd, entry), 0);
+        CHECK_EQ(g_capture_write_eintr_count.load(std::memory_order_relaxed), 0);
     }
-    CHECK_EQ(g_capture_write_eintr_count.load(std::memory_order_relaxed), 0);
 
     lseek(fd, 0, SEEK_SET);
     CaptureEntry out{};
@@ -444,8 +445,8 @@ TEST(capture_file, read_entry_retries_eintr) {
     {
         ScopedCaptureIoFault fault(fd, 1, 0);
         CHECK_EQ(capture_read_entry(fd, out), 0);
+        CHECK_EQ(g_capture_read_eintr_count.load(std::memory_order_relaxed), 0);
     }
-    CHECK_EQ(g_capture_read_eintr_count.load(std::memory_order_relaxed), 0);
     CHECK_EQ(out.resp_status, 201);
     CHECK_EQ(out.method, static_cast<u8>(LogHttpMethod::Post));
     CHECK_EQ(out.raw_header_len, 5);
@@ -757,6 +758,49 @@ static u32 send_request(SmallLoop& loop, Connection& conn, const char* req_str) 
     u32 send_len = conn.send_buf.len();
     loop.inject_and_dispatch(make_ev(conn.id, IoEventType::Send, static_cast<i32>(send_len)));
     return send_len;
+}
+
+TEST(capture_transition, production_capture_persisted_tail_zero) {
+    void* ring_mem = mmap(
+        nullptr, sizeof(CaptureRing), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(ring_mem != MAP_FAILED);
+    auto* ring = new (ring_mem) CaptureRing();
+    ring->init();
+
+    SmallLoop loop;
+    loop.setup();
+    loop.set_capture(ring);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(conn->capture_buf != nullptr);
+    for (u32 i = 0; i < CaptureEntry::kMaxHeaderLen; i++) conn->capture_buf[i] = 0xA5;
+
+    send_request(loop, *conn, "GET /tail-zero HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    CaptureEntry cap{};
+    REQUIRE(ring->pop(cap));
+    REQUIRE(cap.raw_header_len > 0u);
+    REQUIRE(cap.raw_header_len < static_cast<u16>(CaptureEntry::kMaxHeaderLen));
+
+    char path[] = "/tmp/rut_capture_tail_zero_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    CHECK_EQ(capture_write_entry(fd, cap), 0);
+    lseek(fd, 0, SEEK_SET);
+
+    CaptureEntry out{};
+    CHECK_EQ(capture_read_entry(fd, out), 0);
+    CHECK_EQ(out.raw_header_len, cap.raw_header_len);
+    for (u32 i = 0; i < out.raw_header_len; i++) CHECK_EQ(out.raw_headers[i], cap.raw_headers[i]);
+    for (u32 i = out.raw_header_len; i < CaptureEntry::kMaxHeaderLen; i++) {
+        CHECK_EQ(out.raw_headers[i], 0u);
+    }
+
+    close(fd);
+    unlink(path);
+    munmap(ring, sizeof(CaptureRing));
 }
 
 // 2. on → accept → off → request: disable after accept, request not captured

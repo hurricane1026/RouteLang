@@ -60,6 +60,19 @@ TEST(syscall_fault, fcntl_pointer_args_are_forwarded) {
     close(fd);
 }
 
+TEST(syscall_fault, open_tmpfile_mode_arg_is_forwarded) {
+#ifndef O_TMPFILE
+    SKIP("O_TMPFILE unavailable");
+#else
+    i32 fd = open("/tmp", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0 && (errno == EOPNOTSUPP || errno == EISDIR || errno == EINVAL || errno == ENOSYS)) {
+        SKIP("O_TMPFILE unsupported in this environment");
+    }
+    REQUIRE(fd >= 0);
+    close(fd);
+#endif
+}
+
 TEST(syscall_fault, timerfd_settime_failure_is_injected) {
     i32 fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     REQUIRE(fd >= 0);

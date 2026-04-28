@@ -309,6 +309,14 @@ FcntlArgKind fcntl_arg_kind(int cmd) {
     }
 }
 
+bool open_flags_require_mode(int flags) {
+    if ((flags & O_CREAT) != 0) return true;
+#ifdef O_TMPFILE
+    if ((flags & O_TMPFILE) == O_TMPFILE) return true;
+#endif
+    return false;
+}
+
 }  // namespace
 
 FaultState& state() {
@@ -700,8 +708,9 @@ extern "C" int accept4(int fd, struct sockaddr* addr, socklen_t* len, int flags)
 extern "C" int open(const char* path, int flags, ...) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
     mode_t mode = 0;
+    bool has_mode = rut::test_fault::open_flags_require_mode(flags);
     va_list ap;
-    if ((flags & O_CREAT) != 0) {
+    if (has_mode) {
         va_start(ap, flags);
         mode = static_cast<mode_t>(va_arg(ap, int));
         va_end(ap);
@@ -715,7 +724,7 @@ extern "C" int open(const char* path, int flags, ...) {
         errno = ENOSYS;
         return -1;
     }
-    if ((flags & O_CREAT) != 0) return rut::test_fault::g_real_open(path, flags, mode);
+    if (has_mode) return rut::test_fault::g_real_open(path, flags, mode);
     return rut::test_fault::g_real_open(path, flags);
 }
 

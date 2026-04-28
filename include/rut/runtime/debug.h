@@ -192,11 +192,11 @@ inline u32 format_conn_debug_snapshot(const ConnDebugSnapshot& s, char* out, u32
     } else {
         w.put_cstr("none");
     }
-    w.put_cstr(" bufs=");
+    w.put_cstr(" recv_buf=");
     w.put_u64(s.recv_len);
-    w.put_char('/');
+    w.put_cstr(" send_buf=");
     w.put_u64(s.send_len);
-    w.put_char('/');
+    w.put_cstr(" upstream_recv_buf=");
     w.put_u64(s.upstream_recv_len);
     w.put_char('}');
     return w.finish();

@@ -21,7 +21,7 @@ The formatted line includes:
 Example:
 
 ```text
-conn{id=7 state=Sending fd=42 upstream_fd=-1 slots=send armed=send|yield pending_ops=2 resp=204 handler=pending:3 bufs=10/20/30}
+conn{id=7 state=Sending fd=42 upstream_fd=-1 slots=send armed=send|yield pending_ops=2 resp=204 handler=pending:3 recv_buf=10 send_buf=20 upstream_recv_buf=30}
 ```
 
 These helpers are intentionally header-only and allocation-free. They are safe

@@ -97,7 +97,7 @@ TEST(debug, format_conn_debug_snapshot_is_stable) {
     CHECK_STREQ(buf,
                 "conn{id=7 state=Sending fd=42 upstream_fd=-1 slots=send "
                 "armed=send|yield pending_ops=2 resp=204 handler=pending:3 "
-                "bufs=10/20/30}");
+                "recv_buf=10 send_buf=20 upstream_recv_buf=30}");
 }
 
 TEST(debug, format_conn_debug_truncates_and_reports_full_length) {

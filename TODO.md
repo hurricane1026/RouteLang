@@ -1,76 +1,118 @@
 # TODO
 
-Outstanding work items, tracked from code TODOs and Copilot review findings.
+Outstanding work items, prioritized for the next implementation passes.
 
-## Phase 1 (current)
+## Recently Completed
 
-### epoll backend
-- [x] **Partial send proactor semantics** — `add_send()` tracks offset/remaining in `SendState` per conn_id. `wait()` completes the send on EPOLLOUT via loop, emits real byte count. send_buf converted to Buffer.
-- [x] **recv into Connection buffer** — `wait()` now recv's into `Connection::recv_buf` (Buffer) via `write_ptr()`/`commit()`. Connection table passed to `wait()`. Callbacks use `recv_buf.data()`/`recv_buf.len()`.
-
-### io_uring backend
-- [x] **Timeout events** — timerfd created in `init()`, `IORING_OP_READ` submitted for 1-second ticks. `wait()` emits `Timeout` events and re-submits the read.
-- [x] **Provided buffer return** — `wait()` copies recv data from provided buffer into `Connection::recv_buf` via `write_ptr()`/`commit()`, then immediately calls `return_buffer(buf_id)`. Events reach dispatch with `has_buf=0`.
-
-## Phase 2 (shard integration)
-- [x] **Shard: per-core runtime** — Shard<Backend> wraps EventLoop (mmap'd), Arena (per-request scratch), listen_fd (SO_REUSEPORT), pthread with CPU affinity. Multi-shard main with signal-based graceful shutdown.
-- [x] **Shard: connection table** — EventLoop owns Connection[16384] with free-stack pool (inherited from Phase 1). SlabPool deferred to when Connection moves off fixed array.
-- [x] **Shard: timer wheel integration** — EventLoop owns TimerWheel, driven by timerfd. Shard lifecycle: shutdown drains via EventLoop::shutdown().
-- [x] **Shard: upstream connection pools** — UpstreamPool per shard (mmap'd, 4096 slots), alloc/free/find_idle/return_idle/shutdown. UpstreamConn tracks fd + upstream_id + idle state.
-- [x] **Shard: route table** — RouteConfig with RouteEntry[] (prefix match) + UpstreamTarget[] (addr:port). Supports Static/Proxy actions, method filter, first-match-wins. Shard holds const RouteConfig* (swappable for hot reload).
-- [x] **SlicePool** — 16KB slice allocator, mmap-backed, O(1) alloc/free via free-stack. Per-shard, for on-demand network I/O buffers (idle connections hold 0 slices).
-- [x] **SlabPool\<T, Cap\>** — generic fixed-size object pool, mmap-backed. alloc/free by pointer or index, index_of, capacity/available/in_use stats. Generalizes EventLoop's Connection free-stack.
-- [x] **Integration**: replace Connection inline storage with SlicePool slices (idle connections → zero buffer memory). Production loops allocate recv/send slices on accept, lazily allocate upstream recv for proxying, and release all slices when the connection returns idle.
-
-## Testing methodology gaps
-
-Recurring patterns found during code review that automated tests consistently miss. Each needs a systematic prevention mechanism.
-
-### 1. Fault injection for OS-level edge cases
-**Pattern**: EINTR non-retry, mmap failure silent degradation, clock boundary arithmetic overflow.
-**Why tests miss it**: Tests run on local loopback without signals, with abundant memory, and requests complete in < 1 second.
-
-**TODO**: Build fault injection shims for test builds:
-- **EINTR simulation**: Wrap `write()`/`read()`/`send()`/`recv()` to probabilistically return EINTR before the real call. Verifies all I/O loops retry correctly.
-- **mmap failure injection**: Force `mmap()` to return MAP_FAILED on demand. Verifies all allocation paths propagate failure.
-- **Boundary clock**: Provide a `clock_gettime()` shim that returns specific `timespec` values (e.g., `{tv_sec=1, tv_nsec=999999000}` → `{tv_sec=2, tv_nsec=1000}`) to exercise arithmetic edge cases.
-- [x] Capture file read/write tests inject one-shot EINTR and verify `capture_read_entry` / `capture_write_entry` retry.
-
-### 2. Untrusted/malicious input testing
-**Pattern**: Status code parsing assumes digits, response parsing assumes well-formed HTTP.
-**Why tests miss it**: Both client and server are our own code — always produce valid output.
-
-**TODO**: For every function that parses external input, add a "malicious input" test suite:
-- Garbage bytes, truncated data, oversized fields, non-ASCII characters.
-- For sim_one: test with a raw TCP server that returns malformed responses (e.g., `"HTTP/1.1 XYZ Bad\r\n"`, empty response, partial response).
-- For capture_read_entry: test with corrupted capture files (wrong magic, truncated entry, zeroed entry).
+- [x] epoll partial-send proactor semantics and recv-buffer integration.
+- [x] io_uring timerfd timeout events and provided-buffer return path.
+- [x] Shard runtime integration: per-core EventLoop, TimerWheel, route table, upstream pool, SlicePool, and SlabPool.
+- [x] Connection buffers moved from inline storage to SlicePool-backed slices; idle/free connections hold zero buffer slices.
+- [x] Traffic replay now covers static/default paths and explicitly skips proxy routes through `replay_one`.
+- [x] Capture persistence now covers raw-header tail zeroing, corrupted/truncated entries, zeroed entries, and EINTR retry for capture read/write.
 - [x] Response parser rejects malformed status codes (`XYZ`, non-digit, `<100`, `>599`).
-- [x] Capture file tests cover invalid header metadata plus truncated and zeroed entries.
 - [x] Simulate engine rejects malformed captured request headers and counts malformed capture entries as failed.
+- [x] Proxy 502 paths assert `ConnState::Sending`; upstream connect failure now sets that state in production.
 
-### 3. Unused data region hygiene
-**Pattern**: CaptureEntry raw_headers tail contains uninitialized stack data after memcpy of valid bytes.
-**Why tests miss it**: Tests only read `raw_headers[0..raw_header_len]`, never inspect the tail. But the full struct gets persisted to disk.
+## P0: State Invariant Coverage
 
-**TODO**: For any struct that is serialized/persisted:
-- Zero-initialize the entire struct, not just the used portion.
-- Or add a post-serialization check in debug builds that validates `memcmp(buf + used_len, zeros, total_len - used_len) == 0`.
-- [x] Add a test that writes an entry to file, reads it back, and verifies bytes beyond `raw_header_len` are zero.
+**Goal**: Catch debug/metrics state drift automatically after dispatch, not one assertion at a time.
 
-### 4. Internal state consistency testing
-**Pattern**: conn.state left as Proxying while sending a 502 static response.
-**Why tests miss it**: `conn.state` is only used for debugging/metrics, never checked in callback logic. Tests verify behavior (correct response), not internal state fields.
+**Why**: Reviews repeatedly found paths where behavior was correct but `conn.state` disagreed with callback slots. Those fields feed debugging and metrics, so regressions are easy to miss.
 
-**TODO**: For debug-only fields that track state machine position:
-- Add `CHECK_EQ(conn.state, ConnState::Sending)` assertions in tests that verify response paths.
-- Or add a debug-mode invariant checker that validates `state` matches the active callback slot configuration after each dispatch.
-- [x] Add `ConnState::Sending` assertions to proxy connect failure and malformed upstream 502 response paths.
+**Work**:
+- Add a test-only invariant helper for `Connection` slot/state consistency.
+- Run it after representative `SmallLoop::dispatch` / `inject_and_dispatch` transitions.
+- Cover at least:
+  - `ReadingHeader` implies `on_recv == on_header_received`.
+  - `Sending` implies `on_send != nullptr` and no upstream callback slots unless explicitly waiting on armed upstream recv.
+  - `Proxying` / streaming states agree with active upstream recv/send slots.
+  - closed or idle slots have all callback slots clear.
 
-### 5. Cross-path replay coverage
-**Pattern**: replay_one only tested with static routes. Proxy routes through replay_one produce send_len==0 and bogus results.
-**Why tests miss it**: Tests were written incrementally — static routes first, proxy routes tested separately via manual setup. Nobody ran a proxy route through the full `replay_one` → `replay_file` path.
+**Acceptance**:
+- Add focused tests that fail if a 502/500 path sends a response while leaving stale proxy/body-streaming state.
+- No behavior change unless an invariant failure exposes a real production-state bug.
 
-**TODO**: For any function that dispatches to multiple code paths (static vs proxy vs default):
-- Maintain an explicit coverage matrix: `[function × path × test]`.
-- Every time a new path is added to a function, require a test that drives it through ALL callers (not just direct unit tests).
-- [x] For replay: add a test that calls `replay_one` with a proxy route config and verifies `replayed == false` (the current correct behavior).
+## P0: Fault Injection Harness
+
+**Goal**: Make OS-level edge cases cheap to add and hard to skip.
+
+**Why**: EINTR, mmap failure, partial I/O, and clock-boundary issues rarely happen on local loopback. Small local shims caught real gaps, but they are currently duplicated per test file.
+
+**Work**:
+- Extract reusable test shims for:
+  - `read` / `write` / `send` / `recv` one-shot and repeated EINTR.
+  - `mmap` / `mprotect` failure injection.
+  - deterministic `clock_gettime` boundary values.
+- Start with runtime modules that already have retry/failure branches:
+  - `traffic_capture`
+  - `access_log`
+  - `epoll_backend`
+  - `io_uring_backend`
+  - `SlicePool` / `Arena`
+
+**Acceptance**:
+- At least one shared helper replaces ad hoc EINTR counters.
+- New tests verify retry or fail-closed behavior without depending on real network permissions.
+
+## P1: Malformed Upstream E2E
+
+**Goal**: Exercise parser-to-callback-to-wire behavior for malformed upstream responses through real sockets.
+
+**Why**: Parser unit tests reject malformed responses, and mock callback tests cover some 502 branches, but end-to-end proxy behavior should prove the production socket path also fails closed.
+
+**Work**:
+- Add integration tests with a raw TCP upstream returning:
+  - `HTTP/1.1 XYZ Bad\r\n\r\n`
+  - empty response / immediate EOF
+  - partial status line
+  - malformed CRLF in headers
+  - conflicting or invalid content framing
+- Verify client-visible result: 502 or close, depending on the current contract.
+- Verify metrics/debug state where available.
+
+**Acceptance**:
+- Tests drive full route config -> proxy connect -> upstream response -> client response path.
+- No dependency on external services; test server is local and deterministic.
+
+## P1: Replay Coverage Matrix
+
+**Goal**: Prevent caller/path coverage holes when routing behavior expands.
+
+**Why**: `replay_one` previously only covered static routes, so proxy route behavior regressed until review. Future route actions and callers need explicit matrix coverage.
+
+**Work**:
+- Document and enforce `[caller x route action x expected result]` cases for:
+  - `replay_one`
+  - `replay_file`
+  - `simulate_one`
+  - `simulate_file`
+- Include Static, Default, Proxy, JIT ReturnStatus, JIT Forward, malformed input, and unsupported action paths where relevant.
+
+**Acceptance**:
+- A table-driven test or comment block makes missing cells obvious.
+- Adding a route action requires adding or intentionally documenting replay/sim coverage.
+
+## P2: Coverage Tooling Hygiene
+
+**Goal**: Make coverage reports actionable instead of broad percentage noise.
+
+**Why**: The project has many generated, third-party, benchmark, and architecture-specific files. Raw coverage can hide runtime gaps or chase irrelevant files.
+
+**Work**:
+- Review `scripts/coverage_report.py` exclusions and CI coverage target.
+- Add per-area coverage summaries for runtime, parser, replay/sim, and compiler/JIT.
+- Track coverage deltas for changed files in PRs if practical.
+
+**Acceptance**:
+- CI coverage output identifies the lowest-covered first-party runtime files.
+- Third-party and benchmark files do not dominate coverage decisions.
+
+## P2: TODO Maintenance
+
+**Goal**: Keep this file as a live backlog, not a history log.
+
+**Rules**:
+- Move completed implementation milestones into `Recently Completed`.
+- Keep active work scoped, prioritized, and testable.
+- When review feedback creates a new recurring pattern, add it here with an acceptance criterion.

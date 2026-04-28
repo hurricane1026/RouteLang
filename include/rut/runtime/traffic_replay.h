@@ -16,7 +16,10 @@ struct ReplayResult {
     u16 expected_status;  // from capture file
     u16 actual_status;    // from replay
     bool status_match;    // expected == actual
-    bool replayed;        // false if injection failed (e.g., no free conn)
+    bool replayed;        // true if a static response was replayed; false
+                          // means either skipped or replay/injection failed
+    bool skipped;         // meaningful when replayed == false: true if
+                          // intentionally unsupported, false if failed
 };
 
 // Summary of a full replay session.
@@ -25,6 +28,7 @@ struct ReplaySummary {
     u32 replayed;    // successfully injected
     u32 matched;     // status matched
     u32 mismatched;  // status didn't match
+    u32 skipped;     // intentionally unsupported entries
     u32 failed;      // injection failures
 };
 
@@ -154,13 +158,28 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
-    // Step 4: Complete send (proxy routes don't populate send_buf — treat as not replayable)
+    // Step 4: Proxy/forward routes are not replayable here. The replay
+    // harness validates static response decisions only; proxy routes
+    // either submit an upstream connect or synthesize a local 502 if
+    // socket creation fails. In both cases upstream_name has been
+    // populated before the route leaves on_header_received.
+    if (conn->upstream_name[0] != '\0' || conn->state == ConnState::Proxying) {
+        const i32 saved_upstream_fd = conn->upstream_fd;
+        if (saved_upstream_fd >= 0) conn->upstream_fd = -1;
+        loop.close_conn(*conn);
+        if (saved_upstream_fd >= 0) ::close(saved_upstream_fd);
+        result.skipped = true;
+        return result;
+    }
+
+    // Step 5: Complete send (non-static routes that didn't generate a response are not replayable)
     u32 send_len = conn->send_buf.len();
     if (send_len == 0) {
-        // Proxy route initiated upstream connect instead of generating a response.
-        // Close and report as not replayed (replay only validates static routes).
-        IoEvent eof_ev = {conn->id, 0, 0, 0, IoEventType::Recv, 0};
-        loop.inject_and_dispatch(eof_ev);
+        const i32 saved_upstream_fd = conn->upstream_fd;
+        if (saved_upstream_fd >= 0) conn->upstream_fd = -1;
+        loop.close_conn(*conn);
+        if (saved_upstream_fd >= 0) ::close(saved_upstream_fd);
+        result.skipped = true;
         return result;
     }
     IoEvent send_ev = {conn->id, static_cast<i32>(send_len), 0, 0, IoEventType::Send, 0};
@@ -170,7 +189,7 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     result.status_match = (result.expected_status == result.actual_status);
     result.replayed = true;
 
-    // Step 5: Close connection (inject EOF to free the slot)
+    // Step 6: Close connection (inject EOF to free the slot)
     IoEvent eof_ev = {conn->id, 0, 0, 0, IoEventType::Recv, 0};
     loop.inject_and_dispatch(eof_ev);
 
@@ -195,7 +214,10 @@ ReplaySummary replay_file(Loop& loop, ReplayReader& reader) {
             else
                 summary.mismatched++;
         } else {
-            summary.failed++;
+            if (result.skipped)
+                summary.skipped++;
+            else
+                summary.failed++;
         }
     }
     return summary;

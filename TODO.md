@@ -68,4 +68,4 @@ Recurring patterns found during code review that automated tests consistently mi
 **TODO**: For any function that dispatches to multiple code paths (static vs proxy vs default):
 - Maintain an explicit coverage matrix: `[function × path × test]`.
 - Every time a new path is added to a function, require a test that drives it through ALL callers (not just direct unit tests).
-- For replay: add a test that calls `replay_one` with a proxy route config and verifies `replayed == false` (the current correct behavior).
+- [x] For replay: add a test that calls `replay_one` with a proxy route config and verifies `replayed == false` (the current correct behavior).

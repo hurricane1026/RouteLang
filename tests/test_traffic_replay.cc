@@ -634,16 +634,15 @@ TEST(replay_gap, format_static_response_wire_format) {
     }
 }
 
-// G4. Proxy route socket fail → 502 (via replay, not manual proxy setup)
-// Note: In SmallLoop, UpstreamPool::create_socket() calls real socket()
-// which typically succeeds. We can't easily force it to fail without
-// mocking. Instead, test the proxy route path works end-to-end by
-// verifying the connection enters Proxying state.
-TEST(replay_gap, proxy_route_enters_proxy_state) {
+// G4. Proxy route path is selected (manual setup). In SmallLoop,
+// UpstreamPool::create_socket() calls real socket(), which can fail in
+// sandboxed test environments. Either outcome is valid for this test:
+// success submits an upstream connect; failure generates a local 502.
+TEST(replay_gap, proxy_route_enters_proxy_path) {
     RouteConfig cfg;
     auto up_result = cfg.add_upstream("backend", 0x7F000001, 9999);
     REQUIRE(up_result.has_value());
-    cfg.add_proxy("/api", 0, static_cast<u16>(up_result.value()));
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(up_result.value())));
 
     RoutedLoop rl;
     rl.setup(&cfg);
@@ -663,18 +662,71 @@ TEST(replay_gap, proxy_route_enters_proxy_state) {
     u32 n = rl.loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) rl.loop.dispatch(events[i]);
 
-    // Should be in proxy state with upstream_fd set
-    CHECK_EQ(conn->state, ConnState::Proxying);
-    CHECK(conn->upstream_fd >= 0);
-
-    // upstream_name should be copied
+    // upstream_name is copied before either connect submission or
+    // socket-failure fallback, so it proves the proxy route matched.
     CHECK_EQ(conn->upstream_name[0], 'b');  // "backend"
 
-    // Clean up the real socket
-    close(conn->upstream_fd);
-    conn->upstream_fd = -1;
-    // Close connection
-    rl.loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 0));
+    if (conn->state == ConnState::Proxying) {
+        auto* connect_op = rl.loop.backend.last_op(MockOp::Connect);
+        REQUIRE(connect_op != nullptr);
+        CHECK_EQ(connect_op->conn_id, conn->id);
+    } else {
+        CHECK_EQ(conn->state, ConnState::Sending);
+        CHECK_EQ(conn->resp_status, 502u);
+        CHECK_GT(conn->send_buf.len(), 0u);
+    }
+
+    if (conn->upstream_fd >= 0) {
+        close(conn->upstream_fd);
+        conn->upstream_fd = -1;
+    }
+    rl.loop.close_conn(*conn);
+}
+
+TEST(replay_gap, replay_one_proxy_route_not_replayed) {
+    RouteConfig cfg;
+    auto up_result = cfg.add_upstream("backend", 0x7F000001, 9999);
+    REQUIRE(up_result.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(up_result.value())));
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    CaptureEntry entry = make_captured_request("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    ReplayResult result = replay_one(rl.loop, entry, 42);
+    CHECK(!result.replayed);
+    CHECK(result.skipped);
+    CHECK_EQ(result.expected_status, 200);
+    CHECK_EQ(result.actual_status, 0);
+    CHECK(!result.status_match);
+}
+
+TEST(replay_gap, replay_file_proxy_route_counted_as_skipped) {
+    RouteConfig cfg;
+    auto up_result = cfg.add_upstream("backend", 0x7F000001, 9999);
+    REQUIRE(up_result.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(up_result.value())));
+    REQUIRE(cfg.add_static("/health", 0, 200));
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    CaptureEntry entries[2];
+    entries[0] = make_captured_request("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 2));
+
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+    ReplaySummary summary = replay_file(rl.loop, reader);
+    CHECK_EQ(summary.total, 2u);
+    CHECK_EQ(summary.replayed, 1u);
+    CHECK_EQ(summary.matched, 1u);
+    CHECK_EQ(summary.skipped, 1u);
+    CHECK_EQ(summary.failed, 0u);
+    reader.close();
+    tmp.cleanup();
 }
 
 // G5. Query string in path: /health?foo=bar should match /health prefix

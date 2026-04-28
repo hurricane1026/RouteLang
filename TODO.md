@@ -16,24 +16,22 @@ Outstanding work items, prioritized for the next implementation passes.
 - [x] State invariant tests cover representative static, proxy, body-streaming, JIT-yield, idle, and 502 dispatch transitions.
 - [x] Testing notes document the callback-slot/state invariants and the streaming-body exception.
 
-## P0: State Invariant Coverage
+## P0: State Invariant Coverage Follow-ups
 
-**Goal**: Catch debug/metrics state drift automatically after dispatch, not one assertion at a time.
+**Goal**: Extend the newly added invariant checks to less-common transitions and keep the coverage aligned with future runtime changes.
 
-**Why**: Reviews repeatedly found paths where behavior was correct but `conn.state` disagreed with callback slots. Those fields feed debugging and metrics, so regressions are easy to miss.
+**Why**: Baseline slot/state invariant coverage is now in place for representative static, proxy, body-streaming, JIT-yield, idle, and 502 dispatch transitions. The remaining work is to widen that coverage so new paths do not drift from the same debug/metrics expectations.
 
 **Work**:
-- Add a test-only invariant helper for `Connection` slot/state consistency.
-- Run it after representative `SmallLoop::dispatch` / `inject_and_dispatch` transitions.
-- Cover at least:
-  - `ReadingHeader` implies `on_recv == on_header_received`.
-  - `Sending` implies `on_send != nullptr` and no upstream callback slots unless explicitly waiting on armed upstream recv.
-  - `Proxying` / streaming states agree with active upstream recv/send slots.
-  - closed or idle slots have all callback slots clear.
+- Add follow-up tests for less-common or newly introduced transitions not yet covered by the representative dispatch cases.
+- Reuse the existing invariant helper/check pattern when adding new dispatch paths or callback-slot combinations.
+- Audit future state-machine changes for:
+  - new `conn.state` values or transitions that need invariant assertions,
+  - upstream error/timeout paths that may bypass the representative 502/500 cases,
+  - teardown/reset flows where callback slots should be cleared before returning to idle/free states.
 
 **Acceptance**:
-- Add focused tests that fail if a 502/500 path sends a response while leaving stale proxy/body-streaming state.
-- No behavior change unless an invariant failure exposes a real production-state bug.
+- The backlog item is complete when remaining uncovered transitions have explicit invariant assertions or are documented as intentionally exempt.
 
 ## P0: Fault Injection Harness
 

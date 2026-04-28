@@ -8983,6 +8983,7 @@ TEST(state_invariant, jit_timer_yield_keeps_exec_handler_slots_clear) {
     outcome.timer_ms = 25;
     handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_then_status, true);
     check_exec_handler_yield_invariant(_tc, c, &state_invariant_wait_then_status, 7);
+    CHECK_EQ(loop.last_yield_ms, outcome.timer_ms);
 
     loop.dispatch(make_ev(c->id, IoEventType::Timeout, 0));
     loop.dispatch(make_ev(c->id, IoEventType::Timeout, 0));

@@ -1,129 +1,18 @@
 // Access log tests: SPSC ring buffer, text output, zstd compression, flusher.
+#include "fault_injection.h"
 #include "rut/runtime/access_log.h"
 #include "test.h"
 #include "test_helpers.h"
 #include <atomic>
 
-#include <dlfcn.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
-#include <pthread.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 using namespace rut;
-
-namespace {
-
-using PollFn = int (*)(struct pollfd*, nfds_t, int);
-using WriteFn = ssize_t (*)(int, const void*, size_t);
-
-pthread_once_t g_access_log_io_once = PTHREAD_ONCE_INIT;
-PollFn g_real_poll = nullptr;
-WriteFn g_real_write = nullptr;
-
-std::atomic<int> g_fault_fd{-1};
-std::atomic<int> g_poll_timeout_count{0};
-std::atomic<int> g_poll_eintr_count{0};
-std::atomic<int> g_poll_fatal_count{0};
-std::atomic<int> g_write_eagain_count{0};
-std::atomic<int> g_write_eintr_count{0};
-std::atomic<int> g_write_fatal_count{0};
-
-void resolve_access_log_io_symbols() {
-    g_real_poll = reinterpret_cast<PollFn>(dlsym(RTLD_NEXT, "poll"));
-    g_real_write = reinterpret_cast<WriteFn>(dlsym(RTLD_NEXT, "write"));
-}
-
-bool consume_fault(std::atomic<int>& counter) {
-    int remaining = counter.load(std::memory_order_relaxed);
-    while (remaining > 0) {
-        if (counter.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-struct ScopedAccessLogIoFault {
-    ScopedAccessLogIoFault(int fd,
-                           int poll_timeouts,
-                           int poll_eintrs,
-                           int poll_fatals,
-                           int write_eagains,
-                           int write_eintrs,
-                           int write_fatals) {
-        g_fault_fd.store(fd, std::memory_order_relaxed);
-        g_poll_timeout_count.store(poll_timeouts, std::memory_order_relaxed);
-        g_poll_eintr_count.store(poll_eintrs, std::memory_order_relaxed);
-        g_poll_fatal_count.store(poll_fatals, std::memory_order_relaxed);
-        g_write_eagain_count.store(write_eagains, std::memory_order_relaxed);
-        g_write_eintr_count.store(write_eintrs, std::memory_order_relaxed);
-        g_write_fatal_count.store(write_fatals, std::memory_order_relaxed);
-    }
-
-    ~ScopedAccessLogIoFault() {
-        g_fault_fd.store(-1, std::memory_order_relaxed);
-        g_poll_timeout_count.store(0, std::memory_order_relaxed);
-        g_poll_eintr_count.store(0, std::memory_order_relaxed);
-        g_poll_fatal_count.store(0, std::memory_order_relaxed);
-        g_write_eagain_count.store(0, std::memory_order_relaxed);
-        g_write_eintr_count.store(0, std::memory_order_relaxed);
-        g_write_fatal_count.store(0, std::memory_order_relaxed);
-    }
-};
-
-}  // namespace
-
-extern "C" int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
-    pthread_once(&g_access_log_io_once, resolve_access_log_io_symbols);
-    if (g_real_poll == nullptr) {
-        errno = ENOSYS;
-        return -1;
-    }
-
-    if (fds != nullptr && nfds == 1 && (fds[0].events & POLLOUT) != 0 &&
-        fds[0].fd == g_fault_fd.load(std::memory_order_relaxed)) {
-        if (consume_fault(g_poll_timeout_count)) return 0;
-        if (consume_fault(g_poll_eintr_count)) {
-            errno = EINTR;
-            return -1;
-        }
-        if (consume_fault(g_poll_fatal_count)) {
-            errno = EINVAL;
-            return -1;
-        }
-    }
-
-    return g_real_poll(fds, nfds, timeout);
-}
-
-extern "C" ssize_t write(int fd, const void* buf, size_t count) {
-    pthread_once(&g_access_log_io_once, resolve_access_log_io_symbols);
-    if (g_real_write == nullptr) {
-        errno = ENOSYS;
-        return -1;
-    }
-
-    if (fd == g_fault_fd.load(std::memory_order_relaxed)) {
-        if (consume_fault(g_write_eagain_count)) {
-            errno = EAGAIN;
-            return -1;
-        }
-        if (consume_fault(g_write_eintr_count)) {
-            errno = EINTR;
-            return -1;
-        }
-        if (consume_fault(g_write_fatal_count)) {
-            errno = EPIPE;
-            return -1;
-        }
-    }
-
-    return g_real_write(fd, buf, count);
-}
+using rut::test_fault::IoFaultConfig;
+using rut::test_fault::ScopedIoFault;
 
 // --- Helper: create a sample entry ---
 
@@ -347,7 +236,7 @@ TEST(format, includes_upstream_fields) {
 TEST(flusher, flush_empty_rings) {
     AccessLogRing ring;
     ring.init();
-    i32 fd = open("/dev/null", 1);
+    i32 fd = open("/dev/null", O_WRONLY);
     REQUIRE(fd >= 0);
     AccessLogFlusher flusher;
     flusher.init(fd);
@@ -423,7 +312,7 @@ TEST(flusher, flush_multiple_rings) {
     ring1.push(make_entry(200, 0, 0, "/r1"));
     ring2.push(make_entry(500, 0, 1, "/r2"));
 
-    i32 fd = open("/dev/null", 1);
+    i32 fd = open("/dev/null", O_WRONLY);
     REQUIRE(fd >= 0);
     AccessLogFlusher flusher;
     flusher.init(fd);
@@ -446,7 +335,13 @@ TEST(flusher, flush_retries_transient_poll_and_write_failures) {
     flusher.add_ring(&ring);
     flusher.running.store(true, std::memory_order_relaxed);
 
-    ScopedAccessLogIoFault fault(fds[1], 1, 1, 0, 1, 1, 0);
+    IoFaultConfig fault_config;
+    fault_config.fd = fds[1];
+    fault_config.poll_timeouts = 1;
+    fault_config.poll_eintrs = 1;
+    fault_config.write_eagains = 1;
+    fault_config.write_eintrs = 1;
+    ScopedIoFault fault(fault_config);
     CHECK_EQ(flusher.flush_once(), 1u);
 
     flusher.running.store(false, std::memory_order_relaxed);
@@ -473,7 +368,10 @@ TEST(flusher, flush_survives_single_timeout_while_stopped) {
     flusher.init(fds[1]);
     flusher.add_ring(&ring);
 
-    ScopedAccessLogIoFault fault(fds[1], 1, 0, 0, 0, 0, 0);
+    IoFaultConfig fault_config;
+    fault_config.fd = fds[1];
+    fault_config.poll_timeouts = 1;
+    ScopedIoFault fault(fault_config);
     CHECK_EQ(flusher.flush_once(), 1u);
 
     close(fds[1]);
@@ -498,7 +396,10 @@ TEST(flusher, flush_stops_on_non_eintr_poll_error) {
     flusher.add_ring(&ring);
     flusher.running.store(true, std::memory_order_relaxed);
 
-    ScopedAccessLogIoFault fault(fds[1], 0, 0, 1, 0, 0, 0);
+    IoFaultConfig fault_config;
+    fault_config.fd = fds[1];
+    fault_config.poll_fatals = 1;
+    ScopedIoFault fault(fault_config);
     CHECK_EQ(flusher.flush_once(), 1u);
 
     flusher.running.store(false, std::memory_order_relaxed);
@@ -521,7 +422,10 @@ TEST(flusher, flush_stops_on_nonretryable_write_error) {
     flusher.add_ring(&ring);
     flusher.running.store(true, std::memory_order_relaxed);
 
-    ScopedAccessLogIoFault fault(fds[1], 0, 0, 0, 0, 0, 1);
+    IoFaultConfig fault_config;
+    fault_config.fd = fds[1];
+    fault_config.write_fatals = 1;
+    ScopedIoFault fault(fault_config);
     CHECK_EQ(flusher.flush_once(), 1u);
 
     flusher.running.store(false, std::memory_order_relaxed);
@@ -737,7 +641,7 @@ TEST(callback_log, no_log_when_ring_null) {
 TEST(flusher, start_returns_ok_on_success) {
     AccessLogRing ring;
     ring.init();
-    i32 fd = open("/dev/null", 1);
+    i32 fd = open("/dev/null", O_WRONLY);
     REQUIRE(fd >= 0);
     AccessLogFlusher flusher;
     flusher.init(fd);
@@ -757,7 +661,7 @@ TEST(flusher, start_on_bad_fd_still_starts) {
 }
 
 TEST(flusher, start_idempotent) {
-    i32 fd = open("/dev/null", 1);
+    i32 fd = open("/dev/null", O_WRONLY);
     REQUIRE(fd >= 0);
     AccessLogFlusher flusher;
     flusher.init(fd);
@@ -767,41 +671,49 @@ TEST(flusher, start_idempotent) {
     close(fd);
 }
 
-// === Flusher: write_with_poll via closed pipe ===
+// === Flusher: write_with_poll fault tolerance ===
 
-TEST(flusher, flush_to_closed_pipe) {
+TEST(flusher, flush_handles_injected_write_failure) {
     AccessLogRing ring;
     ring.init();
     ring.push(make_entry(200, 100, 0, "/test"));
 
-    i32 fds[2];
-    REQUIRE(pipe(fds) == 0);
-    // Close read end immediately — writes will fail with EPIPE/POLLHUP.
-    close(fds[0]);
+    i32 fd = open("/dev/null", O_WRONLY);
+    REQUIRE(fd >= 0);
 
     AccessLogFlusher flusher;
-    flusher.init(fds[1]);
+    flusher.init(fd);
     flusher.add_ring(&ring);
-    // flush_once should handle the write failure gracefully.
+
+    IoFaultConfig fault_config;
+    fault_config.fd = fd;
+    fault_config.write_fatals = 1;
+    ScopedIoFault fault(fault_config);
+
     flusher.flush_once();
-    close(fds[1]);
+    close(fd);
     CHECK(true);  // no crash
 }
 
-TEST(flusher, compressed_flush_to_closed_pipe) {
+TEST(flusher, compressed_flush_handles_injected_write_failure) {
     AccessLogRing ring;
     ring.init();
     ring.push(make_entry(200, 100, 0, "/compressed"));
 
-    i32 fds[2];
-    REQUIRE(pipe(fds) == 0);
-    close(fds[0]);
+    i32 fd = open("/dev/null", O_WRONLY);
+    REQUIRE(fd >= 0);
 
     AccessLogFlusher flusher;
-    flusher.init(fds[1], true);
+    flusher.init(fd, true);
     flusher.add_ring(&ring);
+
+    IoFaultConfig fault_config;
+    fault_config.fd = fd;
+    fault_config.write_fatals = 1;
+    ScopedIoFault fault(fault_config);
+
     CHECK_EQ(flusher.flush_once(), 1u);
-    close(fds[1]);
+    close(fd);
 }
 
 // === Zstd: stop() produces valid frame under backpressure ===

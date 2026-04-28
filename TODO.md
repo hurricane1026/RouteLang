@@ -16,6 +16,7 @@ Outstanding work items, prioritized for the next implementation passes.
 - [x] State invariant tests cover representative static, proxy, body-streaming, JIT-yield, idle, and 502 dispatch transitions.
 - [x] Testing notes document the callback-slot/state invariants and the streaming-body exception.
 - [x] Runtime debug helpers can snapshot and format connection state, callback slots, armed operations, and buffer lengths.
+- [x] Test framework fault injection provides shared mmap/mprotect/socket/recv/poll/read/write/send/connect/epoll/timerfd/accept/open scopes for network/runtime tests.
 
 ## P0: State Invariant Coverage Follow-ups
 

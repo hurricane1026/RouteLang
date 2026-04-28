@@ -6,7 +6,10 @@ target_include_directories(test_framework PRIVATE
 add_test(NAME test_framework COMMAND test_framework)
 set_tests_properties(test_framework PROPERTIES WILL_FAIL TRUE)
 
-add_executable(test_network test_network.cc)
+add_executable(test_network
+    test_network.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
 target_link_libraries(test_network rut_runtime)
 target_include_directories(test_network PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -166,7 +169,10 @@ target_include_directories(test_drain PRIVATE
 add_test(NAME test_drain COMMAND test_drain)
 set_tests_properties(test_drain PROPERTIES LABELS "unit")
 
-add_executable(test_access_log test_access_log.cc)
+add_executable(test_access_log
+    test_access_log.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
 target_link_libraries(test_access_log rut_runtime)
 target_include_directories(test_access_log PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -196,6 +202,19 @@ target_include_directories(test_debug PRIVATE
 add_test(NAME test_debug COMMAND test_debug)
 set_tests_properties(test_debug PROPERTIES LABELS "unit")
 
+add_executable(test_fault_injection
+    test_fault_injection.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
+target_link_libraries(test_fault_injection rut_runtime)
+target_include_directories(test_fault_injection PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME test_fault_injection COMMAND test_fault_injection)
+set_tests_properties(test_fault_injection PROPERTIES LABELS "unit")
+
 add_executable(test_shard_control test_shard_control.cc)
 target_link_libraries(test_shard_control rut_runtime Threads::Threads)
 target_include_directories(test_shard_control PRIVATE
@@ -217,7 +236,10 @@ target_compile_definitions(test_jit PRIVATE ${LLVM_DEFINITIONS})
 add_test(NAME test_jit COMMAND test_jit)
 set_tests_properties(test_jit PROPERTIES LABELS "unit;jit")
 
-add_executable(test_traffic_capture test_traffic_capture.cc)
+add_executable(test_traffic_capture
+    test_traffic_capture.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
 target_link_libraries(test_traffic_capture rut_runtime Threads::Threads)
 target_include_directories(test_traffic_capture PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -227,7 +249,10 @@ target_include_directories(test_traffic_capture PRIVATE
 add_test(NAME test_traffic_capture COMMAND test_traffic_capture)
 set_tests_properties(test_traffic_capture PROPERTIES LABELS "unit")
 
-add_executable(test_traffic_replay test_traffic_replay.cc)
+add_executable(test_traffic_replay
+    test_traffic_replay.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
 target_link_libraries(test_traffic_replay rut_runtime)
 target_include_directories(test_traffic_replay PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -276,6 +301,7 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_access_log>
     COMMAND $<TARGET_FILE:test_metrics>
     COMMAND $<TARGET_FILE:test_debug>
+    COMMAND $<TARGET_FILE:test_fault_injection>
     COMMAND $<TARGET_FILE:test_chunked_parser>
     COMMAND $<TARGET_FILE:test_shard_control>
     COMMAND $<TARGET_FILE:test_jit>
@@ -286,6 +312,6 @@ add_custom_target(check
     COMMAND $<TARGET_FILE:test_route_trie>
     COMMAND $<TARGET_FILE:test_route_art>
     COMMAND $<TARGET_FILE:test_route_select>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_art test_route_select
+    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_art test_route_select
     COMMENT "Running all tests..."
 )

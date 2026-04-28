@@ -1,13 +1,21 @@
 // Tests for traffic replay: ReplayReader, replay_one, replay_file.
+#include "fault_injection.h"
 #include "rut/runtime/traffic_replay.h"
 #include "test.h"
 #include "test_helpers.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
 
 using namespace rut;
+using rut::test_fault::IoFaultConfig;
+using rut::test_fault::kMatchAllIoFds;
+using rut::test_fault::ScopedFakeSocket;
+using rut::test_fault::ScopedIoFault;
+using rut::test_fault::ScopedSyscallFault;
+using rut::test_fault::SyscallFaultConfig;
 
 // --- Helper: create a capture file with N entries ---
 
@@ -96,6 +104,40 @@ TEST(replay_reader, open_valid_file) {
 TEST(replay_reader, open_nonexistent_fails) {
     ReplayReader reader;
     CHECK_EQ(reader.open("/tmp/rut_does_not_exist_12345"), -1);
+}
+
+TEST(replay_reader, open_injected_failure) {
+    CaptureEntry entry = make_captured_request("GET /open HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(&entry, 1));
+
+    SyscallFaultConfig fault_config;
+    fault_config.open_errno = EACCES;
+    fault_config.open_failures = 1;
+    ScopedSyscallFault fault(fault_config);
+
+    ReplayReader reader;
+    CHECK_EQ(reader.open(tmp.path), -1);
+    CHECK_EQ(errno, EACCES);
+    tmp.cleanup();
+}
+
+TEST(replay_reader, open_handles_short_header_read) {
+    CaptureEntry entry = make_captured_request("GET /short HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(&entry, 1));
+
+    IoFaultConfig fault_config;
+    fault_config.fd = kMatchAllIoFds;
+    fault_config.read_short_len = 7;
+    fault_config.read_shorts = 1;
+    ScopedIoFault fault(fault_config);
+
+    ReplayReader reader;
+    CHECK_EQ(reader.open(tmp.path), 0);
+    CHECK_EQ(reader.entry_count(), 1u);
+    reader.close();
+    tmp.cleanup();
 }
 
 TEST(replay_reader, open_invalid_magic_fails) {
@@ -634,10 +676,7 @@ TEST(replay_gap, format_static_response_wire_format) {
     }
 }
 
-// G4. Proxy route path is selected (manual setup). In SmallLoop,
-// UpstreamPool::create_socket() calls real socket(), which can fail in
-// sandboxed test environments. Either outcome is valid for this test:
-// success submits an upstream connect; failure generates a local 502.
+// G4. Proxy route path is selected (manual setup).
 TEST(replay_gap, proxy_route_enters_proxy_path) {
     RouteConfig cfg;
     auto up_result = cfg.add_upstream("backend", 0x7F000001, 9999);
@@ -653,6 +692,10 @@ TEST(replay_gap, proxy_route_enters_proxy_path) {
     auto* conn = rl.loop.find_fd(42);
     REQUIRE(conn != nullptr);
 
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+
     conn->recv_buf.reset();
     const char req[] = "GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
@@ -662,24 +705,17 @@ TEST(replay_gap, proxy_route_enters_proxy_path) {
     u32 n = rl.loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) rl.loop.dispatch(events[i]);
 
-    // upstream_name is copied before either connect submission or
-    // socket-failure fallback, so it proves the proxy route matched.
     CHECK_EQ(conn->upstream_name[0], 'b');  // "backend"
-
-    if (conn->state == ConnState::Proxying) {
-        auto* connect_op = rl.loop.backend.last_op(MockOp::Connect);
-        REQUIRE(connect_op != nullptr);
-        CHECK_EQ(connect_op->conn_id, conn->id);
-    } else {
-        CHECK_EQ(conn->state, ConnState::Sending);
-        CHECK_EQ(conn->resp_status, 502u);
-        CHECK_GT(conn->send_buf.len(), 0u);
-    }
+    CHECK_EQ(conn->state, ConnState::Proxying);
+    auto* connect_op = rl.loop.backend.last_op(MockOp::Connect);
+    REQUIRE(connect_op != nullptr);
+    CHECK_EQ(connect_op->conn_id, conn->id);
 
     if (conn->upstream_fd >= 0) {
         close(conn->upstream_fd);
         conn->upstream_fd = -1;
     }
+    close(fds[1]);
     rl.loop.close_conn(*conn);
 }
 

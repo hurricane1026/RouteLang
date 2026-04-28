@@ -343,6 +343,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_http_parser.profraw ./build/tests/test_http_parser
           LLVM_PROFILE_FILE=build/test_drain.profraw ./build/tests/test_drain
           LLVM_PROFILE_FILE=build/test_access_log.profraw ./build/tests/test_access_log
+          LLVM_PROFILE_FILE=build/test_fault_injection.profraw ./build/tests/test_fault_injection
           LLVM_PROFILE_FILE=build/test_metrics.profraw ./build/tests/test_metrics
           LLVM_PROFILE_FILE=build/test_chunked_parser.profraw ./build/tests/test_chunked_parser
           LLVM_PROFILE_FILE=build/test_rir.profraw ./build/tests/test_rir
@@ -389,6 +390,7 @@ jobs:
             build/tests/test_expected \
             build/tests/test_drain \
             build/tests/test_access_log \
+            build/tests/test_fault_injection \
             build/tests/test_metrics \
             build/tests/test_chunked_parser \
             build/tests/test_rir \

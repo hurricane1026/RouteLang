@@ -8,7 +8,9 @@
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -58,6 +60,24 @@ TEST(syscall_fault, fcntl_pointer_args_are_forwarded) {
     CHECK_NE(lock.l_type, static_cast<short>(0));
 
     close(fd);
+}
+
+TEST(syscall_fault, fcntl_add_seals_arg_is_forwarded) {
+#if !defined(F_ADD_SEALS) || !defined(F_SEAL_SHRINK) || !defined(SYS_memfd_create) || \
+    !defined(MFD_ALLOW_SEALING)
+    SKIP("memfd sealing unavailable");
+#else
+    i32 fd = static_cast<i32>(
+        syscall(SYS_memfd_create, "rut_fault_seals", MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    if (fd < 0 && (errno == ENOSYS || errno == EINVAL || errno == EPERM)) {
+        SKIP("memfd sealing unsupported in this environment");
+    }
+    REQUIRE(fd >= 0);
+
+    CHECK_EQ(fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK), 0);
+
+    close(fd);
+#endif
 }
 
 TEST(syscall_fault, open_tmpfile_mode_arg_is_forwarded) {

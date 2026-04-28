@@ -272,6 +272,9 @@ FcntlArgKind fcntl_arg_kind(int cmd) {
         case F_SETLEASE:
         case F_NOTIFY:
         case F_SETPIPE_SZ:
+#ifdef F_ADD_SEALS
+        case F_ADD_SEALS:
+#endif
             return FcntlArgKind::Int;
         case F_GETLK:
         case F_SETLK:

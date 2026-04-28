@@ -15,6 +15,7 @@ Outstanding work items, prioritized for the next implementation passes.
 - [x] Proxy 502 paths assert `ConnState::Sending`; upstream connect failure now sets that state in production.
 - [x] State invariant tests cover representative static, proxy, body-streaming, JIT-yield, idle, and 502 dispatch transitions.
 - [x] Testing notes document the callback-slot/state invariants and the streaming-body exception.
+- [x] Runtime debug helpers can snapshot and format connection state, callback slots, armed operations, and buffer lengths.
 
 ## P0: State Invariant Coverage Follow-ups
 

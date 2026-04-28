@@ -537,6 +537,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             "Bad Gateway";
         conn.send_buf.reset();
         conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+        conn.state = ConnState::Sending;
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
         conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);

@@ -2803,6 +2803,141 @@ TEST(route, jit_handler_custom_body_real_socket) {
     destroy_real_loop(loop);
 }
 
+struct ScriptedUpstreamServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    const char* response = nullptr;
+    u32 response_len = 0;
+    bool running = false;
+    bool started = false;
+    pthread_t thread{};
+
+    ~ScriptedUpstreamServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* server = static_cast<ScriptedUpstreamServer*>(arg);
+        i32 client = -1;
+        for (u32 i = 0; i < 2000 && server->running; i++) {
+            client = accept(server->listen_fd, nullptr, nullptr);
+            if (client >= 0) break;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+            usleep(1000);
+        }
+        if (client >= 0) {
+            char req[1024];
+            (void)recv_timeout(client, req, sizeof(req), 1000);
+            if (server->response != nullptr && server->response_len > 0) {
+                (void)send_all(client, server->response, server->response_len);
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup(const char* bytes, u32 len) {
+        auto lfd_result = create_listen_socket(0);
+        if (!lfd_result.has_value()) return false;
+        listen_fd = lfd_result.value();
+        port = get_port(listen_fd);
+        response = bytes;
+        response_len = len;
+        running = true;
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running = false;
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running = false;
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+    }
+};
+
+struct MalformedUpstreamCase {
+    const char* name;
+    const char* response;
+    u32 response_len;
+    bool expect_502;
+};
+
+static void run_malformed_upstream_case(rut::test::TestCase* test_case,
+                                        const MalformedUpstreamCase& tc_cfg) {
+    auto* _tc = test_case;
+
+    ScriptedUpstreamServer upstream;
+    REQUIRE(upstream.setup(tc_cfg.response, tc_cfg.response_len));
+
+    RouteConfig cfg{};
+    auto upstream_id = cfg.add_upstream("malformed", 0x7F000001, upstream.port);
+    REQUIRE(upstream_id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, upstream_id.value()));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 500};
+    lt.start();
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+
+    char buf[2048];
+    i32 n = recv_timeout(client, buf, sizeof(buf), 2000);
+    if (tc_cfg.expect_502) {
+        CHECK_GT(n, 0);
+        CHECK(buf_contains(buf, static_cast<u32>(n > 0 ? n : 0), "502", 3));
+        CHECK(buf_contains(buf, static_cast<u32>(n > 0 ? n : 0), "Connection: close", 17));
+    } else {
+        CHECK_LE(n, 0);
+    }
+
+    close(client);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    upstream.teardown();
+}
+
+TEST(proxy_e2e, malformed_upstream_responses_fail_closed) {
+    static const char kBadStatus[] = "HTTP/1.1 XYZ Bad\r\nContent-Length: 0\r\n\r\n";
+    static const char kPartialStatus[] = "HTTP/1.1 20";
+    static const char kBadHeaderCrlf[] = "HTTP/1.1 200 OK\r\nX-Test: bad\rX-Next: y\r\n\r\n";
+    static const char kBadContentLength[] = "HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n";
+
+    static const MalformedUpstreamCase kCases[] = {
+        {"bad status code", kBadStatus, sizeof(kBadStatus) - 1, true},
+        {"partial status then eof", kPartialStatus, sizeof(kPartialStatus) - 1, true},
+        {"malformed header crlf", kBadHeaderCrlf, sizeof(kBadHeaderCrlf) - 1, true},
+        {"invalid content length", kBadContentLength, sizeof(kBadContentLength) - 1, true},
+        {"empty eof", nullptr, 0, false},
+    };
+
+    for (const auto& tc_cfg : kCases) {
+        run_malformed_upstream_case(_tc, tc_cfg);
+    }
+}
+
 // Handler returns ReturnStatus with an out-of-range body_idx (e.g. no
 // body was registered). Runtime must fall back to the default status-
 // reason body rather than rendering garbage or hanging.

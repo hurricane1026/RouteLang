@@ -256,6 +256,9 @@ TEST(capture_file, write_read_roundtrip) {
         CHECK_EQ(out.resp_status, static_cast<u16>(200 + i));
         CHECK_EQ(out.raw_header_len, 5);
         CHECK_EQ(out.raw_headers[0], static_cast<u8>('G'));
+        for (u32 j = out.raw_header_len; j < CaptureEntry::kMaxHeaderLen; j++) {
+            CHECK_EQ(out.raw_headers[j], 0u);
+        }
     }
 
     close(fd);

@@ -51,7 +51,7 @@ Recurring patterns found during code review that automated tests consistently mi
 **TODO**: For any struct that is serialized/persisted:
 - Zero-initialize the entire struct, not just the used portion.
 - Or add a post-serialization check in debug builds that validates `memcmp(buf + used_len, zeros, total_len - used_len) == 0`.
-- Add a test that writes an entry to file, reads it back, and verifies bytes beyond `raw_header_len` are zero.
+- [x] Add a test that writes an entry to file, reads it back, and verifies bytes beyond `raw_header_len` are zero.
 
 ### 4. Internal state consistency testing
 **Pattern**: conn.state left as Proxying while sending a 502 static response.

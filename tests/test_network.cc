@@ -8746,6 +8746,252 @@ TEST(dispatch_isolation, upstream_send_reaches_upstream_send_slot) {
         CHECK_EQ((c)->on_upstream_send, (us)); \
     } while (0)
 
+static void check_idle_invariant(rut::test::TestCase* _tc, Connection* c) {
+    CHECK_EQ(c->state, ConnState::Idle);
+    CHECK_EQ(c->fd, -1);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
+}
+
+static void check_reading_header_invariant(rut::test::TestCase* _tc, Connection* c) {
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+    CHECK(c->fd >= 0);
+    CHECK_EQ(c->on_recv, &on_header_received<SmallLoop>);
+    CHECK_EQ(c->on_send, nullptr);
+    CHECK_EQ(c->on_upstream_recv, nullptr);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+}
+
+static void check_sending_response_invariant(rut::test::TestCase* _tc, Connection* c) {
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK(c->fd >= 0);
+    CHECK(c->on_send != nullptr);
+    CHECK_EQ(c->on_recv, nullptr);
+    CHECK_EQ(c->on_upstream_recv, nullptr);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+}
+
+static void check_proxying_upstream_wait_invariant(rut::test::TestCase* _tc, Connection* c) {
+    CHECK_EQ(c->state, ConnState::Proxying);
+    CHECK(c->fd >= 0);
+    CHECK(c->upstream_fd >= 0);
+    CHECK_EQ(c->on_recv, nullptr);
+    CHECK_EQ(c->on_send, nullptr);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+}
+
+static void check_proxying_body_stream_invariant(rut::test::TestCase* _tc,
+                                                 Connection* c,
+                                                 Connection::Callback recv,
+                                                 Connection::Callback upstream_recv,
+                                                 Connection::Callback upstream_send) {
+    CHECK_EQ(c->state, ConnState::Proxying);
+    CHECK(c->fd >= 0);
+    CHECK(c->upstream_fd >= 0);
+    CHECK_EQ(c->on_recv, recv);
+    CHECK_EQ(c->on_send, nullptr);
+    CHECK_EQ(c->on_upstream_recv, upstream_recv);
+    CHECK_EQ(c->on_upstream_send, upstream_send);
+}
+
+static void check_proxying_upstream_send_only_invariant(rut::test::TestCase* _tc,
+                                                        Connection* c,
+                                                        Connection::Callback upstream_send) {
+    CHECK_EQ(c->state, ConnState::Proxying);
+    CHECK(c->fd >= 0);
+    CHECK(c->upstream_fd >= 0);
+    CHECK_SLOTS(c, nullptr, nullptr, nullptr, upstream_send);
+}
+
+static void check_sending_waiting_upstream_body_invariant(rut::test::TestCase* _tc, Connection* c) {
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK(c->fd >= 0);
+    CHECK(c->upstream_fd >= 0);
+    CHECK_SLOTS(c, nullptr, nullptr, &on_response_body_recvd<SmallLoop>, nullptr);
+}
+
+static void check_exec_handler_yield_invariant(rut::test::TestCase* _tc,
+                                               Connection* c,
+                                               jit::HandlerFn fn,
+                                               u16 next_state) {
+    CHECK_EQ(c->state, ConnState::ExecHandler);
+    CHECK(c->fd >= 0);
+    CHECK_EQ(c->pending_handler_fn, fn);
+    CHECK_EQ(c->handler_state, next_state);
+    CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
+}
+
+static u64 state_invariant_wait_then_status(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx && ctx->state == 7) return jit::HandlerResult::make_status(204).pack();
+    return jit::HandlerResult::make_yield_payload(7, jit::YieldKind::Timer, 25).pack();
+}
+
+TEST(state_invariant, static_dispatch_keeps_slots_consistent) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    check_reading_header_invariant(_tc, c);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    check_sending_response_invariant(_tc, c);
+
+    const u32 slen = c->send_buf.len();
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(slen)));
+    check_reading_header_invariant(_tc, c);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 0));
+    check_idle_invariant(_tc, c);
+}
+
+TEST(state_invariant, proxy_dispatch_keeps_slots_consistent) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    check_proxying_upstream_wait_invariant(_tc, c);
+
+    inject_upstream_response(loop, *c);
+    check_sending_response_invariant(_tc, c);
+
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    check_reading_header_invariant(_tc, c);
+}
+
+TEST(state_invariant, body_streaming_slots_match_proxying_state) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    check_proxying_body_stream_invariant(
+        _tc, c, &on_request_body_recvd<SmallLoop>, &on_early_upstream_recvd<SmallLoop>, nullptr);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    check_proxying_body_stream_invariant(_tc,
+                                         c,
+                                         nullptr,
+                                         &on_early_upstream_recvd_send_inflight<SmallLoop>,
+                                         &on_request_body_sent<SmallLoop>);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    check_proxying_body_stream_invariant(
+        _tc, c, &on_request_body_recvd<SmallLoop>, &on_early_upstream_recvd<SmallLoop>, nullptr);
+}
+
+TEST(state_invariant, error_responses_drop_proxy_slots) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    check_proxying_upstream_wait_invariant(_tc, c);
+
+    static const char kBad[] = "XHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    const u32 blen = sizeof(kBad) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < blen; j++) dst[j] = static_cast<u8>(kBad[j]);
+    c->upstream_recv_buf.commit(blen);
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(blen)));
+
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    check_sending_response_invariant(_tc, c);
+}
+
+TEST(state_invariant, connect_failure_drops_proxy_slots) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    c->upstream_fd = 100;
+    c->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    c->state = ConnState::Proxying;
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, -111));
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    check_sending_response_invariant(_tc, c);
+}
+
+TEST(state_invariant, streaming_response_body_wait_is_explicit_sending_exception) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    check_proxying_upstream_wait_invariant(_tc, c);
+
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10000\r\n"
+        "\r\n";
+    const u32 rlen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
+    c->upstream_recv_buf.commit(rlen);
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+    CHECK_EQ(c->on_send, &on_response_header_sent<SmallLoop>);
+    check_sending_response_invariant(_tc, c);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(rlen)));
+    check_sending_waiting_upstream_body_invariant(_tc, c);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 500));
+    CHECK_EQ(c->on_send, &on_response_body_sent<SmallLoop>);
+    check_sending_response_invariant(_tc, c);
+}
+
+TEST(state_invariant, early_response_during_body_send_has_one_upstream_slot) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    check_proxying_body_stream_invariant(_tc,
+                                         c,
+                                         nullptr,
+                                         &on_early_upstream_recvd_send_inflight<SmallLoop>,
+                                         &on_request_body_sent<SmallLoop>);
+
+    static const char kResp413[] =
+        "HTTP/1.1 413 Request Entity Too Large\r\n"
+        "Content-Length: 0\r\n\r\n";
+    const u32 rlen = sizeof(kResp413) - 1;
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
+    c->upstream_recv_buf.commit(rlen);
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+
+    check_proxying_upstream_send_only_invariant(
+        _tc, c, &on_body_send_with_early_response<SmallLoop>);
+}
+
+TEST(state_invariant, jit_timer_yield_keeps_exec_handler_slots_clear) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::TimerYield;
+    outcome.next_state = 7;
+    outcome.timer_ms = 25;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_then_status, true);
+    check_exec_handler_yield_invariant(_tc, c, &state_invariant_wait_then_status, 7);
+    CHECK_EQ(loop.last_yield_ms, outcome.timer_ms);
+
+    loop.dispatch(make_ev(c->id, IoEventType::Timeout, 0));
+    loop.dispatch(make_ev(c->id, IoEventType::Timeout, 0));
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->resp_status, 204);
+    check_sending_response_invariant(_tc, c);
+}
+
 // State 1: Accept → ReadingHeader {on_recv=header, rest=null}
 TEST(state_transition, accept_to_reading_header) {
     SmallLoop loop;

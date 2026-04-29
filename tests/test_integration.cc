@@ -2966,7 +2966,8 @@ static void run_malformed_upstream_case(rut::test::TestCase* test_case,
         CHECK_MSG(buf_contains(buf, total, "502", 3), tc_cfg.name);
         CHECK_MSG(buf_contains(buf, total, "Connection: close", 17), tc_cfg.name);
     } else {
-        CHECK_MSG(total == 0 && n <= 0, tc_cfg.name);
+        const bool closed = n == 0 || n == -ECONNRESET || n == -ECONNABORTED || n == -EPIPE;
+        CHECK_MSG(total == 0 && closed, tc_cfg.name);
     }
 
     close(client);

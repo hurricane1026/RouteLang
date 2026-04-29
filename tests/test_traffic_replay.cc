@@ -1,5 +1,6 @@
 // Tests for traffic replay: ReplayReader, replay_one, replay_file.
 #include "fault_injection.h"
+#include "rut/jit/handler_abi.h"
 #include "rut/runtime/traffic_replay.h"
 #include "test.h"
 #include "test_helpers.h"
@@ -74,6 +75,22 @@ static CaptureEntry make_captured_request(const char* req, u16 status) {
     entry.method = static_cast<u8>(LogHttpMethod::Get);
     entry.timestamp_us = realtime_us();
     return entry;
+}
+
+static u64 replay_matrix_status_207_handler(void* /*conn*/,
+                                            rut::jit::HandlerCtx* /*ctx*/,
+                                            const u8* /*req*/,
+                                            u32 /*len*/,
+                                            void* /*arena*/) {
+    return rut::jit::HandlerResult::make_status(207).pack();
+}
+
+static u64 replay_matrix_forward_0_handler(void* /*conn*/,
+                                           rut::jit::HandlerCtx* /*ctx*/,
+                                           const u8* /*req*/,
+                                           u32 /*len*/,
+                                           void* /*arena*/) {
+    return rut::jit::HandlerResult::make_forward(0).pack();
 }
 
 // === ReplayReader ===
@@ -500,6 +517,99 @@ TEST(route, replay_file_with_routing) {
     CHECK_EQ(summary.replayed, 4u);
     CHECK_EQ(summary.matched, 4u);
     CHECK_EQ(summary.mismatched, 0u);
+
+    reader.close();
+    tmp.cleanup();
+}
+
+TEST(route, replay_one_route_action_matrix) {
+    RouteConfig cfg;
+    auto up_result = cfg.add_upstream("backend", 0x7F000001, 9999);
+    REQUIRE(up_result.has_value());
+    REQUIRE(cfg.add_static("/static", 'G', 204));
+    REQUIRE(cfg.add_proxy("/proxy", 'G', static_cast<u16>(up_result.value())));
+    REQUIRE(cfg.add_jit_handler("/jit-status", 'G', &replay_matrix_status_207_handler));
+    REQUIRE(cfg.add_jit_handler("/jit-forward", 'G', &replay_matrix_forward_0_handler));
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    struct MatrixCase {
+        const char* name;
+        const char* request;
+        u16 expected_status;
+        bool replayed;
+        bool skipped;
+        bool status_match;
+        u16 actual_status;
+    };
+
+    const MatrixCase cases[] = {
+        {"static status", "GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 204, true, false, true, 204},
+        {"default status", "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200, true, false, true, 200},
+        {"static mismatch",
+         "GET /static HTTP/1.1\r\nHost: x\r\n\r\n",
+         201,
+         true,
+         false,
+         false,
+         204},
+        {"proxy skipped", "GET /proxy/x HTTP/1.1\r\nHost: x\r\n\r\n", 502, false, true, false, 0},
+        {"jit status", "GET /jit-status HTTP/1.1\r\nHost: x\r\n\r\n", 207, true, false, true, 207},
+        {"jit forward skipped",
+         "GET /jit-forward HTTP/1.1\r\nHost: x\r\n\r\n",
+         502,
+         false,
+         true,
+         false,
+         0},
+    };
+
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const auto& tc = cases[i];
+        CaptureEntry entry = make_captured_request(tc.request, tc.expected_status);
+        ReplayResult result = replay_one(rl.loop, entry, static_cast<i32>(4200 + i));
+        CHECK_MSG(result.replayed == tc.replayed, tc.name);
+        CHECK_MSG(result.skipped == tc.skipped, tc.name);
+        CHECK_MSG(result.status_match == tc.status_match, tc.name);
+        CHECK_MSG(result.actual_status == tc.actual_status, tc.name);
+    }
+}
+
+TEST(route, replay_file_route_action_matrix_summary) {
+    RouteConfig cfg;
+    auto up_result = cfg.add_upstream("backend", 0x7F000001, 9999);
+    REQUIRE(up_result.has_value());
+    REQUIRE(cfg.add_static("/static", 'G', 204));
+    REQUIRE(cfg.add_proxy("/proxy", 'G', static_cast<u16>(up_result.value())));
+    REQUIRE(cfg.add_jit_handler("/jit-status", 'G', &replay_matrix_status_207_handler));
+    REQUIRE(cfg.add_jit_handler("/jit-forward", 'G', &replay_matrix_forward_0_handler));
+
+    CaptureEntry entries[] = {
+        make_captured_request("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 204),
+        make_captured_request("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_captured_request("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 201),
+        make_captured_request("GET /proxy/x HTTP/1.1\r\nHost: x\r\n\r\n", 502),
+        make_captured_request("GET /jit-status HTTP/1.1\r\nHost: x\r\n\r\n", 207),
+        make_captured_request("GET /jit-forward HTTP/1.1\r\nHost: x\r\n\r\n", 502),
+    };
+
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, sizeof(entries) / sizeof(entries[0])));
+
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    ReplaySummary summary = replay_file(rl.loop, reader);
+    CHECK_EQ(summary.total, 6u);
+    CHECK_EQ(summary.replayed, 4u);
+    CHECK_EQ(summary.matched, 3u);
+    CHECK_EQ(summary.mismatched, 1u);
+    CHECK_EQ(summary.skipped, 2u);
+    CHECK_EQ(summary.failed, 0u);
 
     reader.close();
     tmp.cleanup();

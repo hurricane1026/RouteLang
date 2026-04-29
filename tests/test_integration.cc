@@ -2815,6 +2815,12 @@ struct ScriptedUpstreamServer {
 
     ~ScriptedUpstreamServer() { teardown(); }
 
+    static bool set_blocking(i32 fd) {
+        i32 flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0) return false;
+        return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0;
+    }
+
     static void* run(void* arg) {
         auto* server = static_cast<ScriptedUpstreamServer*>(arg);
         i32 client = -1;
@@ -2827,10 +2833,12 @@ struct ScriptedUpstreamServer {
             usleep(1000);
         }
         if (client >= 0) {
-            char req[1024];
-            (void)recv_timeout(client, req, sizeof(req), 1000);
-            if (server->response != nullptr && server->response_len > 0) {
-                (void)send_all(client, server->response, server->response_len);
+            if (set_blocking(client)) {
+                char req[1024];
+                (void)recv_timeout(client, req, sizeof(req), 1000);
+                if (server->response != nullptr && server->response_len > 0) {
+                    (void)send_all(client, server->response, server->response_len);
+                }
             }
             close(client);
         }

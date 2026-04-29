@@ -2881,10 +2881,16 @@ struct ScopedProxyLoop {
         loop = create_real_loop();
         if (loop == nullptr) return false;
         auto lfd_result = create_listen_socket(0);
-        if (!lfd_result.has_value()) return false;
+        if (!lfd_result.has_value()) {
+            teardown();
+            return false;
+        }
         listen_fd = lfd_result.value();
         port = get_port(listen_fd);
-        if (!loop->init(0, listen_fd).has_value()) return false;
+        if (!loop->init(0, listen_fd).has_value()) {
+            teardown();
+            return false;
+        }
         loop->config_ptr = active;
         lt = {loop, {}, iters};
         lt.start();
@@ -2904,6 +2910,7 @@ struct ScopedProxyLoop {
             close(listen_fd);
             listen_fd = -1;
         }
+        port = 0;
         if (loop != nullptr) {
             destroy_real_loop(loop);
             loop = nullptr;
@@ -2945,15 +2952,21 @@ static void run_malformed_upstream_case(rut::test::TestCase* test_case,
         return;
     }
 
-    char buf[2048];
-    i32 n = recv_timeout(client, buf, sizeof(buf), 2000);
+    char buf[4096];
+    u32 total = 0;
+    i32 n = 0;
+    while (total < sizeof(buf)) {
+        n = recv_timeout(client, buf + total, sizeof(buf) - total, 2000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+        if (buf_contains(buf, total, "\r\n\r\n", 4)) break;
+    }
     if (tc_cfg.expect_502) {
-        CHECK_MSG(n > 0, tc_cfg.name);
-        CHECK_MSG(buf_contains(buf, static_cast<u32>(n > 0 ? n : 0), "502", 3), tc_cfg.name);
-        CHECK_MSG(buf_contains(buf, static_cast<u32>(n > 0 ? n : 0), "Connection: close", 17),
-                  tc_cfg.name);
+        CHECK_MSG(total > 0, tc_cfg.name);
+        CHECK_MSG(buf_contains(buf, total, "502", 3), tc_cfg.name);
+        CHECK_MSG(buf_contains(buf, total, "Connection: close", 17), tc_cfg.name);
     } else {
-        CHECK_MSG(n <= 0, tc_cfg.name);
+        CHECK_MSG(total == 0 && n <= 0, tc_cfg.name);
     }
 
     close(client);

@@ -2825,7 +2825,7 @@ struct ScriptedUpstreamServer {
         auto* server = static_cast<ScriptedUpstreamServer*>(arg);
         i32 client = -1;
         const i32 accept_fd = server->listen_fd;
-        for (u32 i = 0; i < 2000 && server->running.load(std::memory_order_acquire); i++) {
+        while (server->running.load(std::memory_order_acquire)) {
             client = accept(accept_fd, nullptr, nullptr);
             if (client >= 0) break;
             if (errno == EINTR) continue;

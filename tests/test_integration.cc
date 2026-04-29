@@ -14,6 +14,7 @@
 #include "rut/runtime/tls.h"
 #include "test.h"
 #include "test_helpers.h"
+#include <atomic>
 
 #include <openssl/ssl.h>
 #include <stdlib.h>
@@ -2801,6 +2802,238 @@ TEST(route, jit_handler_custom_body_real_socket) {
     loop->shutdown();
     close(lfd);
     destroy_real_loop(loop);
+}
+
+struct ScriptedUpstreamServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    const char* response = nullptr;
+    u32 response_len = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~ScriptedUpstreamServer() { teardown(); }
+
+    static bool set_blocking(i32 fd) {
+        i32 flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0) return false;
+        return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0;
+    }
+
+    static void* run(void* arg) {
+        auto* server = static_cast<ScriptedUpstreamServer*>(arg);
+        i32 client = -1;
+        const i32 accept_fd = server->listen_fd;
+        while (server->running.load(std::memory_order_acquire)) {
+            client = accept(accept_fd, nullptr, nullptr);
+            if (client >= 0) break;
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+            usleep(1000);
+        }
+        if (client >= 0) {
+            if (set_blocking(client)) {
+                char req[1024];
+                (void)recv_timeout(client, req, sizeof(req), 1000);
+                if (server->response != nullptr && server->response_len > 0) {
+                    (void)send_all(client, server->response, server->response_len);
+                }
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup(const char* bytes, u32 len) {
+        auto lfd_result = create_listen_socket(0);
+        if (!lfd_result.has_value()) return false;
+        listen_fd = lfd_result.value();
+        port = get_port(listen_fd);
+        response = bytes;
+        response_len = len;
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+struct ScopedProxyLoop {
+    RealLoop* loop = nullptr;
+    i32 listen_fd = -1;
+    u16 port = 0;
+    LoopThread lt{};
+    bool loop_started = false;
+
+    ~ScopedProxyLoop() { teardown(); }
+
+    bool setup(const RouteConfig** active, i32 iters) {
+        loop = create_real_loop();
+        if (loop == nullptr) return false;
+        auto lfd_result = create_listen_socket(0);
+        if (!lfd_result.has_value()) {
+            teardown();
+            return false;
+        }
+        listen_fd = lfd_result.value();
+        port = get_port(listen_fd);
+        if (!loop->init(0, listen_fd).has_value()) {
+            teardown();
+            return false;
+        }
+        loop->config_ptr = active;
+        lt = {loop, {}, iters};
+        lt.start();
+        loop_started = true;
+        return true;
+    }
+
+    void teardown() {
+        if (loop_started) {
+            lt.stop();
+            loop_started = false;
+        }
+        if (loop != nullptr) {
+            loop->shutdown();
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+        port = 0;
+        if (loop != nullptr) {
+            destroy_real_loop(loop);
+            loop = nullptr;
+        }
+    }
+};
+
+struct MalformedUpstreamCase {
+    const char* name;
+    const char* response;
+    u32 response_len;
+    bool expect_502;
+};
+
+static void run_malformed_upstream_case(rut::test::TestCase* test_case,
+                                        const MalformedUpstreamCase& tc_cfg) {
+    auto* _tc = test_case;
+
+    ScriptedUpstreamServer upstream;
+    REQUIRE(upstream.setup(tc_cfg.response, tc_cfg.response_len));
+
+    RouteConfig cfg{};
+    auto upstream_id = cfg.add_upstream("malformed", 0x7F000001, upstream.port);
+    REQUIRE(upstream_id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, upstream_id.value()));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 500));
+
+    i32 client = connect_to(proxy.port);
+    CHECK_MSG(client >= 0, tc_cfg.name);
+    if (client < 0) return;
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    bool sent = send_all(client, kReq, sizeof(kReq) - 1);
+    CHECK_MSG(sent, tc_cfg.name);
+    if (!sent) {
+        close(client);
+        return;
+    }
+
+    char buf[4096];
+    u32 total = 0;
+    i32 n = 0;
+    while (total < sizeof(buf)) {
+        n = recv_timeout(client, buf + total, sizeof(buf) - total, 2000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+        if (buf_contains(buf, total, "\r\n\r\n", 4)) break;
+    }
+    if (tc_cfg.expect_502) {
+        CHECK_MSG(total > 0, tc_cfg.name);
+        CHECK_MSG(buf_contains(buf, total, "502", 3), tc_cfg.name);
+        CHECK_MSG(buf_contains(buf, total, "Connection: close", 17), tc_cfg.name);
+    } else {
+        const bool closed = n == 0 || n == -ECONNRESET || n == -ECONNABORTED || n == -EPIPE;
+        CHECK_MSG(total == 0 && closed, tc_cfg.name);
+    }
+
+    close(client);
+}
+
+TEST(proxy_e2e, malformed_upstream_responses_fail_closed) {
+    static const char kBadStatus[] = "HTTP/1.1 XYZ Bad\r\nContent-Length: 0\r\n\r\n";
+    static const char kPartialStatus[] = "HTTP/1.1 20";
+    static const char kBadHeaderCrlf[] = "HTTP/1.1 200 OK\r\nX-Test: bad\rX-Next: y\r\n\r\n";
+    static const char kBadContentLength[] = "HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n";
+    static const char kStatusTooLow[] = "HTTP/1.1 099 Low\r\nContent-Length: 0\r\n\r\n";
+    static const char kStatusTooHigh[] = "HTTP/1.1 600 High\r\nContent-Length: 0\r\n\r\n";
+    static const char kBadVersion[] = "HTTP/1.2 200 OK\r\nContent-Length: 0\r\n\r\n";
+    static const char kEmptyHeaderName[] = "HTTP/1.1 200 OK\r\n: bad\r\n\r\n";
+    static const char kConflictingContentLength[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 1\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n";
+    static const char kMalformedChunkedInitial[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "XYZ\r\n";
+    static const char kChunkedBeatsContentLengthButStillValidatesChunks[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 100\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "ZZ\r\n";
+
+    static const MalformedUpstreamCase kCases[] = {
+        {"bad status code", kBadStatus, sizeof(kBadStatus) - 1, true},
+        {"partial status then eof", kPartialStatus, sizeof(kPartialStatus) - 1, true},
+        {"malformed header crlf", kBadHeaderCrlf, sizeof(kBadHeaderCrlf) - 1, true},
+        {"invalid content length", kBadContentLength, sizeof(kBadContentLength) - 1, true},
+        {"status below range", kStatusTooLow, sizeof(kStatusTooLow) - 1, true},
+        {"status above range", kStatusTooHigh, sizeof(kStatusTooHigh) - 1, true},
+        {"unsupported http version", kBadVersion, sizeof(kBadVersion) - 1, true},
+        {"empty header name", kEmptyHeaderName, sizeof(kEmptyHeaderName) - 1, true},
+        {"conflicting content length",
+         kConflictingContentLength,
+         sizeof(kConflictingContentLength) - 1,
+         true},
+        {"malformed chunked initial body",
+         kMalformedChunkedInitial,
+         sizeof(kMalformedChunkedInitial) - 1,
+         true},
+        {"chunked wins over content length but malformed chunks fail",
+         kChunkedBeatsContentLengthButStillValidatesChunks,
+         sizeof(kChunkedBeatsContentLengthButStillValidatesChunks) - 1,
+         true},
+        {"empty eof", nullptr, 0, false},
+    };
+
+    for (const auto& tc_cfg : kCases) {
+        run_malformed_upstream_case(_tc, tc_cfg);
+    }
 }
 
 // Handler returns ReturnStatus with an out-of-range body_idx (e.g. no

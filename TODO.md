@@ -17,6 +17,7 @@ Outstanding work items, prioritized for the next implementation passes.
 - [x] Testing notes document the callback-slot/state invariants and the streaming-body exception.
 - [x] Runtime debug helpers can snapshot and format connection state, callback slots, armed operations, and buffer lengths.
 - [x] Test framework fault injection provides shared mmap/mprotect/socket/recv/poll/read/write/send/connect/epoll/timerfd/accept/open scopes for network/runtime tests.
+- [x] Malformed upstream E2E coverage drives real proxy sockets through malformed status, EOF, header, and framing failures.
 
 ## P0: State Invariant Coverage Follow-ups
 
@@ -56,26 +57,6 @@ Outstanding work items, prioritized for the next implementation passes.
 **Acceptance**:
 - At least one shared helper replaces ad hoc EINTR counters.
 - New tests verify retry or fail-closed behavior without depending on real network permissions.
-
-## P1: Malformed Upstream E2E
-
-**Goal**: Exercise parser-to-callback-to-wire behavior for malformed upstream responses through real sockets.
-
-**Why**: Parser unit tests reject malformed responses, and mock callback tests cover some 502 branches, but end-to-end proxy behavior should prove the production socket path also fails closed.
-
-**Work**:
-- Add integration tests with a raw TCP upstream returning:
-  - `HTTP/1.1 XYZ Bad\r\n\r\n`
-  - empty response / immediate EOF
-  - partial status line
-  - malformed CRLF in headers
-  - conflicting or invalid content framing
-- Verify client-visible result: 502 or close, depending on the current contract.
-- Verify metrics/debug state where available.
-
-**Acceptance**:
-- Tests drive full route config -> proxy connect -> upstream response -> client response path.
-- No dependency on external services; test server is local and deterministic.
 
 ## P1: Replay Coverage Matrix
 

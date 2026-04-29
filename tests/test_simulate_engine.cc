@@ -496,15 +496,19 @@ TEST(simulate_engine, simulate_one_route_action_matrix) {
     manifest.upstream_count = 1;
     manifest.upstreams[0].id = 7;
     strcpy(manifest.upstreams[0].name, "api-v1");
-    manifest.route_count = 2;
+    manifest.route_count = 3;
     manifest.routes[0].method = 'G';
     strcpy(manifest.routes[0].pattern, "/static");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 204;
-    manifest.routes[1].method = 'G';
-    strcpy(manifest.routes[1].pattern, "/api");
-    manifest.routes[1].action = ManifestAction::Forward;
-    manifest.routes[1].upstream_id = 7;
+    manifest.routes[1].method = 'P';
+    strcpy(manifest.routes[1].pattern, "/post-only");
+    manifest.routes[1].action = ManifestAction::ReturnStatus;
+    manifest.routes[1].status_code = 202;
+    manifest.routes[2].method = 'G';
+    strcpy(manifest.routes[2].pattern, "/api");
+    manifest.routes[2].action = ManifestAction::Forward;
+    manifest.routes[2].upstream_id = 7;
 
     ModuleContext ctx;
     Engine engine;
@@ -531,6 +535,24 @@ TEST(simulate_engine, simulate_one_route_action_matrix) {
          Verdict::Match,
          jit::HandlerAction::ReturnStatus,
          200,
+         ""},
+        {"default upstream mismatch",
+         make_entry("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200, "api-v1"),
+         Verdict::Mismatch,
+         jit::HandlerAction::ReturnStatus,
+         200,
+         ""},
+        {"method default",
+         make_entry("GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+         Verdict::Match,
+         jit::HandlerAction::ReturnStatus,
+         200,
+         ""},
+        {"method match",
+         make_entry("POST /post-only HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 202),
+         Verdict::Match,
+         jit::HandlerAction::ReturnStatus,
+         202,
          ""},
         {"static mismatch",
          make_entry("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 201),
@@ -575,15 +597,19 @@ TEST(simulate_engine, simulate_file_route_action_matrix_summary) {
     manifest.upstream_count = 1;
     manifest.upstreams[0].id = 7;
     strcpy(manifest.upstreams[0].name, "api-v1");
-    manifest.route_count = 2;
+    manifest.route_count = 3;
     manifest.routes[0].method = 'G';
     strcpy(manifest.routes[0].pattern, "/static");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 204;
-    manifest.routes[1].method = 'G';
-    strcpy(manifest.routes[1].pattern, "/api");
-    manifest.routes[1].action = ManifestAction::Forward;
-    manifest.routes[1].upstream_id = 7;
+    manifest.routes[1].method = 'P';
+    strcpy(manifest.routes[1].pattern, "/post-only");
+    manifest.routes[1].action = ManifestAction::ReturnStatus;
+    manifest.routes[1].status_code = 202;
+    manifest.routes[2].method = 'G';
+    strcpy(manifest.routes[2].pattern, "/api");
+    manifest.routes[2].action = ManifestAction::Forward;
+    manifest.routes[2].upstream_id = 7;
 
     ModuleContext ctx;
     Engine engine;
@@ -592,6 +618,9 @@ TEST(simulate_engine, simulate_file_route_action_matrix_summary) {
     CaptureEntry entries[] = {
         make_entry("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 204),
         make_entry("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_entry("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200, "api-v1"),
+        make_entry("GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_entry("POST /post-only HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 202),
         make_entry("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 201),
         make_entry("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 502, "api-v1"),
         make_entry("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 502, "wrong"),
@@ -601,15 +630,15 @@ TEST(simulate_engine, simulate_file_route_action_matrix_summary) {
     char path[] = "/tmp/rut_sim_matrix_capture_XXXXXX";
     i32 fd = mkstemp(path);
     REQUIRE(fd >= 0);
-    REQUIRE(write_capture_file(fd, 6, entries, 6));
+    REQUIRE(write_capture_file(fd, 9, entries, 9));
     close(fd);
 
     ReplayReader reader;
     REQUIRE(reader.open(path) == 0);
     const auto summary = simulate_file(engine, reader);
-    CHECK_EQ(summary.total, 6u);
-    CHECK_EQ(summary.matched, 3u);
-    CHECK_EQ(summary.mismatched, 2u);
+    CHECK_EQ(summary.total, 9u);
+    CHECK_EQ(summary.matched, 5u);
+    CHECK_EQ(summary.mismatched, 3u);
     CHECK_EQ(summary.failed, 1u);
     CHECK_EQ(summary.unsupported, 0u);
 

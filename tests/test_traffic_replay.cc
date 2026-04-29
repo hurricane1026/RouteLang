@@ -527,6 +527,7 @@ TEST(route, replay_one_route_action_matrix) {
     auto up_result = cfg.add_upstream("backend", 0x7F000001, 9999);
     REQUIRE(up_result.has_value());
     REQUIRE(cfg.add_static("/static", 'G', 204));
+    REQUIRE(cfg.add_static("/post-only", 'P', 202));
     REQUIRE(cfg.add_proxy("/proxy", 'G', static_cast<u16>(up_result.value())));
     REQUIRE(cfg.add_jit_handler("/jit-status", 'G', &replay_matrix_status_207_handler));
     REQUIRE(cfg.add_jit_handler("/jit-forward", 'G', &replay_matrix_forward_0_handler));
@@ -547,6 +548,20 @@ TEST(route, replay_one_route_action_matrix) {
     const MatrixCase cases[] = {
         {"static status", "GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 204, true, false, true, 204},
         {"default status", "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200, true, false, true, 200},
+        {"method default",
+         "GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n",
+         200,
+         true,
+         false,
+         true,
+         200},
+        {"method match",
+         "POST /post-only HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+         202,
+         true,
+         false,
+         true,
+         202},
         {"static mismatch",
          "GET /static HTTP/1.1\r\nHost: x\r\n\r\n",
          201,
@@ -581,6 +596,7 @@ TEST(route, replay_file_route_action_matrix_summary) {
     auto up_result = cfg.add_upstream("backend", 0x7F000001, 9999);
     REQUIRE(up_result.has_value());
     REQUIRE(cfg.add_static("/static", 'G', 204));
+    REQUIRE(cfg.add_static("/post-only", 'P', 202));
     REQUIRE(cfg.add_proxy("/proxy", 'G', static_cast<u16>(up_result.value())));
     REQUIRE(cfg.add_jit_handler("/jit-status", 'G', &replay_matrix_status_207_handler));
     REQUIRE(cfg.add_jit_handler("/jit-forward", 'G', &replay_matrix_forward_0_handler));
@@ -588,6 +604,9 @@ TEST(route, replay_file_route_action_matrix_summary) {
     CaptureEntry entries[] = {
         make_captured_request("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 204),
         make_captured_request("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_captured_request("GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_captured_request("POST /post-only HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+                              202),
         make_captured_request("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 201),
         make_captured_request("GET /proxy/x HTTP/1.1\r\nHost: x\r\n\r\n", 502),
         make_captured_request("GET /jit-status HTTP/1.1\r\nHost: x\r\n\r\n", 207),
@@ -604,9 +623,9 @@ TEST(route, replay_file_route_action_matrix_summary) {
     rl.setup(&cfg);
 
     ReplaySummary summary = replay_file(rl.loop, reader);
-    CHECK_EQ(summary.total, 6u);
-    CHECK_EQ(summary.replayed, 4u);
-    CHECK_EQ(summary.matched, 3u);
+    CHECK_EQ(summary.total, 8u);
+    CHECK_EQ(summary.replayed, 6u);
+    CHECK_EQ(summary.matched, 5u);
     CHECK_EQ(summary.mismatched, 1u);
     CHECK_EQ(summary.skipped, 2u);
     CHECK_EQ(summary.failed, 0u);

@@ -14,6 +14,7 @@
 #include "rut/runtime/tls.h"
 #include "test.h"
 #include "test_helpers.h"
+#include <atomic>
 
 #include <openssl/ssl.h>
 #include <stdlib.h>
@@ -2808,7 +2809,7 @@ struct ScriptedUpstreamServer {
     u16 port = 0;
     const char* response = nullptr;
     u32 response_len = 0;
-    bool running = false;
+    std::atomic<bool> running{false};
     bool started = false;
     pthread_t thread{};
 
@@ -2817,9 +2818,11 @@ struct ScriptedUpstreamServer {
     static void* run(void* arg) {
         auto* server = static_cast<ScriptedUpstreamServer*>(arg);
         i32 client = -1;
-        for (u32 i = 0; i < 2000 && server->running; i++) {
-            client = accept(server->listen_fd, nullptr, nullptr);
+        const i32 accept_fd = server->listen_fd;
+        for (u32 i = 0; i < 2000 && server->running.load(std::memory_order_acquire); i++) {
+            client = accept(accept_fd, nullptr, nullptr);
             if (client >= 0) break;
+            if (errno == EINTR) continue;
             if (errno != EAGAIN && errno != EWOULDBLOCK) break;
             usleep(1000);
         }
@@ -2841,9 +2844,9 @@ struct ScriptedUpstreamServer {
         port = get_port(listen_fd);
         response = bytes;
         response_len = len;
-        running = true;
+        running.store(true, std::memory_order_release);
         if (pthread_create(&thread, nullptr, run, this) != 0) {
-            running = false;
+            running.store(false, std::memory_order_release);
             close(listen_fd);
             listen_fd = -1;
             return false;
@@ -2853,14 +2856,57 @@ struct ScriptedUpstreamServer {
     }
 
     void teardown() {
-        running = false;
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
         if (listen_fd >= 0) {
             close(listen_fd);
             listen_fd = -1;
         }
-        if (started) {
-            pthread_join(thread, nullptr);
-            started = false;
+    }
+};
+
+struct ScopedProxyLoop {
+    RealLoop* loop = nullptr;
+    i32 listen_fd = -1;
+    u16 port = 0;
+    LoopThread lt{};
+    bool loop_started = false;
+
+    ~ScopedProxyLoop() { teardown(); }
+
+    bool setup(const RouteConfig** active, i32 iters) {
+        loop = create_real_loop();
+        if (loop == nullptr) return false;
+        auto lfd_result = create_listen_socket(0);
+        if (!lfd_result.has_value()) return false;
+        listen_fd = lfd_result.value();
+        port = get_port(listen_fd);
+        if (!loop->init(0, listen_fd).has_value()) return false;
+        loop->config_ptr = active;
+        lt = {loop, {}, iters};
+        lt.start();
+        loop_started = true;
+        return true;
+    }
+
+    void teardown() {
+        if (loop_started) {
+            lt.stop();
+            loop_started = false;
+        }
+        if (loop != nullptr) {
+            loop->shutdown();
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+        if (loop != nullptr) {
+            destroy_real_loop(loop);
+            loop = nullptr;
         }
     }
 };
@@ -2885,38 +2931,32 @@ static void run_malformed_upstream_case(rut::test::TestCase* test_case,
     REQUIRE(cfg.add_proxy("/api", 0, upstream_id.value()));
     const RouteConfig* active = &cfg;
 
-    RealLoop* loop = create_real_loop();
-    REQUIRE(loop != nullptr);
-    auto lfd_result = create_listen_socket(0);
-    REQUIRE(lfd_result.has_value());
-    i32 lfd = lfd_result.value();
-    u16 port = get_port(lfd);
-    REQUIRE(loop->init(0, lfd).has_value());
-    loop->config_ptr = &active;
-    LoopThread lt = {loop, {}, 500};
-    lt.start();
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 500));
 
-    i32 client = connect_to(port);
-    REQUIRE(client >= 0);
+    i32 client = connect_to(proxy.port);
+    CHECK_MSG(client >= 0, tc_cfg.name);
+    if (client < 0) return;
     const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
-    REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+    bool sent = send_all(client, kReq, sizeof(kReq) - 1);
+    CHECK_MSG(sent, tc_cfg.name);
+    if (!sent) {
+        close(client);
+        return;
+    }
 
     char buf[2048];
     i32 n = recv_timeout(client, buf, sizeof(buf), 2000);
     if (tc_cfg.expect_502) {
-        CHECK_GT(n, 0);
-        CHECK(buf_contains(buf, static_cast<u32>(n > 0 ? n : 0), "502", 3));
-        CHECK(buf_contains(buf, static_cast<u32>(n > 0 ? n : 0), "Connection: close", 17));
+        CHECK_MSG(n > 0, tc_cfg.name);
+        CHECK_MSG(buf_contains(buf, static_cast<u32>(n > 0 ? n : 0), "502", 3), tc_cfg.name);
+        CHECK_MSG(buf_contains(buf, static_cast<u32>(n > 0 ? n : 0), "Connection: close", 17),
+                  tc_cfg.name);
     } else {
-        CHECK_LE(n, 0);
+        CHECK_MSG(n <= 0, tc_cfg.name);
     }
 
     close(client);
-    lt.stop();
-    loop->shutdown();
-    close(lfd);
-    destroy_real_loop(loop);
-    upstream.teardown();
 }
 
 TEST(proxy_e2e, malformed_upstream_responses_fail_closed) {

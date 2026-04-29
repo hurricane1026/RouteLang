@@ -2924,12 +2924,48 @@ TEST(proxy_e2e, malformed_upstream_responses_fail_closed) {
     static const char kPartialStatus[] = "HTTP/1.1 20";
     static const char kBadHeaderCrlf[] = "HTTP/1.1 200 OK\r\nX-Test: bad\rX-Next: y\r\n\r\n";
     static const char kBadContentLength[] = "HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n";
+    static const char kStatusTooLow[] = "HTTP/1.1 099 Low\r\nContent-Length: 0\r\n\r\n";
+    static const char kStatusTooHigh[] = "HTTP/1.1 600 High\r\nContent-Length: 0\r\n\r\n";
+    static const char kBadVersion[] = "HTTP/1.2 200 OK\r\nContent-Length: 0\r\n\r\n";
+    static const char kEmptyHeaderName[] = "HTTP/1.1 200 OK\r\n: bad\r\n\r\n";
+    static const char kConflictingContentLength[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 1\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n";
+    static const char kMalformedChunkedInitial[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "XYZ\r\n";
+    static const char kChunkedBeatsContentLengthButStillValidatesChunks[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 100\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "ZZ\r\n";
 
     static const MalformedUpstreamCase kCases[] = {
         {"bad status code", kBadStatus, sizeof(kBadStatus) - 1, true},
         {"partial status then eof", kPartialStatus, sizeof(kPartialStatus) - 1, true},
         {"malformed header crlf", kBadHeaderCrlf, sizeof(kBadHeaderCrlf) - 1, true},
         {"invalid content length", kBadContentLength, sizeof(kBadContentLength) - 1, true},
+        {"status below range", kStatusTooLow, sizeof(kStatusTooLow) - 1, true},
+        {"status above range", kStatusTooHigh, sizeof(kStatusTooHigh) - 1, true},
+        {"unsupported http version", kBadVersion, sizeof(kBadVersion) - 1, true},
+        {"empty header name", kEmptyHeaderName, sizeof(kEmptyHeaderName) - 1, true},
+        {"conflicting content length",
+         kConflictingContentLength,
+         sizeof(kConflictingContentLength) - 1,
+         true},
+        {"malformed chunked initial body",
+         kMalformedChunkedInitial,
+         sizeof(kMalformedChunkedInitial) - 1,
+         true},
+        {"chunked wins over content length but malformed chunks fail",
+         kChunkedBeatsContentLengthButStillValidatesChunks,
+         sizeof(kChunkedBeatsContentLengthButStillValidatesChunks) - 1,
+         true},
         {"empty eof", nullptr, 0, false},
     };
 

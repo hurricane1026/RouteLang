@@ -3,6 +3,7 @@
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/runtime/route_method.h"
 #include "rut/sim/simulate_engine.h"
 #include "test.h"
 
@@ -334,7 +335,7 @@ TEST(simulate_engine, load_manifest_accepts_whitespace_comments_and_forward_refs
 TEST(simulate_engine, static_status_match) {
     Manifest manifest{};
     manifest.route_count = 1;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/health");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 204;
@@ -491,10 +492,167 @@ TEST(simulate_engine, default_200_when_no_route_matches) {
     ctx.destroy();
 }
 
+TEST(simulate_engine, simulate_one_route_action_matrix) {
+    Manifest manifest{};
+    manifest.upstream_count = 1;
+    manifest.upstreams[0].id = 7;
+    strcpy(manifest.upstreams[0].name, "api-v1");
+    manifest.route_count = 3;
+    manifest.routes[0].method = kRouteMethodGet;
+    strcpy(manifest.routes[0].pattern, "/static");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 204;
+    manifest.routes[1].method = kRouteMethodPost;
+    strcpy(manifest.routes[1].pattern, "/post-only");
+    manifest.routes[1].action = ManifestAction::ReturnStatus;
+    manifest.routes[1].status_code = 202;
+    manifest.routes[2].method = kRouteMethodGet;
+    strcpy(manifest.routes[2].pattern, "/api");
+    manifest.routes[2].action = ManifestAction::Forward;
+    manifest.routes[2].upstream_id = 7;
+
+    ModuleContext ctx;
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+
+    struct MatrixCase {
+        const char* name;
+        CaptureEntry entry;
+        Verdict verdict;
+        jit::HandlerAction action;
+        u16 actual_status;
+        const char* actual_upstream;
+    };
+
+    const MatrixCase cases[] = {
+        {"static status",
+         make_entry("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 204),
+         Verdict::Match,
+         jit::HandlerAction::ReturnStatus,
+         204,
+         ""},
+        {"default status",
+         make_entry("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+         Verdict::Match,
+         jit::HandlerAction::ReturnStatus,
+         200,
+         ""},
+        {"default upstream mismatch",
+         make_entry("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200, "api-v1"),
+         Verdict::Mismatch,
+         jit::HandlerAction::ReturnStatus,
+         200,
+         ""},
+        {"method default",
+         make_entry("GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+         Verdict::Match,
+         jit::HandlerAction::ReturnStatus,
+         200,
+         ""},
+        {"method match",
+         make_entry("POST /post-only HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 202),
+         Verdict::Match,
+         jit::HandlerAction::ReturnStatus,
+         202,
+         ""},
+        {"static mismatch",
+         make_entry("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 201),
+         Verdict::Mismatch,
+         jit::HandlerAction::ReturnStatus,
+         204,
+         ""},
+        {"forward match",
+         make_entry("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 502, "api-v1"),
+         Verdict::Match,
+         jit::HandlerAction::Forward,
+         0,
+         "api-v1"},
+        {"forward mismatch",
+         make_entry("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 502, "wrong"),
+         Verdict::Mismatch,
+         jit::HandlerAction::Forward,
+         0,
+         "api-v1"},
+        {"malformed capture",
+         make_entry("GET /static HTTP/1.1\r\nHost: x\r\n", 204),
+         Verdict::Failed,
+         jit::HandlerAction::ReturnStatus,
+         0,
+         ""},
+    };
+
+    for (const auto& tc : cases) {
+        const auto result = simulate_one(engine, tc.entry);
+        CHECK_MSG(result.verdict == tc.verdict, tc.name);
+        CHECK_MSG(result.action == tc.action, tc.name);
+        CHECK_MSG(result.actual_status == tc.actual_status, tc.name);
+        CHECK_MSG(strcmp(result.actual_upstream, tc.actual_upstream) == 0, tc.name);
+    }
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
+TEST(simulate_engine, simulate_file_route_action_matrix_summary) {
+    Manifest manifest{};
+    manifest.upstream_count = 1;
+    manifest.upstreams[0].id = 7;
+    strcpy(manifest.upstreams[0].name, "api-v1");
+    manifest.route_count = 3;
+    manifest.routes[0].method = kRouteMethodGet;
+    strcpy(manifest.routes[0].pattern, "/static");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 204;
+    manifest.routes[1].method = kRouteMethodPost;
+    strcpy(manifest.routes[1].pattern, "/post-only");
+    manifest.routes[1].action = ManifestAction::ReturnStatus;
+    manifest.routes[1].status_code = 202;
+    manifest.routes[2].method = kRouteMethodGet;
+    strcpy(manifest.routes[2].pattern, "/api");
+    manifest.routes[2].action = ManifestAction::Forward;
+    manifest.routes[2].upstream_id = 7;
+
+    ModuleContext ctx;
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+
+    CaptureEntry entries[] = {
+        make_entry("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 204),
+        make_entry("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_entry("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200, "api-v1"),
+        make_entry("GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_entry("POST /post-only HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 202),
+        make_entry("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 201),
+        make_entry("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 502, "api-v1"),
+        make_entry("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 502, "wrong"),
+        make_entry("GET /static HTTP/1.1\r\nHost: x\r\n", 204),
+    };
+
+    char path[] = "/tmp/rut_sim_matrix_capture_XXXXXX";
+    i32 fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    REQUIRE(write_capture_file(fd, 9, entries, 9));
+    close(fd);
+
+    ReplayReader reader;
+    REQUIRE(reader.open(path) == 0);
+    const auto summary = simulate_file(engine, reader);
+    CHECK_EQ(summary.total, 9u);
+    CHECK_EQ(summary.matched, 5u);
+    CHECK_EQ(summary.mismatched, 3u);
+    CHECK_EQ(summary.failed, 1u);
+    CHECK_EQ(summary.unsupported, 0u);
+
+    reader.close();
+    unlink(path);
+    engine.shutdown();
+    ctx.destroy();
+}
+
 TEST(simulate_engine, param_prefix_route_matches) {
     Manifest manifest{};
     manifest.route_count = 1;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/users/:id");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 201;
@@ -514,7 +672,7 @@ TEST(simulate_engine, param_prefix_route_matches) {
 TEST(simulate_engine, param_route_rejects_empty_segment) {
     Manifest manifest{};
     manifest.route_count = 1;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/users/:id");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 201;
@@ -535,7 +693,7 @@ TEST(simulate_engine, param_route_rejects_empty_segment) {
 TEST(simulate_engine, colon_inside_segment_matches_literal_colon) {
     Manifest manifest{};
     manifest.route_count = 1;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/v1:beta");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 201;
@@ -756,7 +914,7 @@ TEST(simulate_engine, build_module_rejects_invalid_route_count_without_init) {
 TEST(simulate_engine, engine_init_accepts_codegen_truncated_handler_symbol_names) {
     Manifest manifest{};
     manifest.route_count = 1;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/long-name");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 204;
@@ -783,7 +941,7 @@ TEST(simulate_engine, engine_init_accepts_codegen_truncated_handler_symbol_names
 TEST(simulate_engine, engine_init_rejects_overlong_compiled_route_patterns) {
     Manifest manifest{};
     manifest.route_count = 1;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/ok");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 200;
@@ -810,14 +968,14 @@ TEST(simulate_engine, engine_init_rejects_overlong_compiled_route_patterns) {
 TEST(simulate_engine, engine_init_can_reinitialize_existing_engine) {
     Manifest manifest_a{};
     manifest_a.route_count = 1;
-    manifest_a.routes[0].method = 'G';
+    manifest_a.routes[0].method = kRouteMethodGet;
     strcpy(manifest_a.routes[0].pattern, "/first");
     manifest_a.routes[0].action = ManifestAction::ReturnStatus;
     manifest_a.routes[0].status_code = 201;
 
     Manifest manifest_b{};
     manifest_b.route_count = 1;
-    manifest_b.routes[0].method = 'G';
+    manifest_b.routes[0].method = kRouteMethodGet;
     strcpy(manifest_b.routes[0].pattern, "/second");
     manifest_b.routes[0].action = ManifestAction::ReturnStatus;
     manifest_b.routes[0].status_code = 202;
@@ -849,7 +1007,7 @@ TEST(simulate_engine, engine_init_can_reinitialize_existing_engine) {
 TEST(simulate_engine, engine_init_clears_state_on_precondition_failure) {
     Manifest manifest{};
     manifest.route_count = 1;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/ok");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 200;
@@ -876,11 +1034,11 @@ TEST(simulate_engine, param_route_matching_matrix) {
 
     Manifest manifest{};
     manifest.route_count = 2;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/users/:id");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 201;
-    manifest.routes[1].method = 'G';
+    manifest.routes[1].method = kRouteMethodGet;
     strcpy(manifest.routes[1].pattern, "/teams/:team/members/:member");
     manifest.routes[1].action = ManifestAction::ReturnStatus;
     manifest.routes[1].status_code = 202;
@@ -911,7 +1069,7 @@ TEST(simulate_engine, param_route_matching_matrix) {
 TEST(simulate_engine, simulate_one_rejects_malformed_capture_headers) {
     Manifest manifest{};
     manifest.route_count = 1;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/ok");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 200;
@@ -950,11 +1108,11 @@ TEST(simulate_engine, summary_counts_mismatch) {
     manifest.upstreams[0].id = 9;
     strcpy(manifest.upstreams[0].name, "edge");
     manifest.route_count = 2;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/ok");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 200;
-    manifest.routes[1].method = 'G';
+    manifest.routes[1].method = kRouteMethodGet;
     strcpy(manifest.routes[1].pattern, "/api");
     manifest.routes[1].action = ManifestAction::Forward;
     manifest.routes[1].upstream_id = 9;
@@ -994,7 +1152,7 @@ TEST(simulate_engine, summary_counts_mismatch) {
 TEST(simulate_engine, simulate_file_counts_malformed_entries_as_failed) {
     Manifest manifest{};
     manifest.route_count = 1;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/ok");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 200;
@@ -1043,7 +1201,7 @@ TEST(simulate_engine, simulate_file_counts_truncated_capture_as_failed) {
 
     Manifest manifest{};
     manifest.route_count = 1;
-    manifest.routes[0].method = 'G';
+    manifest.routes[0].method = kRouteMethodGet;
     strcpy(manifest.routes[0].pattern, "/ok");
     manifest.routes[0].action = ManifestAction::ReturnStatus;
     manifest.routes[0].status_code = 200;
@@ -1092,7 +1250,7 @@ TEST(simulate_engine, simulate_file_counts_truncated_capture_as_failed) {
 TEST(simulate_engine, format_result_uses_mismatch_label) {
     SimulateResult result{};
     result.verdict = Verdict::Mismatch;
-    result.method = 'G';
+    result.method = static_cast<u8>(LogHttpMethod::Get);
     strcpy(result.path, "/api");
     result.action = jit::HandlerAction::ReturnStatus;
     result.expected_status = 200;
@@ -1108,7 +1266,7 @@ TEST(simulate_engine, format_result_uses_mismatch_label) {
 TEST(simulate_engine, format_result_failed_status_uses_placeholder) {
     SimulateResult result{};
     result.verdict = Verdict::Failed;
-    result.method = 'G';
+    result.method = static_cast<u8>(LogHttpMethod::Get);
     strcpy(result.path, "/bad");
     result.action = jit::HandlerAction::ReturnStatus;
     result.expected_status = 502;
@@ -1122,7 +1280,7 @@ TEST(simulate_engine, format_result_failed_status_uses_placeholder) {
 TEST(simulate_engine, format_result_yield_uses_placeholders) {
     SimulateResult result{};
     result.verdict = Verdict::Unsupported;
-    result.method = 'G';
+    result.method = static_cast<u8>(LogHttpMethod::Get);
     strcpy(result.path, "/yield");
     result.action = jit::HandlerAction::Yield;
     strcpy(result.expected_upstream, "edge");

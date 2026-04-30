@@ -18,6 +18,7 @@ Outstanding work items, prioritized for the next implementation passes.
 - [x] Runtime debug helpers can snapshot and format connection state, callback slots, armed operations, and buffer lengths.
 - [x] Test framework fault injection provides shared mmap/mprotect/socket/recv/poll/read/write/send/connect/epoll/timerfd/accept/open scopes for network/runtime tests.
 - [x] Malformed upstream E2E coverage drives real proxy sockets through malformed status, EOF, header, and framing failures.
+- [x] Replay/simulate route-action matrix coverage documents Static, Default, Proxy/JIT Forward, JIT ReturnStatus, mismatch, and malformed capture behavior.
 
 ## P0: State Invariant Coverage Follow-ups
 
@@ -57,24 +58,6 @@ Outstanding work items, prioritized for the next implementation passes.
 **Acceptance**:
 - At least one shared helper replaces ad hoc EINTR counters.
 - New tests verify retry or fail-closed behavior without depending on real network permissions.
-
-## P1: Replay Coverage Matrix
-
-**Goal**: Prevent caller/path coverage holes when routing behavior expands.
-
-**Why**: `replay_one` previously only covered static routes, so proxy route behavior regressed until review. Future route actions and callers need explicit matrix coverage.
-
-**Work**:
-- Document and enforce `[caller x route action x expected result]` cases for:
-  - `replay_one`
-  - `replay_file`
-  - `simulate_one`
-  - `simulate_file`
-- Include Static, Default, Proxy, JIT ReturnStatus, JIT Forward, malformed input, and unsupported action paths where relevant.
-
-**Acceptance**:
-- A table-driven test or comment block makes missing cells obvious.
-- Adding a route action requires adding or intentionally documenting replay/sim coverage.
 
 ## P2: Coverage Tooling Hygiene
 

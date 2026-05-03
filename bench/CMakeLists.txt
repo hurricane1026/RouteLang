@@ -31,15 +31,17 @@ target_include_directories(bench_connection PRIVATE
 
 # JIT-specialized ART vs scalar ART, exercising both the direct JIT
 # function pointer and the productized RouteConfig dispatch paths.
-add_executable(bench_art_jit_spike bench_art_jit_spike.cc)
-target_link_libraries(bench_art_jit_spike rut_runtime rut_jit)
-target_include_directories(bench_art_jit_spike PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/testing
-    ${LLVM_INCLUDE_DIRS}
-)
-target_compile_definitions(bench_art_jit_spike PRIVATE ${LLVM_DEFINITIONS})
-target_compile_options(bench_art_jit_spike PRIVATE -O3 -DNDEBUG)
+if(RUT_ENABLE_JIT)
+    add_executable(bench_art_jit_spike bench_art_jit_spike.cc)
+    target_link_libraries(bench_art_jit_spike rut_runtime rut_jit)
+    target_include_directories(bench_art_jit_spike PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/testing
+        ${LLVM_INCLUDE_DIRS}
+    )
+    target_compile_definitions(bench_art_jit_spike PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_options(bench_art_jit_spike PRIVATE -O3 -DNDEBUG)
+endif()
 
 # Parser SIMD scan_uri vs scalar reference. Selected SIMD backend is
 # fixed at build time via -DSIMD_ARCH=<avx512|avx2|sse2|neon|sve|scalar>.
@@ -69,15 +71,17 @@ target_compile_definitions(bench_scan_uri PRIVATE BENCH_SIMD_BACKEND="${SIMD_ARC
 # avx512 on x86, neon on arm64) — same hardware-gating pattern as the
 # scan_uri job means an Intel runner with avx512f would pick that up
 # automatically.
-add_executable(bench_dispatch_compare bench_dispatch_compare.cc)
-target_link_libraries(bench_dispatch_compare rut_runtime rut_jit)
-target_include_directories(bench_dispatch_compare PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/testing
-    ${LLVM_INCLUDE_DIRS}
-)
-target_compile_definitions(bench_dispatch_compare PRIVATE
-    ${LLVM_DEFINITIONS}
-    BENCH_SIMD_BACKEND="${SIMD_ARCH}"
-)
-target_compile_options(bench_dispatch_compare PRIVATE -O3 -DNDEBUG ${SIMD_FLAGS})
+if(RUT_ENABLE_JIT)
+    add_executable(bench_dispatch_compare bench_dispatch_compare.cc)
+    target_link_libraries(bench_dispatch_compare rut_runtime rut_jit)
+    target_include_directories(bench_dispatch_compare PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/testing
+        ${LLVM_INCLUDE_DIRS}
+    )
+    target_compile_definitions(bench_dispatch_compare PRIVATE
+        ${LLVM_DEFINITIONS}
+        BENCH_SIMD_BACKEND="${SIMD_ARCH}"
+    )
+    target_compile_options(bench_dispatch_compare PRIVATE -O3 -DNDEBUG ${SIMD_FLAGS})
+endif()

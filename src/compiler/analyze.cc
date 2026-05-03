@@ -2433,6 +2433,19 @@ static FrontendResult<HirExpr> analyze_method_call_expr(const AstExpr& expr,
     if (recv->may_nil || recv->may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
+    if (expr.name.eq({"matches", 7}) && recv->type == HirTypeKind::Str && expr.args.len == 1 &&
+        expr.args[0]->kind == AstExprKind::RegexLit) {
+        HirExpr out{};
+        out.kind = HirExprKind::RegexMatch;
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        out.str_value = expr.args[0]->str_value;
+        if (!route->exprs.push(recv.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
+
     const bool is_eq_family = expr.name.eq({"eq", 2}) || expr.name.eq({"ne", 2});
     const bool is_ord_family = expr.name.eq({"lt", 2}) || expr.name.eq({"gt", 2}) ||
                                expr.name.eq({"le", 2}) || expr.name.eq({"ge", 2});
@@ -3940,6 +3953,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.str_value = expr.str_value;
         return out;
     }
+    if (expr.kind == AstExprKind::RegexLit) {
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    }
     if (expr.kind == AstExprKind::Call)
         return analyze_call_expr(expr, route, mod, locals, local_count, binding, nullptr);
     if (expr.kind == AstExprKind::StructInit) {
@@ -4161,14 +4177,18 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (resolve_import_namespace_member(mod, expr, ignored_qualified)) user_bound = true;
         }
         if (!user_bound) {
-            // Known fields: method (HttpMethod). Future fields (path,
-            // …) add branches here. `header` isn't reached via this
+            // Known fields: method (HttpMethod), path (str). `header` isn't reached via this
             // path — the parser captures `req.header("...")` as the
             // dedicated ReqHeader special form before generic Field
             // parsing runs.
             if (expr.name.eq({"method", 6})) {
                 out.kind = HirExprKind::ReqMethod;
                 out.type = HirTypeKind::Method;
+                return out;
+            }
+            if (expr.name.eq({"path", 4})) {
+                out.kind = HirExprKind::ReqPath;
+                out.type = HirTypeKind::Str;
                 return out;
             }
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);

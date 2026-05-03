@@ -466,6 +466,16 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_str_regex_match(ValueId str, Str pattern, SourceLoc loc = {}) {
+        if (!val_has_type(str, TypeKind::Str)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::StrRegexMatch, ty, loc));
+        inst->operands[0] = str;
+        inst->operand_count = 1;
+        inst->imm.str_val = pattern;
+        return vid;
+    }
+
     Result<ValueId> emit_str_interpolate(const ValueId* parts, u32 count, SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
         auto r = TRY(emit(Opcode::StrInterpolate, ty, loc));

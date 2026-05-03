@@ -104,6 +104,48 @@ LexResult lex(Str source) {
         tok.line = line;
         tok.col = col;
 
+        if (c == 'r' && pos + 2 < source.len && source.ptr[pos + 1] == 'e' &&
+            source.ptr[pos + 2] == '"') {
+            const u32 literal_start = pos;
+            const u32 literal_col = col;
+            const u32 quote_start = pos + 2;
+            pos += 3;
+            col += 3;
+            tok.start = quote_start + 1;
+            tok.col += 3;
+            while (pos < source.len) {
+                const char cur = source.ptr[pos];
+                if (cur == '"') break;
+                if (cur == '\\') {
+                    if (pos + 1 >= source.len) {
+                        return frontend_error(FrontendError::UnterminatedString,
+                                              Span{literal_start, pos, tok.line, literal_col});
+                    }
+                    pos += 2;
+                    col += 2;
+                    continue;
+                }
+                if (cur == '\n') {
+                    return frontend_error(FrontendError::UnterminatedString,
+                                          Span{literal_start, pos, tok.line, literal_col});
+                }
+                pos++;
+                col++;
+            }
+            if (pos >= source.len || source.ptr[pos] != '"') {
+                return frontend_error(FrontendError::UnterminatedString,
+                                      Span{literal_start, pos, tok.line, literal_col});
+            }
+            tok.type = TokenType::RegexLit;
+            tok.end = pos;
+            tok.text = source.slice(tok.start, tok.end);
+            pos++;
+            col++;
+            if (!out.tokens.push(tok))
+                return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+            continue;
+        }
+
         if (is_ident_start(c)) {
             pos++;
             col++;

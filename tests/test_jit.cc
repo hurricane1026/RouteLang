@@ -15,9 +15,14 @@
 #include <filesystem>
 #include <fstream>
 
+#include <pthread.h>
+#include <stdio.h>
+
 using namespace rut;
 using namespace rut::rir;
 using namespace rut::jit;
+
+extern "C" u32 rut_helper_regex_scratch_cache_entry_count_for_test();
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -142,6 +147,11 @@ static const char kGetApiRequest[] =
     "Host: localhost\r\n"
     "\r\n";
 
+static const char kGetApiQueryRequest[] =
+    "GET /api/users?x=1 HTTP/1.1\r\n"
+    "Host: localhost\r\n"
+    "\r\n";
+
 static const char kGetRootRequest[] =
     "GET / HTTP/1.1\r\n"
     "Host: localhost\r\n"
@@ -169,6 +179,16 @@ TEST(jit, helpers_sanity) {
     rut::test::out("\n");
     CHECK(out_ptr != nullptr);
     CHECK(out_len > 0);
+    CHECK(out_len == 10);
+    CHECK(__builtin_memcmp(out_ptr, "/api/users", 10) == 0);
+
+    rut_helper_req_path(reinterpret_cast<const u8*>(kGetApiQueryRequest),
+                        sizeof(kGetApiQueryRequest) - 1,
+                        &out_ptr,
+                        &out_len);
+    CHECK(out_ptr != nullptr);
+    CHECK(out_len == 14);
+    CHECK(__builtin_memcmp(out_ptr, "/api/users?x=1", 14) == 0);
 }
 
 // Test: Simple handler that always returns 200.
@@ -4050,6 +4070,169 @@ TEST(jit, guard_path_prefix) {
     tc.destroy();
 }
 
+TEST(jit, guard_path_regex_match) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("path_regex_guard"), lit("/api"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok_blk = V(b.create_block(fn, lit("ok")));
+    auto reject_blk = V(b.create_block(fn, lit("reject")));
+
+    b.set_insert_point(fn, entry);
+    auto path = V(b.emit_req_path());
+    auto matched = V(b.emit_str_regex_match(path, lit("^/api/[a-z]+$")));
+    VOK(b.emit_br(matched, ok_blk, reject_blk));
+
+    b.set_insert_point(fn, reject_blk);
+    VOK(b.emit_ret_status(404));
+
+    b.set_insert_point(fn, ok_blk);
+    VOK(b.emit_ret_status(200));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto* addr = engine.lookup("handler_path_regex_guard");
+    REQUIRE(addr != nullptr);
+    auto handler = reinterpret_cast<HandlerFn>(addr);
+
+    {
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(kGetApiRequest),
+                                               sizeof(kGetApiRequest) - 1,
+                                               nullptr));
+        CHECK(r.action == HandlerAction::ReturnStatus);
+        CHECK(r.status_code == 200);
+    }
+
+    {
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(kGetApiQueryRequest),
+                                               sizeof(kGetApiQueryRequest) - 1,
+                                               nullptr));
+        CHECK(r.action == HandlerAction::ReturnStatus);
+        CHECK(r.status_code == 404);
+    }
+
+    {
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(kGetRootRequest),
+                                               sizeof(kGetRootRequest) - 1,
+                                               nullptr));
+        CHECK(r.action == HandlerAction::ReturnStatus);
+        CHECK(r.status_code == 404);
+    }
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, duplicate_regex_literals_share_one_db_symbol) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("duplicate_regex_guard"), lit("/api"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok_blk = V(b.create_block(fn, lit("ok")));
+    auto reject_blk = V(b.create_block(fn, lit("reject")));
+
+    b.set_insert_point(fn, entry);
+    auto path = V(b.emit_req_path());
+    (void)V(b.emit_str_regex_match(path, lit("^/api/[a-z]+$")));
+    auto matched = V(b.emit_str_regex_match(path, lit("^/api/[a-z]+$")));
+    VOK(b.emit_br(matched, ok_blk, reject_blk));
+
+    b.set_insert_point(fn, reject_blk);
+    VOK(b.emit_ret_status(404));
+
+    b.set_insert_point(fn, ok_blk);
+    VOK(b.emit_ret_status(200));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    CHECK(engine.regex_slot_count == 1);
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, regex_registration_rolls_back_on_failed_compile) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("invalid_regex_guard"), lit("/api"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok_blk = V(b.create_block(fn, lit("ok")));
+    auto reject_blk = V(b.create_block(fn, lit("reject")));
+
+    b.set_insert_point(fn, entry);
+    auto path = V(b.emit_req_path());
+    (void)V(b.emit_str_regex_match(path, lit("^/api/[a-z]+$")));
+    auto invalid = V(b.emit_str_regex_match(path, lit("[")));
+    VOK(b.emit_br(invalid, ok_blk, reject_blk));
+
+    b.set_insert_point(fn, reject_blk);
+    VOK(b.emit_ret_status(404));
+
+    b.set_insert_point(fn, ok_blk);
+    VOK(b.emit_ret_status(200));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    CHECK(!engine.compile(cg.mod, cg.ctx));
+    CHECK(engine.regex_slot_count == 0);
+
+    TestContext tc_valid;
+    REQUIRE(tc_valid.init());
+    Builder b_valid;
+    b_valid.init(&tc_valid.mod);
+    auto* fn_valid = V(b_valid.create_function(lit("valid_after_regex_fail"), lit("/api"), 'G'));
+    auto entry_valid = V(b_valid.create_block(fn_valid, lit("entry")));
+    auto ok_valid = V(b_valid.create_block(fn_valid, lit("ok")));
+    auto reject_valid = V(b_valid.create_block(fn_valid, lit("reject")));
+    b_valid.set_insert_point(fn_valid, entry_valid);
+    auto path_valid = V(b_valid.emit_req_path());
+    auto matched_valid = V(b_valid.emit_str_regex_match(path_valid, lit("^/api/[a-z]+$")));
+    VOK(b_valid.emit_br(matched_valid, ok_valid, reject_valid));
+    b_valid.set_insert_point(fn_valid, reject_valid);
+    VOK(b_valid.emit_ret_status(404));
+    b_valid.set_insert_point(fn_valid, ok_valid);
+    VOK(b_valid.emit_ret_status(200));
+
+    auto cg_valid = codegen(tc_valid.mod);
+    REQUIRE(cg_valid.ok);
+    REQUIRE(engine.compile(cg_valid.mod, cg_valid.ctx));
+    CHECK(engine.regex_slot_count == 1);
+
+    engine.shutdown();
+    tc_valid.destroy();
+    tc.destroy();
+}
+
 // Test: Handler that reads a header.
 // RIR equivalent:
 //   %auth = req.header "Authorization"
@@ -4262,6 +4445,125 @@ TEST(helpers, str_has_prefix_edge_cases) {
 
     // Both empty
     CHECK(rut_helper_str_has_prefix("", 0, "", 0) == 1);
+}
+
+TEST(helpers, str_regex_match) {
+    if (!rut_helper_regex_backend_available()) SKIP("vectorscan backend not available");
+    void* db = rut_helper_regex_compile("^/v[0-9]+/users$", 16);
+    REQUIRE(db != nullptr);
+    CHECK(rut_helper_str_regex_match("/v12/users", 10, db) == 1);
+    CHECK(rut_helper_str_regex_match("/v12/users/extra", 16, db) == 0);
+    rut_helper_regex_free(db);
+
+    db = rut_helper_regex_compile("users", 5);
+    REQUIRE(db != nullptr);
+    CHECK(rut_helper_str_regex_match("users", 5, db) == 1);
+    CHECK(rut_helper_str_regex_match("/api/users", 10, db) == 0);
+    rut_helper_regex_free(db);
+
+    db = rut_helper_regex_compile("a.{0,10}z", 9);
+    REQUIRE(db != nullptr);
+    CHECK(rut_helper_str_regex_match("abcdez", 6, db) == 1);
+    rut_helper_regex_free(db);
+
+    db = rut_helper_regex_compile("^/api/users$", 12);
+    REQUIRE(db != nullptr);
+    CHECK(rut_helper_str_regex_match("/api/users", 10, db) == 1);
+    CHECK(rut_helper_str_regex_match("/api/users?x=1", 14, db) == 0);
+    rut_helper_regex_free(db);
+
+    CHECK(rut_helper_regex_compile("[", 1) == nullptr);
+}
+
+TEST(helpers, str_regex_scratch_cache_grows_and_reuses_entries) {
+    if (!rut_helper_regex_backend_available()) SKIP("vectorscan backend not available");
+
+    static constexpr u32 kRegexCount = 40;
+    char patterns[kRegexCount][16]{};
+    u32 lens[kRegexCount]{};
+    void* dbs[kRegexCount]{};
+
+    for (u32 i = 0; i < kRegexCount; i++) {
+        int n = snprintf(patterns[i], sizeof(patterns[i]), "^/r%u$", i);
+        REQUIRE(n > 0);
+        lens[i] = static_cast<u32>(n);
+        dbs[i] = rut_helper_regex_compile(patterns[i], lens[i]);
+        REQUIRE(dbs[i] != nullptr);
+    }
+
+    u32 before_count = rut_helper_regex_scratch_cache_entry_count_for_test();
+    for (u32 i = 0; i < kRegexCount; i++) {
+        char value[16]{};
+        int n = snprintf(value, sizeof(value), "/r%u", i);
+        REQUIRE(n > 0);
+        CHECK(rut_helper_str_regex_match(value, static_cast<u32>(n), dbs[i]) == 1);
+    }
+    u32 warmed_count = rut_helper_regex_scratch_cache_entry_count_for_test();
+    CHECK(warmed_count == before_count + kRegexCount);
+
+    for (u32 i = 0; i < kRegexCount; i++) {
+        char value[16]{};
+        int n = snprintf(value, sizeof(value), "/r%u", i);
+        REQUIRE(n > 0);
+        CHECK(rut_helper_str_regex_match(value, static_cast<u32>(n), dbs[i]) == 1);
+    }
+    CHECK(rut_helper_regex_scratch_cache_entry_count_for_test() == warmed_count);
+
+    for (u32 i = 0; i < kRegexCount; i++) {
+        rut_helper_regex_free(dbs[i]);
+    }
+    CHECK(rut_helper_regex_scratch_cache_entry_count_for_test() == before_count);
+}
+
+struct RegexScratchPruneThreadState {
+    void* db = nullptr;
+    pthread_barrier_t* warmed = nullptr;
+    pthread_barrier_t* pruned = nullptr;
+    u32 warm_count = 0;
+    u32 final_count = 0;
+    u8 matched = 0;
+};
+
+static void* regex_scratch_prune_thread(void* arg) {
+    auto* state = static_cast<RegexScratchPruneThreadState*>(arg);
+    state->matched = rut_helper_str_regex_match("/worker", 7, state->db);
+    state->warm_count = rut_helper_regex_scratch_cache_entry_count_for_test();
+    pthread_barrier_wait(state->warmed);
+    pthread_barrier_wait(state->pruned);
+    state->final_count = rut_helper_regex_scratch_cache_entry_count_for_test();
+    return nullptr;
+}
+
+TEST(helpers, str_regex_free_prunes_other_thread_scratch_cache) {
+    if (!rut_helper_regex_backend_available()) SKIP("vectorscan backend not available");
+
+    void* db = rut_helper_regex_compile("^/worker$", 9);
+    REQUIRE(db != nullptr);
+
+    pthread_barrier_t warmed;
+    pthread_barrier_t pruned;
+    REQUIRE(pthread_barrier_init(&warmed, nullptr, 2) == 0);
+    REQUIRE(pthread_barrier_init(&pruned, nullptr, 2) == 0);
+
+    RegexScratchPruneThreadState state{};
+    state.db = db;
+    state.warmed = &warmed;
+    state.pruned = &pruned;
+
+    pthread_t thread{};
+    REQUIRE(pthread_create(&thread, nullptr, regex_scratch_prune_thread, &state) == 0);
+    pthread_barrier_wait(&warmed);
+
+    CHECK(state.matched == 1);
+    CHECK(state.warm_count == 1);
+    rut_helper_regex_free(db);
+    pthread_barrier_wait(&pruned);
+
+    REQUIRE(pthread_join(thread, nullptr) == 0);
+    CHECK(state.final_count == 0);
+
+    pthread_barrier_destroy(&pruned);
+    pthread_barrier_destroy(&warmed);
 }
 
 TEST(helpers, str_trim_prefix) {

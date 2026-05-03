@@ -5,8 +5,10 @@
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#if RUT_ENABLE_JIT_TESTS
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
+#endif
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
@@ -2226,6 +2228,7 @@ TEST(route, capture_real_socket) {
     destroy_real_loop(loop);
 }
 
+#if RUT_ENABLE_JIT_TESTS
 // End-to-end wait(ms) through the real EpollEventLoop: compile a route
 // that yields for 1 second and returns 204, register it as a JitHandler
 // in the RouteConfig, drive a real TCP connection, and assert the client
@@ -2566,6 +2569,7 @@ TEST(route, wait_longer_than_keepalive_not_resumed_by_wheel) {
     engine.shutdown();
     rir.destroy();
 }
+#endif
 
 // Minimal hand-written handler that returns a Forward action. Matches the
 // jit::HandlerFn ABI so callbacks_impl.h's handle_jit_outcome can dispatch
@@ -3454,6 +3458,7 @@ TEST(http_header_validation, http_header_name_eq_ci_length_mismatch) {
     CHECK(!http_header_name_eq_ci("X", 1, "", 0));
 }
 
+#if RUT_ENABLE_JIT_TESTS
 // End-to-end: compile `route GET "/x" { return response(200, body: "Hi!") }`
 // from source, populate RouteConfig.response_bodies from the compiled
 // rir::Module, and verify a real client receives the exact body.
@@ -3826,6 +3831,7 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
     engine.shutdown();
     rir.destroy();
 }
+#endif
 
 // populate_route_config requires bodies / header sets / routes to
 // start empty (there's no merge semantics). Upstreams are more
@@ -3971,6 +3977,7 @@ TEST(route, populate_route_config_rejects_pre_bound_over_long_name) {
     rir.destroy();
 }
 
+#if RUT_ENABLE_JIT_TESTS
 // End-to-end: compile DSL with an address-carrying `upstream` decl and
 // let populate_route_config bind the RouteConfig. Since no real backend
 // is listening on the compiled port, the forward will ECONNREFUSED and
@@ -4117,7 +4124,9 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     engine.shutdown();
     rir.destroy();
 }
+#endif
 
+#if RUT_ENABLE_JIT_TESTS
 // End-to-end: `guard req.method == POST else { return 405 }` inside a
 // DSL handler. Registers the handler with method=0 so both GET and
 // POST reach it — the guard (not RouteConfig's method filter) is what
@@ -4210,6 +4219,7 @@ TEST(route, dsl_req_method_guard_real_socket) {
     engine.shutdown();
     rir.destroy();
 }
+#endif
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);

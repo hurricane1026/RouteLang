@@ -50,6 +50,16 @@ rut::u8 rut_helper_str_eq(const char* a, rut::u32 a_len, const char* b, rut::u32
 // Lexicographic string comparison. Returns <0, 0, >0 like strcmp.
 rut::i32 rut_helper_str_cmp(const char* a, rut::u32 a_len, const char* b, rut::u32 b_len);
 
+// Compile/free a regular-expression database for full-match scans.
+void* rut_helper_regex_compile(const char* pattern, rut::u32 pattern_len);
+void rut_helper_regex_free(void* db);
+
+// Full regular-expression match using a precompiled database.
+rut::u8 rut_helper_str_regex_match(const char* s, rut::u32 s_len, void* db);
+
+// Returns 1 when the Vectorscan backend is available.
+rut::u8 rut_helper_regex_backend_available();
+
 // Trim prefix from string. If s starts with pfx, out = remainder.
 // Otherwise out = s unchanged.
 void rut_helper_str_trim_prefix(const char* s,

@@ -2,6 +2,8 @@
 
 #include "rut/common/types.h"
 
+#include <pthread.h>
+
 // Forward-declare LLVM C API opaque types to avoid pulling LLVM headers
 // into runtime code. The actual LLVM headers are only included in
 // jit_engine.cc and codegen.cc.
@@ -17,7 +19,7 @@ namespace rut::jit {
 //
 // Thread safety:
 //   - init() / shutdown() on main thread only
-//   - compile() / lookup() are thread-safe (LLJIT uses internal locks)
+//   - compile() is serialized by JitEngine; lookup() uses LLJIT's internal locks
 //   - JIT'd function pointers are plain C calls, no LLVM dependency
 //
 // Lifetime:
@@ -34,11 +36,27 @@ struct JitEngine {
     LLVMContextRef contexts[kMaxContexts];
     u32 ctx_count = 0;
 
+    pthread_mutex_t compile_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    // Precompiled regex databases referenced by JIT modules. prepare_regex_symbols()
+    // writes each compiled database pointer directly into the corresponding LLVM
+    // global initializer; slots retain the handles so engine teardown can free them.
+    struct RegexSlot {
+        char symbol[96];
+        void* db = nullptr;
+    };
+    RegexSlot** regex_slots = nullptr;
+    u32 regex_slot_count = 0;
+    u32 regex_slot_cap = 0;
+
     bool init();
 
     // Compile an LLVM IR module to native code.
     // Always takes ownership of both mod and ctx regardless of return value.
     bool compile(LLVMModuleRef mod, LLVMContextRef ctx);
+    RegexSlot* alloc_regex_slot();
+    bool prepare_regex_symbols(LLVMModuleRef mod, u32* out_start_count);
+    void rollback_regex_symbols(u32 start_count);
 
     void* lookup(const char* name);
     void shutdown();

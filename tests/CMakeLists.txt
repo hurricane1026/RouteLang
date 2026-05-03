@@ -43,7 +43,6 @@ add_executable(test_integration
 target_link_libraries(test_integration
     rut_runtime
     rut_compiler
-    rut_jit
     Threads::Threads
     ssl
     crypto
@@ -57,6 +56,12 @@ target_include_directories(test_integration PRIVATE
 target_compile_definitions(test_integration PRIVATE
     RUT_TESTDATA_DIR="${RUT_TLS_TESTDATA_DIR}"
 )
+if(RUT_ENABLE_JIT)
+    target_link_libraries(test_integration rut_jit)
+    target_compile_definitions(test_integration PRIVATE RUT_ENABLE_JIT_TESTS=1)
+else()
+    target_compile_definitions(test_integration PRIVATE RUT_ENABLE_JIT_TESTS=0)
+endif()
 add_dependencies(test_integration test_tls_fixtures)
 add_test(NAME test_integration COMMAND test_integration)
 set_tests_properties(test_integration PROPERTIES LABELS "integration;network")
@@ -225,16 +230,18 @@ target_include_directories(test_shard_control PRIVATE
 add_test(NAME test_shard_control COMMAND test_shard_control)
 set_tests_properties(test_shard_control PROPERTIES LABELS "unit")
 
-add_executable(test_jit test_jit.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
-target_link_libraries(test_jit rut_jit rut_compiler)
-target_include_directories(test_jit PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/testing
-    ${LLVM_INCLUDE_DIRS}
-)
-target_compile_definitions(test_jit PRIVATE ${LLVM_DEFINITIONS})
-add_test(NAME test_jit COMMAND test_jit)
-set_tests_properties(test_jit PROPERTIES LABELS "unit;jit")
+if(RUT_ENABLE_JIT)
+    add_executable(test_jit test_jit.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+    target_link_libraries(test_jit rut_jit rut_compiler)
+    target_include_directories(test_jit PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/testing
+        ${LLVM_INCLUDE_DIRS}
+    )
+    target_compile_definitions(test_jit PRIVATE ${LLVM_DEFINITIONS})
+    add_test(NAME test_jit COMMAND test_jit)
+    set_tests_properties(test_jit PROPERTIES LABELS "unit;jit")
+endif()
 
 add_executable(test_traffic_capture
     test_traffic_capture.cc
@@ -272,46 +279,77 @@ target_include_directories(test_sim PRIVATE
 add_test(NAME test_sim COMMAND test_sim)
 set_tests_properties(test_sim PROPERTIES LABELS "integration;sim")
 
-add_executable(test_simulate_engine test_simulate_engine.cc)
-add_dependencies(test_simulate_engine rut-simulate)
-target_link_libraries(test_simulate_engine rut_simulate)
-target_include_directories(test_simulate_engine PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/testing
-    ${LLVM_INCLUDE_DIRS}
-)
-target_compile_definitions(test_simulate_engine PRIVATE ${LLVM_DEFINITIONS})
-target_compile_definitions(test_simulate_engine PRIVATE
-    RUT_SIMULATE_BIN_PATH="$<TARGET_FILE:rut-simulate>"
-)
-add_test(NAME test_simulate_engine COMMAND test_simulate_engine)
-set_tests_properties(test_simulate_engine PROPERTIES LABELS "unit;sim;jit")
+if(RUT_ENABLE_JIT)
+    add_executable(test_simulate_engine test_simulate_engine.cc)
+    add_dependencies(test_simulate_engine rut-simulate)
+    target_link_libraries(test_simulate_engine rut_simulate)
+    target_include_directories(test_simulate_engine PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/testing
+        ${LLVM_INCLUDE_DIRS}
+    )
+    target_compile_definitions(test_simulate_engine PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(test_simulate_engine PRIVATE
+        RUT_SIMULATE_BIN_PATH="$<TARGET_FILE:rut-simulate>"
+    )
+    add_test(NAME test_simulate_engine COMMAND test_simulate_engine)
+    set_tests_properties(test_simulate_engine PROPERTIES LABELS "unit;sim;jit")
+endif()
 
-add_custom_target(check
-    COMMAND $<TARGET_FILE:test_network>
-    COMMAND $<TARGET_FILE:test_integration>
-    COMMAND $<TARGET_FILE:test_arena>
-    COMMAND $<TARGET_FILE:test_expected>
-    COMMAND $<TARGET_FILE:test_http_parser>
-    COMMAND $<TARGET_FILE:test_buffer>
-    COMMAND $<TARGET_FILE:test_types>
-    COMMAND $<TARGET_FILE:test_rir>
-    COMMAND $<TARGET_FILE:test_frontend>
-    COMMAND $<TARGET_FILE:test_drain>
-    COMMAND $<TARGET_FILE:test_access_log>
-    COMMAND $<TARGET_FILE:test_metrics>
-    COMMAND $<TARGET_FILE:test_debug>
-    COMMAND $<TARGET_FILE:test_fault_injection>
-    COMMAND $<TARGET_FILE:test_chunked_parser>
-    COMMAND $<TARGET_FILE:test_shard_control>
-    COMMAND $<TARGET_FILE:test_jit>
-    COMMAND $<TARGET_FILE:test_traffic_capture>
-    COMMAND $<TARGET_FILE:test_traffic_replay>
-    COMMAND $<TARGET_FILE:test_sim>
-    COMMAND $<TARGET_FILE:test_simulate_engine>
-    COMMAND $<TARGET_FILE:test_route_trie>
-    COMMAND $<TARGET_FILE:test_route_art>
-    COMMAND $<TARGET_FILE:test_route_select>
-    DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_art test_route_select
-    COMMENT "Running all tests..."
-)
+if(RUT_ENABLE_JIT)
+    add_custom_target(check
+        COMMAND $<TARGET_FILE:test_network>
+        COMMAND $<TARGET_FILE:test_integration>
+        COMMAND $<TARGET_FILE:test_arena>
+        COMMAND $<TARGET_FILE:test_expected>
+        COMMAND $<TARGET_FILE:test_http_parser>
+        COMMAND $<TARGET_FILE:test_buffer>
+        COMMAND $<TARGET_FILE:test_types>
+        COMMAND $<TARGET_FILE:test_rir>
+        COMMAND $<TARGET_FILE:test_frontend>
+        COMMAND $<TARGET_FILE:test_drain>
+        COMMAND $<TARGET_FILE:test_access_log>
+        COMMAND $<TARGET_FILE:test_metrics>
+        COMMAND $<TARGET_FILE:test_debug>
+        COMMAND $<TARGET_FILE:test_fault_injection>
+        COMMAND $<TARGET_FILE:test_chunked_parser>
+        COMMAND $<TARGET_FILE:test_shard_control>
+        COMMAND $<TARGET_FILE:test_jit>
+        COMMAND $<TARGET_FILE:test_traffic_capture>
+        COMMAND $<TARGET_FILE:test_traffic_replay>
+        COMMAND $<TARGET_FILE:test_sim>
+        COMMAND $<TARGET_FILE:test_simulate_engine>
+        COMMAND $<TARGET_FILE:test_route_trie>
+        COMMAND $<TARGET_FILE:test_route_art>
+        COMMAND $<TARGET_FILE:test_route_select>
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_art test_route_select
+        COMMENT "Running all tests..."
+    )
+else()
+    add_custom_target(check
+        COMMAND $<TARGET_FILE:test_network>
+        COMMAND $<TARGET_FILE:test_integration>
+        COMMAND $<TARGET_FILE:test_arena>
+        COMMAND $<TARGET_FILE:test_expected>
+        COMMAND $<TARGET_FILE:test_http_parser>
+        COMMAND $<TARGET_FILE:test_buffer>
+        COMMAND $<TARGET_FILE:test_types>
+        COMMAND $<TARGET_FILE:test_rir>
+        COMMAND $<TARGET_FILE:test_frontend>
+        COMMAND $<TARGET_FILE:test_drain>
+        COMMAND $<TARGET_FILE:test_access_log>
+        COMMAND $<TARGET_FILE:test_metrics>
+        COMMAND $<TARGET_FILE:test_debug>
+        COMMAND $<TARGET_FILE:test_fault_injection>
+        COMMAND $<TARGET_FILE:test_chunked_parser>
+        COMMAND $<TARGET_FILE:test_shard_control>
+        COMMAND $<TARGET_FILE:test_traffic_capture>
+        COMMAND $<TARGET_FILE:test_traffic_replay>
+        COMMAND $<TARGET_FILE:test_sim>
+        COMMAND $<TARGET_FILE:test_route_trie>
+        COMMAND $<TARGET_FILE:test_route_art>
+        COMMAND $<TARGET_FILE:test_route_select>
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_route_trie test_route_art test_route_select
+        COMMENT "Running non-JIT tests..."
+    )
+endif()

@@ -137,6 +137,42 @@ TEST(frontend, lex_recognizes_wait_keyword) {
     CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwWait));
 }
 
+TEST(frontend, lex_recognizes_regex_literal) {
+    const char* src = "re\"^/v[0-9]+$\"";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 2u);
+    CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::RegexLit));
+    CHECK(lexed->tokens[0].text.eq(lit("^/v[0-9]+$")));
+}
+
+TEST(frontend, lex_regex_literal_allows_escaped_quote) {
+    const char* src = "re\"a\\\"b\"";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 2u);
+    CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::RegexLit));
+    CHECK(lexed->tokens[0].text.eq(lit("a\\\"b")));
+}
+
+TEST(frontend, lex_regex_literal_reports_unterminated_at_literal_start) {
+    const char* src = "  re\"abc";
+    auto lexed = lex(lit(src));
+    REQUIRE(!lexed);
+    CHECK_EQ(lexed.error().code, FrontendError::UnterminatedString);
+    CHECK_EQ(lexed.error().span.start, 2u);
+    CHECK_EQ(lexed.error().span.col, 3u);
+}
+
+TEST(frontend, lex_regex_literal_reports_trailing_escape_at_literal_start) {
+    const char* src = "re\"abc\\";
+    auto lexed = lex(lit(src));
+    REQUIRE(!lexed);
+    CHECK_EQ(lexed.error().code, FrontendError::UnterminatedString);
+    CHECK_EQ(lexed.error().span.start, 0u);
+    CHECK_EQ(lexed.error().span.col, 1u);
+}
+
 TEST(frontend, parse_return_response_status_only) {
     // `return response(200)` is the builder entry point. With no body
     // kwarg it's semantically identical to `return 200`; the HIR
@@ -589,6 +625,90 @@ TEST(frontend, parse_guard_req_method_eq_post) {
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
     rir.destroy();
+}
+
+TEST(frontend, parse_req_path_regex_match_lowers_to_rir) {
+    const char* src =
+        "route GET \"/\" { guard req.path.matches(re\"^/v[0-9]+/users$\") else { return 404 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    const auto& cond = hir->routes[0].guards[0].cond;
+    CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(HirExprKind::RegexMatch));
+    REQUIRE(cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(HirExprKind::ReqPath));
+    CHECK(cond.str_value.eq(lit("^/v[0-9]+/users$")));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK(block_has_op(rir.module.functions[0].blocks[0], rir::Opcode::ReqPath));
+    CHECK(block_has_op(rir.module.functions[0].blocks[0], rir::Opcode::StrRegexMatch));
+    rir.destroy();
+}
+
+TEST(frontend, req_path_regex_match_alias_lowers_to_str_regex) {
+    const char* src =
+        "route GET \"/\" { let p = req.path guard p.matches(re\"^/v[0-9]+/users$\") else { "
+        "return 404 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    const auto& cond = hir->routes[0].guards[0].cond;
+    CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(HirExprKind::RegexMatch));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    const auto& block = rir.module.functions[0].blocks[0];
+    CHECK_EQ(block_op_count(block, rir::Opcode::StrRegexMatch), 1u);
+    rir.destroy();
+}
+
+TEST(frontend, user_defined_matches_method_still_dispatches) {
+    const char* src = R"rut(
+protocol Matcher { func matches(value: i32) -> bool }
+struct Box { value: i32 }
+Box impl Matcher {
+    func matches(self: Box, value: i32) -> bool => self.value == value
+}
+route GET "/" { guard Box(value: 7).matches(7) else { return 404 } return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, regex_literal_is_only_valid_as_matches_pattern) {
+    const char* src =
+        "route GET \"/\" { guard re\".*\" == re\".*\" else { return 400 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, parse_method_keyword_as_expression) {

@@ -185,63 +185,185 @@ target_include_directories(rut_compiler PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
 
-# JIT library — LLVM ORC JIT integration via C API.
-# Only this library links LLVM. rut_runtime stays LLVM-free so shard
-# threads never transitively depend on LLVM headers or libraries.
-add_library(rut_jit STATIC
-    jit/jit_engine.cc
-    jit/codegen.cc
-    jit/art_jit_codegen.cc
-    jit/runtime_helpers.cc
-)
+if(RUT_ENABLE_JIT)
+    # Vectorscan/Hyperscan regex backend. Build only the static library and disable
+    # extra targets; Rut links it into rut_jit for regex compilation and scanning.
+    # Vectorscan's CMake mutates global flags, so isolate it between save/restore.
+    set(_RUT_SAVE_CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+    set(_RUT_SAVE_CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    set(_RUT_SAVE_CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+    set(_RUT_SAVE_CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    set(_RUT_SAVE_CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
+    set(_RUT_SAVE_CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+    set(_RUT_SAVE_CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO}")
+    set(_RUT_SAVE_CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+    set(_RUT_SAVE_CMAKE_C_FLAGS_MINSIZEREL "${CMAKE_C_FLAGS_MINSIZEREL}")
+    set(_RUT_SAVE_CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL}")
+    set(_RUT_SAVE_CMAKE_CXX_STANDARD "${CMAKE_CXX_STANDARD}")
+    set(_RUT_SAVE_CMAKE_CXX_EXTENSIONS "${CMAKE_CXX_EXTENSIONS}")
+    set(_RUT_SAVE_CCACHE_DISABLE "$ENV{CCACHE_DISABLE}")
+    get_property(_RUT_SAVE_RULE_LAUNCH_COMPILE GLOBAL PROPERTY RULE_LAUNCH_COMPILE)
+    get_property(_RUT_SAVE_RULE_LAUNCH_LINK GLOBAL PROPERTY RULE_LAUNCH_LINK)
+    foreach(_RUT_VS_CACHE_VAR
+            BUILD_STATIC_LIBS
+            BUILD_SHARED_LIBS
+            BUILD_UNIT
+            BUILD_TOOLS
+            BUILD_EXAMPLES
+            BUILD_BENCHMARKS
+            FAT_RUNTIME
+            DUMP_SUPPORT)
+        if(DEFINED CACHE{${_RUT_VS_CACHE_VAR}})
+            set("_RUT_SAVE_${_RUT_VS_CACHE_VAR}_DEFINED" TRUE)
+            get_property("_RUT_SAVE_${_RUT_VS_CACHE_VAR}_VALUE"
+                CACHE "${_RUT_VS_CACHE_VAR}" PROPERTY VALUE)
+            get_property("_RUT_SAVE_${_RUT_VS_CACHE_VAR}_TYPE"
+                CACHE "${_RUT_VS_CACHE_VAR}" PROPERTY TYPE)
+            get_property("_RUT_SAVE_${_RUT_VS_CACHE_VAR}_HELP"
+                CACHE "${_RUT_VS_CACHE_VAR}" PROPERTY HELPSTRING)
+        else()
+            set("_RUT_SAVE_${_RUT_VS_CACHE_VAR}_DEFINED" FALSE)
+        endif()
+    endforeach()
+    set(ENV{CCACHE_DISABLE} "1")
+    set(CMAKE_C_FLAGS "")
+    set(CMAKE_CXX_FLAGS "")
+    set(CMAKE_C_FLAGS_DEBUG "")
+    set(CMAKE_CXX_FLAGS_DEBUG "")
+    set(CMAKE_C_FLAGS_RELEASE "")
+    set(CMAKE_CXX_FLAGS_RELEASE "")
+    set(CMAKE_C_FLAGS_RELWITHDEBINFO "")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "")
+    set(CMAKE_C_FLAGS_MINSIZEREL "")
+    set(CMAKE_CXX_FLAGS_MINSIZEREL "")
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_EXTENSIONS ON)
+    set(BUILD_STATIC_LIBS ON CACHE BOOL "Build vectorscan static libraries" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build vectorscan shared libraries" FORCE)
+    set(BUILD_UNIT OFF CACHE BOOL "Build vectorscan unit tests" FORCE)
+    set(BUILD_TOOLS OFF CACHE BOOL "Build vectorscan tools" FORCE)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "Build vectorscan examples" FORCE)
+    set(BUILD_BENCHMARKS OFF CACHE BOOL "Build vectorscan benchmarks" FORCE)
+    set(FAT_RUNTIME OFF CACHE BOOL "Build vectorscan fat runtime" FORCE)
+    set(DUMP_SUPPORT OFF CACHE BOOL "Build vectorscan dump support" FORCE)
+    add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/vectorscan
+        ${CMAKE_CURRENT_BINARY_DIR}/third_party/vectorscan
+        EXCLUDE_FROM_ALL
+    )
+    set(CMAKE_C_FLAGS "${_RUT_SAVE_CMAKE_C_FLAGS}")
+    set(CMAKE_CXX_FLAGS "${_RUT_SAVE_CMAKE_CXX_FLAGS}")
+    set(CMAKE_C_FLAGS_DEBUG "${_RUT_SAVE_CMAKE_C_FLAGS_DEBUG}")
+    set(CMAKE_CXX_FLAGS_DEBUG "${_RUT_SAVE_CMAKE_CXX_FLAGS_DEBUG}")
+    set(CMAKE_C_FLAGS_RELEASE "${_RUT_SAVE_CMAKE_C_FLAGS_RELEASE}")
+    set(CMAKE_CXX_FLAGS_RELEASE "${_RUT_SAVE_CMAKE_CXX_FLAGS_RELEASE}")
+    set(CMAKE_C_FLAGS_RELWITHDEBINFO "${_RUT_SAVE_CMAKE_C_FLAGS_RELWITHDEBINFO}")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${_RUT_SAVE_CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+    set(CMAKE_C_FLAGS_MINSIZEREL "${_RUT_SAVE_CMAKE_C_FLAGS_MINSIZEREL}")
+    set(CMAKE_CXX_FLAGS_MINSIZEREL "${_RUT_SAVE_CMAKE_CXX_FLAGS_MINSIZEREL}")
+    set(CMAKE_CXX_STANDARD "${_RUT_SAVE_CMAKE_CXX_STANDARD}")
+    set(CMAKE_CXX_EXTENSIONS "${_RUT_SAVE_CMAKE_CXX_EXTENSIONS}")
+    foreach(_RUT_VS_CACHE_VAR
+            BUILD_STATIC_LIBS
+            BUILD_SHARED_LIBS
+            BUILD_UNIT
+            BUILD_TOOLS
+            BUILD_EXAMPLES
+            BUILD_BENCHMARKS
+            FAT_RUNTIME
+            DUMP_SUPPORT)
+        if(_RUT_SAVE_${_RUT_VS_CACHE_VAR}_DEFINED)
+            set("${_RUT_VS_CACHE_VAR}" "${_RUT_SAVE_${_RUT_VS_CACHE_VAR}_VALUE}"
+                CACHE "${_RUT_SAVE_${_RUT_VS_CACHE_VAR}_TYPE}"
+                "${_RUT_SAVE_${_RUT_VS_CACHE_VAR}_HELP}" FORCE)
+        else()
+            unset("${_RUT_VS_CACHE_VAR}" CACHE)
+        endif()
+        unset("_RUT_SAVE_${_RUT_VS_CACHE_VAR}_DEFINED")
+        unset("_RUT_SAVE_${_RUT_VS_CACHE_VAR}_VALUE")
+        unset("_RUT_SAVE_${_RUT_VS_CACHE_VAR}_TYPE")
+        unset("_RUT_SAVE_${_RUT_VS_CACHE_VAR}_HELP")
+    endforeach()
+    unset(_RUT_VS_CACHE_VAR)
+    set(ENV{CCACHE_DISABLE} "${_RUT_SAVE_CCACHE_DISABLE}")
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${_RUT_SAVE_RULE_LAUNCH_COMPILE}")
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "${_RUT_SAVE_RULE_LAUNCH_LINK}")
+    unset(_RUT_SAVE_CMAKE_C_FLAGS)
+    unset(_RUT_SAVE_CMAKE_CXX_FLAGS)
+    unset(_RUT_SAVE_CMAKE_C_FLAGS_DEBUG)
+    unset(_RUT_SAVE_CMAKE_CXX_FLAGS_DEBUG)
+    unset(_RUT_SAVE_CMAKE_C_FLAGS_RELEASE)
+    unset(_RUT_SAVE_CMAKE_CXX_FLAGS_RELEASE)
+    unset(_RUT_SAVE_CMAKE_C_FLAGS_RELWITHDEBINFO)
+    unset(_RUT_SAVE_CMAKE_CXX_FLAGS_RELWITHDEBINFO)
+    unset(_RUT_SAVE_CMAKE_C_FLAGS_MINSIZEREL)
+    unset(_RUT_SAVE_CMAKE_CXX_FLAGS_MINSIZEREL)
+    unset(_RUT_SAVE_CMAKE_CXX_STANDARD)
+    unset(_RUT_SAVE_CMAKE_CXX_EXTENSIONS)
+    unset(_RUT_SAVE_CCACHE_DISABLE)
+    unset(_RUT_SAVE_RULE_LAUNCH_COMPILE)
+    unset(_RUT_SAVE_RULE_LAUNCH_LINK)
 
-target_include_directories(rut_jit PUBLIC
-    ${PROJECT_SOURCE_DIR}/include
-    ${LLVM_INCLUDE_DIRS}
-)
+    # JIT library — LLVM ORC JIT integration via C API.
+    # Only this library links LLVM. rut_runtime stays LLVM-free so shard
+    # threads never transitively depend on LLVM headers or libraries.
+    add_library(rut_jit STATIC
+        jit/jit_engine.cc
+        jit/codegen.cc
+        jit/art_jit_codegen.cc
+        jit/runtime_helpers.cc
+    )
 
-# Prefer the monolithic shared LLVM dylib when the packaged config exposes it.
-# This avoids depending on broken per-component static archives in environments
-# where LLVM is installed in shared mode.
-if(LLVM_LINK_LLVM_DYLIB AND TARGET LLVM)
-    set(LLVM_LIBS LLVM)
-else()
-    llvm_map_components_to_libnames(LLVM_LIBS core orcjit orcshared orctargetprocess native support)
+    target_include_directories(rut_jit PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/third_party/vectorscan/src
+        ${PROJECT_BINARY_DIR}/src/third_party/vectorscan
+        ${PROJECT_SOURCE_DIR}/third_party/vectorscan/include
+        ${LLVM_INCLUDE_DIRS}
+    )
+
+    # Prefer the monolithic shared LLVM dylib when the packaged config exposes it.
+    # This avoids depending on broken per-component static archives in environments
+    # where LLVM is installed in shared mode.
+    if(LLVM_LINK_LLVM_DYLIB AND TARGET LLVM)
+        set(LLVM_LIBS LLVM)
+    else()
+        llvm_map_components_to_libnames(LLVM_LIBS core orcjit orcshared orctargetprocess native support)
+    endif()
+    target_link_libraries(rut_jit ${LLVM_LIBS})
+
+    # JIT .cc files may need LLVM definitions that conflict with -fno-rtti.
+    # The LLVM C API is pure C so no RTTI issues, but LLVM's cmake may add
+    # -fno-rtti to definitions. Add LLVM definitions selectively.
+    target_compile_definitions(rut_jit PRIVATE ${LLVM_DEFINITIONS})
+
+    # rut_jit also links rut_runtime for runtime_helpers (uses HttpParser, Connection)
+    target_link_libraries(rut_jit rut_runtime hs)
+
+    # Offline simulate library — JIT-backed capture validation with no event loop.
+    add_library(rut_simulate STATIC
+        sim/simulate_engine.cc
+    )
+    target_include_directories(rut_simulate PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+        ${LLVM_INCLUDE_DIRS}
+    )
+    target_compile_definitions(rut_simulate PRIVATE ${LLVM_DEFINITIONS})
+    target_link_libraries(rut_simulate
+        rut_runtime
+        rut_compiler
+        rut_jit
+    )
+
+    add_executable(rut-simulate sim/main.cc)
+    target_link_libraries(rut-simulate
+        rut_simulate
+    )
 endif()
-target_link_libraries(rut_jit ${LLVM_LIBS})
 
-# JIT .cc files may need LLVM definitions that conflict with -fno-rtti.
-# The LLVM C API is pure C so no RTTI issues, but LLVM's cmake may add
-# -fno-rtti to definitions. Add LLVM definitions selectively.
-target_compile_definitions(rut_jit PRIVATE ${LLVM_DEFINITIONS})
-
-# rut_jit also links rut_runtime for runtime_helpers (uses HttpParser, Connection)
-target_link_libraries(rut_jit rut_runtime)
-
-# Offline simulate library — JIT-backed capture validation with no event loop.
-add_library(rut_simulate STATIC
-    sim/simulate_engine.cc
-)
-target_include_directories(rut_simulate PUBLIC
-    ${PROJECT_SOURCE_DIR}/include
-    ${LLVM_INCLUDE_DIRS}
-)
-target_compile_definitions(rut_simulate PRIVATE ${LLVM_DEFINITIONS})
-target_link_libraries(rut_simulate
-    rut_runtime
-    rut_compiler
-    rut_jit
-)
-
-# Main executable
+# Main executable. Keep this outside RUT_ENABLE_JIT so disabling LLVM/Vectorscan
+# only omits the JIT-specific libraries and tools, not the primary server binary.
 add_executable(rut main.cc)
 target_link_libraries(rut
     rut_runtime
     rut_compiler
-    rut_jit
-)
-
-add_executable(rut-simulate sim/main.cc)
-target_link_libraries(rut-simulate
-    rut_simulate
 )

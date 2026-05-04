@@ -338,6 +338,13 @@ if(RUT_ENABLE_JIT)
 
     # rut_jit also links rut_runtime for runtime_helpers (uses HttpParser, Connection)
     target_link_libraries(rut_jit rut_runtime hs)
+    target_include_directories(rut_compiler PRIVATE
+        ${PROJECT_SOURCE_DIR}/third_party/vectorscan/src
+        ${PROJECT_BINARY_DIR}/src/third_party/vectorscan
+        ${PROJECT_SOURCE_DIR}/third_party/vectorscan/include
+    )
+    target_compile_definitions(rut_compiler PUBLIC RUT_VALIDATE_REGEX_WITH_VECTORSCAN=1)
+    target_link_libraries(rut_compiler PUBLIC hs)
 
     # Offline simulate library — JIT-backed capture validation with no event loop.
     add_library(rut_simulate STATIC

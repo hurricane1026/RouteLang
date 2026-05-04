@@ -218,13 +218,15 @@ bool JitEngine::prepare_regex_symbols(LLVMModuleRef mod, u32* out_start_count) {
 
         slot->db = rut_helper_regex_compile(pattern, pattern_len);
         if (!slot->db) {
-            char msg[192];
+            const char* regex_error = rut_helper_regex_last_compile_error();
+            char msg[384];
             snprintf(msg,
                      sizeof(msg),
-                     "jit: regex compilation failed for %s pattern `%.*s`",
+                     "jit: regex compilation failed for %s pattern `%.*s`: %s",
                      slot->symbol,
                      static_cast<int>(pattern_len),
-                     pattern);
+                     pattern,
+                     regex_error ? regex_error : "unknown error");
             log_error(msg, nullptr);
             return false;
         }

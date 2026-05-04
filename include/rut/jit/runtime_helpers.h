@@ -52,6 +52,7 @@ rut::i32 rut_helper_str_cmp(const char* a, rut::u32 a_len, const char* b, rut::u
 
 // Compile/free a regular-expression database for full-match scans.
 void* rut_helper_regex_compile(const char* pattern, rut::u32 pattern_len);
+const char* rut_helper_regex_last_compile_error();
 void rut_helper_regex_free(void* db);
 
 // Full regular-expression match using a precompiled database.

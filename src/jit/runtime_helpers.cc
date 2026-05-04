@@ -220,6 +220,7 @@ struct LiveRegexHandle {
 };
 
 thread_local RegexScratchCache t_regex_scratch_cache;
+thread_local char t_regex_compile_error[256] = "";
 u64 g_regex_generation = 1;
 
 LiveRegexHandle* g_regex_live_handles = nullptr;
@@ -338,12 +339,24 @@ static void regex_runtime_error(const char* msg) {
     fprintf(stderr, "rut regex runtime error: %s\n", msg);
 }
 
+static void set_regex_compile_error(const char* msg) {
+    if (!msg) msg = "regex compilation failed";
+    snprintf(t_regex_compile_error, sizeof(t_regex_compile_error), "%s", msg);
+}
+
 }  // namespace
 
 void* rut_helper_regex_compile(const char* pattern, u32 pattern_len) {
-    if (!pattern) return nullptr;
+    t_regex_compile_error[0] = '\0';
+    if (!pattern) {
+        set_regex_compile_error("missing regex pattern");
+        return nullptr;
+    }
     char* nul_pattern = static_cast<char*>(malloc(static_cast<size_t>(pattern_len) + 7));
-    if (!nul_pattern) return nullptr;
+    if (!nul_pattern) {
+        set_regex_compile_error("out of memory while preparing regex pattern");
+        return nullptr;
+    }
     nul_pattern[0] = '^';
     nul_pattern[1] = '(';
     nul_pattern[2] = '?';
@@ -359,27 +372,32 @@ void* rut_helper_regex_compile(const char* pattern, u32 pattern_len) {
         hs_compile(nul_pattern, HS_FLAG_SINGLEMATCH, HS_MODE_BLOCK, nullptr, &db, &compile_error);
     free(nul_pattern);
     if (rc != 0 || !db) {
+        set_regex_compile_error(compile_error ? compile_error->message : nullptr);
         if (compile_error) hs_free_compile_error(compile_error);
         return nullptr;
     }
     auto* handle = static_cast<RegexHandle*>(calloc(1, sizeof(RegexHandle)));
     if (!handle) {
+        set_regex_compile_error("out of memory while allocating regex handle");
         hs_free_database(db);
         return nullptr;
     }
     handle->db = db;
     if (pthread_mutex_init(&handle->mutex, nullptr) != 0) {
+        set_regex_compile_error("regex mutex initialization failed");
         hs_free_database(db);
         free(handle);
         return nullptr;
     }
     if (pthread_cond_init(&handle->no_active_scans, nullptr) != 0) {
+        set_regex_compile_error("regex condition initialization failed");
         pthread_mutex_destroy(&handle->mutex);
         hs_free_database(db);
         free(handle);
         return nullptr;
     }
     if (!register_regex_handle(handle)) {
+        set_regex_compile_error("out of regex handle registry slots");
         pthread_cond_destroy(&handle->no_active_scans);
         pthread_mutex_destroy(&handle->mutex);
         hs_free_database(db);
@@ -387,6 +405,10 @@ void* rut_helper_regex_compile(const char* pattern, u32 pattern_len) {
         return nullptr;
     }
     return handle;
+}
+
+const char* rut_helper_regex_last_compile_error() {
+    return t_regex_compile_error[0] ? t_regex_compile_error : nullptr;
 }
 
 void rut_helper_regex_free(void* db) {

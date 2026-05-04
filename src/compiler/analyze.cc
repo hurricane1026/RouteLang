@@ -3,6 +3,9 @@
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/route_method.h"
+#if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
+#include <hs.h>
+#endif
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -33,6 +36,33 @@ static Str stash_owned_string(std::deque<std::string>& store, const std::string&
     const auto& kept = store.back();
     return {kept.c_str(), static_cast<u32>(kept.size())};
 }
+
+#if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
+static bool validate_regex_literal(Str pattern, std::string* error) {
+    std::string wrapped;
+    wrapped.reserve(static_cast<size_t>(pattern.len) + 7);
+    wrapped.append("^(?:", 4);
+    wrapped.append(pattern.ptr, pattern.len);
+    wrapped.append(")$", 2);
+
+    hs_database_t* db = nullptr;
+    hs_compile_error_t* compile_error = nullptr;
+    const hs_error_t rc = hs_compile(
+        wrapped.c_str(), HS_FLAG_SINGLEMATCH, HS_MODE_BLOCK, nullptr, &db, &compile_error);
+    if (rc == HS_SUCCESS && db) {
+        hs_free_database(db);
+        return true;
+    }
+    if (compile_error && compile_error->message) {
+        *error = compile_error->message;
+    } else {
+        *error = "regex compilation failed";
+    }
+    if (compile_error) hs_free_compile_error(compile_error);
+    if (db) hs_free_database(db);
+    return false;
+}
+#endif
 
 static bool type_shape_is_simple_importable(const HirTypeKind type,
                                             u32 variant_index,
@@ -2435,6 +2465,14 @@ static FrontendResult<HirExpr> analyze_method_call_expr(const AstExpr& expr,
 
     if (expr.name.eq({"matches", 7}) && recv->type == HirTypeKind::Str && expr.args.len == 1 &&
         expr.args[0]->kind == AstExprKind::RegexLit) {
+#if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
+        std::string regex_error;
+        if (!validate_regex_literal(expr.args[0]->str_value, &regex_error)) {
+            return frontend_error(FrontendError::InvalidRegex,
+                                  expr.args[0]->span,
+                                  intern_generated_name(regex_error));
+        }
+#endif
         HirExpr out{};
         out.kind = HirExprKind::RegexMatch;
         out.type = HirTypeKind::Bool;

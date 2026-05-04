@@ -699,6 +699,21 @@ route GET "/" { guard Box(value: 7).matches(7) else { return 404 } return 200 }
     REQUIRE(hir);
 }
 
+#if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
+TEST(frontend, invalid_regex_literal_is_rejected_during_analysis) {
+    const char* src =
+        "route GET \"/\" { guard req.path.matches(re\"[\") else { return 404 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::InvalidRegex);
+    CHECK(hir.error().detail.len > 0);
+}
+#endif
+
 TEST(frontend, regex_literal_is_only_valid_as_matches_pattern) {
     const char* src =
         "route GET \"/\" { guard re\".*\" == re\".*\" else { return 400 } return 200 }\n";

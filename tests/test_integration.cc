@@ -4219,6 +4219,79 @@ TEST(route, dsl_req_method_guard_real_socket) {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(route, dsl_regex_guard_real_socket) {
+    using namespace rut;
+
+    const char* src =
+        "route GET \"/api/users\" { "
+        "guard req.path.matches(re\"^/api/users$\") else { return 404 } "
+        "return 200 "
+        "}\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/api/users", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+    usleep(10000);
+
+    auto exercise = [&](const char* req, u32 req_len, const char* want, u32 want_len) {
+        const i32 c = connect_to(port);
+        CHECK_GE(c, 0);
+        if (c < 0) return;
+        send_all(c, req, req_len);
+        char buf[2048];
+        const i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+        close(c);
+        CHECK_GT(n, 0);
+        if (n <= 0) return;
+        CHECK(buf_contains(buf, static_cast<u32>(n), want, want_len));
+    };
+
+    const char kMatchReq[] = "GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n";
+    exercise(kMatchReq, sizeof(kMatchReq) - 1, "200 OK", 6);
+
+    const char kQueryReq[] = "GET /api/users?x=1 HTTP/1.1\r\nHost: x\r\n\r\n";
+    exercise(kQueryReq, sizeof(kQueryReq) - 1, "404", 3);
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
 #endif
 
 int main(int argc, char** argv) {

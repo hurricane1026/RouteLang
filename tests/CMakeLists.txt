@@ -20,18 +20,21 @@ add_test(NAME test_network COMMAND test_network)
 set_tests_properties(test_network PROPERTIES LABELS "unit;network")
 
 find_package(Threads REQUIRED)
-find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
 
 set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
 set(RUT_TLS_TEST_CERT ${RUT_TLS_TESTDATA_DIR}/localhost_cert.pem)
 set(RUT_TLS_TEST_KEY ${RUT_TLS_TESTDATA_DIR}/localhost_key.pem)
 
-add_custom_command(
-    OUTPUT ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY}
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${RUT_TLS_TESTDATA_DIR}
-    COMMAND ${OPENSSL_EXECUTABLE} req -x509 -newkey rsa:2048 -keyout ${RUT_TLS_TEST_KEY} -out ${RUT_TLS_TEST_CERT} -sha256 -nodes -days 1 -subj /CN=localhost
-    COMMENT "Generating TLS fixtures for integration tests"
-    VERBATIM
+file(MAKE_DIRECTORY ${RUT_TLS_TESTDATA_DIR})
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/localhost_cert.pem
+    ${RUT_TLS_TEST_CERT}
+    COPYONLY
+)
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/localhost_key.pem
+    ${RUT_TLS_TEST_KEY}
+    COPYONLY
 )
 
 add_custom_target(test_tls_fixtures DEPENDS ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY})

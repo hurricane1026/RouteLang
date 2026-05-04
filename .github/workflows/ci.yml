@@ -187,15 +187,13 @@ jobs:
               cat "/tmp/cmake-$arch.err"
               continue
             fi
-            if ! ninja -C "build-$arch" bench_scan_uri bench_dispatch_compare 2> "/tmp/build-$arch.err"; then
+            if ! ninja -C "build-$arch" bench_scan_uri 2> "/tmp/build-$arch.err"; then
               echo "::warning::build failed for SIMD_ARCH=$arch"
               tail -30 "/tmp/build-$arch.err"
               continue
             fi
             ./build-$arch/bench/bench_scan_uri 2> "/tmp/run-$arch.err" | tee "/tmp/bench-results/$arch.txt" || \
               { echo "::warning::scan_uri run failed for SIMD_ARCH=$arch"; cat "/tmp/run-$arch.err"; }
-            ./build-$arch/bench/bench_dispatch_compare 2> "/tmp/dispatch-$arch.err" | tee "/tmp/dispatch-results/$arch.txt" || \
-              { echo "::warning::dispatch_compare run failed for SIMD_ARCH=$arch"; cat "/tmp/dispatch-$arch.err"; }
             echo
           done
 
@@ -317,17 +315,7 @@ jobs:
           echo "==============================================================="
           echo "dispatch comparison — linear scan vs scalar ART vs JIT ART (arm64)"
           echo "==============================================================="
-          dresults=(/tmp/dispatch-results/*.txt)
-          if [ ${#dresults[@]} -eq 0 ]; then
-            echo "::notice::no per-arch dispatch results captured"
-          else
-            for f in "${dresults[@]}"; do
-              arch=$(basename "$f" .txt)
-              echo
-              echo "--- $arch ---"
-              cat "$f"
-            done
-          fi
+          echo "::notice::bench_dispatch_compare is JIT-only and is skipped on arm64 because Vectorscan is x86_64-only"
 
   coverage:
     name: Code Coverage

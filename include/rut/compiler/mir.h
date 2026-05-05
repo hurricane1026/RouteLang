@@ -17,6 +17,7 @@ enum class MirValueKind : u8 {
     BoolConst,
     IntConst,
     StrConst,
+    RegexMatch,
     Tuple,
     TupleSlot,
     VariantCase,
@@ -24,6 +25,7 @@ enum class MirValueKind : u8 {
     StructInit,
     Field,
     ReqHeader,
+    ReqPath,
     // HTTP method literal — int_value holds the HttpMethod enum value.
     ConstMethod,
     // Read of the parsed request method from the current connection.

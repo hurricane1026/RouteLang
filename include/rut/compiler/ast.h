@@ -54,6 +54,7 @@ enum class AstExprKind : u8 {
     BoolLit,
     IntLit,
     StrLit,
+    RegexLit,
     Tuple,
     // Array literal `[e1, e2, ...]` — elements stored in `args`.
     // Parser accepts empty `[]`; analyze currently rejects empty array

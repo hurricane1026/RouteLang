@@ -40,7 +40,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 clang-tidy-18 llvm-18-dev cmake ninja-build
+          sudo apt-get install -y clang-18 clang-tidy-18 llvm-18-dev cmake ninja-build libboost-dev ragel
           sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
           sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
           sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100
@@ -74,7 +74,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build llvm-18-dev
+          sudo apt-get install -y cmake ninja-build llvm-18-dev libboost-dev ragel
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang-18
             sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
@@ -89,6 +89,27 @@ jobs:
           else
             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $LLVM_OPT
           fi
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
+
+  test-no-jit:
+    name: Build & Test (no JIT)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libboost-dev
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DRUT_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
         run: ninja -C build
@@ -120,7 +141,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 cmake ninja-build llvm-18-dev
+          sudo apt-get install -y clang-18 cmake ninja-build llvm-18-dev libboost-dev ragel
           sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
           sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
 
@@ -166,15 +187,13 @@ jobs:
               cat "/tmp/cmake-$arch.err"
               continue
             fi
-            if ! ninja -C "build-$arch" bench_scan_uri bench_dispatch_compare 2> "/tmp/build-$arch.err"; then
+            if ! ninja -C "build-$arch" bench_scan_uri 2> "/tmp/build-$arch.err"; then
               echo "::warning::build failed for SIMD_ARCH=$arch"
               tail -30 "/tmp/build-$arch.err"
               continue
             fi
             ./build-$arch/bench/bench_scan_uri 2> "/tmp/run-$arch.err" | tee "/tmp/bench-results/$arch.txt" || \
               { echo "::warning::scan_uri run failed for SIMD_ARCH=$arch"; cat "/tmp/run-$arch.err"; }
-            ./build-$arch/bench/bench_dispatch_compare 2> "/tmp/dispatch-$arch.err" | tee "/tmp/dispatch-results/$arch.txt" || \
-              { echo "::warning::dispatch_compare run failed for SIMD_ARCH=$arch"; cat "/tmp/dispatch-$arch.err"; }
             echo
           done
 
@@ -224,7 +243,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 cmake ninja-build llvm-18-dev
+          sudo apt-get install -y clang-18 cmake ninja-build llvm-18-dev libboost-dev ragel
           sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
           sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
 
@@ -257,13 +276,18 @@ jobs:
               cat "/tmp/cmake-$arch.err"
               continue
             fi
-            if ! ninja -C "build-$arch" bench_scan_uri bench_dispatch_compare 2> "/tmp/build-$arch.err"; then
+            if ! ninja -C "build-$arch" bench_scan_uri 2> "/tmp/build-$arch.err"; then
               echo "::warning::build failed for SIMD_ARCH=$arch"
               tail -30 "/tmp/build-$arch.err"
               continue
             fi
             ./build-$arch/bench/bench_scan_uri 2> "/tmp/run-$arch.err" | tee "/tmp/bench-results/$arch.txt" || \
               { echo "::warning::scan_uri run failed for SIMD_ARCH=$arch"; cat "/tmp/run-$arch.err"; }
+            if ! ninja -C "build-$arch" bench_dispatch_compare 2> "/tmp/dispatch-build-$arch.err"; then
+              echo "::warning::dispatch_compare build failed for SIMD_ARCH=$arch"
+              tail -30 "/tmp/dispatch-build-$arch.err"
+              continue
+            fi
             ./build-$arch/bench/bench_dispatch_compare 2> "/tmp/dispatch-$arch.err" | tee "/tmp/dispatch-results/$arch.txt" || \
               { echo "::warning::dispatch_compare run failed for SIMD_ARCH=$arch"; cat "/tmp/dispatch-$arch.err"; }
             echo
@@ -296,11 +320,12 @@ jobs:
           echo "==============================================================="
           echo "dispatch comparison — linear scan vs scalar ART vs JIT ART (arm64)"
           echo "==============================================================="
-          dresults=(/tmp/dispatch-results/*.txt)
-          if [ ${#dresults[@]} -eq 0 ]; then
-            echo "::notice::no per-arch dispatch results captured"
+          shopt -s nullglob
+          dispatch_results=(/tmp/dispatch-results/*.txt)
+          if [ ${#dispatch_results[@]} -eq 0 ]; then
+            echo "::notice::no dispatch_compare results captured — see warnings above"
           else
-            for f in "${dresults[@]}"; do
+            for f in "${dispatch_results[@]}"; do
               arch=$(basename "$f" .txt)
               echo
               echo "--- $arch ---"
@@ -318,7 +343,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 llvm-18 llvm-18-dev cmake ninja-build
+          sudo apt-get install -y clang-18 llvm-18 llvm-18-dev cmake ninja-build libboost-dev ragel
           sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
           sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
           sudo update-alternatives --install /usr/bin/llvm-profdata llvm-profdata /usr/bin/llvm-profdata-18 100

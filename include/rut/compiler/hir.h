@@ -51,6 +51,7 @@ enum class HirExprKind : u8 {
     BoolLit,
     IntLit,
     StrLit,
+    RegexMatch,
     Tuple,
     // Array literal: elements stored in `args`. analyze rejects heterogeneous
     // arrays and empty `[]` (Rutlang has no push/append so size + element
@@ -66,6 +67,7 @@ enum class HirExprKind : u8 {
     StructInit,
     Field,
     ReqHeader,
+    ReqPath,
     // HTTP method literal — int_value holds the HttpMethod enum
     // value (0=GET, 1=POST, …, matching rut/runtime/http_parser.h).
     ConstMethod,

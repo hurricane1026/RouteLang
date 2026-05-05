@@ -172,6 +172,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::StrTrimPrefix:
             buf.put_cstr("str.trim_prefix");
             break;
+        case Opcode::StrRegexMatch:
+            buf.put_cstr("str.regex_match");
+            break;
         case Opcode::StrInterpolate:
             buf.put_cstr("str.interpolate");
             break;
@@ -493,6 +496,12 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             print_value_ref(buf, inst.operands[0]);
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[1]);
+            break;
+        case Opcode::StrRegexMatch:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_quoted_str(buf, inst.imm.str_val);
             break;
         case Opcode::StrInterpolate:
             buf.put_cstr(" [");

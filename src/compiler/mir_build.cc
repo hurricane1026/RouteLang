@@ -247,6 +247,17 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.str_value = expr.str_value;
         return v;
     }
+    if (expr.kind == HirExprKind::RegexMatch) {
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = MirValueKind::RegexMatch;
+        v.type = MirTypeKind::Bool;
+        v.str_value = expr.str_value;
+        v.lhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
     if (expr.kind == HirExprKind::Tuple) {
         v.kind = MirValueKind::Tuple;
         v.type = MirTypeKind::Tuple;
@@ -352,6 +363,11 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.type = MirTypeKind::Str;
         v.may_nil = true;
         v.str_value = expr.str_value;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqPath) {
+        v.kind = MirValueKind::ReqPath;
+        v.type = MirTypeKind::Str;
         return v;
     }
     if (expr.kind == HirExprKind::ConstMethod) {

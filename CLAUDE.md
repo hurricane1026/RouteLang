@@ -61,6 +61,7 @@ Binary: `build/src/rut`. Compiler: clang++. Linter: clang-tidy (`.clang-tidy`). 
 - Compile-time backend selection via templates, not virtual dispatch
 - Cross-shard communication via SPSC message passing (`notify`), per-shard state by default, RCU for config hot reload
 - Cache-line alignment (`alignas(64)`) for shared atomics to prevent false sharing
+- TLS/crypto uses the vendored BoringSSL targets. Do not add system OpenSSL package, library, or CLI dependencies to build/test paths; use checked-in deterministic fixtures or BoringSSL APIs instead.
 
 ## Runtime Design Decisions
 

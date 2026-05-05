@@ -8,6 +8,9 @@
 #include <llvm-c/LLJIT.h>
 #include <llvm-c/Orc.h>
 #include <llvm-c/Target.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>  // write (for error logging)
 
 namespace rut::jit {
@@ -46,6 +49,7 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_str_has_prefix", reinterpret_cast<void*>(&rut_helper_str_has_prefix)},
     {"rut_helper_str_eq", reinterpret_cast<void*>(&rut_helper_str_eq)},
     {"rut_helper_str_cmp", reinterpret_cast<void*>(&rut_helper_str_cmp)},
+    {"rut_helper_str_regex_match", reinterpret_cast<void*>(&rut_helper_str_regex_match)},
     {"rut_helper_str_trim_prefix", reinterpret_cast<void*>(&rut_helper_str_trim_prefix)},
     {nullptr, nullptr},
 };
@@ -57,6 +61,9 @@ bool JitEngine::init() {
     if (LLVMInitializeNativeTarget()) return false;
     LLVMInitializeNativeAsmPrinter();
     ctx_count = 0;
+    regex_slot_count = 0;
+    regex_slot_cap = 0;
+    regex_slots = nullptr;
 
     // Create LLJIT with default settings (auto-detects host target).
     LLVMErrorRef err = LLVMOrcCreateLLJIT(&lljit, nullptr);
@@ -109,6 +116,136 @@ bool JitEngine::init() {
     return true;
 }
 
+static bool name_has_prefix(const char* name, size_t name_len, const char* prefix) {
+    size_t i = 0;
+    while (prefix[i]) {
+        if (i >= name_len || name[i] != prefix[i]) return false;
+        i++;
+    }
+    return true;
+}
+
+static bool extract_regex_pattern(LLVMValueRef global, const char** out_ptr, u32* out_len) {
+    LLVMValueRef init = LLVMGetInitializer(global);
+    if (!init) return false;
+    size_t len = 0;
+    const char* bytes = LLVMGetAsString(init, &len);
+    if (!bytes) return false;
+    if (len > 0 && bytes[len - 1] == '\0') len--;
+    if (len > 0xffffffffu) return false;
+    *out_ptr = bytes;
+    *out_len = static_cast<u32>(len);
+    return true;
+}
+
+JitEngine::RegexSlot* JitEngine::alloc_regex_slot() {
+    if (regex_slot_count == regex_slot_cap) {
+        u32 next_cap = regex_slot_cap ? regex_slot_cap * 2 : 16;
+        size_t bytes = static_cast<size_t>(next_cap) * sizeof(RegexSlot*);
+        auto** next =
+            static_cast<RegexSlot**>(realloc(reinterpret_cast<void*>(regex_slots), bytes));
+        if (!next) return nullptr;
+        for (u32 i = regex_slot_cap; i < next_cap; i++) next[i] = nullptr;
+        regex_slots = next;
+        regex_slot_cap = next_cap;
+    }
+
+    auto* slot = static_cast<RegexSlot*>(calloc(1, sizeof(RegexSlot)));
+    if (!slot) return nullptr;
+    regex_slots[regex_slot_count++] = slot;
+    return slot;
+}
+
+void JitEngine::rollback_regex_symbols(u32 start_count) {
+    while (regex_slot_count > start_count) {
+        RegexSlot* slot = regex_slots[regex_slot_count - 1];
+        if (slot) {
+            rut_helper_regex_free(slot->db);
+            slot->db = nullptr;
+            free(slot);
+        }
+        regex_slots[regex_slot_count - 1] = nullptr;
+        regex_slot_count--;
+    }
+}
+
+struct CompileLockGuard {
+    pthread_mutex_t* mutex;
+    explicit CompileLockGuard(pthread_mutex_t* m) : mutex(m) { pthread_mutex_lock(mutex); }
+    ~CompileLockGuard() { pthread_mutex_unlock(mutex); }
+};
+
+bool JitEngine::prepare_regex_symbols(LLVMModuleRef mod, u32* out_start_count) {
+    static constexpr const char* kPatternPrefix = "__rut_regex_pattern_";
+    static constexpr const char* kDbPrefix = "__rut_regex_db_";
+    *out_start_count = regex_slot_count;
+
+    for (LLVMValueRef global = LLVMGetFirstGlobal(mod); global;
+         global = LLVMGetNextGlobal(global)) {
+        size_t name_len = 0;
+        const char* name = LLVMGetValueName2(global, &name_len);
+        if (!name_has_prefix(name, name_len, kPatternPrefix)) continue;
+
+        const char* pattern = nullptr;
+        u32 pattern_len = 0;
+        if (!extract_regex_pattern(global, &pattern, &pattern_len)) {
+            log_error("jit: unable to read regex pattern global", nullptr);
+            return false;
+        }
+
+        RegexSlot* slot = alloc_regex_slot();
+        if (!slot) {
+            log_error("jit: regex slot allocation failed", nullptr);
+            return false;
+        }
+
+        const size_t pattern_prefix_len = strlen(kPatternPrefix);
+        const size_t suffix_len = name_len - pattern_prefix_len;
+        const size_t db_prefix_len = strlen(kDbPrefix);
+        if (db_prefix_len + suffix_len >= sizeof(slot->symbol)) {
+            log_error("jit: regex symbol name too long", nullptr);
+            return false;
+        }
+        memcpy(slot->symbol, kDbPrefix, db_prefix_len);
+        memcpy(slot->symbol + db_prefix_len, name + pattern_prefix_len, suffix_len);
+        slot->symbol[db_prefix_len + suffix_len] = '\0';
+
+        LLVMValueRef db_global = LLVMGetNamedGlobal(mod, slot->symbol);
+        if (!db_global) {
+            log_error("jit: regex db global missing", nullptr);
+            return false;
+        }
+
+        slot->db = rut_helper_regex_compile(pattern, pattern_len);
+        if (!slot->db) {
+            const char* regex_error = rut_helper_regex_last_compile_error();
+            char msg[384];
+            snprintf(msg,
+                     sizeof(msg),
+                     "jit: regex compilation failed for %s pattern `%.*s`: %s",
+                     slot->symbol,
+                     static_cast<int>(pattern_len),
+                     pattern,
+                     regex_error ? regex_error : "unknown error");
+            log_error(msg, nullptr);
+            return false;
+        }
+
+        LLVMContextRef llvm_ctx = LLVMGetModuleContext(mod);
+        LLVMTypeRef i64_ty = LLVMInt64TypeInContext(llvm_ctx);
+        LLVMTypeRef ptr_ty = LLVMPointerTypeInContext(llvm_ctx, 0);
+        LLVMValueRef db_addr = LLVMConstIntToPtr(
+            LLVMConstInt(
+                i64_ty, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(slot->db)), 0),
+            ptr_ty);
+        LLVMSetInitializer(db_global, db_addr);
+        LLVMSetGlobalConstant(db_global, 1);
+        LLVMSetLinkage(db_global, LLVMPrivateLinkage);
+    }
+
+    return true;
+}
+
 bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
     // Always takes ownership of mod and ctx regardless of return value.
     if (!lljit) {
@@ -116,6 +253,7 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
         LLVMContextDispose(ctx);
         return false;
     }
+    CompileLockGuard compile_guard(&compile_mutex);
 
     // Set the module's data layout and target triple from LLJIT.
     const char* dl = LLVMOrcLLJITGetDataLayoutStr(lljit);
@@ -141,6 +279,14 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
         return false;
     }
 
+    u32 regex_start_count = 0;
+    if (!prepare_regex_symbols(mod, &regex_start_count)) {
+        rollback_regex_symbols(regex_start_count);
+        LLVMDisposeModule(mod);
+        LLVMContextDispose(ctx);
+        return false;
+    }
+
     // Wrap module into a ThreadSafeModule for submission to LLJIT.
     // We create a fresh ThreadSafeContext as the lock wrapper. Its internal
     // context differs from the module's context, but LLJIT only uses it
@@ -156,16 +302,21 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
     // we dispose ctx here rather than letting a failed compile consume a slot
     // in `contexts[]` (and eventually exhaust kMaxContexts).
     LLVMOrcJITDylibRef main_jd = LLVMOrcLLJITGetMainJITDylib(lljit);
-    LLVMErrorRef err = LLVMOrcLLJITAddLLVMIRModule(lljit, main_jd, tsm);
+    LLVMOrcResourceTrackerRef module_rt = LLVMOrcJITDylibCreateResourceTracker(main_jd);
+    LLVMErrorRef err = LLVMOrcLLJITAddLLVMIRModuleWithRT(lljit, module_rt, tsm);
     if (err) {
         log_error("jit: module compilation failed", err);
+        rollback_regex_symbols(regex_start_count);
         // On failure, ownership of tsm stays with us; disposing tsm also
         // disposes the inner module. We still own `ctx` (module's original
         // context) — dispose it here to match the verification-failure path.
         LLVMOrcDisposeThreadSafeModule(tsm);
         LLVMContextDispose(ctx);
+        LLVMOrcReleaseResourceTracker(module_rt);
         return false;
     }
+
+    LLVMOrcReleaseResourceTracker(module_rt);
 
     // Track the orphaned context for cleanup in shutdown(), after LLJIT
     // has accepted the module.
@@ -207,6 +358,19 @@ void JitEngine::shutdown() {
         LLVMContextDispose(contexts[i]);
     }
     ctx_count = 0;
+
+    for (u32 i = 0; i < regex_slot_count; i++) {
+        RegexSlot* slot = regex_slots[i];
+        if (!slot) continue;
+        rut_helper_regex_free(slot->db);
+        slot->db = nullptr;
+        slot->symbol[0] = '\0';
+        free(slot);
+    }
+    regex_slot_count = 0;
+    regex_slot_cap = 0;
+    free(reinterpret_cast<void*>(regex_slots));
+    regex_slots = nullptr;
 }
 
 }  // namespace rut::jit

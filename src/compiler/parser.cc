@@ -322,6 +322,14 @@ struct Parser {
             expr.span = span_from(tok);
             return expr;
         }
+        if (cur().type == TokenType::RegexLit) {
+            const Token tok = cur();
+            pos++;
+            expr.kind = AstExprKind::RegexLit;
+            expr.str_value = tok.text;
+            expr.span = span_from(tok);
+            return expr;
+        }
         if (cur().type == TokenType::Ident && cur().text.eq({"req", 3}) &&
             peek().type == TokenType::Dot && peek(2).type == TokenType::Ident &&
             peek(2).text.eq({"header", 6})) {

@@ -158,6 +158,7 @@ enum class Opcode : u8 {
     // ── String operations ──
     StrHasPrefix,    // %r = str.has_prefix %s, %pfx    → bool
     StrTrimPrefix,   // %r = str.trim_prefix %s, %pfx   → str
+    StrRegexMatch,   // %r = str.regex_match %s, "re"   → bool
     StrInterpolate,  // %r = str.interpolate [%a, %b..]  → str (variadic)
 
     // ── Comparisons ──

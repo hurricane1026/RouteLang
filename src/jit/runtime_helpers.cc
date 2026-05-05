@@ -2,6 +2,13 @@
 
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include <unordered_map>
+
+#include <hs.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 using namespace rut;
 
@@ -29,7 +36,7 @@ void rut_helper_req_path(const u8* req_data, u32 req_len, const char** out_ptr, 
     }
     i++;  // skip space
     u32 path_start = i;
-    while (i < req_len && req_data[i] != ' ' && req_data[i] != '?' && req_data[i] != '\r') {
+    while (i < req_len && req_data[i] != ' ' && req_data[i] != '\r') {
         i++;
     }
     *out_ptr = reinterpret_cast<const char*>(req_data + path_start);
@@ -123,6 +130,343 @@ i32 rut_helper_str_cmp(const char* a, u32 a_len, const char* b, u32 b_len) {
     if (a_len < b_len) return -1;
     if (a_len > b_len) return 1;
     return 0;
+}
+
+namespace {
+
+struct RegexMatchCtx {
+    u32 len = 0;
+    bool matched = false;
+};
+
+struct RegexHandle {
+    hs_database_t* db = nullptr;
+    u64 generation = 0;
+    u32 active_scans = 0;
+    bool closing = false;
+    pthread_mutex_t mutex = {};
+    pthread_cond_t no_active_scans = {};
+};
+
+struct RegexScratchSlot {
+    const void* handle = nullptr;
+    u64 generation = 0;
+    hs_scratch_t* scratch = nullptr;
+};
+
+struct RegexScratchCache {
+    RegexScratchSlot* slots = nullptr;
+    u32 count = 0;
+    u32 cap = 0;
+    std::unordered_map<u64, u32> generation_to_index;
+    RegexScratchCache* next = nullptr;
+    RegexScratchCache* prev = nullptr;
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    RegexScratchCache();
+
+    ~RegexScratchCache() {
+        unregister_cache();
+        for (u32 i = 0; i < count; i++) {
+            if (slots[i].scratch) hs_free_scratch(slots[i].scratch);
+        }
+        free(slots);
+        pthread_mutex_destroy(&mutex);
+    }
+
+    bool reserve(u32 min_cap) {
+        if (cap >= min_cap) return true;
+        u32 new_cap = cap ? cap * 2 : 32;
+        while (new_cap < min_cap) new_cap *= 2;
+        void* p = realloc(slots, sizeof(RegexScratchSlot) * new_cap);
+        if (!p) return false;
+        slots = static_cast<RegexScratchSlot*>(p);
+        for (u32 i = cap; i < new_cap; i++) {
+            slots[i] = {};
+        }
+        cap = new_cap;
+        return true;
+    }
+
+    void remove_at(u32 idx) {
+        if (idx >= count) return;
+        const u64 generation = slots[idx].generation;
+        if (slots[idx].scratch) hs_free_scratch(slots[idx].scratch);
+        generation_to_index.erase(generation);
+        count--;
+        if (idx != count) {
+            slots[idx] = slots[count];
+            generation_to_index[slots[idx].generation] = idx;
+        }
+        slots[count] = {};
+    }
+
+    hs_scratch_t* get(const RegexHandle* handle) {
+        const auto iter = generation_to_index.find(handle->generation);
+        if (iter != generation_to_index.end()) {
+            return slots[iter->second].scratch;
+        }
+        hs_scratch_t* scratch = nullptr;
+        if (hs_alloc_scratch(handle->db, &scratch) != HS_SUCCESS || !scratch) return nullptr;
+        if (!reserve(count + 1)) {
+            hs_free_scratch(scratch);
+            return nullptr;
+        }
+        slots[count] = {handle, handle->generation, scratch};
+        generation_to_index[handle->generation] = count;
+        count++;
+        return scratch;
+    }
+
+    void prune_handle(const RegexHandle* handle);
+    void unregister_cache();
+};
+
+struct LiveRegexHandle {
+    const void* handle = nullptr;
+    u64 generation = 0;
+};
+
+thread_local RegexScratchCache t_regex_scratch_cache;
+thread_local char t_regex_compile_error[256] = "";
+u64 g_regex_generation = 1;
+
+LiveRegexHandle* g_regex_live_handles = nullptr;
+u32 g_regex_live_count = 0;
+u32 g_regex_live_cap = 0;
+pthread_mutex_t g_regex_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+RegexScratchCache* g_regex_caches = nullptr;
+pthread_mutex_t g_regex_cache_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+RegexScratchCache::RegexScratchCache() {
+    pthread_mutex_lock(&g_regex_cache_list_mutex);
+    next = g_regex_caches;
+    if (next) next->prev = this;
+    g_regex_caches = this;
+    pthread_mutex_unlock(&g_regex_cache_list_mutex);
+}
+
+static bool register_regex_handle(RegexHandle* handle) {
+    pthread_mutex_lock(&g_regex_registry_mutex);
+    handle->generation = g_regex_generation++;
+    if (g_regex_live_count == g_regex_live_cap) {
+        u32 next_cap = g_regex_live_cap ? g_regex_live_cap * 2 : 32;
+        void* p = realloc(g_regex_live_handles, sizeof(LiveRegexHandle) * next_cap);
+        if (p) {
+            g_regex_live_handles = static_cast<LiveRegexHandle*>(p);
+            g_regex_live_cap = next_cap;
+        }
+    }
+    if (g_regex_live_count < g_regex_live_cap) {
+        g_regex_live_handles[g_regex_live_count++] = {handle, handle->generation};
+        pthread_mutex_unlock(&g_regex_registry_mutex);
+        return true;
+    }
+    pthread_mutex_unlock(&g_regex_registry_mutex);
+    return false;
+}
+
+static bool begin_regex_scan(RegexHandle* handle, hs_database_t** db) {
+    pthread_mutex_lock(&handle->mutex);
+    if (handle->closing || !handle->db) {
+        pthread_mutex_unlock(&handle->mutex);
+        return false;
+    }
+    handle->active_scans++;
+    *db = handle->db;
+    pthread_mutex_unlock(&handle->mutex);
+    return true;
+}
+
+static void end_regex_scan(RegexHandle* handle) {
+    pthread_mutex_lock(&handle->mutex);
+    if (handle->active_scans) handle->active_scans--;
+    if (handle->closing && handle->active_scans == 0) {
+        pthread_cond_signal(&handle->no_active_scans);
+    }
+    pthread_mutex_unlock(&handle->mutex);
+}
+
+static void unregister_regex_handle(const RegexHandle* handle) {
+    pthread_mutex_lock(&g_regex_registry_mutex);
+    for (u32 i = 0; i < g_regex_live_count; i++) {
+        if (g_regex_live_handles[i].handle == handle &&
+            g_regex_live_handles[i].generation == handle->generation) {
+            g_regex_live_count--;
+            if (i != g_regex_live_count)
+                g_regex_live_handles[i] = g_regex_live_handles[g_regex_live_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_regex_registry_mutex);
+
+    pthread_mutex_lock(&g_regex_cache_list_mutex);
+    for (RegexScratchCache* cache = g_regex_caches; cache; cache = cache->next) {
+        pthread_mutex_lock(&cache->mutex);
+        cache->prune_handle(handle);
+        pthread_mutex_unlock(&cache->mutex);
+    }
+    pthread_mutex_unlock(&g_regex_cache_list_mutex);
+}
+
+void RegexScratchCache::prune_handle(const RegexHandle* handle) {
+    const auto iter = generation_to_index.find(handle->generation);
+    if (iter != generation_to_index.end() && iter->second < count &&
+        slots[iter->second].handle == handle) {
+        remove_at(iter->second);
+    }
+}
+
+void RegexScratchCache::unregister_cache() {
+    pthread_mutex_lock(&g_regex_cache_list_mutex);
+    if (prev) {
+        prev->next = next;
+    } else if (g_regex_caches == this) {
+        g_regex_caches = next;
+    }
+    if (next) next->prev = prev;
+    next = nullptr;
+    prev = nullptr;
+    pthread_mutex_unlock(&g_regex_cache_list_mutex);
+}
+
+static int on_full_regex_match(
+    unsigned int, unsigned long long, unsigned long long to, unsigned int, void* context) {
+    auto* ctx = static_cast<RegexMatchCtx*>(context);
+    if (to == ctx->len) {
+        ctx->matched = true;
+        return 1;
+    }
+    return 0;
+}
+
+static void regex_runtime_error(const char* msg) {
+    fprintf(stderr, "rut regex runtime error: %s\n", msg);
+}
+
+static void set_regex_compile_error(const char* msg) {
+    if (!msg) msg = "regex compilation failed";
+    snprintf(t_regex_compile_error, sizeof(t_regex_compile_error), "%s", msg);
+}
+
+}  // namespace
+
+void* rut_helper_regex_compile(const char* pattern, u32 pattern_len) {
+    t_regex_compile_error[0] = '\0';
+    if (!pattern) {
+        set_regex_compile_error("missing regex pattern");
+        return nullptr;
+    }
+    char* nul_pattern = static_cast<char*>(malloc(static_cast<size_t>(pattern_len) + 7));
+    if (!nul_pattern) {
+        set_regex_compile_error("out of memory while preparing regex pattern");
+        return nullptr;
+    }
+    nul_pattern[0] = '^';
+    nul_pattern[1] = '(';
+    nul_pattern[2] = '?';
+    nul_pattern[3] = ':';
+    memcpy(nul_pattern + 4, pattern, pattern_len);
+    nul_pattern[pattern_len + 4] = ')';
+    nul_pattern[pattern_len + 5] = '$';
+    nul_pattern[pattern_len + 6] = '\0';
+
+    hs_database_t* db = nullptr;
+    hs_compile_error_t* compile_error = nullptr;
+    hs_error_t rc =
+        hs_compile(nul_pattern, HS_FLAG_SINGLEMATCH, HS_MODE_BLOCK, nullptr, &db, &compile_error);
+    free(nul_pattern);
+    if (rc != 0 || !db) {
+        set_regex_compile_error(compile_error ? compile_error->message : nullptr);
+        if (compile_error) hs_free_compile_error(compile_error);
+        return nullptr;
+    }
+    auto* handle = static_cast<RegexHandle*>(calloc(1, sizeof(RegexHandle)));
+    if (!handle) {
+        set_regex_compile_error("out of memory while allocating regex handle");
+        hs_free_database(db);
+        return nullptr;
+    }
+    handle->db = db;
+    if (pthread_mutex_init(&handle->mutex, nullptr) != 0) {
+        set_regex_compile_error("regex mutex initialization failed");
+        hs_free_database(db);
+        free(handle);
+        return nullptr;
+    }
+    if (pthread_cond_init(&handle->no_active_scans, nullptr) != 0) {
+        set_regex_compile_error("regex condition initialization failed");
+        pthread_mutex_destroy(&handle->mutex);
+        hs_free_database(db);
+        free(handle);
+        return nullptr;
+    }
+    if (!register_regex_handle(handle)) {
+        set_regex_compile_error("out of regex handle registry slots");
+        pthread_cond_destroy(&handle->no_active_scans);
+        pthread_mutex_destroy(&handle->mutex);
+        hs_free_database(db);
+        free(handle);
+        return nullptr;
+    }
+    return handle;
+}
+
+const char* rut_helper_regex_last_compile_error() {
+    return t_regex_compile_error[0] ? t_regex_compile_error : nullptr;
+}
+
+void rut_helper_regex_free(void* db) {
+    if (!db) return;
+    auto* handle = static_cast<RegexHandle*>(db);
+    pthread_mutex_lock(&handle->mutex);
+    handle->closing = true;
+    while (handle->active_scans) {
+        pthread_cond_wait(&handle->no_active_scans, &handle->mutex);
+    }
+    hs_database_t* regex_db = handle->db;
+    handle->db = nullptr;
+    pthread_mutex_unlock(&handle->mutex);
+
+    unregister_regex_handle(handle);
+    if (regex_db) hs_free_database(regex_db);
+    pthread_cond_destroy(&handle->no_active_scans);
+    pthread_mutex_destroy(&handle->mutex);
+    free(handle);
+}
+
+u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
+    if (!s || !db) return 0;
+    auto* handle = static_cast<RegexHandle*>(db);
+    hs_database_t* regex_db = nullptr;
+    if (!begin_regex_scan(handle, &regex_db)) return 0;
+    pthread_mutex_lock(&t_regex_scratch_cache.mutex);
+    hs_scratch_t* scratch = t_regex_scratch_cache.get(handle);
+    if (!scratch) {
+        pthread_mutex_unlock(&t_regex_scratch_cache.mutex);
+        end_regex_scan(handle);
+        regex_runtime_error("scratch allocation failed");
+        return 0;
+    }
+
+    RegexMatchCtx ctx{};
+    ctx.len = s_len;
+    hs_error_t rc = hs_scan(regex_db, s, s_len, 0, scratch, on_full_regex_match, &ctx);
+    pthread_mutex_unlock(&t_regex_scratch_cache.mutex);
+    end_regex_scan(handle);
+    return (rc == HS_SUCCESS || rc == HS_SCAN_TERMINATED) && ctx.matched ? 1 : 0;
+}
+
+u8 rut_helper_regex_backend_available() {
+    return 1;
+}
+
+extern "C" u32 rut_helper_regex_scratch_cache_entry_count_for_test() {
+    pthread_mutex_lock(&t_regex_scratch_cache.mutex);
+    const u32 count = t_regex_scratch_cache.count;
+    pthread_mutex_unlock(&t_regex_scratch_cache.mutex);
+    return count;
 }
 
 void rut_helper_str_trim_prefix(

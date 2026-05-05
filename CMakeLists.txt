@@ -25,6 +25,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffunction-sections -fdata-sections -Wal
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
 option(RUT_ENABLE_IPO "Enable interprocedural optimization/LTO for Release builds" OFF)
+option(RUT_ENABLE_JIT "Build LLVM/Vectorscan JIT targets" ON)
 if(RUT_ENABLE_IPO)
     # Use CMake's native IPO support only when explicitly requested.
     # In the default developer/test build, keep archives and test linking simple and stable.
@@ -42,12 +43,16 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
 # LLVM — required for JIT compilation (ORC JIT via C API).
 # Only the rut_jit library links LLVM; rut_runtime stays LLVM-free.
 # Minimum LLVM 18: stable C API, ORC components (orcshared/orctargetprocess) split finalized.
-find_package(LLVM REQUIRED CONFIG)
-if(LLVM_PACKAGE_VERSION VERSION_LESS "18")
-    message(FATAL_ERROR "LLVM >= 18 required, found ${LLVM_PACKAGE_VERSION}")
+if(RUT_ENABLE_JIT)
+    find_package(LLVM REQUIRED CONFIG)
+    if(LLVM_PACKAGE_VERSION VERSION_LESS "18")
+        message(FATAL_ERROR "LLVM >= 18 required, found ${LLVM_PACKAGE_VERSION}")
+    endif()
+    message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+    message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+else()
+    message(STATUS "JIT targets disabled; skipping LLVM and Vectorscan")
 endif()
-message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
-message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 # Project include paths
 include_directories(include)

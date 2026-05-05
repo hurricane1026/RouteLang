@@ -17,6 +17,7 @@ enum class FrontendError : u8 {
     DuplicateUpstream,
     UnknownUpstream,
     OutOfMemory,
+    InvalidRegex,
     UnsupportedSyntax,
 };
 

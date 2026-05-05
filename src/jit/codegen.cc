@@ -2,8 +2,12 @@
 
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
+#include <atomic>
 
 #include <llvm-c/Core.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 namespace rut::jit {
 
@@ -84,6 +88,7 @@ struct Ctx {
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
     LLVMValueRef fn_str_cmp;
+    LLVMValueRef fn_str_regex_match;
     LLVMValueRef fn_str_trim_prefix;
 
     // Cache for map_type: LLVM literal structs (Optional<composite>, Struct
@@ -99,6 +104,15 @@ struct Ctx {
     };
     TypeCacheEntry type_cache[kMaxCachedTypes];
     u32 type_cache_count;
+    u32 regex_module_id;
+    u32 regex_count;
+    struct RegexGlobalEntry {
+        Str pattern;
+        LLVMValueRef db_global;
+    };
+    RegexGlobalEntry* regex_globals;
+    u32 regex_global_count;
+    u32 regex_global_cap;
 
     void init_types() {
         i1_ty = LLVMInt1TypeInContext(llvm_ctx);
@@ -201,6 +215,16 @@ struct Ctx {
         return fn_str_cmp;
     }
 
+    // u8 rut_helper_str_regex_match(ptr, i32, ptr)
+    LLVMValueRef get_str_regex_match() {
+        if (!fn_str_regex_match) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 3, 0);
+            fn_str_regex_match = LLVMAddFunction(llvm_mod, "rut_helper_str_regex_match", ft);
+        }
+        return fn_str_regex_match;
+    }
+
     // void rut_helper_str_trim_prefix(ptr, i32, ptr, i32, ptr, ptr)
     LLVMValueRef get_str_trim_prefix() {
         if (!fn_str_trim_prefix) {
@@ -250,6 +274,46 @@ struct Ctx {
         LLVMValueRef zero = LLVMConstInt(i32_ty, 0, 0);
         LLVMValueRef indices[] = {zero, zero};
         return LLVMBuildInBoundsGEP2(builder, LLVMTypeOf(str_const), global, indices, 2, name);
+    }
+
+    LLVMValueRef make_regex_db_load(Str pattern) {
+        for (u32 i = 0; i < regex_global_count; i++) {
+            const Str cached = regex_globals[i].pattern;
+            if (cached.len == pattern.len &&
+                (pattern.len == 0 || memcmp(cached.ptr, pattern.ptr, pattern.len) == 0)) {
+                return LLVMBuildLoad2(builder, ptr_ty, regex_globals[i].db_global, "regex.db");
+            }
+        }
+
+        char pattern_name[96];
+        char db_name[96];
+        const u32 id = regex_count++;
+        snprintf(
+            pattern_name, sizeof(pattern_name), "__rut_regex_pattern_%u_%u", regex_module_id, id);
+        snprintf(db_name, sizeof(db_name), "__rut_regex_db_%u_%u", regex_module_id, id);
+
+        LLVMValueRef str_const =
+            LLVMConstStringInContext(llvm_ctx, pattern.ptr, pattern.len, /*DontNullTerminate=*/0);
+        LLVMValueRef pattern_global = LLVMAddGlobal(llvm_mod, LLVMTypeOf(str_const), pattern_name);
+        LLVMSetInitializer(pattern_global, str_const);
+        LLVMSetGlobalConstant(pattern_global, 1);
+        LLVMSetLinkage(pattern_global, LLVMPrivateLinkage);
+        LLVMSetUnnamedAddress(pattern_global, LLVMGlobalUnnamedAddr);
+
+        LLVMValueRef db_global = LLVMAddGlobal(llvm_mod, ptr_ty, db_name);
+        LLVMSetLinkage(db_global, LLVMExternalLinkage);
+        if (regex_global_count == regex_global_cap) {
+            u32 new_cap = regex_global_cap ? regex_global_cap * 2 : 32;
+            void* p = realloc(regex_globals, sizeof(RegexGlobalEntry) * new_cap);
+            if (p) {
+                regex_globals = static_cast<RegexGlobalEntry*>(p);
+                regex_global_cap = new_cap;
+            }
+        }
+        if (regex_global_count < regex_global_cap) {
+            regex_globals[regex_global_count++] = {pattern, db_global};
+        }
+        return LLVMBuildLoad2(builder, ptr_ty, db_global, "regex.db");
     }
 
     // ── Value / Block access ───────────────────────────────────────
@@ -502,6 +566,20 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             // Convert u8 result to i1 for branch usage
             LLVMValueRef b =
                 LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(c.i8_ty, 0, 0), "hp.bool");
+            c.set_value(inst.result, b);
+            break;
+        }
+        case rir::Opcode::StrRegexMatch: {
+            LLVMValueRef s = c.get_value(inst.operands[0]);
+            LLVMValueRef s_ptr = LLVMBuildExtractValue(c.builder, s, 0, "s.ptr");
+            LLVMValueRef s_len = LLVMBuildExtractValue(c.builder, s, 1, "s.len");
+            LLVMValueRef db = c.make_regex_db_load(inst.imm.str_val);
+            LLVMValueRef args[] = {s_ptr, s_len, db};
+            LLVMValueRef fn = c.get_str_regex_match();
+            LLVMValueRef r =
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(fn), fn, args, 3, "rx");
+            LLVMValueRef b =
+                LLVMBuildICmp(c.builder, LLVMIntNE, r, LLVMConstInt(c.i8_ty, 0, 0), "rx.bool");
             c.set_value(inst.result, b);
             break;
         }
@@ -951,6 +1029,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 // ── Module Codegen ─────────────────────────────────────────────────
 
 CodegenResult codegen(const rir::Module& rir_mod) {
+    static std::atomic<u32> next_regex_module_id{1};
     Ctx c{};
     c.llvm_ctx = LLVMContextCreate();
     c.llvm_mod = LLVMModuleCreateWithNameInContext(
@@ -965,9 +1044,15 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;
     c.fn_str_cmp = nullptr;
+    c.fn_str_regex_match = nullptr;
     c.fn_str_trim_prefix = nullptr;
     c.cur_fn = nullptr;
     c.type_cache_count = 0;
+    c.regex_module_id = next_regex_module_id.fetch_add(1);
+    c.regex_count = 0;
+    c.regex_globals = nullptr;
+    c.regex_global_count = 0;
+    c.regex_global_cap = 0;
 
     c.init_types();
 
@@ -980,6 +1065,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     }
 
     LLVMDisposeBuilder(c.builder);
+    free(c.regex_globals);
 
     if (!ok) {
         LLVMDisposeModule(c.llvm_mod);

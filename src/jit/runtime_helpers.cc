@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unordered_map>
 
 using namespace rut;
 
@@ -157,6 +158,7 @@ struct RegexScratchCache {
     RegexScratchSlot* slots = nullptr;
     u32 count = 0;
     u32 cap = 0;
+    std::unordered_map<u64, u32> generation_to_index;
     RegexScratchCache* next = nullptr;
     RegexScratchCache* prev = nullptr;
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -188,17 +190,21 @@ struct RegexScratchCache {
 
     void remove_at(u32 idx) {
         if (idx >= count) return;
+        const u64 generation = slots[idx].generation;
         if (slots[idx].scratch) hs_free_scratch(slots[idx].scratch);
+        generation_to_index.erase(generation);
         count--;
-        if (idx != count) slots[idx] = slots[count];
+        if (idx != count) {
+            slots[idx] = slots[count];
+            generation_to_index[slots[idx].generation] = idx;
+        }
         slots[count] = {};
     }
 
     hs_scratch_t* get(const RegexHandle* handle) {
-        for (u32 i = 0; i < count; i++) {
-            if (slots[i].handle == handle && slots[i].generation == handle->generation) {
-                return slots[i].scratch;
-            }
+        const auto iter = generation_to_index.find(handle->generation);
+        if (iter != generation_to_index.end()) {
+            return slots[iter->second].scratch;
         }
         hs_scratch_t* scratch = nullptr;
         if (hs_alloc_scratch(handle->db, &scratch) != HS_SUCCESS || !scratch) return nullptr;
@@ -206,7 +212,9 @@ struct RegexScratchCache {
             hs_free_scratch(scratch);
             return nullptr;
         }
-        slots[count++] = {handle, handle->generation, scratch};
+        slots[count] = {handle, handle->generation, scratch};
+        generation_to_index[handle->generation] = count;
+        count++;
         return scratch;
     }
 
@@ -303,12 +311,9 @@ static void unregister_regex_handle(const RegexHandle* handle) {
 }
 
 void RegexScratchCache::prune_handle(const RegexHandle* handle) {
-    for (u32 i = 0; i < count;) {
-        if (slots[i].handle == handle && slots[i].generation == handle->generation) {
-            remove_at(i);
-        } else {
-            i++;
-        }
+    const auto iter = generation_to_index.find(handle->generation);
+    if (iter != generation_to_index.end() && iter->second < count && slots[iter->second].handle == handle) {
+        remove_at(iter->second);
     }
 }
 

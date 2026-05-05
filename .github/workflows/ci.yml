@@ -283,6 +283,11 @@ jobs:
             fi
             ./build-$arch/bench/bench_scan_uri 2> "/tmp/run-$arch.err" | tee "/tmp/bench-results/$arch.txt" || \
               { echo "::warning::scan_uri run failed for SIMD_ARCH=$arch"; cat "/tmp/run-$arch.err"; }
+            if ! ninja -C "build-$arch" bench_dispatch_compare 2> "/tmp/dispatch-build-$arch.err"; then
+              echo "::warning::dispatch_compare build failed for SIMD_ARCH=$arch"
+              tail -30 "/tmp/dispatch-build-$arch.err"
+              continue
+            fi
             ./build-$arch/bench/bench_dispatch_compare 2> "/tmp/dispatch-$arch.err" | tee "/tmp/dispatch-results/$arch.txt" || \
               { echo "::warning::dispatch_compare run failed for SIMD_ARCH=$arch"; cat "/tmp/dispatch-$arch.err"; }
             echo
@@ -315,7 +320,18 @@ jobs:
           echo "==============================================================="
           echo "dispatch comparison — linear scan vs scalar ART vs JIT ART (arm64)"
           echo "==============================================================="
-          echo "::notice::bench_dispatch_compare is JIT-only and is skipped on arm64 because Vectorscan is x86_64-only"
+          shopt -s nullglob
+          dispatch_results=(/tmp/dispatch-results/*.txt)
+          if [ ${#dispatch_results[@]} -eq 0 ]; then
+            echo "::notice::no dispatch_compare results captured — see warnings above"
+          else
+            for f in "${dispatch_results[@]}"; do
+              arch=$(basename "$f" .txt)
+              echo
+              echo "--- $arch ---"
+              cat "$f"
+            done
+          fi
 
   coverage:
     name: Code Coverage

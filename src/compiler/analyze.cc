@@ -9869,13 +9869,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // awkwardly once impure inits land. Deferring until the
         // state-machine has real per-state code gen.
         //
-        // Decorators are routed through the entry block, so mixing
-        // waits with decorators would sleep before running the
-        // decorator — `@auth GET "/x" { wait(50) return 204 }` would
-        // let an unauthorized request sleep before rejecting. Reject
-        // that combination here until decorators gain pre-yield
-        // placement.
-        //
         // wait(0) is rejected: it has no meaning for a sleep primitive
         // and would stall 1s under the wheel fallback.
         bool seen_wait = false;
@@ -9886,8 +9879,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (seen_non_let_non_wait)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 if (stmt.status_code == 0)
-                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-                if (!item.route.decorators.empty())
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 seen_wait = true;
                 // ms payload is the 32-bit Yield slot (status_code +
@@ -10450,11 +10441,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // place doesn't invalidate any pointers.
         const u32 num_user_guards = first_decorator_guard_index;
         const u32 num_deco_guards = route.guards.len - first_decorator_guard_index;
+        route.decorator_guard_count = num_deco_guards;
         if (num_deco_guards > 0 && num_user_guards > 0) {
             HirGuard tmp[HirRoute::kMaxGuards];
             for (u32 i = 0; i < route.guards.len; i++) tmp[i] = route.guards[i];
             for (u32 i = 0; i < num_deco_guards; i++) route.guards[i] = tmp[num_user_guards + i];
             for (u32 i = 0; i < num_user_guards; i++) route.guards[num_deco_guards + i] = tmp[i];
+        }
+        if (route.waits.len != 0 && route.decorator_guard_count != 0 &&
+            (route.guards.len != route.decorator_guard_count ||
+             route.control.kind != HirControlKind::Direct || route.for_loops.len != 0)) {
+            return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
         }
 
         if (!mod.routes.push(route))

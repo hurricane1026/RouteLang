@@ -2464,6 +2464,12 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
+    if (term.kind == MirTerminatorKind::YieldTimer) {
+        if (!b.emit_yield_timer(
+                term.yield_ms, term.yield_next_state, {term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
+        return {};
+    }
     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
 }
 
@@ -3012,6 +3018,14 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         if (mir.functions[i].blocks.len == 0) {
             out.destroy();
             return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
+        }
+        if (mir.functions[i].state_zero_enters_entry) {
+            if (mir.functions[i].resume_terminal_block >= mir.functions[i].blocks.len ||
+                !b.set_state_zero_entry_resume(fn.value(),
+                                               block_ids[mir.functions[i].resume_terminal_block])) {
+                out.destroy();
+                return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
+            }
         }
         b.set_insert_point(fn.value(), block_ids[0]);
 

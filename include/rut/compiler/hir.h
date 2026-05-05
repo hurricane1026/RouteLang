@@ -759,6 +759,7 @@ struct HirRoute {
     FixedVec<HirLocal, kMaxLocals> locals;
     FixedVec<HirGuard, kMaxGuards> guards;
     FixedVec<DecoratorRef, kMaxDecorators> decorators;
+    u32 decorator_guard_count = 0;
     FixedVec<Wait, kMaxWaits> waits;
     FixedVec<HirForLoop, kMaxForLoops> for_loops;
     HirControl control{};
@@ -773,6 +774,7 @@ struct HirRoute {
           locals(other.locals),
           guards(other.guards),
           decorators(other.decorators),
+          decorator_guard_count(other.decorator_guard_count),
           waits(other.waits),
           for_loops(other.for_loops),
           control(other.control),
@@ -788,6 +790,7 @@ struct HirRoute {
         locals = other.locals;
         guards = other.guards;
         decorators = other.decorators;
+        decorator_guard_count = other.decorator_guard_count;
         waits = other.waits;
         for_loops = other.for_loops;
         control = other.control;
@@ -803,6 +806,7 @@ struct HirRoute {
           locals(other.locals),
           guards(other.guards),
           decorators(other.decorators),
+          decorator_guard_count(other.decorator_guard_count),
           waits(other.waits),
           for_loops(other.for_loops),
           control(other.control),
@@ -818,6 +822,7 @@ struct HirRoute {
         locals = other.locals;
         guards = other.guards;
         decorators = other.decorators;
+        decorator_guard_count = other.decorator_guard_count;
         waits = other.waits;
         for_loops = other.for_loops;
         control = other.control;

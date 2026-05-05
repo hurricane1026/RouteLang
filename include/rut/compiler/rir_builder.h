@@ -109,6 +109,8 @@ struct Builder {
         fn->route_pattern = route_pattern;
         fn->http_method = http_method;
         fn->yield_count = 0;
+        fn->state_zero_enters_entry = false;
+        fn->resume_terminal_block = 0;
         fn->yield_payload = nullptr;
         fn->blocks = blocks;
         fn->block_count = 0;
@@ -135,6 +137,13 @@ struct Builder {
         for (u32 i = 0; i < count; i++) buf[i] = ms_list[i];
         fn->yield_payload = buf;
         fn->yield_count = count;
+        return {};
+    }
+
+    VoidResult set_state_zero_entry_resume(Function* fn, BlockId terminal_block) {
+        if (!fn || terminal_block.id >= fn->block_count) return err(RirError::InvalidState);
+        fn->state_zero_enters_entry = true;
+        fn->resume_terminal_block = terminal_block.id;
         return {};
     }
 
@@ -854,6 +863,13 @@ struct Builder {
         }
         cur_func->yield_count++;
         return vid;
+    }
+
+    VoidResult emit_yield_timer(u32 ms, u16 next_state, SourceLoc loc = {}) {
+        if (!cur_func) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::YieldTimer, nullptr, loc));
+        r.inst->imm.i64_val = (static_cast<i64>(next_state) << 32) | static_cast<i64>(ms);
+        return {};
     }
 };
 

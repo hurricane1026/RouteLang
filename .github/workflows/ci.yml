@@ -276,7 +276,7 @@ jobs:
               cat "/tmp/cmake-$arch.err"
               continue
             fi
-            if ! ninja -C "build-$arch" bench_scan_uri bench_dispatch_compare 2> "/tmp/build-$arch.err"; then
+            if ! ninja -C "build-$arch" bench_scan_uri 2> "/tmp/build-$arch.err"; then
               echo "::warning::build failed for SIMD_ARCH=$arch"
               tail -30 "/tmp/build-$arch.err"
               continue

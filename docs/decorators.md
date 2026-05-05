@@ -11,22 +11,23 @@ continue or reject it with an HTTP status code.
 Decorator functions use this convention:
 
 ```rut
-func auth(_ req: i32) -> i32 => 0
+func auth(_ ignored: i32) -> i32 => 0
 ```
 
 Rules:
 
 - The function must have at least one parameter.
-- The first parameter must use the omitted-label form: `_ req: ...`.
+- The first parameter must use the omitted-label form: `_ <name>: ...`.
 - The return type must be `i32`.
 - Returning `0` means pass through.
 - Returning any non-zero value short-circuits the route and returns that value
   as the HTTP status code.
 
 The first parameter is currently a placeholder. A real runtime `Request` type is
-not implemented yet. Decorators that need request data should use the existing
-request expression surface such as `req.header(...)`, `req.path`, and
-`req.method` inside the function body.
+not implemented yet. If a decorator needs the magic request expression surface
+such as `req.header(...)`, `req.path`, or `req.method`, do not name the
+placeholder parameter `req`; a user-bound parameter or local named `req` shadows
+the magic request object.
 
 ## Binding To Routes
 
@@ -37,7 +38,7 @@ Decorators can be bound inside a `route { ... }` block.
 `"*"` applies the decorator to every entry in the block:
 
 ```rut
-func auth(_ req: i32) -> i32 => 0
+func auth(_ ignored: i32) -> i32 => 0
 
 route {
     @auth "*"
@@ -51,7 +52,7 @@ route {
 A string pattern other than `"*"` applies to route paths with that prefix:
 
 ```rut
-func adminOnly(_ req: i32) -> i32 => 0
+func adminOnly(_ ignored: i32) -> i32 => 0
 
 route {
     @adminOnly "/admin"
@@ -68,7 +69,7 @@ In this example, `adminOnly` applies to `/admin/users` but not to
 A decorator can be attached directly to a single route entry:
 
 ```rut
-func requestId(_ req: i32) -> i32 => 0
+func requestId(_ ignored: i32) -> i32 => 0
 
 route {
     @requestId
@@ -86,9 +87,9 @@ Block bindings and entry decorators are merged. Matching block bindings come
 first in declaration order, then entry decorators:
 
 ```rut
-func requestId(_ req: i32) -> i32 => 0
-func auth(_ req: i32) -> i32 => 0
-func maxBody(_ req: i32) -> i32 => 0
+func requestId(_ ignored: i32) -> i32 => 0
+func auth(_ ignored: i32) -> i32 => 0
+func maxBody(_ ignored: i32) -> i32 => 0
 
 route {
     @requestId "*"
@@ -113,7 +114,7 @@ The first decorator that returns a non-zero status stops the chain.
 Decorators can be used with direct terminal `wait(...)` routes:
 
 ```rut
-func auth(_ req: i32) -> i32 => 0
+func auth(_ ignored: i32) -> i32 => 0
 
 route {
     @auth "*"

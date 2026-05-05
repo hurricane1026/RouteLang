@@ -2,13 +2,13 @@
 
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include <unordered_map>
 
 #include <hs.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unordered_map>
 
 using namespace rut;
 
@@ -312,7 +312,8 @@ static void unregister_regex_handle(const RegexHandle* handle) {
 
 void RegexScratchCache::prune_handle(const RegexHandle* handle) {
     const auto iter = generation_to_index.find(handle->generation);
-    if (iter != generation_to_index.end() && iter->second < count && slots[iter->second].handle == handle) {
+    if (iter != generation_to_index.end() && iter->second < count &&
+        slots[iter->second].handle == handle) {
         remove_at(iter->second);
     }
 }

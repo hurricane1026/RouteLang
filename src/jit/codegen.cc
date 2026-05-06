@@ -963,7 +963,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
     // State-machine prologue. When the RIR function has yield points, the
     // handler is called multiple times (once per state) and the first
-    // LLVM basic block dispatches on HandlerCtx::state:
+    // LLVM basic block dispatches on HandlerCtx::state. The default mapping
+    // uses state 0..N-1 for prologue yield blocks and any later state for
+    // terminal execution:
     //
     //   dispatch:
     //     switch state {
@@ -976,6 +978,11 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     // running any of the original code; the terminal state runs the
     // original RIR blocks unchanged. Single-function model — no frame
     // needed for this slice (nothing lives across the yield).
+    //
+    // Decorated wait routes can set state_zero_enters_entry. In that mode,
+    // state 0 enters the original entry block so decorator guards run before
+    // the first timer yield, yield_0 is omitted from the prologue, and
+    // resumed states dispatch to the recorded terminal block by default.
     if (fn.yield_count > 0) {
         LLVMBasicBlockRef dispatch_bb = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, "dispatch");
         // Move dispatch to be the first block; it will become the function's

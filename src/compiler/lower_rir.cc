@@ -3027,34 +3027,64 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
             }
         }
+        if (mir.functions[i].has_explicit_resume_blocks) {
+            rir::BlockId resume_blocks[MirFunction::kMaxWaits + 1]{};
+            const u32 count = mir.functions[i].waits.len + 1;
+            for (u32 ri = 0; ri < count; ri++) {
+                if (mir.functions[i].resume_blocks[ri] >= mir.functions[i].blocks.len) {
+                    out.destroy();
+                    return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
+                }
+                resume_blocks[ri] = block_ids[mir.functions[i].resume_blocks[ri]];
+            }
+            if (!b.set_resume_blocks(fn.value(), resume_blocks, count)) {
+                out.destroy();
+                return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
+            }
+        }
         b.set_insert_point(fn.value(), block_ids[0]);
 
         rir::ValueId local_vals[MirFunction::kMaxLocals]{};
-        for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
-            auto val = materialize_local_init(mir.functions[i].locals[li],
-                                              mir,
-                                              variant_infos,
-                                              tuple_infos,
-                                              &tuple_info_count,
-                                              error_scalar_infos,
-                                              error_variant_infos,
-                                              error_struct_infos,
-                                              error_struct_def.value(),
-                                              user_struct_defs,
-                                              b,
-                                              local_vals,
-                                              MirFunction::kMaxLocals,
-                                              mir.functions[i].name,
-                                              out.module.name);
-            if (!val) {
-                out.destroy();
-                return core::make_unexpected(val.error());
+        auto materialize_locals = [&]() -> FrontendResult<void> {
+            for (u32 li = 0; li < MirFunction::kMaxLocals; li++) local_vals[li] = {};
+            for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+                auto val = materialize_local_init(mir.functions[i].locals[li],
+                                                  mir,
+                                                  variant_infos,
+                                                  tuple_infos,
+                                                  &tuple_info_count,
+                                                  error_scalar_infos,
+                                                  error_variant_infos,
+                                                  error_struct_infos,
+                                                  error_struct_def.value(),
+                                                  user_struct_defs,
+                                                  b,
+                                                  local_vals,
+                                                  MirFunction::kMaxLocals,
+                                                  mir.functions[i].name,
+                                                  out.module.name);
+                if (!val) return core::make_unexpected(val.error());
+                local_vals[mir.functions[i].locals[li].ref_index] = val.value();
             }
-            local_vals[mir.functions[i].locals[li].ref_index] = val.value();
+            return {};
+        };
+        if (!mir.functions[i].has_explicit_resume_blocks) {
+            auto locals_ok = materialize_locals();
+            if (!locals_ok) {
+                out.destroy();
+                return core::make_unexpected(locals_ok.error());
+            }
         }
 
         for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
             b.set_insert_point(fn.value(), block_ids[bi]);
+            if (mir.functions[i].has_explicit_resume_blocks) {
+                auto locals_ok = materialize_locals();
+                if (!locals_ok) {
+                    out.destroy();
+                    return core::make_unexpected(locals_ok.error());
+                }
+            }
             auto emitted = emit_term(mir.functions[i].blocks[bi].term,
                                      mir,
                                      variant_infos,

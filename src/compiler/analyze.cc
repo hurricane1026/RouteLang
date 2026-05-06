@@ -9840,44 +9840,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (route.method == 0)
             return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
 
-        // Slice-1 constraint: a route body has the shape
-        //   let* ; wait* ; guard* ; terminal_control
-        // — zero or more `let`s, zero or more `wait`s, zero or more
-        // top-level `guard`s (each guard requires a following
-        // statement), then one top-level terminal control statement
-        // (return / forward / if / match / block containing that
-        // terminal region). Guards gate subsequent waits the same
-        // way any other non-let non-wait does, but are called out
-        // separately because they're common pre-terminal filters.
-        //
-        // Mechanism (slice 1, pure-expression surface): codegen routes
-        // states 0..N-1 to dead-end yield blocks that emit the packed
-        // Yield; state N (terminal) runs the original entry block,
-        // which re-materializes every local fresh via
-        // materialize_local_init. For pure initializers that's
-        // idempotent, so pre-wait locals reach the post-wait terminal
-        // with the right value. The HandlerCtx slot helpers
-        // (load_slot/store_slot in include/rut/jit/handler_abi.h) are
-        // NOT used today — they stay parked until impure initializers
-        // (I/O expressions) arrive and re-materialization becomes
-        // incorrect.
-        //
-        // `let` after the first `wait` is rejected: it would still
-        // execute in the terminal block (so pure inits would work in
-        // principle), but the source order would misrepresent when
-        // the initializer actually runs, and the mechanism extends
-        // awkwardly once impure inits land. Deferring until the
-        // state-machine has real per-state code gen.
-        //
         // wait(0) is rejected: it has no meaning for a sleep primitive
         // and would stall 1s under the wheel fallback.
         bool seen_wait = false;
-        bool seen_non_let_non_wait = false;
         for (u32 si = 0; si < item.route.statements.len; si++) {
             const auto& stmt = item.route.statements[si];
             if (stmt.kind == AstStmtKind::Wait) {
-                if (seen_non_let_non_wait)
-                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 if (stmt.status_code == 0)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 seen_wait = true;
@@ -9892,12 +9860,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     return frontend_error(FrontendError::TooManyItems, stmt.span);
                 continue;
             }
-            // Pre-wait lets are allowed; post-wait lets are not. Any
-            // other statement (guard/if/match/return/forward/...) counts
-            // as the terminal region and gates further waits.
-            if (stmt.kind != AstStmtKind::Let) {
-                seen_non_let_non_wait = true;
-            } else if (seen_wait) {
+            // Post-wait locals need frame slots or per-state rematerialization
+            // to preserve source order across resume. Keep that scoped out
+            // while guards/control are now source-ordered around waits.
+            if (stmt.kind == AstStmtKind::Let && seen_wait) {
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
             }
             if (stmt.kind == AstStmtKind::Let) {
@@ -10353,7 +10319,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // local + guard pair. Pre-middleware short-circuit is achieved by guards:
         // each guard checks `local == 0`; on non-zero, fail_term returns the
         // local's runtime value (HirTerminatorSourceKind::LocalRef).
-        const u32 user_local_count_before_decorators = route.locals.len;
         const u32 first_decorator_guard_index = route.guards.len;
         for (u32 di = 0; di < item.route.decorators.len; di++) {
             const auto& ast_deco = item.route.decorators[di];
@@ -10450,13 +10415,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 i = 0; i < num_user_guards; i++) route.guards[num_deco_guards + i] = tmp[i];
         }
         if (route.waits.len != 0 && route.decorator_guard_count != 0) {
-            for (u32 li = 0; li < user_local_count_before_decorators; li++) {
-                if (route.locals[li].name.len != 0) {
-                    return frontend_error(FrontendError::UnsupportedSyntax, route.locals[li].span);
-                }
-            }
-            if (route.guards.len != route.decorator_guard_count ||
-                route.control.kind != HirControlKind::Direct || route.for_loops.len != 0) {
+            if (route.for_loops.len != 0 || (route.control.kind != HirControlKind::Direct &&
+                                             route.control.kind != HirControlKind::If)) {
                 return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
             }
         }

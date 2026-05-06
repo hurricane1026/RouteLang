@@ -1322,17 +1322,18 @@ TEST(frontend, parser_rejects_wait_above_u32_max) {
     CHECK(!ast);
 }
 
-TEST(frontend, analyze_rejects_wait_after_non_wait_statement) {
-    // Slice 0 codegen dispatches yields before the entry block, so waits
-    // must be a contiguous prefix. `guard ...; wait(50); return 204`
-    // would otherwise run the wait before the guard check.
+TEST(frontend, analyze_accepts_wait_after_guard) {
+    // Wait lowering is source-ordered: the guard runs before the timer is
+    // armed, and only the pass path reaches wait(50).
     const char* src = "route GET \"/x\" { guard true else { return 500 } wait(50) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
 }
 
 TEST(frontend, analyze_accepts_wait_as_prefix_with_return) {
@@ -1464,10 +1465,9 @@ TEST(frontend, parse_wait_rejects_unknown_suffix) {
     CHECK(!ast);
 }
 
-TEST(frontend, analyze_rejects_wait_after_let_guard) {
-    // Non-let non-wait statements still gate subsequent waits. A guard
-    // between a let and a wait introduces a terminal-ish control path
-    // the state machine can't yet thread through.
+TEST(frontend, analyze_accepts_wait_after_let_guard) {
+    // Source-ordered wait lowering threads top-level guards before the
+    // timer yield and preserves pre-wait locals used by those guards.
     const char* src =
         "route GET \"/x\" { let k = 42 guard k else { return 401 } wait(50) return 204 }\n";
     auto lexed = lex(lit(src));
@@ -1475,7 +1475,10 @@ TEST(frontend, analyze_rejects_wait_after_let_guard) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
 }
 
 TEST(frontend, analyze_accepts_wait_in_decorated_route) {
@@ -1499,7 +1502,7 @@ route {
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
 }
 
-TEST(frontend, analyze_rejects_decorated_wait_with_terminal_control) {
+TEST(frontend, analyze_accepts_decorated_wait_with_terminal_control) {
     const char* src = R"rut(
 func auth(_ req: i32) -> i32 => 0
 route {
@@ -1512,11 +1515,12 @@ route {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
-    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].decorator_guard_count, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::If));
 }
 
-TEST(frontend, analyze_rejects_decorated_wait_with_user_local) {
+TEST(frontend, analyze_accepts_decorated_wait_with_user_local) {
     const char* src = R"rut(
 func auth(_ req: i32) -> i32 => 0
 route {
@@ -1529,8 +1533,10 @@ route {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
-    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    REQUIRE_EQ(hir->routes[0].decorator_guard_count, 1u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
 }
 
 TEST(frontend, rir_function_carries_yield_payload_for_waits) {
@@ -1556,6 +1562,11 @@ TEST(frontend, rir_function_carries_yield_payload_for_waits) {
     REQUIRE(rir.module.functions[0].yield_payload != nullptr);
     CHECK_EQ(rir.module.functions[0].yield_payload[0], 500u);
     CHECK_EQ(rir.module.functions[0].yield_payload[1], 1000u);
+    REQUIRE(rir.module.functions[0].resume_blocks != nullptr);
+    REQUIRE_EQ(rir.module.functions[0].resume_block_count, 3u);
+    CHECK_EQ(rir.module.functions[0].resume_blocks[0], 0u);
+    CHECK_EQ(rir.module.functions[0].resume_blocks[1], 1u);
+    CHECK_EQ(rir.module.functions[0].resume_blocks[2], 2u);
     rir.destroy();
 }
 

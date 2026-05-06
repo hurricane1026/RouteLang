@@ -237,6 +237,8 @@ struct MirFunction {
     FixedVec<Wait, kMaxWaits> waits;
     bool state_zero_enters_entry = false;
     u32 resume_terminal_block = 0;
+    bool has_explicit_resume_blocks = false;
+    u32 resume_blocks[kMaxWaits + 1]{};
     u32 error_variant_index = 0xffffffffu;
 
     MirFunction() = default;
@@ -251,7 +253,9 @@ struct MirFunction {
           waits(other.waits),
           state_zero_enters_entry(other.state_zero_enters_entry),
           resume_terminal_block(other.resume_terminal_block),
+          has_explicit_resume_blocks(other.has_explicit_resume_blocks),
           error_variant_index(other.error_variant_index) {
+        for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
     MirFunction& operator=(const MirFunction& other) {
@@ -266,6 +270,8 @@ struct MirFunction {
         waits = other.waits;
         state_zero_enters_entry = other.state_zero_enters_entry;
         resume_terminal_block = other.resume_terminal_block;
+        has_explicit_resume_blocks = other.has_explicit_resume_blocks;
+        for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
         rebase_from(other);
         return *this;
@@ -281,7 +287,9 @@ struct MirFunction {
           waits(other.waits),
           state_zero_enters_entry(other.state_zero_enters_entry),
           resume_terminal_block(other.resume_terminal_block),
+          has_explicit_resume_blocks(other.has_explicit_resume_blocks),
           error_variant_index(other.error_variant_index) {
+        for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
     MirFunction& operator=(MirFunction&& other) noexcept {
@@ -296,6 +304,8 @@ struct MirFunction {
         waits = other.waits;
         state_zero_enters_entry = other.state_zero_enters_entry;
         resume_terminal_block = other.resume_terminal_block;
+        has_explicit_resume_blocks = other.has_explicit_resume_blocks;
+        for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
         rebase_from(other);
         return *this;

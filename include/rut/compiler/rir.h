@@ -357,6 +357,8 @@ struct Function {
     u32 yield_count;
     bool state_zero_enters_entry;
     u32 resume_terminal_block;
+    u32* resume_blocks;
+    u32 resume_block_count;
 
     // Per-yield payload. For a Timer yield, yield_payload[i] is the
     // duration in milliseconds (u32 ≈ 49 days). Arena-allocated, length

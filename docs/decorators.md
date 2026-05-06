@@ -136,7 +136,7 @@ route handler's terminal control from running.
 
 ## `wait(...)` Routes
 
-Decorators can be used with direct terminal `wait(...)` routes:
+Decorators can be used with `wait(...)` routes:
 
 ```rut
 func auth(_ ignored: i32) -> i32 => 0
@@ -152,25 +152,23 @@ The decorator runs before the timer yield is armed:
 - If `auth` returns `401`, the handler immediately returns `401`.
 - If `auth` returns `0`, the handler yields the timer and resumes to `return 200`.
 
-Current limitation: decorated `wait(...)` routes must use direct terminal
-control and cannot contain user `let` bindings. These forms are rejected today:
+Decorated wait routes also support user locals, user top-level guards, and `if`
+terminal control:
 
 ```rut
 route {
     @auth "*"
-    GET "/x" { wait(50) if true { return 200 } else { return 500 } }
+    GET "/x" {
+        let code = 200
+        guard req.method == GET else { return 405 }
+        wait(50)
+        if code == 200 { return 200 } else { return 500 }
+    }
 }
 ```
 
-```rut
-route {
-    @auth "*"
-    GET "/x" { let code = 200 wait(50) return 200 }
-}
-```
-
-Decorated wait routes with user top-level guards or for-loops are also rejected.
-Those shapes need a fuller source-ordered state-machine lowering.
+Decorated wait routes with for-loops, nested waits, or `match` terminal control
+are still rejected today.
 
 ## Unsupported Today
 
@@ -191,4 +189,5 @@ The analyzer rejects:
 - Decorator functions with zero parameters.
 - Decorator functions whose first parameter is missing `_`.
 - Decorator functions whose return type is not `i32`.
-- Decorated wait routes outside the direct terminal subset described above.
+- Decorated wait routes with for-loops, nested waits, or `match` terminal
+  control.

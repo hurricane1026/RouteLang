@@ -929,6 +929,127 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             return {};
         };
 
+        if (fn.waits.len != 0 && module.routes[i].for_loops.len == 0) {
+            if (module.routes[i].control.kind != HirControlKind::Direct &&
+                module.routes[i].control.kind != HirControlKind::If) {
+                return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+            }
+
+            struct RouteStep {
+                enum class Kind : u8 { Guard, Wait };
+                Kind kind;
+                u32 index;
+                Span span;
+            };
+            RouteStep steps[HirRoute::kMaxGuards + HirRoute::kMaxWaits]{};
+            u32 step_count = 0;
+            for (u32 gi = 0; gi < module.routes[i].guards.len; gi++) {
+                steps[step_count++] = {
+                    RouteStep::Kind::Guard, gi, module.routes[i].guards[gi].span};
+            }
+            for (u32 wi = 0; wi < fn.waits.len; wi++) {
+                steps[step_count++] = {RouteStep::Kind::Wait, wi, fn.waits[wi].span};
+            }
+            for (u32 si = 1; si < step_count; si++) {
+                RouteStep cur = steps[si];
+                u32 pos = si;
+                while (pos > 0 && cur.span.start < steps[pos - 1].span.start) {
+                    steps[pos] = steps[pos - 1];
+                    pos--;
+                }
+                steps[pos] = cur;
+            }
+
+            const u32 terminal_index = step_count;
+            const u32 then_index =
+                module.routes[i].control.kind == HirControlKind::If ? terminal_index + 1 : 0;
+            const u32 else_index =
+                module.routes[i].control.kind == HirControlKind::If ? terminal_index + 2 : 0;
+            u32 fail_cursor =
+                terminal_index + (module.routes[i].control.kind == HirControlKind::If ? 3 : 1);
+            u32 guard_fail_index[HirRoute::kMaxGuards]{};
+            for (u32 si = 0; si < step_count; si++) {
+                if (steps[si].kind != RouteStep::Kind::Guard) continue;
+                const u32 gi = steps[si].index;
+                guard_fail_index[gi] = fail_cursor;
+                fail_cursor += guard_fail_block_count(module.routes[i].guards[gi]);
+            }
+            if (fail_cursor > MirFunction::kMaxBlocks)
+                return frontend_error(FrontendError::TooManyItems, fn.span);
+
+            u32 wait_ordinal = 0;
+            fn.has_explicit_resume_blocks = true;
+            fn.state_zero_enters_entry = true;
+            fn.resume_blocks[0] = 0;
+            for (u32 si = 0; si < step_count; si++) {
+                MirBlock step_block{};
+                step_block.label = si == 0 ? entry_label() : cont_label();
+                const u32 next_index = si + 1 < step_count ? si + 1 : terminal_index;
+                if (steps[si].kind == RouteStep::Kind::Guard) {
+                    const auto& guard = module.routes[i].guards[steps[si].index];
+                    step_block.term.kind = MirTerminatorKind::Branch;
+                    step_block.term.span = guard.span;
+                    auto cond = mir_value(guard.cond, module, &fn);
+                    if (!cond) return core::make_unexpected(cond.error());
+                    step_block.term.cond = cond.value();
+                    step_block.term.then_block = next_index;
+                    step_block.term.else_block = guard_fail_index[steps[si].index];
+                } else {
+                    const auto& wait = fn.waits[steps[si].index];
+                    wait_ordinal++;
+                    step_block.term.kind = MirTerminatorKind::YieldTimer;
+                    step_block.term.span = wait.span;
+                    step_block.term.yield_ms = wait.ms;
+                    step_block.term.yield_next_state = static_cast<u16>(wait_ordinal);
+                    fn.resume_blocks[wait_ordinal] = next_index;
+                }
+                if (!fn.blocks.push(step_block))
+                    return frontend_error(FrontendError::TooManyItems, fn.span);
+            }
+            if (wait_ordinal != fn.waits.len)
+                return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+
+            MirBlock terminal_block{};
+            terminal_block.label = cont_label();
+            if (module.routes[i].control.kind == HirControlKind::Direct) {
+                set_term_from_hir(&terminal_block.term, module.routes[i].control.direct_term);
+                if (!fn.blocks.push(terminal_block))
+                    return frontend_error(FrontendError::TooManyItems, fn.span);
+            } else {
+                terminal_block.term.kind = MirTerminatorKind::Branch;
+                terminal_block.term.span = module.routes[i].control.cond.span;
+                auto cond = mir_value(module.routes[i].control.cond, module, &fn);
+                if (!cond) return core::make_unexpected(cond.error());
+                terminal_block.term.cond = cond.value();
+                terminal_block.term.then_block = then_index;
+                terminal_block.term.else_block = else_index;
+                if (!fn.blocks.push(terminal_block))
+                    return frontend_error(FrontendError::TooManyItems, fn.span);
+
+                MirBlock then_block{};
+                then_block.label = then_label();
+                set_term_from_hir(&then_block.term, module.routes[i].control.then_term);
+                if (!fn.blocks.push(then_block))
+                    return frontend_error(FrontendError::TooManyItems, fn.span);
+
+                MirBlock else_block{};
+                else_block.label = else_label();
+                set_term_from_hir(&else_block.term, module.routes[i].control.else_term);
+                if (!fn.blocks.push(else_block))
+                    return frontend_error(FrontendError::TooManyItems, fn.span);
+            }
+
+            for (u32 si = 0; si < step_count; si++) {
+                if (steps[si].kind != RouteStep::Kind::Guard) continue;
+                auto emitted = emit_guard_fail(module.routes[i].guards[steps[si].index]);
+                if (!emitted) return core::make_unexpected(emitted.error());
+            }
+
+            if (!mir->functions.push(fn))
+                return frontend_error(FrontendError::TooManyItems, fn.span);
+            continue;
+        }
+
         // Phase 4b Scope A for-loop unroll. A for-loop compiles to a flat
         // chain of N × M virtual guards (N = iter_expr.args.len, M =
         // body.guards.len), each branching to the next on pass and to its

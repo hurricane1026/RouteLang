@@ -963,9 +963,10 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
     // State-machine prologue. When the RIR function has yield points, the
     // handler is called multiple times (once per state) and the first
-    // LLVM basic block dispatches on HandlerCtx::state. The default mapping
-    // uses state 0..N-1 for prologue yield blocks and any later state for
-    // terminal execution:
+    // LLVM basic block dispatches on HandlerCtx::state. Newer lowering emits
+    // explicit YieldTimer blocks and provides state -> resume block mapping.
+    // Older lowering uses state 0..N-1 for prologue yield blocks and any
+    // later state for terminal execution:
     //
     //   dispatch:
     //     switch state {
@@ -994,12 +995,25 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         // HandlerCtx layout: state (u16) @ offset 0.
         LLVMValueRef state = LLVMBuildLoad2(c.builder, c.i16_ty, c.param_ctx, "state");
 
+        const bool explicit_resume =
+            fn.resume_blocks != nullptr && fn.resume_block_count == fn.yield_count + 1;
         const u32 terminal_block_id =
-            fn.state_zero_enters_entry ? fn.resume_terminal_block : fn.blocks[0].id.id;
+            explicit_resume
+                ? fn.resume_blocks[fn.yield_count]
+                : (fn.state_zero_enters_entry ? fn.resume_terminal_block : fn.blocks[0].id.id);
         LLVMBasicBlockRef terminal_bb = c.block_map[terminal_block_id];
         LLVMValueRef sw = LLVMBuildSwitch(
-            c.builder, state, terminal_bb, fn.yield_count + (fn.state_zero_enters_entry ? 1 : 0));
-        if (fn.state_zero_enters_entry) {
+            c.builder,
+            state,
+            terminal_bb,
+            explicit_resume ? fn.resume_block_count
+                            : fn.yield_count + (fn.state_zero_enters_entry ? 1 : 0));
+        if (explicit_resume) {
+            for (u32 si = 0; si < fn.resume_block_count; si++) {
+                LLVMAddCase(sw, LLVMConstInt(c.i16_ty, si, 0), c.block_map[fn.resume_blocks[si]]);
+            }
+        }
+        if (!explicit_resume && fn.state_zero_enters_entry) {
             LLVMAddCase(sw, LLVMConstInt(c.i16_ty, 0, 0), c.block_map[fn.blocks[0].id.id]);
         }
 
@@ -1007,7 +1021,8 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         // layers will branch on per-yield metadata.
         constexpr u8 kYieldKindTimer = static_cast<u8>(YieldKind::Timer);
         const u32 first_prologue_yield = fn.state_zero_enters_entry ? 1 : 0;
-        for (u32 si = first_prologue_yield; si < fn.yield_count; si++) {
+        for (u32 si = explicit_resume ? fn.yield_count : first_prologue_yield; si < fn.yield_count;
+             si++) {
             char ylabel[24];
             u32 lpos = 0;
             const char* prefix = "yield_";

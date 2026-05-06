@@ -111,6 +111,8 @@ struct Builder {
         fn->yield_count = 0;
         fn->state_zero_enters_entry = false;
         fn->resume_terminal_block = 0;
+        fn->resume_blocks = nullptr;
+        fn->resume_block_count = 0;
         fn->yield_payload = nullptr;
         fn->blocks = blocks;
         fn->block_count = 0;
@@ -146,6 +148,19 @@ struct Builder {
         if (!fn || terminal_block.id >= fn->block_count) return err(RirError::InvalidState);
         fn->state_zero_enters_entry = true;
         fn->resume_terminal_block = terminal_block.id;
+        return {};
+    }
+
+    VoidResult set_resume_blocks(Function* fn, const BlockId* blocks, u32 count) {
+        if (!fn || count == 0) return err(RirError::InvalidState);
+        auto* buf = mod->arena->alloc_array<u32>(count);
+        if (!buf) return err(RirError::OutOfMemory);
+        for (u32 i = 0; i < count; i++) {
+            if (blocks[i].id >= fn->block_count) return err(RirError::InvalidState);
+            buf[i] = blocks[i].id;
+        }
+        fn->resume_blocks = buf;
+        fn->resume_block_count = count;
         return {};
     }
 

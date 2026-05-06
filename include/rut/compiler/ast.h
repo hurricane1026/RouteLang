@@ -26,7 +26,7 @@ enum class AstStmtKind : u8 {
     If,
     Match,
     Block,
-    Wait,  // `wait(N)` — suspend handler for N milliseconds (v1: IntLit only)
+    Wait,  // `wait(N)` / `wait(2s)` — suspend handler for a timer duration.
     // `for <name> in <expr> { <body> }`. Fields reused from AstStatement:
     //   - name        = loop variable identifier (e.g., "item" in `for item in xs`)
     //   - expr        = iteration source expression (must type-check as Array<T>)

@@ -1500,7 +1500,7 @@ route {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE(!hir);
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
@@ -1517,7 +1517,7 @@ route {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE(!hir);
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 

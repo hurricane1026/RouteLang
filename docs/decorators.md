@@ -5,8 +5,9 @@ route middleware subset, not a general language-level decorator system.
 
 ## Purpose
 
-A route decorator runs before the route handler. It can allow the request to
-continue or reject it with an HTTP status code.
+A route decorator can allow the request to continue or reject it with an HTTP
+status code before the route reaches terminal control such as `return`,
+`forward(...)`, or `wait(...)`.
 
 Decorator functions use this convention:
 
@@ -28,6 +29,26 @@ not implemented yet. If a decorator needs the magic request expression surface
 such as `req.header(...)`, `req.path`, or `req.method`, do not name the
 placeholder parameter `req`; a user-bound parameter or local named `req` shadows
 the magic request object.
+
+## Execution Order
+
+Decorators are currently lowered as synthetic locals and guards. User `let`
+initializers are materialized before those guards run, so a decorated route like
+this:
+
+```rut
+func auth(_ ignored: i32) -> i32 => 401
+
+route {
+    @auth "*"
+    GET "/x" { let code = 200 return code }
+}
+```
+
+still evaluates the `let code = 200` initializer before `auth` can reject.
+The decorator guard runs before the route's terminal control and before any
+`wait(...)` timer yield is armed, but it is not yet a strict "first instruction
+in the handler" hook.
 
 ## Binding To Routes
 

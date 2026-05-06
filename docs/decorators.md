@@ -121,14 +121,18 @@ route {
 }
 ```
 
-Execution order for `/admin/upload` is:
+Guard order for `/admin/upload` is:
 
 1. `requestId`
 2. `auth`
 3. `maxBody`
 4. route handler
 
-The first decorator that returns a non-zero status stops the chain.
+Current implementation note: decorator expressions are materialized before the
+guard chain runs, so all decorators may be evaluated even when an earlier one
+returns a non-zero status. The guard chain still observes the order above: the
+first non-zero decorator result determines the returned status and prevents the
+route handler's terminal control from running.
 
 ## `wait(...)` Routes
 

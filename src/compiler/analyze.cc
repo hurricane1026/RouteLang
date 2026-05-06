@@ -10353,6 +10353,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // local + guard pair. Pre-middleware short-circuit is achieved by guards:
         // each guard checks `local == 0`; on non-zero, fail_term returns the
         // local's runtime value (HirTerminatorSourceKind::LocalRef).
+        const u32 user_local_count_before_decorators = route.locals.len;
         const u32 first_decorator_guard_index = route.guards.len;
         for (u32 di = 0; di < item.route.decorators.len; di++) {
             const auto& ast_deco = item.route.decorators[di];
@@ -10448,10 +10449,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 i = 0; i < num_deco_guards; i++) route.guards[i] = tmp[num_user_guards + i];
             for (u32 i = 0; i < num_user_guards; i++) route.guards[num_deco_guards + i] = tmp[i];
         }
-        if (route.waits.len != 0 && route.decorator_guard_count != 0 &&
-            (route.guards.len != route.decorator_guard_count ||
-             route.control.kind != HirControlKind::Direct || route.for_loops.len != 0)) {
-            return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
+        if (route.waits.len != 0 && route.decorator_guard_count != 0) {
+            for (u32 li = 0; li < user_local_count_before_decorators; li++) {
+                if (route.locals[li].name.len != 0) {
+                    return frontend_error(FrontendError::UnsupportedSyntax, route.locals[li].span);
+                }
+            }
+            if (route.guards.len != route.decorator_guard_count ||
+                route.control.kind != HirControlKind::Direct || route.for_loops.len != 0) {
+                return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
+            }
         }
 
         if (!mod.routes.push(route))

@@ -149,12 +149,19 @@ The decorator runs before the timer yield is armed:
 - If `auth` returns `0`, the handler yields the timer and resumes to `return 200`.
 
 Current limitation: decorated `wait(...)` routes must use direct terminal
-control. These forms are rejected today:
+control and cannot contain user `let` bindings. These forms are rejected today:
 
 ```rut
 route {
     @auth "*"
     GET "/x" { wait(50) if true { return 200 } else { return 500 } }
+}
+```
+
+```rut
+route {
+    @auth "*"
+    GET "/x" { let code = 200 wait(50) return 200 }
 }
 ```
 

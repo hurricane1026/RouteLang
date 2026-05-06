@@ -1504,6 +1504,23 @@ route {
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
+TEST(frontend, analyze_rejects_decorated_wait_with_user_local) {
+    const char* src = R"rut(
+func auth(_ req: i32) -> i32 => 0
+route {
+    @auth "*"
+    GET "/x" { let code = 200 wait(50) return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
 TEST(frontend, rir_function_carries_yield_payload_for_waits) {
     const char* src = "route GET \"/x\" { wait(500) wait(1000) return 200 }\n";
     auto lexed = lex(lit(src));

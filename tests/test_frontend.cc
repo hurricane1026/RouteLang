@@ -13615,6 +13615,41 @@ route GET "/users" {
     REQUIRE(lowered);
     rir.destroy();
 }
+
+TEST(frontend, lower_to_rir_inlines_pipe_stages_as_plain_expressions) {
+    const auto src = R"(
+func normalize_status(code: i32) -> i32 {
+    if code == 204 { 200 } else { code }
+}
+route GET "/users" {
+    let code = 204 | normalize_status(_)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    // Pipe has no MIR/RIR opcode and source functions are not emitted as
+    // callable RIR functions. The stage body should already be expanded into
+    // the route function as ordinary expression instructions.
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    const auto& fn = rir.module.functions[0];
+    REQUIRE_EQ(fn.block_count, 3u);
+    CHECK(block_has_op(fn.blocks[0], rir::Opcode::CmpEq));
+    CHECK(block_has_op(fn.blocks[0], rir::Opcode::Select));
+    CHECK(block_op_count(fn.blocks[0], rir::Opcode::ConstI32) >= 4u);
+    rir.destroy();
+}
+
 TEST(frontend, lower_to_rir_supports_source_runtime_optional_error_value_flow) {
     const auto src = R"(
 func maybefail(ok: bool) -> i32 {

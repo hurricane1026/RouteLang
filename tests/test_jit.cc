@@ -14106,6 +14106,154 @@ route {
     rir.destroy();
 }
 
+TEST(jit, frontend_route_decorator_rejects_before_wait_yield) {
+    const auto src = R"rut(
+func rejecting(_ req: i32) -> i32 => 401
+route {
+    @rejecting "*"
+    GET "/sleep" { wait(1000) return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    HandlerCtx ctx{};
+    ctx.state = 0;
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           &ctx,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK_EQ(static_cast<u8>(r.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(r.status_code, 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_decorator_passes_then_waits) {
+    const auto src = R"rut(
+func passing(_ req: i32) -> i32 => 0
+route {
+    @passing "*"
+    GET "/sleep" { wait(1000) return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    HandlerCtx ctx{};
+    ctx.state = 0;
+    auto r0 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r0.action), static_cast<u8>(HandlerAction::Yield));
+    CHECK_EQ(r0.next_state, 1);
+    CHECK_EQ(static_cast<u8>(r0.yield_kind), static_cast<u8>(YieldKind::Timer));
+    CHECK_EQ(r0.yield_payload_u32(), 1000u);
+
+    ctx.state = r0.next_state;
+    auto r1 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r1.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(r1.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_decorator_passes_then_multiple_waits) {
+    const auto src = R"rut(
+func passing(_ req: i32) -> i32 => 0
+route {
+    @passing "*"
+    GET "/sleep" { wait(100) wait(200) return 202 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    HandlerCtx ctx{};
+    ctx.state = 0;
+    const u32 expected_ms[] = {100u, 200u};
+    for (u16 state = 0; state < 2; state++) {
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               &ctx,
+                                               reinterpret_cast<const u8*>(kGetRootRequest),
+                                               sizeof(kGetRootRequest) - 1,
+                                               nullptr));
+        CHECK_EQ(static_cast<u8>(r.action), static_cast<u8>(HandlerAction::Yield));
+        CHECK_EQ(r.next_state, static_cast<u16>(state + 1));
+        CHECK_EQ(static_cast<u8>(r.yield_kind), static_cast<u8>(YieldKind::Timer));
+        CHECK_EQ(r.yield_payload_u32(), expected_ms[state]);
+        ctx.state = r.next_state;
+    }
+
+    auto done = HandlerResult::unpack(handler(nullptr,
+                                              &ctx,
+                                              reinterpret_cast<const u8*>(kGetRootRequest),
+                                              sizeof(kGetRootRequest) - 1,
+                                              nullptr));
+    CHECK_EQ(static_cast<u8>(done.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(done.status_code, 202);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_route_wait_emits_yield_then_terminal_status) {
     // Source: one wait(1000) followed by return 200.
     // Expected: first handler call returns Yield(next_state=1, kind=Timer, payload=1000);

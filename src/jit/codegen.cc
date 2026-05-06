@@ -895,6 +895,15 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildRet(c.builder, result);
             break;
         }
+        case rir::Opcode::YieldTimer: {
+            const u64 packed = static_cast<u64>(inst.imm.i64_val);
+            const u32 payload = static_cast<u32>(packed & 0xffffffffu);
+            const u16 next_state = static_cast<u16>((packed >> 32) & 0xffffu);
+            LLVMBuildRet(
+                c.builder,
+                c.make_result_yield(next_state, static_cast<u8>(YieldKind::Timer), payload));
+            break;
+        }
 
         default:
             // Unhandled opcode in Phase 1 — emit unreachable as a placeholder.
@@ -954,7 +963,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
     // State-machine prologue. When the RIR function has yield points, the
     // handler is called multiple times (once per state) and the first
-    // LLVM basic block dispatches on HandlerCtx::state:
+    // LLVM basic block dispatches on HandlerCtx::state. The default mapping
+    // uses state 0..N-1 for prologue yield blocks and any later state for
+    // terminal execution:
     //
     //   dispatch:
     //     switch state {
@@ -967,6 +978,11 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     // running any of the original code; the terminal state runs the
     // original RIR blocks unchanged. Single-function model — no frame
     // needed for this slice (nothing lives across the yield).
+    //
+    // Decorated wait routes can set state_zero_enters_entry. In that mode,
+    // state 0 enters the original entry block so decorator guards run before
+    // the first timer yield, yield_0 is omitted from the prologue, and
+    // resumed states dispatch to the recorded terminal block by default.
     if (fn.yield_count > 0) {
         LLVMBasicBlockRef dispatch_bb = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, "dispatch");
         // Move dispatch to be the first block; it will become the function's
@@ -978,13 +994,20 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         // HandlerCtx layout: state (u16) @ offset 0.
         LLVMValueRef state = LLVMBuildLoad2(c.builder, c.i16_ty, c.param_ctx, "state");
 
-        LLVMBasicBlockRef terminal_bb = c.block_map[fn.blocks[0].id.id];
-        LLVMValueRef sw = LLVMBuildSwitch(c.builder, state, terminal_bb, fn.yield_count);
+        const u32 terminal_block_id =
+            fn.state_zero_enters_entry ? fn.resume_terminal_block : fn.blocks[0].id.id;
+        LLVMBasicBlockRef terminal_bb = c.block_map[terminal_block_id];
+        LLVMValueRef sw = LLVMBuildSwitch(
+            c.builder, state, terminal_bb, fn.yield_count + (fn.state_zero_enters_entry ? 1 : 0));
+        if (fn.state_zero_enters_entry) {
+            LLVMAddCase(sw, LLVMConstInt(c.i16_ty, 0, 0), c.block_map[fn.blocks[0].id.id]);
+        }
 
         // Use function-specific yield kind. v1: all yields are Timer; later
         // layers will branch on per-yield metadata.
         constexpr u8 kYieldKindTimer = static_cast<u8>(YieldKind::Timer);
-        for (u32 si = 0; si < fn.yield_count; si++) {
+        const u32 first_prologue_yield = fn.state_zero_enters_entry ? 1 : 0;
+        for (u32 si = first_prologue_yield; si < fn.yield_count; si++) {
             char ylabel[24];
             u32 lpos = 0;
             const char* prefix = "yield_";

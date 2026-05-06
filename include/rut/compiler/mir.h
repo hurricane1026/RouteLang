@@ -11,6 +11,7 @@ enum class MirTerminatorKind : u8 {
     Branch,
     ReturnStatus,
     ForwardUpstream,
+    YieldTimer,
 };
 
 enum class MirValueKind : u8 {
@@ -198,6 +199,8 @@ struct MirTerminator {
     MirValue rhs{};
     u32 then_block = 0;
     u32 else_block = 0;
+    u32 yield_ms = 0;
+    u16 yield_next_state = 0;
     // Optional response body literal — carried verbatim from HIR for
     // ReturnStatus terminators. lower_rir maps identical literals to a
     // shared body_idx that codegen packs into HandlerResult.upstream_id.
@@ -232,6 +235,8 @@ struct MirFunction {
     FixedVec<MirLocal, kMaxLocals> locals;
     FixedVec<MirBlock, kMaxBlocks> blocks;
     FixedVec<Wait, kMaxWaits> waits;
+    bool state_zero_enters_entry = false;
+    u32 resume_terminal_block = 0;
     u32 error_variant_index = 0xffffffffu;
 
     MirFunction() = default;
@@ -244,6 +249,8 @@ struct MirFunction {
           locals(other.locals),
           blocks(other.blocks),
           waits(other.waits),
+          state_zero_enters_entry(other.state_zero_enters_entry),
+          resume_terminal_block(other.resume_terminal_block),
           error_variant_index(other.error_variant_index) {
         rebase_from(other);
     }
@@ -257,6 +264,8 @@ struct MirFunction {
         locals = other.locals;
         blocks = other.blocks;
         waits = other.waits;
+        state_zero_enters_entry = other.state_zero_enters_entry;
+        resume_terminal_block = other.resume_terminal_block;
         error_variant_index = other.error_variant_index;
         rebase_from(other);
         return *this;
@@ -270,6 +279,8 @@ struct MirFunction {
           locals(other.locals),
           blocks(other.blocks),
           waits(other.waits),
+          state_zero_enters_entry(other.state_zero_enters_entry),
+          resume_terminal_block(other.resume_terminal_block),
           error_variant_index(other.error_variant_index) {
         rebase_from(other);
     }
@@ -283,6 +294,8 @@ struct MirFunction {
         locals = other.locals;
         blocks = other.blocks;
         waits = other.waits;
+        state_zero_enters_entry = other.state_zero_enters_entry;
+        resume_terminal_block = other.resume_terminal_block;
         error_variant_index = other.error_variant_index;
         rebase_from(other);
         return *this;

@@ -1054,6 +1054,66 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             continue;
         }
 
+        if (fn.waits.len != 0 && module.routes[i].decorator_guard_count != 0) {
+            const u32 deco_count = module.routes[i].decorator_guard_count;
+            const bool scope = module.routes[i].control.kind == HirControlKind::Direct &&
+                               module.routes[i].guards.len == deco_count &&
+                               fn.waits.len <= MirFunction::kMaxWaits;
+            if (!scope) return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+
+            const u32 yield_index = deco_count;
+            const u32 terminal_index = yield_index + 1;
+            u32 guard_fail_index[HirRoute::kMaxGuards]{};
+            u32 fail_cursor = terminal_index + 1;
+            for (u32 gi = 0; gi < deco_count; gi++) {
+                guard_fail_index[gi] = fail_cursor;
+                fail_cursor += guard_fail_block_count(module.routes[i].guards[gi]);
+            }
+            if (fail_cursor > MirFunction::kMaxBlocks)
+                return frontend_error(FrontendError::TooManyItems, fn.span);
+
+            for (u32 gi = 0; gi < deco_count; gi++) {
+                const auto& guard = module.routes[i].guards[gi];
+                MirBlock guard_block{};
+                guard_block.label = gi == 0 ? entry_label() : cont_label();
+                guard_block.term.kind = MirTerminatorKind::Branch;
+                guard_block.term.span = guard.span;
+                auto cond = mir_value(guard.cond, module, &fn);
+                if (!cond) return core::make_unexpected(cond.error());
+                guard_block.term.cond = cond.value();
+                guard_block.term.then_block = gi + 1 < deco_count ? gi + 1 : yield_index;
+                guard_block.term.else_block = guard_fail_index[gi];
+                if (!fn.blocks.push(guard_block))
+                    return frontend_error(FrontendError::TooManyItems, fn.span);
+            }
+
+            MirBlock yield_block{};
+            yield_block.label = cont_label();
+            yield_block.term.kind = MirTerminatorKind::YieldTimer;
+            yield_block.term.span = fn.waits[0].span;
+            yield_block.term.yield_ms = fn.waits[0].ms;
+            yield_block.term.yield_next_state = 1;
+            if (!fn.blocks.push(yield_block))
+                return frontend_error(FrontendError::TooManyItems, fn.span);
+
+            MirBlock terminal_block{};
+            terminal_block.label = cont_label();
+            set_term_from_hir(&terminal_block.term, module.routes[i].control.direct_term);
+            if (!fn.blocks.push(terminal_block))
+                return frontend_error(FrontendError::TooManyItems, fn.span);
+
+            for (u32 gi = 0; gi < deco_count; gi++) {
+                auto emitted = emit_guard_fail(module.routes[i].guards[gi]);
+                if (!emitted) return core::make_unexpected(emitted.error());
+            }
+
+            fn.state_zero_enters_entry = true;
+            fn.resume_terminal_block = terminal_index;
+            if (!mir->functions.push(fn))
+                return frontend_error(FrontendError::TooManyItems, fn.span);
+            continue;
+        }
+
         MirBlock block{};
         block.label = entry_label();
         if (module.routes[i].guards.len != 0) {

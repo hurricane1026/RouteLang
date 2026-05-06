@@ -226,6 +226,7 @@ enum class Opcode : u8 {
     RetForward,  // ret.forward upstream [, options]
 
     // ── Yield (I/O suspend → state machine boundary) ──
+    YieldTimer,     // yield.timer ms, next_state
     YieldHttpGet,   // %r = yield.http_get url, headers
     YieldHttpPost,  // %r = yield.http_post url, headers, body
     YieldForward,   // %r = yield.forward upstream
@@ -288,6 +289,7 @@ struct Instruction {
             case Opcode::YieldHttpGet:
             case Opcode::YieldHttpPost:
             case Opcode::YieldForward:
+            case Opcode::YieldTimer:
                 return true;
             default:
                 return false;
@@ -353,6 +355,8 @@ struct Function {
 
     // Yield point count (determines state machine states).
     u32 yield_count;
+    bool state_zero_enters_entry;
+    u32 resume_terminal_block;
 
     // Per-yield payload. For a Timer yield, yield_payload[i] is the
     // duration in milliseconds (u32 ≈ 49 days). Arena-allocated, length

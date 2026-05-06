@@ -277,6 +277,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::RetForward:
             buf.put_cstr("ret.forward");
             break;
+        case Opcode::YieldTimer:
+            buf.put_cstr("yield.timer");
+            break;
         case Opcode::YieldHttpGet:
             buf.put_cstr("yield.http_get");
             break;
@@ -631,6 +634,14 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             if (inst.operand_count > 0) print_value_ref(buf, inst.operands[0]);
             break;
+        case Opcode::YieldTimer: {
+            const u64 packed = static_cast<u64>(inst.imm.i64_val);
+            buf.put(' ');
+            buf.put_u32(static_cast<u32>(packed & 0xffffffffu));
+            buf.put_cstr(", state ");
+            buf.put_u32(static_cast<u32>((packed >> 32) & 0xffffu));
+            break;
+        }
 
         // Instrumentation
         case Opcode::TraceFuncEnter:

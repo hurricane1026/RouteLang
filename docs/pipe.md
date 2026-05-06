@@ -1,213 +1,224 @@
 # Pipe Expressions
 
 Pipe expressions pass the value on the left into a function call on the right.
-They are an analyzer-level rewrite: after type checking, pipe expressions become
-ordinary inlined function-call expressions and do not introduce a separate
+They are useful for writing small, named transformation steps in route logic
+without nesting calls.
+
+Pipe is resolved during analysis. After type checking, a pipe becomes an
+ordinary inlined function-call expression; it does not introduce a separate
 MIR/RIR opcode.
 
-## Syntax
+## Lowering And Inlining
+
+Pipe is a source-level convenience, not a runtime abstraction. A pipeline such
+as:
 
 ```rut
-func id(x: i32) -> i32 => x
+let code = 204 | normalize_status(_) | mask_internal_error(_)
+```
 
-route GET "/users" {
-    let code = 200 | id(_)
+is analyzed as nested stage application, and each stage function body is
+instantiated at the use site. By the time MIR/RIR are built, there is no
+`Pipe` node, no call chain, and no pipe dispatch. The route contains the
+ordinary expression instructions produced by the stage bodies, such as
+constants, comparisons, selects, tuple-slot projections, optional unwraps, and
+terminal branches.
+
+For runtime optional/error values, the analyzer still inlines the stage body but
+wraps it with presence checks:
+
+```rut
+let host = req.header("Host") | tenant_from_host(_)
+```
+
+lowers conceptually like:
+
+```rut
+if has_value(req.header("Host")) {
+    tenant_from_host(value_of(req.header("Host")))
+} else {
+    missing_of(req.header("Host"))
+}
+```
+
+where `tenant_from_host(...)` is also expanded into ordinary expression IR.
+
+## Basic Use
+
+The right-hand side must be a function call with exactly one placeholder.
+`_` and `_1` both mean "the whole value from the left-hand side":
+
+```rut
+func normalize_status(code: i32) -> i32 {
+    if code == 204 { 200 } else { code }
+}
+
+route GET "/health" {
+    let code = 204 | normalize_status(_)
     if code == 200 { return 200 } else { return 500 }
 }
 ```
 
-The right-hand side must be a function call and must contain exactly one
-placeholder. `_` and `_1` both mean "the whole left-hand value":
+The same call can use `_1`:
 
 ```rut
-let code = 200 | id(_)
-let same = 200 | id(_1)
+let code = 204 | normalize_status(_1)
 ```
 
-Pipe stages can be chained:
+## Chaining
+
+Each stage receives the previous stage's output. This keeps request policy code
+readable when several small decisions are applied in order:
 
 ```rut
-let code = 200 | id(_) | id(_)
-```
+func status_for_path(path: str) -> i32 {
+    if path == "/users" { 200 } else { 404 }
+}
 
-## Placeholder Slots
-
-When the left-hand side is a tuple, numbered placeholders select tuple slots:
-
-```rut
-func second(a: i32, b: i32) -> i32 => b
+func mask_internal_error(code: i32) -> i32 {
+    if code == 500 { 503 } else { code }
+}
 
 route GET "/users" {
-    let code = (200, 500) | second(_2, _1)
-    if code == 200 { return 200 } else { return 500 }
+    let code = req.path | status_for_path(_) | mask_internal_error(_)
+    if code == 200 { return 200 } else { return 404 }
 }
 ```
 
-Tuple slots can come from tuple literals, tuple locals, tuple-returning
-functions, struct fields, variant payloads, and generic functions as long as the
-shape is known to the analyzer.
-
-Placeholder indexes are 1-based. `_1` through `_10` are accepted by the parser;
-the analyzer rejects indexes that are not valid for the left-hand value.
-
-## Nil And Error Flow
-
-Pipe expressions preserve optional/error flow from the left-hand side:
+Route terminal control should still spell out the statuses it returns:
 
 ```rut
-func id(x: str) -> str => x
-
 route GET "/users" {
-    let host = req.header("Host") | id(_)
-    let safe = or(host, "missing")
-    return 200
+    let code = req.path | status_for_path(_) | mask_internal_error(_)
+    if code == 200 { return 200 } else { return 404 }
 }
 ```
 
-If the left side is a runtime optional/error value, the generated expression only
-calls the stage when the value is present. Missing values flow through as
-`nil`/`error` with the stage's return shape, so downstream `or(...)` can handle
-them.
+## Placeholder Position
 
-For fallible runtime left-hand values, only `_` / `_1` is accepted. Numbered
-tuple-slot placeholders such as `_2` are rejected because the value has to be
-unwrapped before tuple slots can be safely projected.
+The placeholder can appear in any argument position. This is useful when a stage
+needs constants or policy values alongside the piped value:
+
+```rut
+func allow_if_token(token: str, expected: str, ok_status: i32) -> i32 {
+    if token == expected { ok_status } else { 401 }
+}
+
+route GET "/admin" {
+    let code = req.header("Authorization") | allow_if_token(_, "Bearer root", 200)
+    let safe = or(code, 401)
+    if safe == 200 { return 200 } else { return 401 }
+}
+```
+
+## Optional Header Flow
+
+`req.header(...)` returns an optional string. A pipe stage only runs when the
+header is present; missing values flow through as `nil` and can be handled with
+`or(...)`.
+
+```rut
+func tenant_from_host(host: str) -> str {
+    if host == "api.example.com" { "api" } else { "unknown" }
+}
+
+func status_for_tenant(tenant: str) -> i32 {
+    if tenant == "api" { 200 } else { 404 }
+}
+
+route GET "/tenant" {
+    let code = req.header("Host") | tenant_from_host(_) | status_for_tenant(_)
+    let safe = or(code, 404)
+    if safe == 200 { return 200 } else { return 404 }
+}
+```
+
+## Error Flow
+
+Error values also flow through a pipe without calling later stages. Downstream
+`or(...)` can turn the error into a concrete fallback:
+
+```rut
+func parse_mode(raw: str) -> i32 {
+    if raw == "fast" { 1 } else { error(.bad_mode) }
+}
+
+func status_for_mode(mode: i32) -> i32 {
+    if mode == 1 { 200 } else { 400 }
+}
+
+route GET "/mode" {
+    let code = req.header("X-Mode") | parse_mode(_) | status_for_mode(_)
+    let safe = or(code, 400)
+    if safe == 200 { return 200 } else { return 400 }
+}
+```
 
 Known `nil` and known `error(...)` left-hand values are folded at analysis time
 and do not call the stage.
 
-## Code Snippets
+## Tuple Slots
 
-### Single Stage
-
-Use `_` to pass the left-hand value into a function:
+When the left-hand side is a tuple, numbered placeholders select tuple slots.
+Indexes are 1-based:
 
 ```rut
-func normalize_status(code: i32) -> i32 => code
+func status_from_policy(auth_status: i32, default_status: i32) -> i32 {
+    if auth_status == 200 { auth_status } else { default_status }
+}
 
-route GET "/single" {
-    let code = 200 | normalize_status(_)
+route GET "/tuple-policy" {
+    let policy = (200, 401)
+    let code = policy | status_from_policy(_1, _2)
+    if code == 200 { return 200 } else { return 401 }
+}
+```
+
+Tuple slots can be reordered:
+
+```rut
+func prefer_second(primary: i32, secondary: i32) -> i32 => secondary
+
+route GET "/tuple-reorder" {
+    let code = (500, 200) | prefer_second(_1, _2)
     if code == 200 { return 200 } else { return 500 }
 }
 ```
 
-### Chained Stages
-
-Each stage receives the previous stage's result:
+Tuple slots can also come from tuple-returning functions:
 
 ```rut
-func clamp_success(code: i32) -> i32 {
-    if code == 204 { 200 } else { code }
+func route_policy(path: str) {
+    if path == "/tuple-stage" { (200, 401) } else { (404, 401) }
 }
 
-func ensure_ok(code: i32) -> i32 {
-    if code == 200 { 200 } else { 500 }
-}
-
-route GET "/chain" {
-    let code = 204 | clamp_success(_) | ensure_ok(_)
-    if code == 200 { return 200 } else { return 500 }
-}
-```
-
-### Placeholder In A Later Argument
-
-The placeholder can appear in any argument position:
-
-```rut
-func choose(flag: bool, fallback: i32, value: i32) -> i32 {
-    if flag { value } else { fallback }
-}
-
-route GET "/position" {
-    let code = 200 | choose(true, 500, _)
-    if code == 200 { return 200 } else { return 500 }
-}
-```
-
-### Tuple Slot Reordering
-
-Use `_1`, `_2`, and later slot numbers to pull values from a tuple:
-
-```rut
-func status_from_pair(primary: i32, fallback: i32) -> i32 {
+func choose_policy(primary: i32, fallback: i32) -> i32 {
     if primary == 200 { primary } else { fallback }
 }
 
-route GET "/tuple" {
-    let pair = (200, 500)
-    let code = pair | status_from_pair(_1, _2)
-    if code == 200 { return 200 } else { return 500 }
-}
-```
-
-You can also reorder tuple slots:
-
-```rut
-func second(a: i32, b: i32) -> i32 => b
-
-route GET "/swap" {
-    let code = (500, 200) | second(_1, _2)
-    if code == 200 { return 200 } else { return 500 }
-}
-```
-
-### Tuple-Returning Stage
-
-Pipes can chain through tuple-returning functions:
-
-```rut
-func pair(code: i32) { (code, 500) }
-func pick_primary(primary: i32, fallback: i32) -> i32 => primary
-
 route GET "/tuple-stage" {
-    let code = 200 | pair(_) | pick_primary(_1, _2)
-    if code == 200 { return 200 } else { return 500 }
+    let code = req.path | route_policy(_) | choose_policy(_1, _2)
+    if code == 200 { return 200 } else { return 401 }
 }
 ```
 
-### Request Header Optional Flow
+`_1` through `_10` are accepted by the parser. The analyzer rejects indexes that
+are not valid for the left-hand value.
 
-`req.header(...)` is optional. A pipe stage runs only when the value is present;
-`or(...)` can provide a fallback:
+For runtime optional/error left-hand values, only `_` / `_1` is accepted.
+Numbered tuple-slot placeholders such as `_2` are rejected because the value has
+to be unwrapped before tuple slots can be safely projected.
 
-```rut
-func lower_host(host: str) -> str => host
-
-route GET "/host" {
-    let host = req.header("Host") | lower_host(_)
-    let safe = or(host, "missing")
-    return 200
-}
-```
-
-### Error Flow
-
-Error values propagate through the pipe until handled:
-
-```rut
-func maybe_code(ok: bool) -> i32 {
-    if ok { 200 } else { error(.timeout) }
-}
-
-func keep(code: i32) -> i32 => code
-
-route GET "/error" {
-    let code = maybe_code(false) | keep(_)
-    let safe = or(code, 500)
-    if safe == 500 { return 500 } else { return 200 }
-}
-```
-
-### Generic Stage
+## Generic Stages
 
 Generic functions can be used as pipe stages when the type shape can be inferred:
 
 ```rut
-func id<T>(x: T) -> T => x
+func keep<T>(x: T) -> T => x
+func status_for_code(code: i32) -> i32 => code
 
 route GET "/generic" {
-    let code = 200 | id(_)
+    let code = 200 | keep(_) | status_for_code(_)
     if code == 200 { return 200 } else { return 500 }
 }
 ```

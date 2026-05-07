@@ -1288,7 +1288,7 @@ TEST(frontend, analyze_accepts_wait_larger_than_u16_max) {
 }
 
 TEST(frontend, analyze_accepts_wait_near_u32_max) {
-    // UINT32_MAX-1 is the largest wait representable through the parser's
+    // UINT32_MAX-1 is near the largest wait representable through the parser's
     // u64 accumulator + UINT32_MAX cap. Round-trips through to HIR as-is.
     const char* src = "route GET \"/x\" { wait(4294967294) return 200 }\n";
     auto lexed = lex(lit(src));
@@ -1299,6 +1299,18 @@ TEST(frontend, analyze_accepts_wait_near_u32_max) {
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
     CHECK_EQ(hir->routes[0].waits[0].ms, 4294967294u);
+}
+
+TEST(frontend, analyze_accepts_wait_at_u32_max) {
+    const char* src = "route GET \"/x\" { wait(4294967295) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 4294967295u);
 }
 
 TEST(frontend, parser_rejects_wait_above_u32_max) {

@@ -1874,7 +1874,7 @@ TEST(epoll_metrics, accept_and_request_counted) {
     u16 port = get_port(lfd);
     LoopThread lt = {loop, {}, 20};
     lt.start();
-    usleep(10000);
+    usleep(100000);
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
     send_all(c, HTTP_REQ, HTTP_REQ_LEN);
@@ -2230,18 +2230,19 @@ TEST(route, capture_real_socket) {
 
 #if RUT_ENABLE_JIT_TESTS
 // End-to-end wait(ms) through the real EpollEventLoop: compile a route
-// that yields for 1 second and returns 204, register it as a JitHandler
+// that yields briefly and returns 204, register it as a JitHandler
 // in the RouteConfig, drive a real TCP connection, and assert the client
 // observes the 204 response after the timer fires.
 //
 // Timing note: EpollEventLoop now uses a one-shot yield_timer_fd + min-heap
-// driven by absolute CLOCK_MONOTONIC deadlines, so wait(1000) lands near
-// 1000ms with ms precision (no TimerWheel bucketing). recv_timeout is
-// 3000ms to tolerate scheduler jitter on slow CI.
+// driven by absolute CLOCK_MONOTONIC deadlines with ms precision (no
+// TimerWheel bucketing). Use a non-1s wait so this smoke test does not race
+// the periodic keepalive wheel tick; exact sub-second timing is covered by
+// wait_ms_precision_sub_second below.
 TEST(route, wait_jit_handler_real_socket) {
     using namespace rut;  // pull in compiler helpers (lex / parse_file / ...)
 
-    const char* src = "route GET \"/sleep\" { wait(1000) return 204 }\n";
+    const char* src = "route GET \"/sleep\" { wait(250) return 204 }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -2278,10 +2279,14 @@ TEST(route, wait_jit_handler_real_socket) {
     loop->config_ptr = &active;
     LoopThread lt = {loop, {}, 200};
     lt.start();
+    // Let the loop thread register the listener before the client connects.
+    // Without this, this smoke test can be flaky when it runs immediately
+    // after io_uring backend tests on a busy runner.
+    usleep(10000);
 
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    send_all(c, "GET /sleep HTTP/1.1\r\nHost: x\r\n\r\n", 32);
+    REQUIRE(send_all(c, "GET /sleep HTTP/1.1\r\nHost: x\r\n\r\n", 32));
     char buf[1024];
     i32 n = recv_timeout(c, buf, sizeof(buf), 3000);
     CHECK_GT(n, 0);

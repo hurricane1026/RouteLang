@@ -9882,9 +9882,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 seen_wait = true;
                 // ms payload is the 32-bit Yield slot (status_code +
-                // upstream_id co-opted); the parser already caps at
-                // UINT32_MAX. Duration literals (`1s`, `500ms`) are future
-                // work for the parser.
+                // upstream_id co-opted); the parser already converts bare
+                // millisecond ints and duration literals (`500ms`, `1s`,
+                // `1m`, `1h`) to a UINT32_MAX-capped millisecond value.
                 HirRoute::Wait w{};
                 w.span = stmt.span;
                 w.ms = stmt.status_code;

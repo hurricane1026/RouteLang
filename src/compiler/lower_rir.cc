@@ -1,10 +1,39 @@
 #include "rut/compiler/lower_rir.h"
 
 #include "rut/compiler/rir_builder.h"
+#include "rut/jit/handler_abi.h"
 
 namespace rut {
 
 namespace {
+
+static u8 yield_kind_abi(WaitEventKind kind) {
+    switch (kind) {
+        case WaitEventKind::Timer:
+            return static_cast<u8>(jit::YieldKind::Timer);
+        case WaitEventKind::Any:
+            return static_cast<u8>(jit::YieldKind::Any);
+        case WaitEventKind::Recv:
+            return static_cast<u8>(jit::YieldKind::Recv);
+        case WaitEventKind::Send:
+            return static_cast<u8>(jit::YieldKind::Send);
+        case WaitEventKind::UpstreamConnect:
+            return static_cast<u8>(jit::YieldKind::UpstreamConnect);
+        case WaitEventKind::UpstreamRecv:
+            return static_cast<u8>(jit::YieldKind::UpstreamRecv);
+        case WaitEventKind::UpstreamSend:
+            return static_cast<u8>(jit::YieldKind::UpstreamSend);
+    }
+    return static_cast<u8>(jit::YieldKind::Timer);
+}
+
+static constexpr u32 wait_kind_slot(u32 wait_index) {
+    return wait_index * 2;
+}
+
+static constexpr u32 wait_result_slot(u32 wait_index) {
+    return wait_index * 2 + 1;
+}
 
 struct VariantLoweringInfo {
     const rir::Type* struct_type = nullptr;
@@ -1397,6 +1426,90 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
+    if (value.kind == MirValueKind::WaitResult) {
+        return frontend_error(FrontendError::UnsupportedSyntax, span);
+    }
+    if (value.kind == MirValueKind::WaitField) {
+        const u32 wait_index = value.wait_index;
+        if (wait_index == 0xffffffffu)
+            return frontend_error(FrontendError::UnsupportedSyntax, span, value.str_value);
+        if (value.str_value.eq({"kind", 4})) {
+            auto v = b.emit_ctx_load_slot_i32(wait_kind_slot(wait_index), {span.line, span.col});
+            if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+            return v.value();
+        }
+        auto result = b.emit_ctx_load_slot_i32(wait_result_slot(wait_index), {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        if (value.str_value.eq({"result", 6})) return result.value();
+        auto zero = b.emit_const_i32(0, {span.line, span.col});
+        if (!zero) return frontend_error(FrontendError::OutOfMemory, span);
+        if (value.str_value.eq({"ok", 2})) {
+            auto cmp =
+                b.emit_cmp(rir::Opcode::CmpGe, result.value(), zero.value(), {span.line, span.col});
+            if (!cmp) return frontend_error(FrontendError::OutOfMemory, span);
+            return cmp.value();
+        }
+        if (value.str_value.eq({"eof", 3})) {
+            auto event_kind =
+                b.emit_ctx_load_slot_i32(wait_kind_slot(wait_index), {span.line, span.col});
+            if (!event_kind) return frontend_error(FrontendError::OutOfMemory, span);
+            auto recv_kind =
+                b.emit_const_i32(static_cast<i32>(jit::YieldKind::Recv), {span.line, span.col});
+            if (!recv_kind) return frontend_error(FrontendError::OutOfMemory, span);
+            auto upstream_recv_kind = b.emit_const_i32(
+                static_cast<i32>(jit::YieldKind::UpstreamRecv), {span.line, span.col});
+            if (!upstream_recv_kind) return frontend_error(FrontendError::OutOfMemory, span);
+            auto recv_like = b.emit_cmp(
+                rir::Opcode::CmpEq, event_kind.value(), recv_kind.value(), {span.line, span.col});
+            if (!recv_like) return frontend_error(FrontendError::OutOfMemory, span);
+            auto upstream_recv_like = b.emit_cmp(rir::Opcode::CmpEq,
+                                                 event_kind.value(),
+                                                 upstream_recv_kind.value(),
+                                                 {span.line, span.col});
+            if (!upstream_recv_like) return frontend_error(FrontendError::OutOfMemory, span);
+            auto result_is_zero =
+                b.emit_cmp(rir::Opcode::CmpEq, result.value(), zero.value(), {span.line, span.col});
+            if (!result_is_zero) return frontend_error(FrontendError::OutOfMemory, span);
+            auto false_v = b.emit_const_bool(false, {span.line, span.col});
+            if (!false_v) return frontend_error(FrontendError::OutOfMemory, span);
+            auto upstream_eof = b.emit_select(upstream_recv_like.value(),
+                                              result_is_zero.value(),
+                                              false_v.value(),
+                                              {span.line, span.col});
+            if (!upstream_eof) return frontend_error(FrontendError::OutOfMemory, span);
+            auto eof = b.emit_select(recv_like.value(),
+                                     result_is_zero.value(),
+                                     upstream_eof.value(),
+                                     {span.line, span.col});
+            if (!eof) return frontend_error(FrontendError::OutOfMemory, span);
+            return eof.value();
+        }
+        u32 wanted = 0xffffffffu;
+        if (value.str_value.eq({"timer", 5}))
+            wanted = static_cast<u32>(jit::YieldKind::Timer);
+        else if (value.str_value.eq({"recv", 4}))
+            wanted = static_cast<u32>(jit::YieldKind::Recv);
+        else if (value.str_value.eq({"send", 4}))
+            wanted = static_cast<u32>(jit::YieldKind::Send);
+        else if (value.str_value.eq({"upstream_connect", 16}))
+            wanted = static_cast<u32>(jit::YieldKind::UpstreamConnect);
+        else if (value.str_value.eq({"upstream_recv", 13}))
+            wanted = static_cast<u32>(jit::YieldKind::UpstreamRecv);
+        else if (value.str_value.eq({"upstream_send", 13}))
+            wanted = static_cast<u32>(jit::YieldKind::UpstreamSend);
+        if (wanted != 0xffffffffu) {
+            auto event_kind =
+                b.emit_ctx_load_slot_i32(wait_kind_slot(wait_index), {span.line, span.col});
+            if (!event_kind) return frontend_error(FrontendError::OutOfMemory, span);
+            auto kind_const = b.emit_const_i32(static_cast<i32>(wanted), {span.line, span.col});
+            if (!kind_const) return frontend_error(FrontendError::OutOfMemory, span);
+            auto cmp = b.emit_cmp(
+                rir::Opcode::CmpEq, event_kind.value(), kind_const.value(), {span.line, span.col});
+            if (!cmp) return frontend_error(FrontendError::OutOfMemory, span);
+            return cmp.value();
+        }
+        return frontend_error(FrontendError::UnsupportedSyntax, span, value.str_value);
+    }
     if (value.kind == MirValueKind::Nil) {
         auto v = b.emit_const_i32(0, {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
@@ -2465,8 +2578,10 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         return {};
     }
     if (term.kind == MirTerminatorKind::YieldTimer) {
-        if (!b.emit_yield_timer(
-                term.yield_ms, term.yield_next_state, {term.span.line, term.span.col}))
+        if (!b.emit_yield_event(yield_kind_abi(term.yield_event_kind),
+                                term.yield_ms,
+                                term.yield_next_state,
+                                {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
@@ -2999,9 +3114,12 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         }
         if (mir.functions[i].waits.len > 0) {
             u32 ms_list[MirFunction::kMaxWaits]{};
-            for (u32 wi = 0; wi < mir.functions[i].waits.len; wi++)
+            u8 kind_list[MirFunction::kMaxWaits]{};
+            for (u32 wi = 0; wi < mir.functions[i].waits.len; wi++) {
                 ms_list[wi] = mir.functions[i].waits[wi].ms;
-            if (!b.set_yield_payload(fn.value(), ms_list, mir.functions[i].waits.len)) {
+                kind_list[wi] = yield_kind_abi(mir.functions[i].waits[wi].event_kind);
+            }
+            if (!b.set_yield_payload(fn.value(), ms_list, mir.functions[i].waits.len, kind_list)) {
                 out.destroy();
                 return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
             }
@@ -3019,7 +3137,25 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             out.destroy();
             return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
         }
-        if (mir.functions[i].state_zero_enters_entry) {
+        if (mir.functions[i].has_explicit_resume_blocks) {
+            if (mir.functions[i].waits.len + 1 > rir::Function::kMaxResumeBlocks) {
+                out.destroy();
+                return frontend_error(FrontendError::TooManyItems, mir.functions[i].span);
+            }
+            rir::BlockId resume_blocks[rir::Function::kMaxResumeBlocks]{};
+            for (u32 ri = 0; ri <= mir.functions[i].waits.len; ri++) {
+                if (mir.functions[i].resume_blocks[ri] >= mir.functions[i].blocks.len) {
+                    out.destroy();
+                    return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
+                }
+                resume_blocks[ri] = block_ids[mir.functions[i].resume_blocks[ri]];
+            }
+            if (!b.set_explicit_resume_blocks(
+                    fn.value(), resume_blocks, mir.functions[i].waits.len + 1)) {
+                out.destroy();
+                return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
+            }
+        } else if (mir.functions[i].state_zero_enters_entry) {
             if (mir.functions[i].resume_terminal_block >= mir.functions[i].blocks.len ||
                 !b.set_state_zero_entry_resume(fn.value(),
                                                block_ids[mir.functions[i].resume_terminal_block])) {
@@ -3055,6 +3191,26 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
 
         for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
             b.set_insert_point(fn.value(), block_ids[bi]);
+            if (mir.functions[i].has_explicit_resume_blocks) {
+                const Span store_span = mir.functions[i].blocks[bi].term.span;
+                for (u32 wi = 0; wi < mir.functions[i].waits.len; wi++) {
+                    if (mir.functions[i].resume_blocks[wi + 1] != bi) continue;
+                    auto kind = b.emit_resume_event_kind({store_span.line, store_span.col});
+                    if (!kind ||
+                        !b.emit_ctx_store_slot_i32(
+                            wait_kind_slot(wi), kind.value(), {store_span.line, store_span.col})) {
+                        out.destroy();
+                        return frontend_error(FrontendError::OutOfMemory, store_span);
+                    }
+                    auto result = b.emit_resume_event_result({store_span.line, store_span.col});
+                    if (!result || !b.emit_ctx_store_slot_i32(wait_result_slot(wi),
+                                                              result.value(),
+                                                              {store_span.line, store_span.col})) {
+                        out.destroy();
+                        return frontend_error(FrontendError::OutOfMemory, store_span);
+                    }
+                }
+            }
             auto emitted = emit_term(mir.functions[i].blocks[bi].term,
                                      mir,
                                      variant_infos,

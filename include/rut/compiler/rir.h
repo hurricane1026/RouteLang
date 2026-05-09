@@ -143,17 +143,21 @@ enum class Opcode : u8 {
     ConstStatus,    // %r = const.status <code>       (printed as raw i32)
 
     // ── Request access ──
-    ReqHeader,         // %r = req.header "Name"        → Optional(str)
-    ReqParam,          // %r = req.param "id"           → str
-    ReqMethod,         // %r = req.method               → Method
-    ReqPath,           // %r = req.path                 → str
-    ReqRemoteAddr,     // %r = req.remote_addr          → IP
-    ReqContentLength,  // %r = req.content_length       → ByteSize
-    ReqCookie,         // %r = req.cookie "name"        → Optional(str)
+    ReqHeader,          // %r = req.header "Name"        → Optional(str)
+    ReqParam,           // %r = req.param "id"           → str
+    ReqMethod,          // %r = req.method               → Method
+    ReqPath,            // %r = req.path                 → str
+    ResumeEventKind,    // %r = ctx.resume_event_kind    → i32
+    ResumeEventResult,  // %r = ctx.resume_event_result  → i32
+    CtxLoadSlotI32,     // %r = ctx.slot[i]              → i32
+    ReqRemoteAddr,      // %r = req.remote_addr          → IP
+    ReqContentLength,   // %r = req.content_length       → ByteSize
+    ReqCookie,          // %r = req.cookie "name"        → Optional(str)
 
     // ── Request mutation ──
-    ReqSetHeader,  // req.set_header "Name", %val
-    ReqSetPath,    // req.set_path %path
+    ReqSetHeader,     // req.set_header "Name", %val
+    ReqSetPath,       // req.set_path %path
+    CtxStoreSlotI32,  // ctx.slot[i] = %val
 
     // ── String operations ──
     StrHasPrefix,    // %r = str.has_prefix %s, %pfx    → bool
@@ -357,12 +361,15 @@ struct Function {
     u32 yield_count;
     bool state_zero_enters_entry;
     u32 resume_terminal_block;
+    bool has_explicit_resume_blocks;
+    static constexpr u32 kMaxResumeBlocks = 8;
+    u32 resume_blocks[kMaxResumeBlocks];
 
-    // Per-yield payload. For a Timer yield, yield_payload[i] is the
-    // duration in milliseconds (u32 ≈ 49 days). Arena-allocated, length
-    // = yield_count. Other yield kinds will extend this or use a richer
-    // structure; for v1 timer-only it stays a flat u32 array.
+    // Per-yield ABI metadata. yield_payload[i] is the u32 payload carried
+    // by state i+1, and yield_kinds[i] is the jit::YieldKind ABI byte.
+    // Both arrays are arena-allocated with length = yield_count.
     u32* yield_payload;
+    u8* yield_kinds;
 
     Block* entry() { return block_count > 0 ? &blocks[0] : nullptr; }
     const Block* entry() const { return block_count > 0 ? &blocks[0] : nullptr; }

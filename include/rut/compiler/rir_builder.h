@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/compiler/rir.h"
+#include "rut/jit/handler_abi.h"
 
 namespace rut {
 namespace rir {
@@ -28,6 +29,8 @@ inline auto err(RirError e) {
 }
 
 struct Builder {
+    static constexpr u8 kDefaultYieldKind = static_cast<u8>(jit::YieldKind::Timer);
+
     Module* mod;
 
     // Current insert point — stored as index to survive grow_blocks().
@@ -111,7 +114,10 @@ struct Builder {
         fn->yield_count = 0;
         fn->state_zero_enters_entry = false;
         fn->resume_terminal_block = 0;
+        fn->has_explicit_resume_blocks = false;
+        for (u32 i = 0; i < Function::kMaxResumeBlocks; i++) fn->resume_blocks[i] = 0;
         fn->yield_payload = nullptr;
+        fn->yield_kinds = nullptr;
         fn->blocks = blocks;
         fn->block_count = 0;
         fn->block_cap = kInitBlocks;
@@ -122,22 +128,30 @@ struct Builder {
         return fn;
     }
 
-    // Record the wait(ms) list for a function: arena-allocates a u32 array
-    // sized to count and copies the ms values in order. After this call,
-    // fn->yield_count reflects the number of state-machine yield points
-    // and codegen can consume fn->yield_payload[i]. Explicit YieldTimer
-    // terminators reuse this bookkeeping; emit_yield_timer validates that
-    // the payload table already covers its next state.
-    VoidResult set_yield_payload(Function* fn, const u32* ms_list, u32 count) {
+    // Record the wait list for a function. After this call, fn->yield_count
+    // reflects the number of state-machine yield points, and codegen can
+    // consume fn->yield_payload[i] and fn->yield_kinds[i]. Explicit
+    // YieldTimer terminators reuse this bookkeeping; emit_yield_timer
+    // validates that the metadata table already covers its next state.
+    VoidResult set_yield_payload(Function* fn,
+                                 const u32* ms_list,
+                                 u32 count,
+                                 const u8* kind_list = nullptr) {
         if (count == 0) {
             fn->yield_count = 0;
             fn->yield_payload = nullptr;
+            fn->yield_kinds = nullptr;
             return {};
         }
         auto* buf = mod->arena->alloc_array<u32>(count);
-        if (!buf) return err(RirError::OutOfMemory);
-        for (u32 i = 0; i < count; i++) buf[i] = ms_list[i];
+        auto* kinds = mod->arena->alloc_array<u8>(count);
+        if (!buf || !kinds) return err(RirError::OutOfMemory);
+        for (u32 i = 0; i < count; i++) {
+            buf[i] = ms_list[i];
+            kinds[i] = kind_list ? kind_list[i] : kDefaultYieldKind;
+        }
         fn->yield_payload = buf;
+        fn->yield_kinds = kinds;
         fn->yield_count = count;
         return {};
     }
@@ -146,6 +160,19 @@ struct Builder {
         if (!fn || terminal_block.id >= fn->block_count) return err(RirError::InvalidState);
         fn->state_zero_enters_entry = true;
         fn->resume_terminal_block = terminal_block.id;
+        return {};
+    }
+
+    VoidResult set_explicit_resume_blocks(Function* fn, const BlockId* blocks, u32 count) {
+        if (!fn || count > Function::kMaxResumeBlocks) return err(RirError::InvalidState);
+        for (u32 i = 0; i < count; i++) {
+            if (blocks[i].id >= fn->block_count) return err(RirError::InvalidState);
+            fn->resume_blocks[i] = blocks[i].id;
+        }
+        for (u32 i = count; i < Function::kMaxResumeBlocks; i++) fn->resume_blocks[i] = 0;
+        fn->has_explicit_resume_blocks = true;
+        fn->state_zero_enters_entry = true;
+        fn->resume_terminal_block = count != 0 ? blocks[count - 1].id : 0;
         return {};
     }
 
@@ -416,6 +443,23 @@ struct Builder {
         return TRY(emit(Opcode::ReqPath, ty, loc)).vid;
     }
 
+    Result<ValueId> emit_resume_event_kind(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::I32));
+        return TRY(emit(Opcode::ResumeEventKind, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_resume_event_result(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::I32));
+        return TRY(emit(Opcode::ResumeEventResult, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_ctx_load_slot_i32(u32 slot, SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(Opcode::CtxLoadSlotI32, ty, loc));
+        inst->imm.i32_val = static_cast<i32>(slot);
+        return vid;
+    }
+
     Result<ValueId> emit_req_remote_addr(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::IP));
         return TRY(emit(Opcode::ReqRemoteAddr, ty, loc)).vid;
@@ -449,6 +493,15 @@ struct Builder {
         if (!val_has_type(path, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));
         r.inst->operands[0] = path;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
+    VoidResult emit_ctx_store_slot_i32(u32 slot, ValueId value, SourceLoc loc = {}) {
+        if (!val_has_type(value, TypeKind::I32)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::CtxStoreSlotI32, nullptr, loc));
+        r.inst->imm.i32_val = static_cast<i32>(slot);
+        r.inst->operands[0] = value;
         r.inst->operand_count = 1;
         return {};
     }
@@ -868,11 +921,16 @@ struct Builder {
     }
 
     VoidResult emit_yield_timer(u32 ms, u16 next_state, SourceLoc loc = {}) {
+        return emit_yield_event(kDefaultYieldKind, ms, next_state, loc);
+    }
+
+    VoidResult emit_yield_event(u8 kind, u32 payload, u16 next_state, SourceLoc loc = {}) {
         if (!cur_func) return err(RirError::InvalidState);
         if (cur_func->yield_count == 0 || next_state == 0 || next_state > cur_func->yield_count)
             return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::YieldTimer, nullptr, loc));
-        r.inst->imm.i64_val = (static_cast<i64>(next_state) << 32) | static_cast<i64>(ms);
+        r.inst->imm.i64_val = (static_cast<i64>(kind) << 48) |
+                              (static_cast<i64>(next_state) << 32) | static_cast<i64>(payload);
         return {};
     }
 };

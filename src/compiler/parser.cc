@@ -237,6 +237,70 @@ struct Parser {
             expr.span = Span{start.start, rparen.value()->end, start.line, start.col};
             return expr;
         }
+        if (take(TokenType::KwWait)) {
+            auto lparen = expect(TokenType::LParen);
+            if (!lparen) return core::make_unexpected(lparen.error());
+            expr.kind = AstExprKind::Wait;
+            if (const Token* rparen = take(TokenType::RParen)) {
+                expr.wait_event_kind = WaitEventKind::Any;
+                expr.span = Span{start.start, rparen->end, start.line, start.col};
+                return expr;
+            }
+            const Token* arg = nullptr;
+            if (const Token* t = take(TokenType::IntLit)) {
+                arg = t;
+            } else if (const Token* t = take(TokenType::DurLit)) {
+                arg = t;
+            } else {
+                auto op = parse_expr();
+                if (!op) return core::make_unexpected(op.error());
+                auto op_ptr = alloc_expr(op.value());
+                if (!op_ptr) return core::make_unexpected(op_ptr.error());
+                auto rparen = expect(TokenType::RParen);
+                if (!rparen) return core::make_unexpected(rparen.error());
+                expr.lhs = op_ptr.value();
+                expr.wait_event_kind = WaitEventKind::Any;
+                expr.span = Span{start.start, rparen.value()->end, start.line, start.col};
+                return expr;
+            }
+            u32 digit_len = arg->text.len;
+            u64 multiplier_ms = 1;
+            if (arg->type == TokenType::DurLit) {
+                if (digit_len >= 2 && arg->text.ptr[digit_len - 2] == 'm' &&
+                    arg->text.ptr[digit_len - 1] == 's') {
+                    digit_len -= 2;
+                } else if (digit_len >= 1) {
+                    const char unit = arg->text.ptr[digit_len - 1];
+                    digit_len -= 1;
+                    if (unit == 's')
+                        multiplier_ms = 1000;
+                    else if (unit == 'm')
+                        multiplier_ms = 60ull * 1000;
+                    else if (unit == 'h')
+                        multiplier_ms = 3600ull * 1000;
+                    else
+                        return frontend_error(
+                            FrontendError::InvalidInteger, span_from(*arg), arg->text);
+                }
+            }
+            u64 value = 0;
+            for (u32 i = 0; i < digit_len; i++) {
+                const u32 digit = static_cast<u32>(arg->text.ptr[i] - '0');
+                if (value > (static_cast<u64>(0xffffffffu) - static_cast<u64>(digit)) / 10)
+                    return frontend_error(
+                        FrontendError::InvalidInteger, span_from(*arg), arg->text);
+                value = value * 10 + static_cast<u64>(digit);
+            }
+            const u64 ms = value * multiplier_ms;
+            if (ms > 0xffffffffull)
+                return frontend_error(FrontendError::InvalidInteger, span_from(*arg), arg->text);
+            auto rparen = expect(TokenType::RParen);
+            if (!rparen) return core::make_unexpected(rparen.error());
+            expr.wait_event_kind = WaitEventKind::Timer;
+            expr.wait_ms = static_cast<u32>(ms);
+            expr.span = Span{start.start, rparen.value()->end, start.line, start.col};
+            return expr;
+        }
         if (take(TokenType::KwTrue)) {
             expr.kind = AstExprKind::BoolLit;
             expr.bool_value = true;
@@ -383,6 +447,14 @@ struct Parser {
                 default:
                     return frontend_error(FrontendError::UnsupportedSyntax, span_from(tok));
             }
+            expr.span = span_from(tok);
+            return expr;
+        }
+        if (cur().type == TokenType::KwUpstream || cur().type == TokenType::KwDownstream) {
+            const Token tok = cur();
+            pos++;
+            expr.kind = AstExprKind::Ident;
+            expr.name = tok.text;
             expr.span = span_from(tok);
             return expr;
         }
@@ -950,19 +1022,69 @@ struct Parser {
             return stmt;
         }
         if (take(TokenType::KwWait)) {
+            if (cur().type == TokenType::Ident && cur().text.eq({"any", 3}) &&
+                peek().type == TokenType::LBrace) {
+                const Token any_tok = cur();
+                pos++;
+                auto lbrace = expect(TokenType::LBrace);
+                if (!lbrace) return core::make_unexpected(lbrace.error());
+                AstStatement stmt{};
+                stmt.kind = AstStmtKind::WaitAny;
+                stmt.span = Span{start.start, any_tok.end, start.line, start.col};
+                while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+                    AstStatement::MatchArm arm{};
+                    arm.span = span_from(cur());
+                    auto event = parse_expr();
+                    if (!event) return core::make_unexpected(event.error());
+                    arm.pattern = event.value();
+                    auto arrow = expect(TokenType::Arrow);
+                    if (!arrow) return core::make_unexpected(arrow.error());
+                    auto body_lbrace = expect(TokenType::LBrace);
+                    if (!body_lbrace) return core::make_unexpected(body_lbrace.error());
+                    auto body = parse_braced_stmt_body(*body_lbrace.value());
+                    if (!body) return core::make_unexpected(body.error());
+                    auto body_ptr = alloc_stmt(body.value());
+                    if (!body_ptr) return core::make_unexpected(body_ptr.error());
+                    arm.stmt = body_ptr.value();
+                    arm.span =
+                        Span{arm.span.start, body.value().span.end, arm.span.line, arm.span.col};
+                    if (!stmt.match_arms.push(arm))
+                        return frontend_error(FrontendError::TooManyItems, arm.span);
+                }
+                auto rbrace = expect(TokenType::RBrace);
+                if (!rbrace) return core::make_unexpected(rbrace.error());
+                stmt.span = Span{start.start, rbrace.value()->end, start.line, start.col};
+                return stmt;
+            }
+            auto lparen = expect(TokenType::LParen);
+            if (!lparen) return core::make_unexpected(lparen.error());
+            AstStatement stmt{};
+            stmt.kind = AstStmtKind::Wait;
+            if (const Token* rparen = take(TokenType::RParen)) {
+                stmt.wait_event_kind = WaitEventKind::Any;
+                stmt.span = Span{start.start, rparen->end, start.line, start.col};
+                return stmt;
+            }
+
             // Accepts either a bare IntLit (milliseconds, legacy form) or
             // a DurLit (digits + ms/s/m/h suffix). u64 accumulator +
             // UINT32_MAX cap — the yield payload is 32 bits wide, so
             // waits up to ~49 days are expressible.
-            auto lparen = expect(TokenType::LParen);
-            if (!lparen) return core::make_unexpected(lparen.error());
             const Token* arg = nullptr;
             if (const Token* t = take(TokenType::IntLit)) {
                 arg = t;
             } else if (const Token* t = take(TokenType::DurLit)) {
                 arg = t;
             } else {
-                return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+                auto op = parse_expr();
+                if (!op) return core::make_unexpected(op.error());
+                auto rparen = expect(TokenType::RParen);
+                if (!rparen) return core::make_unexpected(rparen.error());
+                stmt.expr = op.value();
+                stmt.wait_event_kind = WaitEventKind::Any;
+                stmt.has_wait_expr = true;
+                stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
+                return stmt;
             }
             // Peel the unit suffix (if any) off the end of the text:
             // DurLit ends in ms/s/m/h; IntLit has no suffix.
@@ -1001,8 +1123,7 @@ struct Parser {
                 return frontend_error(FrontendError::InvalidInteger, span_from(*arg), arg->text);
             auto rparen = expect(TokenType::RParen);
             if (!rparen) return core::make_unexpected(rparen.error());
-            AstStatement stmt{};
-            stmt.kind = AstStmtKind::Wait;
+            stmt.wait_event_kind = WaitEventKind::Timer;
             stmt.status_code = static_cast<u32>(ms);  // reused field: ms to sleep
             stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
             return stmt;

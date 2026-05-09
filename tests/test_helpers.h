@@ -147,18 +147,18 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         c.reset();
         free_stack[free_top++] = cid;
     }
-    void submit_recv_impl(Connection& c) { backend.add_recv(c.fd, c.id); }
+    bool submit_recv_impl(Connection& c) { return backend.add_recv(c.fd, c.id); }
     void submit_send_impl(Connection& c, const u8* buf, u32 len) {
         backend.add_send(c.fd, c.id, buf, len);
     }
-    void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
+    bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+        return backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
     }
-    void submit_recv_upstream_impl(Connection& c) {
-        backend.add_recv_upstream(c.upstream_fd, c.id);
+    bool submit_recv_upstream_impl(Connection& c) {
+        return backend.add_recv_upstream(c.upstream_fd, c.id);
     }
-    void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
+    bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
+        return backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
     }
     // Test shim: record the ms for assertions, fall back to 1s wheel so
     // pending_handler_fn is still re-entered when the test ticks.
@@ -177,6 +177,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         // intrusive list. Production loops remove first; mirror that
         // so keepalive-armed conns can yield safely.
         timer.remove(&c);
+        c.yield_armed = true;
         timer.add(&c, secs);
         return true;
     }
@@ -249,7 +250,13 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
                 // yield fallback (resume). schedule_yield_timer on
                 // this mock uses the wheel, so tests exercising
                 // wait(...) reach this branch.
-                if (c->pending_handler_fn) {
+                if (c->pending_handler_fn &&
+                    (c->pending_yield_kind == jit::YieldKind::Timer ||
+                     (c->yield_armed &&
+                      yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
+                    c->yield_armed = false;
+                    c->resume_event_kind = jit::YieldKind::Timer;
+                    c->resume_event_result = 0;
                     resume_jit_handler<SmallLoop>(this, *c);
                 } else {
                     this->close_conn(*c);
@@ -262,6 +269,15 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
             if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
+            } else if (conn.pending_handler_fn &&
+                       yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                if (conn.yield_armed) {
+                    conn.yield_armed = false;
+                    timer.remove(&conn);
+                }
+                conn.resume_event_kind = yield_kind_from_event(ev.type);
+                conn.resume_event_result = ev.result;
+                resume_jit_handler<SmallLoop>(this, conn);
             }
         }
     }
@@ -290,6 +306,9 @@ struct AsyncMockBackend {
     static constexpr u32 kMaxOps = 256;
     MockOp ops[kMaxOps];
     u32 op_count = 0;
+    bool fail_connect = false;
+    bool fail_upstream_recv = false;
+    bool fail_upstream_send = false;
 
     static constexpr u32 kMaxEvents = 256;
     IoEvent pending[kMaxEvents];
@@ -298,6 +317,9 @@ struct AsyncMockBackend {
     core::Expected<void, Error> init(u32 /*shard_id*/, i32 /*listen_fd*/) {
         op_count = 0;
         pending_count = 0;
+        fail_connect = false;
+        fail_upstream_recv = false;
+        fail_upstream_send = false;
         return {};
     }
 
@@ -314,7 +336,10 @@ struct AsyncMockBackend {
         return true;
     }
 
-    bool add_recv_upstream(i32 fd, u32 conn_id) { return add_recv(fd, conn_id); }
+    bool add_recv_upstream(i32 fd, u32 conn_id) {
+        if (fail_upstream_recv) return false;
+        return add_recv(fd, conn_id);
+    }
 
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
         if (op_count < kMaxOps) {
@@ -324,10 +349,12 @@ struct AsyncMockBackend {
     }
 
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+        if (fail_upstream_send) return false;
         return add_send(fd, conn_id, buf, len);
     }
 
     bool add_connect(i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/) {
+        if (fail_connect) return false;
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::Connect, fd, conn_id, nullptr, 0};
         }
@@ -504,12 +531,14 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         }
     }
 
-    void submit_recv_impl(Connection& c) {
-        if (c.recv_armed) return;
+    bool submit_recv_impl(Connection& c) {
+        if (c.recv_armed) return true;
         if (backend.add_recv(c.fd, c.id)) {
             c.pending_ops++;
             c.recv_armed = true;
+            return true;
         }
+        return false;
     }
     void submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send(c.fd, c.id, buf, len)) {
@@ -517,23 +546,29 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             c.send_armed = true;
         }
     }
-    void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+    bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
             c.pending_ops++;
             c.upstream_send_armed = true;
+            return true;
         }
+        return false;
     }
-    void submit_recv_upstream_impl(Connection& c) {
-        if (c.upstream_recv_armed) return;
-        if (backend.add_recv(c.upstream_fd, c.id)) {
+    bool submit_recv_upstream_impl(Connection& c) {
+        if (c.upstream_recv_armed) return true;
+        if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
+            return true;
         }
+        return false;
     }
-    void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
+    bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
             c.pending_ops++;
+            return true;
         }
+        return false;
     }
 
     // Test shim matching SmallLoop's: drive the legacy wheel so existing
@@ -553,6 +588,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         // intrusive list. Production loops remove first; mirror that
         // so keepalive-armed conns can yield safely.
         timer.remove(&c);
+        c.yield_armed = true;
         timer.add(&c, secs);
         return true;
     }
@@ -615,11 +651,41 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             this->submit_recv(*c);
             return;
         }
+        if (ev.type == IoEventType::HandlerTimer) {
+            if (ev.conn_id < kMaxConns) {
+                auto& conn = conns[ev.conn_id];
+                if (conn.pending_ops > 0) conn.pending_ops--;
+                const bool matching_generation =
+                    ev.result == static_cast<i32>(conn.yield_timer_gen);
+                const bool was_yield_armed = conn.yield_armed;
+                if (matching_generation) {
+                    conn.yield_armed = false;
+                    timer.remove(&conn);
+                }
+                if (conn.pending_handler_fn && matching_generation &&
+                    (conn.pending_yield_kind == jit::YieldKind::Timer ||
+                     (was_yield_armed && yield_kind_matches_event(conn.pending_yield_kind,
+                                                                  IoEventType::HandlerTimer)))) {
+                    conn.resume_event_kind = jit::YieldKind::Timer;
+                    conn.resume_event_result = 0;
+                    resume_jit_handler<AsyncSmallLoop>(this, conn);
+                } else if (conn.pending_ops == 0 && !conn.pending_handler_fn && conn.fd < 0) {
+                    reclaim_slot(ev.conn_id);
+                }
+            }
+            return;
+        }
         if (ev.type == IoEventType::Timeout) {
             timer.tick([this](Connection* c) {
                 // See SmallLoop: a tick resumes yielded JIT handlers and
                 // otherwise closes on keepalive expiry.
-                if (c->pending_handler_fn) {
+                if (c->pending_handler_fn &&
+                    (c->pending_yield_kind == jit::YieldKind::Timer ||
+                     (c->yield_armed &&
+                      yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
+                    c->yield_armed = false;
+                    c->resume_event_kind = jit::YieldKind::Timer;
+                    c->resume_event_result = 0;
                     resume_jit_handler<AsyncSmallLoop>(this, *c);
                 } else {
                     this->close_conn(*c);
@@ -640,6 +706,15 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
+            } else if (conn.pending_handler_fn &&
+                       yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                if (conn.yield_armed) {
+                    conn.yield_armed = false;
+                    timer.remove(&conn);
+                }
+                conn.resume_event_kind = yield_kind_from_event(ev.type);
+                conn.resume_event_result = ev.result;
+                resume_jit_handler<AsyncSmallLoop>(this, conn);
             } else {
                 // Stale CQE: if all ops complete, reclaim immediately.
                 if (conn.pending_ops == 0) {
@@ -707,6 +782,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     bool is_draining() const { return draining; }
 
     // Per-shard control plane pointers (mirrors EventLoop for testing).
+    const RouteConfig** config_ptr = nullptr;
     ShardEpoch* epoch = nullptr;
 
     // Epoch helpers — functional when epoch pointer is wired.
@@ -737,6 +813,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         draining = false;
         access_log = nullptr;
         metrics = nullptr;
+        config_ptr = nullptr;
         epoch = nullptr;
         keepalive_timeout = 60;
         free_top = kMaxConns;
@@ -768,28 +845,40 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         free_stack[free_top++] = cid;
     }
 
-    void submit_recv_impl(Connection& c) {
-        if (c.recv_armed) return;
+    bool submit_recv_impl(Connection& c) {
+        if (c.recv_armed) return true;
         if (backend.add_recv(c.fd, c.id)) {
             c.pending_ops++;
             c.recv_armed = true;
+            return true;
         }
+        return false;
     }
     void submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send(c.fd, c.id, buf, len)) c.pending_ops++;
     }
-    void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        if (backend.add_send(c.upstream_fd, c.id, buf, len)) c.pending_ops++;
+    bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
+            c.pending_ops++;
+            return true;
+        }
+        return false;
     }
-    void submit_recv_upstream_impl(Connection& c) {
-        if (c.upstream_recv_armed) return;
-        if (backend.add_recv(c.upstream_fd, c.id)) {
+    bool submit_recv_upstream_impl(Connection& c) {
+        if (c.upstream_recv_armed) return true;
+        if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
+            return true;
         }
+        return false;
     }
-    void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) c.pending_ops++;
+    bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
+        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
+            c.pending_ops++;
+            return true;
+        }
+        return false;
     }
     u32 last_yield_ms = 0;
     [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
@@ -806,6 +895,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         // intrusive list. Production loops remove first; mirror that
         // so keepalive-armed conns can yield safely.
         timer.remove(&c);
+        c.yield_armed = true;
         timer.add(&c, secs);
         return true;
     }

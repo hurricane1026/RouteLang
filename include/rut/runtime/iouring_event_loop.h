@@ -324,12 +324,14 @@ public:
         pending_free[pending_free_count++] = cid;
     }
 
-    void submit_recv_impl(Connection& c) {
-        if (c.recv_armed) return;
+    bool submit_recv_impl(Connection& c) {
+        if (c.recv_armed) return true;
         if (backend.add_recv(c.fd, c.id)) {
             c.pending_ops++;
             c.recv_armed = true;
+            return true;
         }
+        return false;
     }
 
     void submit_send_impl(Connection& c, const u8* buf, u32 len) {
@@ -339,25 +341,31 @@ public:
         }
     }
 
-    void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
+    bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
             c.pending_ops++;
+            return true;
         }
+        return false;
     }
 
-    void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+    bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
             c.pending_ops++;
             c.upstream_send_armed = true;
+            return true;
         }
+        return false;
     }
 
-    void submit_recv_upstream_impl(Connection& c) {
-        if (c.upstream_recv_armed) return;
+    bool submit_recv_upstream_impl(Connection& c) {
+        if (c.upstream_recv_armed) return true;
         if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
+            return true;
         }
+        return false;
     }
 
     void close_conn_impl(Connection& c) {
@@ -371,7 +379,8 @@ public:
                                             c.upstream_recv_armed,
                                             c.upstream_send_armed,
                                             c.upstream_fd >= 0,
-                                            c.yield_armed);
+                                            c.yield_armed,
+                                            c.yield_timer_gen);
         }
         if (c.fd >= 0) {
             ::close(c.fd);
@@ -454,8 +463,18 @@ public:
         // the entry would then sit idle until the wheel wraps (~64s).
         // analyze rejects wait(0) upstream, so this is defence-in-depth.
         if (secs == 0) secs = 1;
+        conn.yield_armed = true;
         timer.add(&conn, secs);
         return true;
+    }
+
+    void disarm_yield_timer(Connection& conn) {
+        if (!conn.yield_armed) return;
+        const u32 old_gen = conn.yield_timer_gen;
+        conn.yield_armed = false;
+        conn.yield_timer_gen++;
+        timer.remove(&conn);
+        (void)backend.cancel_yield_timeout(conn.id, old_gen);
     }
 
     void dispatch(const IoEvent& ev) {
@@ -476,10 +495,17 @@ public:
             if (ev.conn_id < kMaxConns) {
                 auto& c = conns[ev.conn_id];
                 if (c.pending_ops > 0) c.pending_ops--;
-                c.yield_armed = false;
-                if (c.pending_handler_fn) {
+                const bool matching_generation = ev.result == static_cast<i32>(c.yield_timer_gen);
+                const bool was_yield_armed = c.yield_armed;
+                if (matching_generation) c.yield_armed = false;
+                if (c.pending_handler_fn && matching_generation &&
+                    (c.pending_yield_kind == jit::YieldKind::Timer ||
+                     (was_yield_armed &&
+                      yield_kind_matches_event(c.pending_yield_kind, IoEventType::HandlerTimer)))) {
+                    c.resume_event_kind = jit::YieldKind::Timer;
+                    c.resume_event_result = 0;
                     resume_jit_handler<IoUringEventLoop>(this, c);
-                } else if (c.pending_ops == 0) {
+                } else if (c.pending_ops == 0 && !c.pending_handler_fn && c.fd < 0) {
                     // Stale CQE for an already-closed slot; safe to
                     // reclaim now that the last in-flight op has drained.
                     reclaim_slot(ev.conn_id);
@@ -493,9 +519,15 @@ public:
             if (ticks > max_ticks) ticks = max_ticks;
             for (i32 t = 0; t < ticks; t++) {
                 timer.tick([this](Connection* c) {
-                    // See epoll_event_loop.h: timer fires for keepalive OR
-                    // for a JIT handler resume (pending_handler_fn set).
-                    if (c->pending_handler_fn) {
+                    // See epoll_event_loop.h: timer fires for keepalive,
+                    // wait(ms), or wait-any timeout completion.
+                    if (c->pending_handler_fn &&
+                        (c->pending_yield_kind == jit::YieldKind::Timer ||
+                         (c->yield_armed &&
+                          yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
+                        c->yield_armed = false;
+                        c->resume_event_kind = jit::YieldKind::Timer;
+                        c->resume_event_result = 0;
                         resume_jit_handler<IoUringEventLoop>(this, *c);
                     } else {
                         this->close_conn(*c);
@@ -529,6 +561,13 @@ public:
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
             } else if (conn.pending_handler_fn) {
+                if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                    disarm_yield_timer(conn);
+                    conn.resume_event_kind = yield_kind_from_event(ev.type);
+                    conn.resume_event_result = ev.result;
+                    resume_jit_handler<IoUringEventLoop>(this, conn);
+                    return;
+                }
                 // Stray CQE for a conn that's mid-yield (all slots null
                 // while the timer owns the wakeup). Provided-buffer
                 // lifetime is already handled inside

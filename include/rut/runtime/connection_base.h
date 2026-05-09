@@ -33,6 +33,7 @@ struct ConnectionBase {
     static constexpr u32 kMaxReqPathLen = 64;
     static constexpr u32 kMaxUpstreamNameLen = 24;
     static constexpr u16 kMaxPipelineDepth = 16;
+    static constexpr u32 kMaxJitHandlerSlots = 8;
     // Event callback type — void* loop to avoid circular dependency.
     using Callback = void (*)(void* loop, ConnectionBase& conn, IoEvent ev);
 
@@ -76,16 +77,33 @@ struct ConnectionBase {
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
     //     entry and dispatches. On yield the runtime stores next_state here.
-    //   handler_ctx:   reserved for future frame / slot storage (SlicePool
-    //     slice or arena-allocated HandlerCtx). Slice 0 (wait only) keeps
-    //     this null and uses a stack-local HandlerCtx.
+    //   handler_ctx:   points at handler_ctx_storage while a JIT handler is
+    //     running. The first slots store wait result kind/result pairs across
+    //     resume boundaries.
     //   pending_handler_fn: non-null while the handler has yielded and is
     //     waiting for its timer/io completion. The tick callback uses this
     //     to distinguish "resume JIT handler" from "keepalive expired,
     //     close connection". Reset to null on terminal outcome.
     u16 handler_state;
+    jit::YieldKind pending_yield_kind;
+    jit::YieldKind resume_event_kind;
+    i32 resume_event_result;
     void* handler_ctx;
     jit::HandlerFn pending_handler_fn;
+    alignas(8) u8 handler_ctx_storage[sizeof(jit::HandlerCtx) + kMaxJitHandlerSlots * 8]{};
+
+    jit::HandlerCtx* reset_jit_ctx() {
+        __builtin_memset(handler_ctx_storage, 0, sizeof(handler_ctx_storage));
+        auto* ctx = reinterpret_cast<jit::HandlerCtx*>(handler_ctx_storage);
+        ctx->slot_count = kMaxJitHandlerSlots;
+        handler_ctx = ctx;
+        return ctx;
+    }
+
+    jit::HandlerCtx* jit_ctx() {
+        if (handler_ctx == nullptr) return reset_jit_ctx();
+        return reinterpret_cast<jit::HandlerCtx*>(handler_ctx);
+    }
 
     // Per-request generation counter. Incremented on every new request
     // (in on_header_received) so the epoll YieldHeap can filter out
@@ -111,6 +129,7 @@ struct ConnectionBase {
     // stable lifetime. Unused by the epoll backend (which uses a shared
     // yield_timer_fd + min-heap).
     __kernel_timespec yield_timespec;
+    u32 yield_timer_gen = 0;
 
     bool keep_alive;
     bool tls_active;
@@ -224,6 +243,9 @@ struct ConnectionBase {
         upstream_fd = -1;
         upstream_idx = 0;
         handler_state = 0;
+        pending_yield_kind = jit::YieldKind::Timer;
+        resume_event_kind = jit::YieldKind::Timer;
+        resume_event_result = 0;
         handler_ctx = nullptr;
         // Deliberately NOT reset here: handler_gen persists across
         // reset() so a stale YieldHeap entry whose target slot was
@@ -233,6 +255,7 @@ struct ConnectionBase {
         pending_handler_fn = nullptr;
         yield_timespec.tv_sec = 0;
         yield_timespec.tv_nsec = 0;
+        yield_timer_gen = 0;
         keep_alive = false;
         tls_active = false;
         tls_handshake_complete = false;

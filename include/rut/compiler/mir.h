@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 
 namespace rut {
@@ -43,6 +44,8 @@ enum class MirValueKind : u8 {
     ValueOf,
     MissingOf,
     MatchPayload,
+    WaitResult,
+    WaitField,
 };
 
 enum class MirTypeKind : u8 {
@@ -151,6 +154,10 @@ struct MirValue {
     u32 error_case_index = 0xffffffffu;
     MirValue* lhs = nullptr;
     MirValue* rhs = nullptr;
+    bool is_wait_result = false;
+    WaitEventKind wait_event_kind = WaitEventKind::Timer;
+    u32 wait_payload = 0;
+    u32 wait_index = 0xffffffffu;
     static constexpr u32 kMaxFieldInits = 8;
     static constexpr u32 kMaxArgs = 8;
     FixedVec<FieldInit, kMaxFieldInits> field_inits;
@@ -173,6 +180,10 @@ struct MirLocal {
     u32 tuple_struct_indices[kMaxMirTupleSlots]{};
     u32 error_struct_index = 0xffffffffu;
     u32 error_variant_index = 0xffffffffu;
+    bool is_wait_result = false;
+    WaitEventKind wait_event_kind = WaitEventKind::Timer;
+    u32 wait_payload = 0;
+    u32 wait_index = 0xffffffffu;
     MirValue init{};
 };
 
@@ -199,6 +210,7 @@ struct MirTerminator {
     MirValue rhs{};
     u32 then_block = 0;
     u32 else_block = 0;
+    WaitEventKind yield_event_kind = WaitEventKind::Timer;
     u32 yield_ms = 0;
     u16 yield_next_state = 0;
     // Optional response body literal — carried verbatim from HIR for
@@ -220,6 +232,7 @@ struct MirBlock {
 struct MirFunction {
     struct Wait {
         Span span{};
+        WaitEventKind event_kind = WaitEventKind::Timer;
         u32 ms = 0;
     };
 
@@ -237,6 +250,8 @@ struct MirFunction {
     FixedVec<Wait, kMaxWaits> waits;
     bool state_zero_enters_entry = false;
     u32 resume_terminal_block = 0;
+    bool has_explicit_resume_blocks = false;
+    u32 resume_blocks[kMaxWaits + 1]{};
     u32 error_variant_index = 0xffffffffu;
 
     MirFunction() = default;
@@ -251,7 +266,9 @@ struct MirFunction {
           waits(other.waits),
           state_zero_enters_entry(other.state_zero_enters_entry),
           resume_terminal_block(other.resume_terminal_block),
+          has_explicit_resume_blocks(other.has_explicit_resume_blocks),
           error_variant_index(other.error_variant_index) {
+        for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
     MirFunction& operator=(const MirFunction& other) {
@@ -266,6 +283,8 @@ struct MirFunction {
         waits = other.waits;
         state_zero_enters_entry = other.state_zero_enters_entry;
         resume_terminal_block = other.resume_terminal_block;
+        has_explicit_resume_blocks = other.has_explicit_resume_blocks;
+        for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
         rebase_from(other);
         return *this;
@@ -281,7 +300,9 @@ struct MirFunction {
           waits(other.waits),
           state_zero_enters_entry(other.state_zero_enters_entry),
           resume_terminal_block(other.resume_terminal_block),
+          has_explicit_resume_blocks(other.has_explicit_resume_blocks),
           error_variant_index(other.error_variant_index) {
+        for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
     MirFunction& operator=(MirFunction&& other) noexcept {
@@ -296,6 +317,8 @@ struct MirFunction {
         waits = other.waits;
         state_zero_enters_entry = other.state_zero_enters_entry;
         resume_terminal_block = other.resume_terminal_block;
+        has_explicit_resume_blocks = other.has_explicit_resume_blocks;
+        for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
         rebase_from(other);
         return *this;

@@ -9,6 +9,7 @@
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/connection_base.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/traffic_capture.h"
@@ -399,9 +400,9 @@ bool load_manifest(const char* path, Manifest& out) {
                 munmap(map, static_cast<u64>(st.st_size));
                 return false;
             }
-            const u32 pattern_len = tokens[2].len;
-            for (u32 i = 0; i < pattern_len; i++) route.pattern[i] = tokens[2].ptr[i];
-            route.pattern[pattern_len] = '\0';
+            const u32 kPatternLen = tokens[2].len;
+            for (u32 i = 0; i < kPatternLen; i++) route.pattern[i] = tokens[2].ptr[i];
+            route.pattern[kPatternLen] = '\0';
 
             if (tokens[3].len == 6 && __builtin_memcmp(tokens[3].ptr, "status", 6) == 0) {
                 u32 code = 0;
@@ -431,16 +432,16 @@ bool load_manifest(const char* path, Manifest& out) {
         return false;
     }
 
-    const bool ok = validate_manifest(parsed);
+    const bool kOk = validate_manifest(parsed);
     munmap(map, static_cast<u64>(st.st_size));
-    if (ok) out = parsed;
-    return ok;
+    if (kOk) out = parsed;
+    return kOk;
 }
 
 bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
     if (manifest.route_count > Manifest::kMaxRoutes) return false;
     if (!ctx.init(manifest.route_count == 0 ? 1 : manifest.route_count)) return false;
-    const auto fail = [&ctx]() {
+    const auto kFail = [&ctx]() {
         ctx.destroy();
         return false;
     };
@@ -472,26 +473,26 @@ bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
         name_buf[pos] = '\0';
 
         Str name;
-        if (!copy_str_into_arena(ctx.arena, name_buf, cstr_len(name_buf), &name)) return fail();
+        if (!copy_str_into_arena(ctx.arena, name_buf, cstr_len(name_buf), &name)) return kFail();
         Str pattern;
         if (!copy_str_into_arena(ctx.arena,
                                  manifest.routes[i].pattern,
                                  cstr_len(manifest.routes[i].pattern),
                                  &pattern))
-            return fail();
+            return kFail();
 
         auto fn = b.create_function(name, pattern, manifest.routes[i].method);
-        if (!fn) return fail();
+        if (!fn) return kFail();
         auto entry = b.create_block(fn.value(), {"entry", 5});
-        if (!entry) return fail();
+        if (!entry) return kFail();
         b.set_insert_point(fn.value(), entry.value());
 
         if (manifest.routes[i].action == ManifestAction::ReturnStatus) {
-            if (!b.emit_ret_status(manifest.routes[i].status_code)) return fail();
+            if (!b.emit_ret_status(manifest.routes[i].status_code)) return kFail();
         } else {
             auto upstream = b.emit_const_i32(manifest.routes[i].upstream_id);
-            if (!upstream) return fail();
-            if (!b.emit_ret_forward(upstream.value())) return fail();
+            if (!upstream) return kFail();
+            if (!b.emit_ret_forward(upstream.value())) return kFail();
         }
     }
 
@@ -585,10 +586,14 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
 
     Connection conn;
     conn.reset();
-    jit::HandlerCtx ctx{};
+    struct HandlerFrame {
+        jit::HandlerCtx ctx{};
+        u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
+    } frame;
+    jit::HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
     ctx.handler_idx = 0;
-    ctx.slot_count = 0;
+    ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots;
 
     // Drive the handler's state machine to completion. Yields are the
     // handler's signal "I need I/O, resume me with state=next_state".
@@ -602,37 +607,40 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     // is deliberately small: real handlers yield at most a handful of times
     // per spec (submit + wait batches, not loops).
     static constexpr u32 kMaxHandlerYields = 32;
-    jit::HandlerResult kUnpacked{};
+    jit::HandlerResult unpacked{};
     for (u32 iter = 0; iter < kMaxHandlerYields; iter++) {
         const u64 kPacked =
             route->fn(&conn, &ctx, entry.raw_headers, entry.raw_header_len, nullptr);
-        kUnpacked = jit::HandlerResult::unpack(kPacked);
-        if (kUnpacked.action != jit::HandlerAction::Yield) break;
+        unpacked = jit::HandlerResult::unpack(kPacked);
+        if (unpacked.action != jit::HandlerAction::Yield) break;
         result.yield_count++;
-        // Advance to the continuation segment. Next-state is encoded in
-        // the HandlerResult; the status_code slot carries the yield
-        // payload (ms for Timer, etc.) which we ignore in sim mode.
-        ctx.state = kUnpacked.next_state;
+        // Advance to the continuation segment. Simulate mode treats the
+        // requested wait as immediately completed with a successful result,
+        // which lets wait-result frame slots preserve branch behavior without
+        // opening sockets or ticking timers.
+        ctx.resume_event_kind = static_cast<u32>(unpacked.yield_kind);
+        ctx.resume_event_result = 1;
+        ctx.state = unpacked.next_state;
     }
-    if (kUnpacked.action == jit::HandlerAction::Yield) {
+    if (unpacked.action == jit::HandlerAction::Yield) {
         // Exceeded the cap — treat as failure rather than silently
         // returning a stale state.
         result.verdict = Verdict::Failed;
         return result;
     }
-    result.action = kUnpacked.action;
+    result.action = unpacked.action;
 
-    if (kUnpacked.action == jit::HandlerAction::ReturnStatus) {
-        result.actual_status = kUnpacked.status_code;
+    if (unpacked.action == jit::HandlerAction::ReturnStatus) {
+        result.actual_status = unpacked.status_code;
         result.verdict =
-            (kUnpacked.status_code == entry.resp_status && entry.upstream_name[0] == '\0')
+            (unpacked.status_code == entry.resp_status && entry.upstream_name[0] == '\0')
                 ? Verdict::Match
                 : Verdict::Mismatch;
         return result;
     }
 
-    if (kUnpacked.action == jit::HandlerAction::Forward) {
-        const auto* upstream = find_upstream(engine, kUnpacked.upstream_id);
+    if (unpacked.action == jit::HandlerAction::Forward) {
+        const auto* upstream = find_upstream(engine, unpacked.upstream_id);
         if (!upstream) {
             result.verdict = Verdict::Failed;
             return result;

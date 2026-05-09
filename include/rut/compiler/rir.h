@@ -149,13 +149,15 @@ enum class Opcode : u8 {
     ReqPath,            // %r = req.path                 → str
     ResumeEventKind,    // %r = ctx.resume_event_kind    → i32
     ResumeEventResult,  // %r = ctx.resume_event_result  → i32
+    CtxLoadSlotI32,     // %r = ctx.slot[i]              → i32
     ReqRemoteAddr,      // %r = req.remote_addr          → IP
     ReqContentLength,   // %r = req.content_length       → ByteSize
     ReqCookie,          // %r = req.cookie "name"        → Optional(str)
 
     // ── Request mutation ──
-    ReqSetHeader,  // req.set_header "Name", %val
-    ReqSetPath,    // req.set_path %path
+    ReqSetHeader,     // req.set_header "Name", %val
+    ReqSetPath,       // req.set_path %path
+    CtxStoreSlotI32,  // ctx.slot[i] = %val
 
     // ── String operations ──
     StrHasPrefix,    // %r = str.has_prefix %s, %pfx    → bool

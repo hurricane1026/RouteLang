@@ -33,6 +33,7 @@ struct ConnectionBase {
     static constexpr u32 kMaxReqPathLen = 64;
     static constexpr u32 kMaxUpstreamNameLen = 24;
     static constexpr u16 kMaxPipelineDepth = 16;
+    static constexpr u32 kMaxJitHandlerSlots = 8;
     // Event callback type — void* loop to avoid circular dependency.
     using Callback = void (*)(void* loop, ConnectionBase& conn, IoEvent ev);
 
@@ -76,9 +77,9 @@ struct ConnectionBase {
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
     //     entry and dispatches. On yield the runtime stores next_state here.
-    //   handler_ctx:   reserved for future frame / slot storage (SlicePool
-    //     slice or arena-allocated HandlerCtx). Slice 0 (wait only) keeps
-    //     this null and uses a stack-local HandlerCtx.
+    //   handler_ctx:   points at handler_ctx_storage while a JIT handler is
+    //     running. The first slots store wait result kind/result pairs across
+    //     resume boundaries.
     //   pending_handler_fn: non-null while the handler has yielded and is
     //     waiting for its timer/io completion. The tick callback uses this
     //     to distinguish "resume JIT handler" from "keepalive expired,
@@ -89,6 +90,21 @@ struct ConnectionBase {
     i32 resume_event_result;
     void* handler_ctx;
     jit::HandlerFn pending_handler_fn;
+    alignas(8) u8 handler_ctx_storage[sizeof(jit::HandlerCtx) +
+                                      static_cast<size_t>(kMaxJitHandlerSlots) * 8]{};
+
+    jit::HandlerCtx* reset_jit_ctx() {
+        __builtin_memset(handler_ctx_storage, 0, sizeof(handler_ctx_storage));
+        auto* ctx = reinterpret_cast<jit::HandlerCtx*>(handler_ctx_storage);
+        ctx->slot_count = kMaxJitHandlerSlots;
+        handler_ctx = ctx;
+        return ctx;
+    }
+
+    jit::HandlerCtx* jit_ctx() {
+        if (handler_ctx == nullptr) return reset_jit_ctx();
+        return reinterpret_cast<jit::HandlerCtx*>(handler_ctx);
+    }
 
     // Per-request generation counter. Incremented on every new request
     // (in on_header_received) so the epoll YieldHeap can filter out
@@ -147,12 +163,13 @@ struct ConnectionBase {
     bool send_armed;
     bool upstream_recv_armed;
     bool upstream_send_armed;
-    // True between schedule_yield_timer (io_uring: IORING_OP_TIMEOUT SQE
-    // submitted) and the matching HandlerTimer CQE. Mirrors the other
-    // *_armed flags so close_conn_impl can submit a cancel SQE, keeping
-    // the slot pinned until the timer CQE is harvested — otherwise a
-    // late-arriving stale CQE could resume a handler on a reused slot.
+    // True while a handler yield timer is logically armed. For io_uring,
+    // the timer may be backed either by an IORING_OP_TIMEOUT SQE or by the
+    // coarse timer wheel fallback.
     bool yield_armed;
+    // True only when an IORING_OP_TIMEOUT SQE is in flight for the yield.
+    // Used to avoid cancel SQEs for wheel-backed yields.
+    bool yield_timeout_armed;
 
     // Response status (set by handler/proxy, used by access log)
     u16 resp_status;
@@ -264,6 +281,7 @@ struct ConnectionBase {
         upstream_recv_armed = false;
         upstream_send_armed = false;
         yield_armed = false;
+        yield_timeout_armed = false;
         resp_status = 0;
         req_method = 0;
         req_size = 0;

@@ -1257,6 +1257,25 @@ TEST(frontend, parse_route_accepts_wait_statement) {
     CHECK_EQ(route.statements[2].status_code, 200);
 }
 
+TEST(frontend, parse_route_accepts_wait_any_statement) {
+    const char* src =
+        "route GET \"/x\" { wait any { downstream.recv() => { return 204 } timer(250) => { "
+        "return 408 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 1u);
+    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::WaitAny));
+    REQUIRE_EQ(route.statements[0].match_arms.len, 2u);
+    CHECK_EQ(static_cast<u8>(route.statements[0].match_arms[0].pattern.kind),
+             static_cast<u8>(AstExprKind::MethodCall));
+    CHECK_EQ(static_cast<u8>(route.statements[0].match_arms[1].pattern.kind),
+             static_cast<u8>(AstExprKind::Call));
+}
+
 TEST(frontend, analyze_records_wait_in_hir_route) {
     const char* src = "route GET \"/sleep\" { wait(1000) return 200 }\n";
     auto lexed = lex(lit(src));
@@ -1268,6 +1287,26 @@ TEST(frontend, analyze_records_wait_in_hir_route) {
     REQUIRE_EQ(hir->routes.len, 1u);
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
     CHECK_EQ(hir->routes[0].waits[0].ms, 1000);
+}
+
+TEST(frontend, analyze_wait_any_statement_lowers_to_any_wait_and_if_control) {
+    const char* src =
+        "route GET \"/x\" { wait any { downstream.recv() => { return 204 } timer(250) => { "
+        "return 408 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].event_kind, WaitEventKind::Any);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 250u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::If));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.cond.kind),
+             static_cast<u8>(HirExprKind::WaitField));
+    CHECK_EQ(hir->routes[0].control.then_term.status_code, 408u);
+    CHECK_EQ(hir->routes[0].control.else_term.status_code, 204u);
 }
 
 TEST(frontend, analyze_records_multiple_waits_in_order) {
@@ -1651,6 +1690,28 @@ TEST(frontend, analyze_wait_result_fields) {
              static_cast<u8>(HirExprKind::WaitField));
 }
 
+TEST(frontend, analyze_wait_result_event_predicate_fields) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(250))) "
+        "guard ev.timer else { return 500 } guard ev.recv else { return 501 } "
+        "guard ev.send else { return 502 } guard ev.upstream_connect else { return 503 } "
+        "guard ev.upstream_recv else { return 504 } guard ev.upstream_send else { return 505 } "
+        "return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 6u);
+    for (u32 i = 0; i < hir->routes[0].guards.len; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].guards[i].cond.kind),
+                 static_cast<u8>(HirExprKind::WaitField));
+        CHECK_EQ(static_cast<u8>(hir->routes[0].guards[i].cond.type),
+                 static_cast<u8>(HirTypeKind::Bool));
+    }
+}
+
 TEST(frontend, analyze_rejects_unbound_wait_result_field) {
     const char* src =
         "route GET \"/x\" { guard wait(downstream.recv()).ok else { return 500 } return 204 }\n";
@@ -1677,7 +1738,7 @@ TEST(frontend, analyze_rejects_wait_expression_outside_let_initializer) {
     }
 }
 
-TEST(frontend, analyze_rejects_stale_wait_result_field_after_later_wait) {
+TEST(frontend, analyze_allows_wait_result_field_after_later_wait) {
     const char* src =
         "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { let first = "
         "wait(downstream.recv()) let second = "
@@ -1687,7 +1748,11 @@ TEST(frontend, analyze_rejects_stale_wait_result_field_after_later_wait) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 2u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
+             static_cast<u8>(HirExprKind::WaitField));
 }
 
 TEST(frontend, lower_wait_result_then_guard_let_preserves_local_refs) {

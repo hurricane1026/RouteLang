@@ -285,13 +285,13 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     } else if (route && route->action == RouteAction::JitHandler && route->fn) {
         conn.state = ConnState::ExecHandler;
         conn.handler_state = 0;  // entry state
-        jit::HandlerCtx ctx{};
-        ctx.state = 0;
-        ctx.resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
-        ctx.resume_event_result = 0;
+        auto* ctx = conn.reset_jit_ctx();
+        ctx->state = 0;
+        ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
+        ctx->resume_event_result = 0;
         auto outcome = invoke_jit_handler(route->fn,
                                           static_cast<void*>(&conn),
-                                          ctx,
+                                          *ctx,
                                           conn.recv_buf.data(),
                                           conn.recv_buf.len(),
                                           /*arena=*/nullptr);
@@ -684,13 +684,13 @@ void resume_jit_handler(Loop* loop, Connection& conn) {
     // refresh handles both without double-inserting the intrusive node.
     loop->timer.refresh(&conn, loop->keepalive_timeout);
     auto* fn = conn.pending_handler_fn;
-    jit::HandlerCtx ctx{};
-    ctx.state = conn.handler_state;
-    ctx.resume_event_kind = static_cast<u32>(conn.resume_event_kind);
-    ctx.resume_event_result = conn.resume_event_result;
+    auto* ctx = conn.jit_ctx();
+    ctx->state = conn.handler_state;
+    ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
+    ctx->resume_event_result = conn.resume_event_result;
     auto outcome = invoke_jit_handler(fn,
                                       static_cast<void*>(&conn),
-                                      ctx,
+                                      *ctx,
                                       conn.recv_buf.data(),
                                       conn.recv_buf.len(),
                                       /*arena=*/nullptr);

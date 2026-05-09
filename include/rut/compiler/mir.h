@@ -157,6 +157,7 @@ struct MirValue {
     bool is_wait_result = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
+    u32 wait_index = 0xffffffffu;
     static constexpr u32 kMaxFieldInits = 8;
     static constexpr u32 kMaxArgs = 8;
     FixedVec<FieldInit, kMaxFieldInits> field_inits;
@@ -182,6 +183,7 @@ struct MirLocal {
     bool is_wait_result = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
+    u32 wait_index = 0xffffffffu;
     MirValue init{};
 };
 

@@ -451,6 +451,25 @@ TEST(simulate_engine, multiple_waits_all_drive_then_return) {
     rir.destroy();
 }
 
+TEST(simulate_engine, wait_result_fields_survive_later_waits) {
+    const char* src =
+        "route GET \"/x\" { let first = wait(50) let second = wait(downstream.recv()) if "
+        "first.timer { guard second.ok else { return 500 } return 204 } else { return 502 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 2u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, forward_upstream_match) {
     Manifest manifest{};
     manifest.upstream_count = 1;

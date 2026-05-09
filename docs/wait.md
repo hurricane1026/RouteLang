@@ -24,6 +24,10 @@ wait(upstream(api).connect())
 wait(upstream(api).recv())
 wait(upstream(api).send(req.body))
 wait(any(downstream.recv(), timer(250)))
+wait any {
+    downstream.recv() => { return 204 }
+    timer(250) => { return 408 }
+}
 wait(250)
 ```
 
@@ -42,6 +46,19 @@ The forms are either operation-start waits or completion waits:
 `downstream.recv()` plus an optional `timer(N)` timeout arm; `N` is
 milliseconds.
 
+When the route needs different control flow for each winning arm, prefer
+statement-form `wait any`. The first slice supports a downstream recv arm and a
+timer arm, with direct terminal branch bodies:
+
+```rut
+route POST "/upload" {
+    wait any {
+        downstream.recv() => { return 204 }
+        timer(2000) => { return 408 }
+    }
+}
+```
+
 ## Result Values
 
 `wait(...)` may be bound to a local. The result currently exposes these fields:
@@ -54,6 +71,9 @@ milliseconds.
 - `ok`: true when `result >= 0`.
 - `eof`: true only for recv-like events (`downstream.recv` and
   `upstream.recv`) when `result == 0`; false for timer/connect/send events.
+- `timer`, `recv`, `send`, `upstream_connect`, `upstream_recv`, and
+  `upstream_send`: boolean predicates derived from `kind`, provided so routes
+  do not need to hard-code numeric `YieldKind` values.
 
 Wait for downstream activity on the current connection:
 
@@ -105,23 +125,51 @@ route POST "/proxy" {
 }
 ```
 
-The bound result is backed by the event that most recently resumed the handler.
-Do not rely on an older wait result after a later `wait(...)` until frame-slot
-storage is added.
+Each bound wait result is stored in the handler frame. Older wait results stay
+available after later waits:
+
+```rut
+route POST "/upload" {
+    let first = wait(any(downstream.recv(), timer(2000)))
+    let second = wait(downstream.recv())
+    if first.timer {
+        return 408
+    } else {
+        guard second.ok else { return 400 }
+        return 204
+    }
+}
+```
 
 Wait routes support direct `return`, `if`, and `match` terminal control after
 the ordered wait/guard sequence.
 
 ## Race Waits
 
-`wait(any(...))` returns the same result surface as other event waits:
+`wait any` is the clearest form when each winning event should run different
+route logic:
+
+```rut
+route POST "/upload" {
+    wait any {
+        downstream.recv() => { return 204 }
+        timer(2000) => { return 408 }
+    }
+}
+```
+
+The older `wait(any(...))` expression form remains available and returns the
+same result surface as other event waits:
 
 ```rut
 route POST "/upload" {
     let ev = wait(any(downstream.recv(), timer(2000)))
-    if ev.kind == 3 { return 408 }
-    guard ev.ok else { return 400 }
-    return 200
+    if ev.timer {
+        return 408
+    } else {
+        guard ev.ok else { return 400 }
+        return 200
+    }
 }
 ```
 
@@ -215,9 +263,8 @@ arming later waits. A `let` after a `wait`, or a `wait` after terminal control
 (`if` / `match` / `return` / `forward`), is rejected today.
 
 The current codegen re-materializes pure pre-wait local initializers when the
-handler reaches the terminal state. Dedicated `HandlerCtx` slot storage for
-values that truly live across yield boundaries is reserved for a later
-state-machine lowering pass.
+handler reaches the terminal state. Wait result `kind` / `result` pairs are
+stored in dedicated `HandlerCtx` frame slots so they survive later waits.
 
 ## Runtime Behavior
 
@@ -250,6 +297,13 @@ Event `wait(...)` compiles to an event yield:
    next_state`.
 4. Non-matching events do not resume the pending handler.
 
+Offline simulation uses the same handler frame shape as production. The
+simulator drives each yielded handler state to completion immediately, records a
+successful synthetic completion in `HandlerCtx`, and keeps the wait-result
+slots allocated across later waits. This lets capture replay exercise branches
+such as `first.timer` after a later `wait(...)` without opening sockets or
+waiting for real timers.
+
 ## Decorators
 
 Decorated wait routes are supported for the direct terminal subset:
@@ -271,7 +325,8 @@ and non-direct terminal control such as `if` / `match`.
 
 The following are future work rather than current behavior:
 
-- Rich result payloads beyond `kind`, `result`, `ok`, and `eof`.
+- Rich result payloads beyond the current scalar fields and event-kind
+  predicates.
 - Response starts inside `wait(downstream.send(response(...)))`; use terminal
   `return response(...)` for downstream responses until route completion can
   model "send and finish" without a second terminal response.
@@ -279,7 +334,6 @@ The following are future work rather than current behavior:
   `Any` once the listed forms validate.
 - Parameterized IO starts inside `wait(any(...))`; start the operation before a
   later race wait until that payload has a richer representation.
-- `HandlerCtx` frame slots for older wait results that must survive a later
-  wait.
+- `wait any` arm result binding such as `r = downstream.recv() => { ... }`.
 - Non-wait `let` bindings after a `wait(...)`.
 - Waits inside nested blocks, loops, branches, or decorator bodies.

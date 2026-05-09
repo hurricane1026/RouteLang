@@ -49,16 +49,29 @@ static i32 io_uring_register(i32 fd, u32 opcode, const void* arg, u32 nr_args) {
 }
 
 // --- user_data encoding ---
-// Layout: [63:8] = conn_id (up to 56 bits used, stored in u32 on decode), [7:0] = IoEventType
-// Enough for 16M connections per shard.
+// Layout: [63:32] = auxiliary generation, [31:8] = 24-bit conn_id/sentinel,
+// [7:0] = IoEventType. conn_id is still decoded as u32; 24 bits covers every
+// live connection id and the io_uring sentinel ids while preserving the full
+// u32 HandlerTimer generation used to reject stale timeout CQEs.
 
 u64 IoUringBackend::encode_user_data(u32 conn_id, IoEventType type) {
-    return (static_cast<u64>(conn_id) << 8) | static_cast<u64>(type);
+    return encode_user_data(conn_id, type, 0);
+}
+
+u64 IoUringBackend::encode_user_data(u32 conn_id, IoEventType type, u32 aux) {
+    return (static_cast<u64>(aux) << 32) | ((static_cast<u64>(conn_id) & 0xFFFFFFu) << 8) |
+           static_cast<u64>(type);
 }
 
 void IoUringBackend::decode_user_data(u64 data, u32& conn_id, IoEventType& type) {
+    u32 aux = 0;
+    decode_user_data(data, conn_id, type, aux);
+}
+
+void IoUringBackend::decode_user_data(u64 data, u32& conn_id, IoEventType& type, u32& aux) {
     type = static_cast<IoEventType>(data & 0xFF);
-    conn_id = static_cast<u32>(data >> 8);
+    conn_id = static_cast<u32>((data >> 8) & 0xFFFFFFu);
+    aux = static_cast<u32>(data >> 32);
 }
 
 // --- SQE helpers ---
@@ -415,7 +428,8 @@ bool IoUringBackend::add_yield_timeout(u32 conn_id, Connection& conn, u32 ms) {
     sqe->addr = reinterpret_cast<u64>(&conn.yield_timespec);
     sqe->len = 1;  // one timespec
     sqe->off = 0;  // count=0 → plain relative timeout (no "wait for N events" semantics)
-    sqe->user_data = encode_user_data(conn_id, IoEventType::HandlerTimer);
+    conn.yield_timer_gen++;
+    sqe->user_data = encode_user_data(conn_id, IoEventType::HandlerTimer, conn.yield_timer_gen);
 
     sqe_advance_tail(sq_tail);
     pending++;
@@ -448,7 +462,7 @@ void IoUringBackend::cancel_accept() {
 
 // Submit a cancel SQE matching a specific user_data value.
 // Returns true if the SQE was queued, false if SQ is full.
-bool IoUringBackend::cancel_by_user_data(u64 target, u32 conn_id, IoEventType type) {
+bool IoUringBackend::cancel_by_user_data(u64 target, u32 conn_id, IoEventType type, u32 aux) {
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) {
         // SQ ring full — flush pending SQEs to make room, then retry.
@@ -465,14 +479,22 @@ bool IoUringBackend::cancel_by_user_data(u64 target, u32 conn_id, IoEventType ty
     // Cancel by user_data match (not fd) — safe across fd reuse after close().
     sqe->addr = target;
     sqe->cancel_flags = IORING_ASYNC_CANCEL_ALL;
-    // Encode the real conn_id in the cancel CQE's user_data so dispatch()
-    // can decrement pending_ops when the cancel completes. This prevents
-    // slot reuse before all cancel CQEs have been processed.
-    sqe->user_data = encode_user_data(conn_id, type);
+    // Encode the caller-provided conn_id/type/aux in the cancel CQE. Close-path
+    // cancels use the real conn_id so dispatch can account pending_ops; mid-wait
+    // timeout disarms use kCancelConnId so the cancel CQE is consumed silently.
+    sqe->user_data = encode_user_data(conn_id, type, aux);
 
     sqe_advance_tail(sq_tail);
     pending++;
     return true;
+}
+
+bool IoUringBackend::cancel_yield_timeout(u32 conn_id, u32 yield_timer_gen) {
+    return cancel_by_user_data(
+        encode_user_data(conn_id, IoEventType::HandlerTimer, yield_timer_gen),
+        kCancelConnId,
+        IoEventType::HandlerTimer,
+        yield_timer_gen);
 }
 
 u32 IoUringBackend::cancel(i32 /*fd*/,
@@ -482,7 +504,8 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
                            bool upstream_recv_armed,
                            bool upstream_send_armed,
                            bool has_upstream,
-                           bool yield_armed) {
+                           bool yield_armed,
+                           u32 yield_timer_gen) {
     // Only cancel op types that are actually in flight to avoid wasting
     // SQ/CQ capacity with no-op cancels that produce -ENOENT completions.
     u32 submitted = 0;
@@ -520,9 +543,11 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
     // until the target CQE arrives, preventing stale HandlerTimer events
     // from resuming a handler on a reused slot.
     if (yield_armed) {
-        if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::HandlerTimer),
-                                conn_id,
-                                IoEventType::HandlerTimer))
+        if (cancel_by_user_data(
+                encode_user_data(conn_id, IoEventType::HandlerTimer, yield_timer_gen),
+                conn_id,
+                IoEventType::HandlerTimer,
+                yield_timer_gen))
             submitted++;
     }
 
@@ -572,7 +597,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
 
         u32 conn_id;
         IoEventType type;
-        decode_user_data(cqe->user_data, conn_id, type);
+        u32 aux = 0;
+        decode_user_data(cqe->user_data, conn_id, type, aux);
 
         // Cancel CQEs — silently consume, don't emit event
         if (conn_id == kCancelConnId) {
@@ -696,7 +722,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // --- Default: non-buffer events (Accept, Connect, error Send/Recv) ---
         events[count].conn_id = conn_id;
         events[count].type = type;
-        events[count].result = cqe->res;
+        events[count].result = type == IoEventType::HandlerTimer ? static_cast<i32>(aux) : cqe->res;
         events[count].buf_id = 0;
         events[count].has_buf = 0;
         events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;

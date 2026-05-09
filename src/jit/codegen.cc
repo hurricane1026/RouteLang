@@ -3,6 +3,7 @@
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
 #include <atomic>
+#include <cstddef>
 
 #include <llvm-c/Core.h>
 #include <stdio.h>
@@ -511,6 +512,24 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, v);
             break;
         }
+        case rir::Opcode::ResumeEventKind: {
+            LLVMValueRef off = LLVMConstInt(
+                c.i32_ty, static_cast<u32>(offsetof(HandlerCtx, resume_event_kind)), 0);
+            LLVMValueRef ptr =
+                LLVMBuildGEP2(c.builder, c.i8_ty, c.param_ctx, &off, 1, "ev.kind.ptr");
+            LLVMValueRef v = LLVMBuildLoad2(c.builder, c.i32_ty, ptr, "ev.kind");
+            c.set_value(inst.result, v);
+            break;
+        }
+        case rir::Opcode::ResumeEventResult: {
+            LLVMValueRef off = LLVMConstInt(
+                c.i32_ty, static_cast<u32>(offsetof(HandlerCtx, resume_event_result)), 0);
+            LLVMValueRef ptr =
+                LLVMBuildGEP2(c.builder, c.i8_ty, c.param_ctx, &off, 1, "ev.result.ptr");
+            LLVMValueRef v = LLVMBuildLoad2(c.builder, c.i32_ty, ptr, "ev.result");
+            c.set_value(inst.result, v);
+            break;
+        }
         case rir::Opcode::ReqHeader: {
             Str name = inst.imm.str_val;
             LLVMValueRef name_ptr = c.make_global_str(name, "hdr.name");
@@ -899,9 +918,9 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             const u64 packed = static_cast<u64>(inst.imm.i64_val);
             const u32 payload = static_cast<u32>(packed & 0xffffffffu);
             const u16 next_state = static_cast<u16>((packed >> 32) & 0xffffu);
-            LLVMBuildRet(
-                c.builder,
-                c.make_result_yield(next_state, static_cast<u8>(YieldKind::Timer), payload));
+            u8 yield_kind = static_cast<u8>((packed >> 48) & 0xffu);
+            if (yield_kind == 0) yield_kind = static_cast<u8>(YieldKind::Timer);
+            LLVMBuildRet(c.builder, c.make_result_yield(next_state, yield_kind, payload));
             break;
         }
 
@@ -995,19 +1014,28 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         LLVMValueRef state = LLVMBuildLoad2(c.builder, c.i16_ty, c.param_ctx, "state");
 
         const u32 terminal_block_id =
-            fn.state_zero_enters_entry ? fn.resume_terminal_block : fn.blocks[0].id.id;
+            fn.has_explicit_resume_blocks
+                ? fn.resume_blocks[0]
+                : (fn.state_zero_enters_entry ? fn.resume_terminal_block : fn.blocks[0].id.id);
         LLVMBasicBlockRef terminal_bb = c.block_map[terminal_block_id];
         LLVMValueRef sw = LLVMBuildSwitch(
-            c.builder, state, terminal_bb, fn.yield_count + (fn.state_zero_enters_entry ? 1 : 0));
-        if (fn.state_zero_enters_entry) {
+            c.builder,
+            state,
+            terminal_bb,
+            fn.yield_count +
+                ((fn.state_zero_enters_entry || fn.has_explicit_resume_blocks) ? 1 : 0));
+        if (fn.has_explicit_resume_blocks) {
+            for (u32 si = 0; si <= fn.yield_count && si < rir::Function::kMaxResumeBlocks; si++) {
+                LLVMAddCase(sw, LLVMConstInt(c.i16_ty, si, 0), c.block_map[fn.resume_blocks[si]]);
+            }
+        } else if (fn.state_zero_enters_entry) {
             LLVMAddCase(sw, LLVMConstInt(c.i16_ty, 0, 0), c.block_map[fn.blocks[0].id.id]);
         }
 
-        // Use function-specific yield kind. v1: all yields are Timer; later
-        // layers will branch on per-yield metadata.
-        constexpr u8 kYieldKindTimer = static_cast<u8>(YieldKind::Timer);
         const u32 first_prologue_yield = fn.state_zero_enters_entry ? 1 : 0;
-        for (u32 si = first_prologue_yield; si < fn.yield_count; si++) {
+        for (u32 si = fn.has_explicit_resume_blocks ? fn.yield_count : first_prologue_yield;
+             si < fn.yield_count;
+             si++) {
             char ylabel[24];
             u32 lpos = 0;
             const char* prefix = "yield_";
@@ -1022,9 +1050,11 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
             LLVMBasicBlockRef yield_bb = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, ylabel);
             LLVMMoveBasicBlockBefore(yield_bb, terminal_bb);
             const u32 payload = fn.yield_payload ? fn.yield_payload[si] : 0;
+            u8 yield_kind = fn.yield_kinds ? fn.yield_kinds[si] : static_cast<u8>(YieldKind::Timer);
+            if (yield_kind == 0) yield_kind = static_cast<u8>(YieldKind::Timer);
             LLVMPositionBuilderAtEnd(c.builder, yield_bb);
             LLVMValueRef result =
-                c.make_result_yield(static_cast<u16>(si + 1), kYieldKindTimer, payload);
+                c.make_result_yield(static_cast<u16>(si + 1), yield_kind, payload);
             LLVMBuildRet(c.builder, result);
             LLVMAddCase(sw, LLVMConstInt(c.i16_ty, si, 0), yield_bb);
         }

@@ -15,7 +15,7 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 // No real sockets, no syscalls, fully deterministic.
 
 struct MockOp {
-    enum Type : u8 { Accept, Recv, Send, Connect, Cancel };
+    enum Type : u8 { Accept, Recv, Send, Connect, Cancel, PauseRecv };
     Type type;
     i32 fd;
     u32 conn_id;
@@ -31,6 +31,9 @@ struct MockBackend {
     static constexpr u32 kMaxOps = 256;
     MockOp ops[kMaxOps];
     u32 op_count = 0;
+    bool fail_connect = false;
+    bool fail_upstream_recv = false;
+    bool fail_upstream_send = false;
 
     // Injected completions (fed back to event loop)
     static constexpr u32 kMaxEvents = 256;
@@ -40,6 +43,9 @@ struct MockBackend {
     core::Expected<void, Error> init(u32 /*shard_id*/, i32 /*listen_fd*/) {
         op_count = 0;
         pending_count = 0;
+        fail_connect = false;
+        fail_upstream_recv = false;
+        fail_upstream_send = false;
         return {};
     }
 
@@ -56,9 +62,13 @@ struct MockBackend {
         return true;
     }
 
-    bool add_recv_upstream(i32 fd, u32 conn_id) { return add_recv(fd, conn_id); }
+    bool add_recv_upstream(i32 fd, u32 conn_id) {
+        if (fail_upstream_recv) return false;
+        return add_recv(fd, conn_id);
+    }
 
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+        if (fail_upstream_send) return false;
         return add_send(fd, conn_id, buf, len);
     }
 
@@ -70,10 +80,17 @@ struct MockBackend {
     }
 
     bool add_connect(i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/) {
+        if (fail_connect) return false;
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::Connect, fd, conn_id, nullptr, 0};
         }
         return true;
+    }
+
+    void pause_recv(u32 conn_id) {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::PauseRecv, -1, conn_id, nullptr, 0};
+        }
     }
 
     u32 cancel(i32 fd,

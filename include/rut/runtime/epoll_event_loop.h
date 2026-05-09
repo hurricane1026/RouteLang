@@ -371,7 +371,7 @@ public:
         free_stack[free_top++] = cid;
     }
 
-    void submit_recv_impl(Connection& c) { backend.add_recv(c.fd, c.id); }
+    bool submit_recv_impl(Connection& c) { return backend.add_recv(c.fd, c.id); }
 
     void submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (c.tls_active) {
@@ -381,16 +381,16 @@ public:
         backend.add_send(c.fd, c.id, buf, len);
     }
 
-    void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
+    bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
+        return backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
     }
 
-    void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
+    bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+        return backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
     }
 
-    void submit_recv_upstream_impl(Connection& c) {
-        backend.add_recv_upstream(c.upstream_fd, c.id);
+    bool submit_recv_upstream_impl(Connection& c) {
+        return backend.add_recv_upstream(c.upstream_fd, c.id);
     }
 
     void close_conn_impl(Connection& c) {
@@ -455,6 +455,7 @@ public:
         u64 now = epoll_yield::monotonic_ns();
         u64 deadline = now + static_cast<u64>(ms) * 1'000'000ull;
         if (yield_heap.push(deadline, conn.handler_gen, conn.id)) {
+            conn.yield_armed = true;
             rearm_yield_timerfd();
             return true;
         }
@@ -469,6 +470,7 @@ public:
         // the entry would then sit idle until the wheel wraps (~64s).
         // analyze rejects wait(0) upstream, so this is defence-in-depth.
         if (secs == 0) secs = 1;
+        conn.yield_armed = true;
         timer.add(&conn, secs);
         return true;
     }
@@ -490,6 +492,14 @@ public:
         yield_timer_armed_ns = top;
     }
 
+    void disarm_yield_timer(Connection& conn) {
+        if (!conn.yield_armed) return;
+        conn.yield_armed = false;
+        conn.yield_timer_gen++;
+        timer.remove(&conn);
+        if (yield_heap.remove_by_conn(conn.id) > 0) rearm_yield_timerfd();
+    }
+
     // Drain all heap entries whose deadline has passed. Resume each
     // connection's pending JIT handler (skipping stale entries whose
     // handler_gen no longer matches — indicating the slot was closed
@@ -502,7 +512,13 @@ public:
             if (entry.conn_id >= kMaxConns) continue;
             auto& c = conns[entry.conn_id];
             if (!c.pending_handler_fn) continue;
+            if (c.pending_yield_kind != jit::YieldKind::Timer &&
+                !yield_kind_matches_event(c.pending_yield_kind, IoEventType::HandlerTimer))
+                continue;
             if (c.handler_gen != entry.handler_gen) continue;  // stale
+            c.yield_armed = false;
+            c.resume_event_kind = jit::YieldKind::Timer;
+            c.resume_event_result = 0;
             resume_jit_handler<EpollEventLoop>(this, c);
         }
         rearm_yield_timerfd();
@@ -529,10 +545,15 @@ public:
                 timer.tick([this](Connection* c) {
                     // A timer can now expire for two reasons:
                     //   (1) keepalive — close the connection (existing).
-                    //   (2) a JIT handler yielded with wait(ms) and asked to
-                    //       be resumed; pending_handler_fn is the handler to
-                    //       re-enter with ctx.state = c->handler_state.
-                    if (c->pending_handler_fn) {
+                    //   (2) a JIT handler yielded with wait(ms), or wait-any
+                    //       chose timeout as its completion event.
+                    if (c->pending_handler_fn &&
+                        (c->pending_yield_kind == jit::YieldKind::Timer ||
+                         (c->yield_armed &&
+                          yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
+                        c->yield_armed = false;
+                        c->resume_event_kind = jit::YieldKind::Timer;
+                        c->resume_event_result = 0;
                         resume_jit_handler<EpollEventLoop>(this, *c);
                     } else {
                         this->close_conn(*c);
@@ -558,6 +579,13 @@ public:
                 timer.refresh(&conn, keepalive_timeout);
                 this->dispatch_event(conn, ev);
             } else if (conn.pending_handler_fn) {
+                if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                    disarm_yield_timer(conn);
+                    conn.resume_event_kind = yield_kind_from_event(ev.type);
+                    conn.resume_event_result = ev.result;
+                    resume_jit_handler<EpollEventLoop>(this, conn);
+                    return;
+                }
                 // Mid-yield (all callback slots null while the yield timer
                 // owns the wakeup). Close on terminal recv (peer FIN / RST /
                 // hang-up) so a client disconnect during wait(ms) can't

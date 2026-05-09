@@ -43,6 +43,7 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"or", 2})) return TokenType::KwOr;
     if (text.eq({"nil", 3})) return TokenType::KwNil;
     if (text.eq({"upstream", 8})) return TokenType::KwUpstream;
+    if (text.eq({"downstream", 10})) return TokenType::KwDownstream;
     // `at` is deliberately NOT reserved globally — only
     // `parse_upstream` treats the identifier specially, matching the
     // `response()` / `forward()` builder pattern. This keeps `at`

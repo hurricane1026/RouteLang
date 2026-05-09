@@ -43,6 +43,16 @@ enum class AstStmtKind : u8 {
     For,
 };
 
+enum class WaitEventKind : u8 {
+    Timer,
+    Any,
+    Recv,
+    Send,
+    UpstreamConnect,
+    UpstreamRecv,
+    UpstreamSend,
+};
+
 // Single response header key/value pair, used by `response(N, headers: {...})`.
 // Both fields are non-owning views into the lexer's source buffer.
 struct AstHeaderKV {
@@ -84,6 +94,7 @@ enum class AstExprKind : u8 {
     Gt,
     Or,
     Pipe,
+    Wait,
 };
 
 struct AstTypeRef {
@@ -127,6 +138,8 @@ struct AstExpr {
     FixedVec<FieldInit, kMaxFieldInits> field_inits;
     FixedVec<AstTypeRef, kMaxTypeArgs> type_args;
     FixedVec<AstExpr*, kMaxArgs> args;
+    WaitEventKind wait_event_kind = WaitEventKind::Timer;
+    u32 wait_ms = 0;
 };
 
 struct AstStatement {
@@ -142,6 +155,8 @@ struct AstStatement {
     // `wait(N)`. u32 fits both the HTTP range and the full u32 yield
     // payload range (~49 days); semantic validation is in analyze.
     u32 status_code = 0;
+    WaitEventKind wait_event_kind = WaitEventKind::Timer;
+    bool has_wait_expr = false;
     // Response body literal, populated when `return` uses the
     // `response(N, body: "...")` form. `has_response_body` distinguishes
     // an omitted kwarg from an explicit empty string — the latter must

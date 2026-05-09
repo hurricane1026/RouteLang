@@ -137,6 +137,14 @@ TEST(frontend, lex_recognizes_wait_keyword) {
     CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwWait));
 }
 
+TEST(frontend, lex_recognizes_downstream_keyword) {
+    const char* src = "downstream";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 2u);  // downstream, EOF
+    CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwDownstream));
+}
+
 TEST(frontend, lex_recognizes_regex_literal) {
     const char* src = "re\"^/v[0-9]+$\"";
     auto lexed = lex(lit(src));
@@ -1232,18 +1240,21 @@ TEST(frontend, lex_duration_suffix_boundary) {
 }
 
 TEST(frontend, parse_route_accepts_wait_statement) {
-    const char* src = "route GET \"/sleep\" { wait(1000) return 200 }\n";
+    const char* src = "route GET \"/sleep\" { wait(1000) wait(downstream.recv()) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items.len, 1u);
     const auto& route = ast->items[0].route;
-    REQUIRE_EQ(route.statements.len, 2u);
+    REQUIRE_EQ(route.statements.len, 3u);
     CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Wait));
     CHECK_EQ(route.statements[0].status_code, 1000);  // ms stored in status_code field
-    CHECK_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::ReturnStatus));
-    CHECK_EQ(route.statements[1].status_code, 200);
+    CHECK(!route.statements[0].has_wait_expr);
+    CHECK_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Wait));
+    CHECK(route.statements[1].has_wait_expr);
+    CHECK_EQ(static_cast<u8>(route.statements[2].kind), static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(route.statements[2].status_code, 200);
 }
 
 TEST(frontend, analyze_records_wait_in_hir_route) {
@@ -1313,6 +1324,26 @@ TEST(frontend, analyze_accepts_wait_at_u32_max) {
     CHECK_EQ(hir->routes[0].waits[0].ms, 4294967295u);
 }
 
+TEST(frontend, bound_wait_preserves_u32_timer_payload) {
+    const char* src = "route GET \"/x\" { let ev = wait(4294967295) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 4294967295u);
+    CHECK_EQ(hir->routes[0].locals[0].init.wait_payload, 4294967295u);
+    CHECK_EQ(hir->routes[0].locals[0].wait_payload, 4294967295u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].waits.len, 1u);
+    CHECK_EQ(mir->functions[0].waits[0].ms, 4294967295u);
+}
+
 TEST(frontend, parser_rejects_wait_above_u32_max) {
     // 2^32 overflows the u32 cap even with the u64 accumulator.
     const char* src = "route GET \"/x\" { wait(4294967296) return 200 }\n";
@@ -1322,17 +1353,17 @@ TEST(frontend, parser_rejects_wait_above_u32_max) {
     CHECK(!ast);
 }
 
-TEST(frontend, analyze_rejects_wait_after_non_wait_statement) {
-    // Slice 0 codegen dispatches yields before the entry block, so waits
-    // must be a contiguous prefix. `guard ...; wait(50); return 204`
-    // would otherwise run the wait before the guard check.
+TEST(frontend, analyze_accepts_guard_before_wait) {
+    // Source-ordered wait lowering must run the guard before arming the wait.
     const char* src = "route GET \"/x\" { guard true else { return 500 } wait(50) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
 }
 
 TEST(frontend, analyze_accepts_wait_as_prefix_with_return) {
@@ -1464,10 +1495,8 @@ TEST(frontend, parse_wait_rejects_unknown_suffix) {
     CHECK(!ast);
 }
 
-TEST(frontend, analyze_rejects_wait_after_let_guard) {
-    // Non-let non-wait statements still gate subsequent waits. A guard
-    // between a let and a wait introduces a terminal-ish control path
-    // the state machine can't yet thread through.
+TEST(frontend, analyze_accepts_let_guard_wait_source_order) {
+    // Guards and waits are threaded in source order after pre-wait locals.
     const char* src =
         "route GET \"/x\" { let k = 42 guard k else { return 401 } wait(50) return 204 }\n";
     auto lexed = lex(lit(src));
@@ -1475,7 +1504,10 @@ TEST(frontend, analyze_rejects_wait_after_let_guard) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
 }
 
 TEST(frontend, analyze_accepts_wait_in_decorated_route) {
@@ -1559,6 +1591,279 @@ TEST(frontend, rir_function_carries_yield_payload_for_waits) {
     rir.destroy();
 }
 
+TEST(frontend, analyze_wait_event_statement_kinds) {
+    struct Case {
+        const char* src;
+        WaitEventKind kind;
+    };
+    const Case cases[] = {
+        {"route GET \"/x\" { wait() return 204 }\n", WaitEventKind::Any},
+        {"route GET \"/x\" { wait(downstream.recv()) return 204 }\n", WaitEventKind::Recv},
+        {"upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { wait(upstream(api).connect()) "
+         "return 204 }\n",
+         WaitEventKind::UpstreamConnect},
+        {"upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { wait(upstream(api).recv()) return "
+         "204 }\n",
+         WaitEventKind::UpstreamRecv},
+        {"upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { "
+         "wait(upstream(api).send(req.body)) return 204 }\n",
+         WaitEventKind::UpstreamSend},
+    };
+
+    for (const auto& c : cases) {
+        auto lexed = lex(lit(c.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+        CHECK_EQ(static_cast<u8>(hir->routes[0].waits[0].event_kind), static_cast<u8>(c.kind));
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        REQUIRE_EQ(mir->functions[0].waits.len, 1u);
+        CHECK_EQ(static_cast<u8>(mir->functions[0].waits[0].event_kind), static_cast<u8>(c.kind));
+    }
+}
+
+TEST(frontend, analyze_wait_result_fields) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(downstream.recv()) guard ev.ok else { return 500 } "
+        "guard ev.kind == 5 else { return 501 } guard ev.result > 0 else { return 502 } "
+        "if ev.eof { return 499 } else { return 204 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].waits[0].event_kind),
+             static_cast<u8>(WaitEventKind::Recv));
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].is_wait_result);
+    REQUIRE_EQ(hir->routes[0].guards.len, 3u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
+             static_cast<u8>(HirExprKind::WaitField));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[1].cond.kind), static_cast<u8>(HirExprKind::Eq));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[2].cond.kind), static_cast<u8>(HirExprKind::Gt));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.cond.kind),
+             static_cast<u8>(HirExprKind::WaitField));
+}
+
+TEST(frontend, analyze_rejects_unbound_wait_result_field) {
+    const char* src =
+        "route GET \"/x\" { guard wait(downstream.recv()).ok else { return 500 } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_rejects_wait_expression_outside_let_initializer) {
+    const char* sources[] = {
+        "route GET \"/x\" { guard wait(50) else { return 500 } return 204 }\n",
+        "route GET \"/x\" { guard wait(downstream.recv()) == 1 else { return 500 } return 204 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+    }
+}
+
+TEST(frontend, analyze_rejects_stale_wait_result_field_after_later_wait) {
+    const char* src =
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { let first = "
+        "wait(downstream.recv()) let second = "
+        "wait(upstream(api).connect()) guard first.ok else { return 500 } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, lower_wait_result_then_guard_let_preserves_local_refs) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(downstream.recv()) guard let code = 204 else { return "
+        "500 } guard code == 204 else { return 501 } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, lower_wait_result_then_match_terminal) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(downstream.recv()) match ev.kind { case 5: return 204 "
+        "case _: return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_wait_io_arguments_start_operations) {
+    const char* sources[] = {
+        "route GET \"/x\" { wait(downstream.recv()) return 204 }\n",
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { let ev = "
+        "wait(upstream(api).connect()) "
+        "return 204 }\n",
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { let ev = "
+        "wait(upstream(api).send(req.body)) "
+        "return 204 }\n",
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { let ev = "
+        "wait(upstream(api).recv()) "
+        "return 204 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    }
+}
+
+TEST(frontend, analyze_wait_upstream_recv_send_preserve_target_payload) {
+    const char* src =
+        "upstream api at \"127.0.0.1:9000\"\n"
+        "upstream other at \"127.0.0.1:9001\"\n"
+        "route GET \"/x\" { wait(upstream(other).recv()) wait(upstream(other).send(req.body)) "
+        "return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 2u);
+    CHECK_EQ(hir->routes[0].waits[0].event_kind, WaitEventKind::UpstreamRecv);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 2u);
+    CHECK_EQ(hir->routes[0].waits[1].event_kind, WaitEventKind::UpstreamSend);
+    CHECK_EQ(hir->routes[0].waits[1].ms, 2u);
+}
+
+TEST(frontend, analyze_wait_io_rejects_ignored_arguments) {
+    const char* sources[] = {
+        "route GET \"/x\" { wait(downstream.recv(req.body)) return 204 }\n",
+        "route GET \"/x\" { wait(downstream.send()) return 204 }\n",
+        "route GET \"/x\" { wait(downstream.send(response(200))) return 204 }\n",
+        "route GET \"/x\" { wait(any(downstream.send(), timer(250))) return 204 }\n",
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { "
+        "wait(upstream(api).send(123)) return 204 }\n",
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { "
+        "wait(upstream(api).send()) return 204 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+    }
+}
+
+TEST(frontend, analyze_wait_connect_argument_records_upstream_payload) {
+    const char* src =
+        "upstream api at \"127.0.0.1:9000\"\n"
+        "route GET \"/x\" { let ev = wait(upstream(api).connect()) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].event_kind, WaitEventKind::UpstreamConnect);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 1u);
+}
+
+TEST(frontend, analyze_wait_any_records_event_payload) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(250))) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].event_kind, WaitEventKind::Any);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 250u);
+}
+
+TEST(frontend, analyze_rejects_timer_only_wait_any) {
+    const char* src = "route GET \"/x\" { let ev = wait(any(timer(250))) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_rejects_parameterized_wait_any_arms_until_rich_payloads) {
+    const char* sources[] = {
+        "upstream api at \"127.0.0.1:9000\"\n"
+        "route GET \"/x\" { let ev = wait(any(upstream(api).connect(), timer(250))) return 204 "
+        "}\n",
+        "upstream api at \"127.0.0.1:9000\"\n"
+        "route GET \"/x\" { let ev = wait(any(upstream(api).recv(), timer(250))) return 204 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+    }
+}
+
+TEST(frontend, analyze_rejects_wait_after_for_loop) {
+    const char* sources[] = {
+        "route GET \"/x\" { for item in [1] { guard item > 0 else { return 400 } } "
+        "wait(50) return 204 }\n",
+        "route GET \"/x\" { for item in [1] { guard item > 0 else { return 400 } } "
+        "let ev = wait(downstream.recv()) return 204 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+    }
+}
+
 TEST(frontend, parse_route_rejects_wait_without_parens) {
     const char* src = "route GET \"/sleep\" { wait 1000 return 200 }\n";
     auto lexed = lex(lit(src));
@@ -1567,12 +1872,14 @@ TEST(frontend, parse_route_rejects_wait_without_parens) {
     REQUIRE(!ast);
 }
 
-TEST(frontend, parse_route_rejects_wait_non_integer_arg) {
+TEST(frontend, analyze_route_rejects_unsupported_wait_expr) {
     const char* src = "route GET \"/sleep\" { wait(\"1s\") return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
 }
 
 TEST(frontend, parse_route_block_single_entry_no_decorators) {

@@ -151,6 +151,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqPath:
             buf.put_cstr("req.path");
             break;
+        case Opcode::ResumeEventKind:
+            buf.put_cstr("resume.event_kind");
+            break;
+        case Opcode::ResumeEventResult:
+            buf.put_cstr("resume.event_result");
+            break;
         case Opcode::ReqRemoteAddr:
             buf.put_cstr("req.remote_addr");
             break;
@@ -470,6 +476,8 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::ReqMethod:
         case Opcode::ReqPath:
+        case Opcode::ResumeEventKind:
+        case Opcode::ResumeEventResult:
         case Opcode::ReqRemoteAddr:
         case Opcode::ReqContentLength:
         case Opcode::TimeNow:

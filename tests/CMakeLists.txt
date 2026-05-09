@@ -16,6 +16,7 @@ target_include_directories(test_network PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+target_compile_definitions(test_network PRIVATE RUT_TESTING=1)
 add_test(NAME test_network COMMAND test_network)
 set_tests_properties(test_network PROPERTIES LABELS "unit;network")
 

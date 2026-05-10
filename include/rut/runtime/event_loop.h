@@ -27,9 +27,11 @@ namespace rut {
 // No virtual functions, no vtable, no RTTI. The compiler inlines everything.
 //
 // Derived must implement:
-//   void submit_recv_impl(Connection& c)
+//   bool submit_recv_impl(Connection& c)
 //   void submit_send_impl(Connection& c, const u8* buf, u32 len)
-//   void submit_connect_impl(Connection& c, const void* addr, u32 addr_len)
+//   bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len)
+//   bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len)
+//   bool submit_recv_upstream_impl(Connection& c)
 //   void close_conn_impl(Connection& c)
 //   Connection* alloc_conn_impl()
 //   void free_conn_impl(Connection& c)
@@ -42,22 +44,22 @@ class EventLoopCRTP {
     Derived& self() { return static_cast<Derived&>(*this); }
 
 public:
-    void submit_recv(Connection& c) { self().submit_recv_impl(c); }
+    bool submit_recv(Connection& c) { return self().submit_recv_impl(c); }
     void submit_send(Connection& c, const u8* buf, u32 len) {
         self().submit_send_impl(c, buf, len);
     }
-    void submit_connect(Connection& c, const void* addr, u32 addr_len) {
-        self().submit_connect_impl(c, addr, addr_len);
+    bool submit_connect(Connection& c, const void* addr, u32 addr_len) {
+        return self().submit_connect_impl(c, addr, addr_len);
     }
     void close_conn(Connection& c) { self().close_conn_impl(c); }
     Connection* alloc_conn() { return self().alloc_conn_impl(); }
     void free_conn(Connection& c) { self().free_conn_impl(c); }
 
     // Upstream I/O: send/recv on upstream_fd instead of fd.
-    void submit_send_upstream(Connection& c, const u8* buf, u32 len) {
-        self().submit_send_upstream_impl(c, buf, len);
+    bool submit_send_upstream(Connection& c, const u8* buf, u32 len) {
+        return self().submit_send_upstream_impl(c, buf, len);
     }
-    void submit_recv_upstream(Connection& c) { self().submit_recv_upstream_impl(c); }
+    bool submit_recv_upstream(Connection& c) { return self().submit_recv_upstream_impl(c); }
 
     // Per-event-type dispatch: route to typed slot.
     // Called from each concrete EventLoop's dispatch() after timer refresh.
@@ -77,8 +79,11 @@ public:
             case IoEventType::UpstreamRecv:
                 if (conn.on_upstream_recv) {
                     conn.on_upstream_recv(&self(), conn, ev);
-                } else if (ev.result < 0) {
+                } else if (ev.result < 0 && conn.state != ConnState::ReadingHeader) {
                     // -ENOBUFS: upstream_recv_buf full, close to prevent hot-loop.
+                    // Once keep-alive has returned to ReadingHeader, negative
+                    // UpstreamRecv CQEs can be stale completions from a just-
+                    // closed upstream fd and must not kill the client.
                     self().close_conn(conn);
                 }
                 // null + result >= 0: data in upstream_recv_buf, safely ignored.
@@ -133,6 +138,7 @@ private:
 public:
     static constexpr u32 kMaxConns = 16384;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
+    static constexpr bool kSupportsEventYieldResume = false;
     SlicePool
         pool;  // per-shard buffer pool (3 slices max per connection: recv + send + upstream_recv)
     Connection conns[kMaxConns];
@@ -483,18 +489,20 @@ public:
         }
     }
 
-    void submit_recv_impl(Connection& c) {
+    bool submit_recv_impl(Connection& c) {
         if constexpr (Backend::kAsyncIo) {
             // Multishot recv stays armed across keep-alive cycles.
             // Skip re-submit to avoid inflating pending_ops.
-            if (c.recv_armed) return;
+            if (c.recv_armed) return true;
         }
         if (backend.add_recv(c.fd, c.id)) {
             if constexpr (Backend::kAsyncIo) {
                 c.pending_ops++;
                 c.recv_armed = true;
             }
+            return true;
         }
+        return false;
     }
     void submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if constexpr (requires(Backend& be, Connection& conn, const u8* ptr, u32 n) {
@@ -511,29 +519,35 @@ public:
             }
         }
     }
-    void submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
+    bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
             if constexpr (Backend::kAsyncIo) c.pending_ops++;
+            return true;
         }
+        return false;
     }
-    void submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+    bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
             if constexpr (Backend::kAsyncIo) {
                 c.pending_ops++;
                 c.upstream_send_armed = true;
             }
+            return true;
         }
+        return false;
     }
-    void submit_recv_upstream_impl(Connection& c) {
+    bool submit_recv_upstream_impl(Connection& c) {
         if constexpr (Backend::kAsyncIo) {
-            if (c.upstream_recv_armed) return;
+            if (c.upstream_recv_armed) return true;
         }
         if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
             if constexpr (Backend::kAsyncIo) {
                 c.pending_ops++;
                 c.upstream_recv_armed = true;
             }
+            return true;
         }
+        return false;
     }
 
     void close_conn_impl(Connection& c) {

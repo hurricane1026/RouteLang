@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 #include <deque>
 #include <string>
@@ -86,6 +87,8 @@ enum class HirExprKind : u8 {
     MissingOf,
     MatchPayload,
     ProtocolCall,
+    WaitResult,
+    WaitField,
 };
 
 enum class HirTypeKind : u8 {
@@ -325,6 +328,10 @@ struct HirExpr {
     u32 array_len = 0;
     HirExpr* lhs = nullptr;
     HirExpr* rhs = nullptr;
+    bool is_wait_result = false;
+    WaitEventKind wait_event_kind = WaitEventKind::Timer;
+    u32 wait_payload = 0;
+    u32 wait_index = 0xffffffffu;
     static constexpr u32 kMaxFieldInits = 8;
     // HIR-level cap stays at 8 even though AstExpr::kMaxArgs = 32: HirRoute
     // sits at ~300 KB on stack and is copied on each recursive
@@ -560,6 +567,10 @@ struct HirLocal {
     u32 shape_index = 0xffffffffu;
     u32 error_struct_index = 0xffffffffu;
     u32 error_variant_index = 0xffffffffu;
+    bool is_wait_result = false;
+    WaitEventKind wait_event_kind = WaitEventKind::Timer;
+    u32 wait_payload = 0;
+    u32 wait_index = 0xffffffffu;
     HirExpr init{};
 };
 
@@ -737,6 +748,7 @@ struct HirRoute {
     };
     struct Wait {
         Span span{};
+        WaitEventKind event_kind = WaitEventKind::Timer;
         u32 ms = 0;  // duration in milliseconds; packed into the u32 yield
                      // payload (status_code + upstream_id) at codegen time.
                      // Parser caps at UINT32_MAX (~49 days).

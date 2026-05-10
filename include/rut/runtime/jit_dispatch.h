@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/io_event.h"
 
 namespace rut {
 
@@ -29,6 +30,7 @@ struct JitDispatchOutcome {
         ReturnStatus,
         Forward,
         TimerYield,
+        EventYield,
         Error,
     };
 
@@ -36,6 +38,7 @@ struct JitDispatchOutcome {
     u16 status_code = 0;
     u16 upstream_id = 0;
     u16 next_state = 0;
+    jit::YieldKind yield_kind = jit::YieldKind::Timer;
     u32 timer_ms = 0;  // raw ms payload; callers pick their own precision
     // 1-based index into RouteConfig::response_bodies for
     // Kind::ReturnStatus; 0 = no custom body. Decoded from the
@@ -73,11 +76,33 @@ inline u32 timer_seconds_from_ms(u32 ms) {
     return secs > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<u32>(secs);
 }
 
+inline bool yield_kind_matches_event(jit::YieldKind kind, IoEventType type) {
+    if (kind == jit::YieldKind::Any) {
+        return type == IoEventType::Recv || type == IoEventType::Timeout ||
+               type == IoEventType::HandlerTimer;
+    }
+    if (kind == jit::YieldKind::Recv) return type == IoEventType::Recv;
+    if (kind == jit::YieldKind::Send) return type == IoEventType::Send;
+    if (kind == jit::YieldKind::UpstreamConnect) return type == IoEventType::UpstreamConnect;
+    if (kind == jit::YieldKind::UpstreamRecv) return type == IoEventType::UpstreamRecv;
+    if (kind == jit::YieldKind::UpstreamSend) return type == IoEventType::UpstreamSend;
+    return false;
+}
+
+inline jit::YieldKind yield_kind_from_event(IoEventType type) {
+    if (type == IoEventType::Recv) return jit::YieldKind::Recv;
+    if (type == IoEventType::Send) return jit::YieldKind::Send;
+    if (type == IoEventType::UpstreamConnect) return jit::YieldKind::UpstreamConnect;
+    if (type == IoEventType::UpstreamRecv) return jit::YieldKind::UpstreamRecv;
+    if (type == IoEventType::UpstreamSend) return jit::YieldKind::UpstreamSend;
+    return jit::YieldKind::Timer;
+}
+
 // Invoke a JIT-compiled handler once and translate the packed result
-// into an event-loop-facing outcome. Does NOT loop — each Yield returns
-// a TimerYield outcome, and the caller is expected to resume by setting
+// into an event-loop-facing outcome. Does NOT loop: a Yield returns either
+// TimerYield or EventYield, and the caller is expected to resume by setting
 // `ctx.state = out.next_state` and calling this function again after the
-// timer fires.
+// requested timer or event fires.
 //
 // Caller owns storage for `ctx`. For Layer 0 (no live-across-yield
 // locals) `ctx.slot_count == 0` and the same `ctx` is reused across
@@ -112,9 +137,19 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             out.upstream_id = r.upstream_id;
             return out;
         case jit::HandlerAction::Yield:
+            out.next_state = r.next_state;
+            out.yield_kind = r.yield_kind;
             if (r.yield_kind == jit::YieldKind::Timer) {
                 out.kind = JitDispatchOutcome::Kind::TimerYield;
-                out.next_state = r.next_state;
+                out.timer_ms = r.yield_payload_u32();
+                return out;
+            }
+            if (r.yield_kind == jit::YieldKind::Any || r.yield_kind == jit::YieldKind::Recv ||
+                r.yield_kind == jit::YieldKind::Send ||
+                r.yield_kind == jit::YieldKind::UpstreamConnect ||
+                r.yield_kind == jit::YieldKind::UpstreamRecv ||
+                r.yield_kind == jit::YieldKind::UpstreamSend) {
+                out.kind = JitDispatchOutcome::Kind::EventYield;
                 out.timer_ms = r.yield_payload_u32();
                 return out;
             }

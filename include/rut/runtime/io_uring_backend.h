@@ -118,7 +118,8 @@ struct IoUringBackend {
     // the timespec storage lives on the Connection because the kernel
     // reads it asynchronously. CQE completes with res == -ETIME under
     // normal expiry; the wait() path emits IoEvent{HandlerTimer, conn_id}
-    // regardless of res so the dispatcher can resume the handler.
+    // with IoEvent::result set to the connection's yield_timer_gen so
+    // the dispatcher can reject stale timeout CQEs.
     bool add_yield_timeout(u32 conn_id, Connection& conn, u32 ms);
 
     // Cancel outstanding operations for a connection (by user_data match).
@@ -131,7 +132,10 @@ struct IoUringBackend {
                bool upstream_recv_armed,
                bool upstream_send_armed,
                bool has_upstream,
-               bool yield_armed = false);
+               bool yield_armed = false,
+               u32 yield_timer_gen = 0);
+
+    bool cancel_yield_timeout(u32 conn_id, u32 yield_timer_gen);
 
     // Cancel the multishot accept request. Must be called before closing
     // listen_fd during drain to stop io_uring from accepting new connections.
@@ -149,20 +153,27 @@ struct IoUringBackend {
     // Return a provided buffer back to the ring after processing.
     void return_buffer(u16 buf_id);
 
+#ifdef RUT_TESTING
+public:
+#else
+private:
+#endif
+    // Encode/decode SQE user_data. Production callers should continue using the
+    // typed submit/cancel helpers.
+    static u64 encode_user_data(u32 conn_id, IoEventType type);
+    static u64 encode_user_data(u32 conn_id, IoEventType type, u32 aux);
+    static void decode_user_data(u64 data, u32& conn_id, IoEventType& type);
+    static void decode_user_data(u64 data, u32& conn_id, IoEventType& type, u32& aux);
+
 private:
     // Submit a cancel SQE matching a specific user_data value.
-    // conn_id is encoded in the cancel CQE's user_data so dispatch()
-    // can decrement pending_ops when the cancel completes.
-    bool cancel_by_user_data(u64 target, u32 conn_id, IoEventType type);
+    // conn_id/type/aux are encoded in the cancel CQE's user_data. Pass the real
+    // conn_id for tracked close-path cancels, or kCancelConnId for fire-and-
+    // forget cancels that should be consumed silently.
+    bool cancel_by_user_data(u64 target, u32 conn_id, IoEventType type, u32 aux = 0);
 
     // Get next available SQE. Returns nullptr if SQ is full.
     io_uring_sqe* get_sqe();
-
-    // Encode conn_id + event type into SQE user_data.
-    static u64 encode_user_data(u32 conn_id, IoEventType type);
-
-    // Decode user_data back into conn_id + event type.
-    static void decode_user_data(u64 data, u32& conn_id, IoEventType& type);
 
     // Setup provided buffer ring via io_uring_register.
     core::Expected<void, Error> setup_buf_ring();

@@ -260,9 +260,22 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         conn.upstream_fd = kUpstreamFd;
+        conn.upstream_idx = route->upstream_id;
         conn.upstream_start_us = monotonic_us();
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-        loop->submit_connect(conn, &target.addr, sizeof(target.addr));
+        if (!loop->submit_connect(conn, &target.addr, sizeof(target.addr))) {
+            ::close(conn.upstream_fd);
+            conn.upstream_fd = -1;
+            conn.upstream_idx = 0;
+            loop->clear_upstream_fd(conn.id);
+            conn.state = ConnState::Sending;
+            conn.resp_status = kStatusBadGateway;
+            format_static_response(conn, 502, false);
+            conn.keep_alive = false;
+            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
     } else if (route && route->action == RouteAction::Static) {
         conn.state = ConnState::Sending;
         conn.resp_status = route->status_code;
@@ -274,6 +287,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.handler_state = 0;  // entry state
         jit::HandlerCtx ctx{};
         ctx.state = 0;
+        ctx.resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
+        ctx.resume_event_result = 0;
         auto outcome = invoke_jit_handler(route->fn,
                                           static_cast<void*>(&conn),
                                           ctx,
@@ -315,6 +330,15 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
 
     on_request_complete(loop, conn, conn.resp_status, conn.send_buf.len());
     loop->epoch_leave();
+
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+    }
+    conn.upstream_idx = 0;
+    loop->clear_upstream_fd(conn.id);
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
 
     if (!conn.keep_alive) {
         loop->close_conn(conn);
@@ -423,6 +447,7 @@ void handle_jit_outcome(Loop* loop,
             // on epoll).
             conn.pending_handler_fn = fn;
             conn.handler_state = outcome.next_state;
+            conn.pending_yield_kind = jit::YieldKind::Timer;
             conn.state = ConnState::ExecHandler;
             conn.set_slots(nullptr, nullptr, nullptr, nullptr);
             if (loop->schedule_yield_timer(conn, outcome.timer_ms)) return;
@@ -443,6 +468,147 @@ void handle_jit_outcome(Loop* loop,
             // cover it, but only if the Send CQE arrives.
             loop->timer.add(&conn, loop->keepalive_timeout);
             loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
+        case JitDispatchOutcome::Kind::EventYield: {
+            conn.pending_handler_fn = fn;
+            conn.handler_state = outcome.next_state;
+            conn.pending_yield_kind = outcome.yield_kind;
+            conn.state = ConnState::ExecHandler;
+            conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+            auto send_bad_gateway = [&]() {
+                conn.pending_handler_fn = nullptr;
+                conn.state = ConnState::Sending;
+                conn.resp_status = kStatusBadGateway;
+                format_static_response(conn, 502, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            };
+            auto send_internal_error = [&]() {
+                conn.pending_handler_fn = nullptr;
+                conn.state = ConnState::Sending;
+                conn.resp_status = 500;
+                format_static_response(conn, 500, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            };
+            auto upstream_target_matches = [&]() {
+                if (conn.upstream_fd < 0) return false;
+                if (outcome.timer_ms == 0) return true;
+                return conn.upstream_idx == static_cast<u16>(outcome.timer_ms - 1);
+            };
+            if constexpr (requires { Loop::kSupportsEventYieldResume; }) {
+                if (!Loop::kSupportsEventYieldResume) {
+                    send_internal_error();
+                    return;
+                }
+            }
+            if (outcome.yield_kind == jit::YieldKind::Send) {
+                send_internal_error();
+                return;
+            } else if (outcome.yield_kind == jit::YieldKind::UpstreamConnect &&
+                       outcome.timer_ms != 0) {
+                const RouteConfig* config = conn.request_config;
+                const u32 upstream_id = outcome.timer_ms - 1;
+                if (!config || upstream_id >= config->upstream_count) {
+                    conn.pending_handler_fn = nullptr;
+                    conn.state = ConnState::Sending;
+                    conn.resp_status = kStatusBadGateway;
+                    format_static_response(conn, 502, /*keep_alive=*/false);
+                    conn.keep_alive = false;
+                    conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
+                auto& target = config->upstreams[upstream_id];
+                const i32 kUpstreamFd = UpstreamPool::create_socket();
+                if (kUpstreamFd < 0) {
+                    conn.pending_handler_fn = nullptr;
+                    conn.state = ConnState::Sending;
+                    conn.resp_status = kStatusBadGateway;
+                    format_static_response(conn, 502, /*keep_alive=*/false);
+                    conn.keep_alive = false;
+                    conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
+                if (conn.upstream_fd >= 0) {
+                    ::close(conn.upstream_fd);
+                    conn.upstream_fd = -1;
+                    conn.upstream_idx = 0;
+                    loop->clear_upstream_fd(conn.id);
+                    conn.upstream_recv_armed = false;
+                    conn.upstream_send_armed = false;
+                }
+                conn.upstream_fd = kUpstreamFd;
+                conn.upstream_idx = static_cast<u16>(upstream_id);
+                conn.upstream_start_us = monotonic_us();
+                if (!loop->submit_connect(conn, &target.addr, sizeof(target.addr))) {
+                    ::close(conn.upstream_fd);
+                    conn.upstream_fd = -1;
+                    conn.upstream_idx = 0;
+                    loop->clear_upstream_fd(conn.id);
+                    send_bad_gateway();
+                    return;
+                }
+            } else if (outcome.yield_kind == jit::YieldKind::UpstreamSend) {
+                if (upstream_target_matches()) {
+                    if (!loop->submit_send_upstream(
+                            conn, conn.recv_buf.data(), conn.recv_buf.len())) {
+                        send_bad_gateway();
+                        return;
+                    }
+                } else {
+                    send_bad_gateway();
+                    return;
+                }
+            } else if (outcome.yield_kind == jit::YieldKind::UpstreamRecv) {
+                if (upstream_target_matches()) {
+                    if (!loop->submit_recv_upstream(conn)) {
+                        send_bad_gateway();
+                        return;
+                    }
+                } else {
+                    send_bad_gateway();
+                    return;
+                }
+            }
+            const bool waits_downstream_recv = outcome.yield_kind == jit::YieldKind::Any ||
+                                               outcome.yield_kind == jit::YieldKind::Recv;
+            if (!waits_downstream_recv) {
+                if constexpr (requires(Loop* lp, u32 conn_id) {
+                                  lp->backend.pause_recv(conn_id);
+                              }) {
+                    loop->backend.pause_recv(conn.id);
+                }
+            }
+            if (outcome.yield_kind == jit::YieldKind::Any && outcome.timer_ms != 0 &&
+                !loop->schedule_yield_timer(conn, outcome.timer_ms)) {
+                send_internal_error();
+                loop->timer.refresh(&conn, loop->keepalive_timeout);
+                return;
+            }
+            auto disarm_yield_timer = [&]() {
+                if constexpr (requires(Loop* lp, Connection& c) { lp->disarm_yield_timer(c); }) {
+                    loop->disarm_yield_timer(conn);
+                } else {
+                    conn.yield_armed = false;
+                }
+            };
+            if ((outcome.yield_kind == jit::YieldKind::Any ||
+                 outcome.yield_kind == jit::YieldKind::Recv) &&
+                conn.fd >= 0 && !conn.recv_armed) {
+                if (!loop->submit_recv(conn)) {
+                    if (conn.yield_armed) {
+                        disarm_yield_timer();
+                        loop->timer.refresh(&conn, loop->keepalive_timeout);
+                    }
+                    send_internal_error();
+                    return;
+                }
+            }
             return;
         }
         case JitDispatchOutcome::Kind::Forward: {
@@ -472,6 +638,14 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_name[target.name_len] = '\0';
             else
                 conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
+            if (conn.upstream_fd >= 0) {
+                ::close(conn.upstream_fd);
+                conn.upstream_fd = -1;
+                conn.upstream_idx = 0;
+                loop->clear_upstream_fd(conn.id);
+                conn.upstream_recv_armed = false;
+                conn.upstream_send_armed = false;
+            }
             const i32 kUpstreamFd = UpstreamPool::create_socket();
             if (kUpstreamFd < 0) {
                 conn.state = ConnState::Sending;
@@ -505,16 +679,15 @@ void handle_jit_outcome(Loop* loop,
 
 template <typename Loop>
 void resume_jit_handler(Loop* loop, Connection& conn) {
-    // schedule_yield_timer took the conn off the keepalive wheel while
-    // the precise timer owned its wakeup. Restore it before running the
-    // handler: non-TimerYield outcomes submit I/O whose completion will
-    // call timer.refresh via dispatch_event, but until that happens a
-    // silent peer has no backstop. A chained wait removes again via
-    // schedule_yield_timer, so this is harmless when yielding again.
-    loop->timer.add(&conn, loop->keepalive_timeout);
+    // A yielded handler can resume while still on the keepalive wheel
+    // (pure event waits) or after schedule_yield_timer removed it.
+    // refresh handles both without double-inserting the intrusive node.
+    loop->timer.refresh(&conn, loop->keepalive_timeout);
     auto* fn = conn.pending_handler_fn;
     jit::HandlerCtx ctx{};
     ctx.state = conn.handler_state;
+    ctx.resume_event_kind = static_cast<u32>(conn.resume_event_kind);
+    ctx.resume_event_result = conn.resume_event_result;
     auto outcome = invoke_jit_handler(fn,
                                       static_cast<void*>(&conn),
                                       ctx,

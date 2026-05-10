@@ -24,6 +24,12 @@ enum class YieldKind : u8 {
     Timer = 3,  // sleep for N ms; payload packed across status_code +
                 // upstream_id as a u32 (~49 days). See make_yield_payload /
                 // yield_payload_u32.
+    Any = 4,
+    Recv = 5,
+    Send = 6,
+    UpstreamConnect = 7,
+    UpstreamRecv = 8,
+    UpstreamSend = 9,
 };
 
 // ── Handler Result ─────────────────────────────────────────────────
@@ -118,9 +124,11 @@ struct HandlerResult {
 // determined at compile time by the state-splitting pass.
 
 struct HandlerCtx {
-    u16 state;        // current state machine state
-    u16 handler_idx;  // index into CompiledHandlers::handlers[]
-    u32 slot_count;   // number of 8-byte slots following this header
+    u16 state;                // current state machine state
+    u16 handler_idx;          // index into CompiledHandlers::handlers[]
+    u32 slot_count;           // number of 8-byte slots following this header
+    u32 resume_event_kind;    // YieldKind value that resumed this handler
+    i32 resume_event_result;  // IoEvent::result for event waits
 
     // Access slot storage (8-byte aligned, immediately after header).
     u8* slots() { return reinterpret_cast<u8*>(this + 1); }
@@ -146,7 +154,7 @@ struct HandlerCtx {
     }
 };
 
-static_assert(sizeof(HandlerCtx) == 8, "HandlerCtx header must be 8 bytes");
+static_assert(sizeof(HandlerCtx) == 16, "HandlerCtx header must be 16 bytes");
 
 // ── Handler Function Pointer ───────────────────────────────────────
 // JIT-compiled handlers return u64 (not a struct) to guarantee

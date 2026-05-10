@@ -84,6 +84,9 @@ struct ConnectionBase {
     //     to distinguish "resume JIT handler" from "keepalive expired,
     //     close connection". Reset to null on terminal outcome.
     u16 handler_state;
+    jit::YieldKind pending_yield_kind;
+    jit::YieldKind resume_event_kind;
+    i32 resume_event_result;
     void* handler_ctx;
     jit::HandlerFn pending_handler_fn;
 
@@ -111,6 +114,7 @@ struct ConnectionBase {
     // stable lifetime. Unused by the epoll backend (which uses a shared
     // yield_timer_fd + min-heap).
     __kernel_timespec yield_timespec;
+    u32 yield_timer_gen = 0;
 
     bool keep_alive;
     bool tls_active;
@@ -224,6 +228,9 @@ struct ConnectionBase {
         upstream_fd = -1;
         upstream_idx = 0;
         handler_state = 0;
+        pending_yield_kind = jit::YieldKind::Timer;
+        resume_event_kind = jit::YieldKind::Timer;
+        resume_event_result = 0;
         handler_ctx = nullptr;
         // Deliberately NOT reset here: handler_gen persists across
         // reset() so a stale YieldHeap entry whose target slot was
@@ -233,6 +240,7 @@ struct ConnectionBase {
         pending_handler_fn = nullptr;
         yield_timespec.tv_sec = 0;
         yield_timespec.tv_nsec = 0;
+        yield_timer_gen = 0;
         keep_alive = false;
         tls_active = false;
         tls_handshake_complete = false;

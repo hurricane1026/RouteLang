@@ -869,8 +869,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef off = LLVMConstInt(c.i32_ty, byte_offset, 0);
             LLVMValueRef ptr =
                 LLVMBuildGEP2(c.builder, c.i8_ty, c.param_ctx, &off, 1, "ctx.slot.ptr");
-            LLVMValueRef v = c.get_value(inst.operands[0]);
-            LLVMBuildStore(c.builder, v, ptr);
+            LLVMTypeRef slot_ptr_ty = LLVMPointerType(c.i64_ty, 0);
+            LLVMValueRef slot_ptr = LLVMBuildBitCast(c.builder, ptr, slot_ptr_ty, "ctx.slot.ptr64");
+            LLVMValueRef value64 =
+                LLVMBuildZExt(c.builder, c.get_value(inst.operands[0]), c.i64_ty, "ctx.slot.value");
+            LLVMBuildStore(c.builder, value64, slot_ptr);
             LLVMBuildBr(c.builder, cont_bb);
 
             LLVMPositionBuilderAtEnd(c.builder, cont_bb);

@@ -615,11 +615,13 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
         if (unpacked.action != jit::HandlerAction::Yield) break;
         result.yield_count++;
         // Advance to the continuation segment. Simulate mode treats the
-        // requested wait as immediately completed with a successful result,
-        // which lets wait-result frame slots preserve branch behavior without
-        // opening sockets or ticking timers.
-        ctx.resume_event_kind = static_cast<u32>(unpacked.yield_kind);
-        ctx.resume_event_result = 1;
+        // requested wait as immediately completed and sets the synthetic
+        // wake-up event. For wait(any), choose a concrete event kind so
+        // event predicates observe a deterministic branch in offline tests.
+        jit::YieldKind resume_kind = unpacked.yield_kind;
+        if (resume_kind == jit::YieldKind::Any) resume_kind = jit::YieldKind::Recv;
+        ctx.resume_event_kind = static_cast<u32>(resume_kind);
+        ctx.resume_event_result = (resume_kind == jit::YieldKind::Timer) ? 0 : 1;
         ctx.state = unpacked.next_state;
     }
     if (unpacked.action == jit::HandlerAction::Yield) {

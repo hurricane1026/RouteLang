@@ -470,6 +470,42 @@ TEST(simulate_engine, wait_result_fields_survive_later_waits) {
     rir.destroy();
 }
 
+TEST(simulate_engine, wait_any_statement_uses_concrete_wait_kind) {
+    const char* src =
+        "route GET \"/x\" { wait any { downstream.recv() => { return 204 } timer(50) => { return 408 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, timer_wait_result_matches_runtime_zero) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(50) if ev.result == 0 { return 204 } else { return 500 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, forward_upstream_match) {
     Manifest manifest{};
     manifest.upstream_count = 1;

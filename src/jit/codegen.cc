@@ -92,6 +92,11 @@ struct Ctx {
     LLVMValueRef fn_str_regex_match;
     LLVMValueRef fn_str_trim_prefix;
 
+    // Scratch storage for conditional slot stores when the handler frame
+    // does not provide per-resume slots. This keeps codegen branchless
+    // by redirecting disabled writes to an internal i64 sink.
+    LLVMValueRef ctx_store_sink = nullptr;
+
     // Cache for map_type: LLVM literal structs (Optional<composite>, Struct
     // with a StructDef) are identity-compared, so emitting a fresh
     // LLVMStructTypeInContext call per lookup produces *different* LLVM types
@@ -847,28 +852,24 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef count = LLVMBuildLoad2(c.builder, c.i32_ty, count_ptr, "ctx.slot.count");
             LLVMValueRef has_slot = LLVMBuildICmp(
                 c.builder, LLVMIntUGT, count, LLVMConstInt(c.i32_ty, slot, 0), "ctx.has.slot");
-
-            LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(c.builder);
-            LLVMValueRef fn = LLVMGetBasicBlockParent(cur_bb);
-            LLVMBasicBlockRef store_bb =
-                LLVMAppendBasicBlockInContext(c.llvm_ctx, fn, "ctx.slot.store");
-            LLVMBasicBlockRef cont_bb =
-                LLVMAppendBasicBlockInContext(c.llvm_ctx, fn, "ctx.slot.store.cont");
-            LLVMBuildCondBr(c.builder, has_slot, store_bb, cont_bb);
-
-            LLVMPositionBuilderAtEnd(c.builder, store_bb);
             const u32 byte_offset = static_cast<u32>(sizeof(HandlerCtx)) + slot * 8u;
             LLVMValueRef off = LLVMConstInt(c.i32_ty, byte_offset, 0);
             LLVMValueRef ptr =
                 LLVMBuildGEP2(c.builder, c.i8_ty, c.param_ctx, &off, 1, "ctx.slot.ptr");
             LLVMTypeRef slot_ptr_ty = LLVMPointerType(c.i64_ty, 0);
             LLVMValueRef slot_ptr = LLVMBuildBitCast(c.builder, ptr, slot_ptr_ty, "ctx.slot.ptr64");
+
+            if (!c.ctx_store_sink) {
+                LLVMBasicBlockRef sink_bb = LLVMGetInsertBlock(c.builder);
+                c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+                LLVMPositionBuilderAtEnd(c.builder, sink_bb);
+            }
+
+            LLVMValueRef slot_store_ptr =
+                LLVMBuildSelect(c.builder, has_slot, slot_ptr, c.ctx_store_sink, "ctx.slot.store.ptr");
             LLVMValueRef value64 =
                 LLVMBuildZExt(c.builder, c.get_value(inst.operands[0]), c.i64_ty, "ctx.slot.value");
-            LLVMBuildStore(c.builder, value64, slot_ptr);
-            LLVMBuildBr(c.builder, cont_bb);
-
-            LLVMPositionBuilderAtEnd(c.builder, cont_bb);
+            LLVMBuildStore(c.builder, value64, slot_store_ptr);
             break;
         }
         case rir::Opcode::StructCreate: {
@@ -1012,6 +1013,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
 
 static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.cur_fn = &fn;
+    c.ctx_store_sink = nullptr;
 
     // Build function name: "handler_<name>"
     char fname[256];

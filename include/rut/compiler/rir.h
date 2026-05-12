@@ -149,11 +149,10 @@ enum class Opcode : u8 {
     ReqPath,            // %r = req.path                 → str
     ResumeEventKind,    // %r = ctx.resume_event_kind    → i32
     ResumeEventResult,  // %r = ctx.resume_event_result → i32
-    CtxLoadSlotI32,     // %r = ctx.slot[i]            → i32
-                        // Falls back to current resume metadata when
-                        // slot data is unavailable: even index slots
-                        // read resume_event_kind, odd index slots read
-                        // resume_event_result.
+    CtxLoadSlotI32,     // %r = ctx.slot[i] if i < ctx.slot_count → i32
+                        // Otherwise reads current resume metadata:
+                        // even index slots read resume_event_kind,
+                        // odd index slots read resume_event_result.
     ReqRemoteAddr,      // %r = req.remote_addr          → IP
     ReqContentLength,   // %r = req.content_length       → ByteSize
     ReqCookie,          // %r = req.cookie "name"        → Optional(str)
@@ -161,7 +160,9 @@ enum class Opcode : u8 {
     // ── Request mutation ──
     ReqSetHeader,     // req.set_header "Name", %val
     ReqSetPath,       // req.set_path %path
-    CtxStoreSlotI32,  // ctx.slot[i] = %val (stored as zero-extended i64 slot)
+    CtxStoreSlotI32,  // if i < ctx.slot_count: ctx.slot[i] = %val
+                      // Stored as a zero-extended i64 slot. If no slot
+                      // is available, the write is ignored.
 
     // ── String operations ──
     StrHasPrefix,    // %r = str.has_prefix %s, %pfx    → bool

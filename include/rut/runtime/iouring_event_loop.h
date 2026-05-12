@@ -379,7 +379,7 @@ public:
                                             c.upstream_recv_armed,
                                             c.upstream_send_armed,
                                             c.upstream_fd >= 0,
-                                            c.yield_armed,
+                                            c.yield_timeout_armed,
                                             c.yield_timer_gen);
         }
         if (c.fd >= 0) {
@@ -448,6 +448,7 @@ public:
         // inject data.
         if (backend.add_yield_timeout(conn.id, conn, ms)) {
             conn.yield_armed = true;
+            conn.yield_timeout_armed = true;
             conn.pending_ops++;
             return true;
         }
@@ -464,6 +465,7 @@ public:
         // analyze rejects wait(0) upstream, so this is defence-in-depth.
         if (secs == 0) secs = 1;
         conn.yield_armed = true;
+        conn.yield_timeout_armed = false;
         timer.add(&conn, secs);
         return true;
     }
@@ -471,10 +473,12 @@ public:
     void disarm_yield_timer(Connection& conn) {
         if (!conn.yield_armed) return;
         const u32 old_gen = conn.yield_timer_gen;
+        const bool timeout_armed = conn.yield_timeout_armed;
         conn.yield_armed = false;
+        conn.yield_timeout_armed = false;
         conn.yield_timer_gen++;
         timer.remove(&conn);
-        (void)backend.cancel_yield_timeout(conn.id, old_gen);
+        if (timeout_armed) (void)backend.cancel_yield_timeout(conn.id, old_gen);
     }
 
     void dispatch(const IoEvent& ev) {
@@ -497,7 +501,10 @@ public:
                 if (c.pending_ops > 0) c.pending_ops--;
                 const bool matching_generation = ev.result == static_cast<i32>(c.yield_timer_gen);
                 const bool was_yield_armed = c.yield_armed;
-                if (matching_generation) c.yield_armed = false;
+                if (matching_generation) {
+                    c.yield_armed = false;
+                    c.yield_timeout_armed = false;
+                }
                 if (c.pending_handler_fn && matching_generation &&
                     (c.pending_yield_kind == jit::YieldKind::Timer ||
                      (was_yield_armed &&
@@ -526,6 +533,7 @@ public:
                          (c->yield_armed &&
                           yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
                         c->yield_armed = false;
+                        c->yield_timeout_armed = false;
                         c->resume_event_kind = jit::YieldKind::Timer;
                         c->resume_event_result = 0;
                         resume_jit_handler<IoUringEventLoop>(this, *c);

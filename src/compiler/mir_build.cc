@@ -574,6 +574,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.is_wait_result = expr.is_wait_result;
         v.wait_event_kind = expr.wait_event_kind;
         v.wait_payload = expr.wait_payload;
+        v.wait_index = expr.wait_index;
         v.variant_index = expr.variant_index;
         v.struct_index = expr.struct_index;
         v.local_index = expr.local_index;
@@ -588,6 +589,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.is_wait_result = true;
         v.wait_event_kind = expr.wait_event_kind;
         v.wait_payload = expr.wait_payload;
+        v.wait_index = expr.wait_index;
         return v;
     }
     if (expr.kind == HirExprKind::WaitField) {
@@ -599,6 +601,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.type = mir_type_kind(expr.type);
         v.str_value = expr.str_value;
         v.lhs = &fn->values[fn->values.len - 1];
+        v.wait_index = lhs->wait_index;
         return v;
     }
     return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -811,6 +814,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             local.is_wait_result = module.routes[i].locals[li].is_wait_result;
             local.wait_event_kind = module.routes[i].locals[li].wait_event_kind;
             local.wait_payload = module.routes[i].locals[li].wait_payload;
+            local.wait_index = module.routes[i].locals[li].wait_index;
             auto init = mir_value(module.routes[i].locals[li].init, module, &fn);
             if (!init) return core::make_unexpected(init.error());
             local.init = init.value();

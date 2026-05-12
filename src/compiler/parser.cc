@@ -1022,6 +1022,40 @@ struct Parser {
             return stmt;
         }
         if (take(TokenType::KwWait)) {
+            if (cur().type == TokenType::Ident && cur().text.eq({"any", 3}) &&
+                peek().type == TokenType::LBrace) {
+                const Token any_tok = cur();
+                pos++;
+                auto lbrace = expect(TokenType::LBrace);
+                if (!lbrace) return core::make_unexpected(lbrace.error());
+                AstStatement stmt{};
+                stmt.kind = AstStmtKind::WaitAny;
+                stmt.span = Span{start.start, any_tok.end, start.line, start.col};
+                while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+                    AstStatement::MatchArm arm{};
+                    arm.span = span_from(cur());
+                    auto event = parse_expr();
+                    if (!event) return core::make_unexpected(event.error());
+                    arm.pattern = event.value();
+                    auto arrow = expect(TokenType::Arrow);
+                    if (!arrow) return core::make_unexpected(arrow.error());
+                    auto body_lbrace = expect(TokenType::LBrace);
+                    if (!body_lbrace) return core::make_unexpected(body_lbrace.error());
+                    auto body = parse_braced_stmt_body(*body_lbrace.value());
+                    if (!body) return core::make_unexpected(body.error());
+                    auto body_ptr = alloc_stmt(body.value());
+                    if (!body_ptr) return core::make_unexpected(body_ptr.error());
+                    arm.stmt = body_ptr.value();
+                    arm.span =
+                        Span{arm.span.start, body.value().span.end, arm.span.line, arm.span.col};
+                    if (!stmt.match_arms.push(arm))
+                        return frontend_error(FrontendError::TooManyItems, arm.span);
+                }
+                auto rbrace = expect(TokenType::RBrace);
+                if (!rbrace) return core::make_unexpected(rbrace.error());
+                stmt.span = Span{start.start, rbrace.value()->end, start.line, start.col};
+                return stmt;
+            }
             auto lparen = expect(TokenType::LParen);
             if (!lparen) return core::make_unexpected(lparen.error());
             AstStatement stmt{};

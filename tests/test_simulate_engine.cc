@@ -3,6 +3,7 @@
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/rir_builder.h"
 #include "rut/runtime/route_method.h"
 #include "rut/sim/simulate_engine.h"
 #include "test.h"
@@ -357,18 +358,29 @@ TEST(simulate_engine, static_status_match) {
 // The caller must keep `rir` alive for as long as the Engine.
 static bool compile_to_rir(const char* src, FrontendRirModule& rir) {
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
-    if (!lexed) return false;
+    if (!lexed) {
+        return false;
+    }
     auto ast = parse_file(lexed.value());
-    if (!ast) return false;
+    if (!ast) {
+        return false;
+    }
     std::unique_ptr<AstFile> ast_owned(ast.value());
     auto hir = analyze_file(*ast_owned);
-    if (!hir) return false;
+    if (!hir) {
+        return false;
+    }
     std::unique_ptr<HirModule> hir_owned(hir.value());
     auto mir = build_mir(*hir_owned);
-    if (!mir) return false;
+    if (!mir) {
+        return false;
+    }
     std::unique_ptr<MirModule> mir_owned(mir.value());
     auto lowered = lower_to_rir(*mir_owned, rir);
-    return lowered.has_value();
+    if (!lowered) {
+        return false;
+    }
+    return true;
 }
 
 TEST(simulate_engine, wait_handler_drives_state_machine_to_terminal_status) {
@@ -446,6 +458,223 @@ TEST(simulate_engine, multiple_waits_all_drive_then_return) {
     CHECK_EQ(result.verdict, Verdict::Match);
     CHECK_EQ(result.actual_status, 201u);
     CHECK_EQ(result.yield_count, 3u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, repeated_yield_at_cap_fails_without_status_zero_mismatch) {
+    ModuleContext ctx{};
+    REQUIRE(ctx.init(1));
+
+    rir::Builder b;
+    b.init(&ctx.module);
+
+    auto fn_res = b.create_function({"loop", 4}, {"/loop", 5}, kRouteMethodGet);
+    REQUIRE(fn_res);
+    auto* fn = fn_res.value();
+    auto entry_res = b.create_block(fn, {"entry", 5});
+    REQUIRE(entry_res);
+
+    const u32 payloads[] = {1};
+    const u8 kinds[] = {static_cast<u8>(jit::YieldKind::Timer)};
+    REQUIRE(b.set_yield_payload(fn, payloads, 1, kinds));
+    const rir::BlockId resume_blocks[] = {entry_res.value(), entry_res.value()};
+    REQUIRE(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry_res.value());
+    REQUIRE(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 1, 1));
+
+    Engine engine;
+    REQUIRE(engine.init(ctx.module, nullptr, 0));
+
+    const auto result =
+        simulate_one(engine, make_entry("GET /loop HTTP/1.1\r\nHost: x\r\n\r\n", 200));
+    CHECK_EQ(result.verdict, Verdict::Failed);
+    CHECK_EQ(result.actual_status, 0u);
+    CHECK_EQ(result.yield_count, 32u);
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
+TEST(simulate_engine, wait_result_fields_survive_later_waits) {
+    const char* src =
+        "route GET \"/x\" { let first = wait(50) let second = wait(downstream.recv()) if "
+        "first.timer { guard second.ok else { return 500 } return 204 } else { return 502 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 2u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, wait_any_statement_uses_concrete_wait_kind) {
+    const char* src =
+        "route GET \"/x\" { wait any { downstream.recv() => { return 204 } timer(50) => { return "
+        "408 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+    REQUIRE_GE(rir.module.func_count, 1u);
+    REQUIRE_GE(rir.module.functions[0].yield_count, 1u);
+    CHECK_EQ(rir.module.functions[0].yield_kinds[0], static_cast<u8>(jit::YieldKind::Any));
+    CHECK_EQ(rir.module.functions[0].yield_payload[0], 50u);
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 408));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 408u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, wait_any_statement_can_match_recv_winner) {
+    const char* src =
+        "route GET \"/x\" { wait any { downstream.recv() => { return 204 } timer(50) => { return "
+        "408 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, wait_any_expression_can_resume_with_timer_predicate) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(50))) if ev.timer { "
+        "return 408 } else { return 204 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 408));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 408u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, wait_any_expression_can_match_recv_predicate) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(50))) if ev.timer { "
+        "return 408 } else { return 204 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, nested_wait_any_can_match_later_recv_winner) {
+    const char* src =
+        "route GET \"/x\" { "
+        "let first = wait(any(downstream.recv(), timer(50))) "
+        "guard first.recv else { return 408 } "
+        "let second = wait(any(downstream.recv(), timer(50))) "
+        "if second.recv { return 204 } else { return 409 } "
+        "}\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 2u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, wait_any_prefers_terminal_mismatch_over_failed_candidate) {
+    const char* src =
+        "upstream api\n"
+        "route GET \"/x\" { wait any { downstream.recv() => { return forward(api) } timer(50) => "
+        "{ return 408 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Mismatch);
+    CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(result.actual_status, 408u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, timer_wait_result_matches_runtime_zero) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(50) if ev.result == 0 { return 204 } else { return 500 } "
+        "}\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, upstream_connect_wait_result_matches_runtime_zero) {
+    const char* src =
+        "upstream api at \"127.0.0.1:9000\"\n"
+        "route GET \"/x\" { let ev = wait(upstream(api).connect()) if ev.result == 0 { return "
+        "204 } else { return 500 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 1u);
 
     engine.shutdown();
     rir.destroy();

@@ -104,9 +104,10 @@ inline jit::YieldKind yield_kind_from_event(IoEventType type) {
 // `ctx.state = out.next_state` and calling this function again after the
 // requested timer or event fires.
 //
-// Caller owns storage for `ctx`. For Layer 0 (no live-across-yield
-// locals) `ctx.slot_count == 0` and the same `ctx` is reused across
-// resumes; the entry call must set `ctx.state = 0`.
+// Caller owns storage for `ctx`. If the handler reads wait result fields after
+// a resume, `ctx` must include the 8-byte-aligned frame slots advertised by
+// `slot_count`, and the same 8-byte-aligned storage must be reused across
+// resumes. The entry call must set `ctx.state = 0`.
 inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
                                              void* conn,
                                              jit::HandlerCtx& ctx,

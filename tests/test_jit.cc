@@ -32,6 +32,13 @@ static Str lit(const char* s) {
     return {s, n};
 }
 
+struct TestHandlerCtxFrame {
+    HandlerCtx ctx{};
+    u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
+
+    TestHandlerCtxFrame() { ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots; }
+};
+
 // RAII wrapper — frontend APIs (parse_file/analyze_file/build_mir) all
 // .release() a unique_ptr. Without ownership the raw pointer leaks; the
 // test suite was leaking ~75 MB per test case before this guard landed.
@@ -14133,7 +14140,8 @@ route {
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
     auto r = HandlerResult::unpack(handler(nullptr,
                                            &ctx,
@@ -14174,7 +14182,8 @@ route {
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
     auto r0 = HandlerResult::unpack(handler(nullptr,
                                             &ctx,
@@ -14226,7 +14235,8 @@ route {
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
     const u32 expected_ms[] = {100u, 200u};
     for (u16 state = 0; state < 2; state++) {
@@ -14280,10 +14290,10 @@ route GET "/sleep" { wait(1000) return 200 }
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
     ctx.handler_idx = 0;
-    ctx.slot_count = 0;
 
     // First call: state=0 → yield
     auto r0 = HandlerResult::unpack(handler(nullptr,
@@ -14353,7 +14363,8 @@ TEST(jit, frontend_route_event_waits_emit_event_yield_kinds) {
         auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
         REQUIRE(handler != nullptr);
 
-        HandlerCtx ctx{};
+        TestHandlerCtxFrame frame{};
+        HandlerCtx& ctx = frame.ctx;
         ctx.state = 0;
         auto r0 = HandlerResult::unpack(handler(nullptr,
                                                 &ctx,
@@ -14377,6 +14388,80 @@ TEST(jit, frontend_route_event_waits_emit_event_yield_kinds) {
         engine.shutdown();
         rir.destroy();
     }
+}
+
+TEST(jit, frontend_route_wait_any_statement_branches_on_winning_event) {
+    const auto src = R"rut(
+route GET "/x" {
+    wait any {
+        downstream.recv() => { return 204 }
+        timer(250) => { return 408 }
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame recv_frame{};
+    HandlerCtx& recv_ctx = recv_frame.ctx;
+    auto first = HandlerResult::unpack(handler(nullptr,
+                                               &recv_ctx,
+                                               reinterpret_cast<const u8*>(kGetRootRequest),
+                                               sizeof(kGetRootRequest) - 1,
+                                               nullptr));
+    REQUIRE_EQ(static_cast<u8>(first.action), static_cast<u8>(HandlerAction::Yield));
+    CHECK_EQ(first.next_state, 1);
+    CHECK_EQ(static_cast<u8>(first.yield_kind), static_cast<u8>(YieldKind::Any));
+    CHECK_EQ(first.yield_payload_u32(), 250u);
+
+    recv_ctx.state = first.next_state;
+    recv_ctx.resume_event_kind = static_cast<u32>(YieldKind::Recv);
+    recv_ctx.resume_event_result = 8;
+    auto recv_done = HandlerResult::unpack(handler(nullptr,
+                                                   &recv_ctx,
+                                                   reinterpret_cast<const u8*>(kGetRootRequest),
+                                                   sizeof(kGetRootRequest) - 1,
+                                                   nullptr));
+    CHECK_EQ(static_cast<u8>(recv_done.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(recv_done.status_code, 204);
+
+    TestHandlerCtxFrame timer_frame{};
+    HandlerCtx& timer_ctx = timer_frame.ctx;
+    auto timer_first = HandlerResult::unpack(handler(nullptr,
+                                                     &timer_ctx,
+                                                     reinterpret_cast<const u8*>(kGetRootRequest),
+                                                     sizeof(kGetRootRequest) - 1,
+                                                     nullptr));
+    REQUIRE_EQ(static_cast<u8>(timer_first.action), static_cast<u8>(HandlerAction::Yield));
+    timer_ctx.state = timer_first.next_state;
+    timer_ctx.resume_event_kind = static_cast<u32>(YieldKind::Timer);
+    timer_ctx.resume_event_result = 0;
+    auto timer_done = HandlerResult::unpack(handler(nullptr,
+                                                    &timer_ctx,
+                                                    reinterpret_cast<const u8*>(kGetRootRequest),
+                                                    sizeof(kGetRootRequest) - 1,
+                                                    nullptr));
+    CHECK_EQ(static_cast<u8>(timer_done.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(timer_done.status_code, 408);
+
+    engine.shutdown();
+    rir.destroy();
 }
 
 TEST(jit, decorated_route_prologue_yields_preserve_event_kind) {
@@ -14406,7 +14491,8 @@ route {
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     auto first = HandlerResult::unpack(handler(nullptr,
                                                &ctx,
                                                reinterpret_cast<const u8*>(kGetRootRequest),
@@ -14468,7 +14554,8 @@ route GET "/x" {
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
     auto r0 = HandlerResult::unpack(handler(nullptr,
                                             &ctx,
@@ -14523,6 +14610,61 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(jit, frontend_route_wait_result_store_skips_missing_frame_slots) {
+    const auto src = R"rut(
+route GET "/x" {
+    let ev = wait(downstream.recv())
+    if ev.recv { return 204 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    struct NoSlotCtx {
+        HandlerCtx ctx{};
+        u64 canary0 = 0x1122334455667788ull;
+        u64 canary1 = 0x8877665544332211ull;
+    } frame;
+
+    auto first = HandlerResult::unpack(handler(nullptr,
+                                               &frame.ctx,
+                                               reinterpret_cast<const u8*>(kGetRootRequest),
+                                               sizeof(kGetRootRequest) - 1,
+                                               nullptr));
+    REQUIRE_EQ(static_cast<u8>(first.action), static_cast<u8>(HandlerAction::Yield));
+    frame.ctx.state = first.next_state;
+    frame.ctx.resume_event_kind = static_cast<u32>(YieldKind::Recv);
+    frame.ctx.resume_event_result = 8;
+    auto done = HandlerResult::unpack(handler(nullptr,
+                                              &frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetRootRequest),
+                                              sizeof(kGetRootRequest) - 1,
+                                              nullptr));
+    CHECK_EQ(static_cast<u8>(done.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(done.status_code, 204);
+    CHECK_EQ(frame.canary0, 0x1122334455667788ull);
+    CHECK_EQ(frame.canary1, 0x8877665544332211ull);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_route_parameterized_event_waits_emit_payloads) {
     struct Case {
         const char* src;
@@ -14555,7 +14697,8 @@ TEST(jit, frontend_route_parameterized_event_waits_emit_payloads) {
         auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
         REQUIRE(handler != nullptr);
 
-        HandlerCtx ctx{};
+        TestHandlerCtxFrame frame{};
+        HandlerCtx& ctx = frame.ctx;
         ctx.state = 0;
         auto r0 = HandlerResult::unpack(handler(nullptr,
                                                 &ctx,
@@ -14569,6 +14712,154 @@ TEST(jit, frontend_route_parameterized_event_waits_emit_payloads) {
         engine.shutdown();
         rir.destroy();
     }
+}
+
+TEST(jit, frontend_route_wait_event_predicate_fields_drive_control_flow) {
+    struct Case {
+        const char* wait_src;
+        const char* field;
+        YieldKind resume_kind;
+    };
+    const Case cases[] = {
+        {"wait(any(downstream.recv(), timer(250)))", "timer", YieldKind::Timer},
+        {"wait(downstream.recv())", "recv", YieldKind::Recv},
+        {"wait(downstream.recv())", "send", YieldKind::Send},
+        {"wait(upstream(api).connect())", "upstream_connect", YieldKind::UpstreamConnect},
+        {"wait(upstream(api).recv())", "upstream_recv", YieldKind::UpstreamRecv},
+        {"wait(upstream(api).send(req.body))", "upstream_send", YieldKind::UpstreamSend},
+    };
+    for (const auto& c : cases) {
+        char src[320];
+        int n = snprintf(src,
+                         sizeof(src),
+                         "upstream api at \"127.0.0.1:9000\"\n"
+                         "route GET \"/x\" { let ev = %s if ev.%s { return 204 } else { return "
+                         "500 } }\n",
+                         c.wait_src,
+                         c.field);
+        REQUIRE(n > 0);
+        REQUIRE(static_cast<size_t>(n) < sizeof(src));
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler != nullptr);
+
+        TestHandlerCtxFrame frame{};
+        HandlerCtx& ctx = frame.ctx;
+        ctx.state = 0;
+        auto yielded = HandlerResult::unpack(handler(nullptr,
+                                                     &ctx,
+                                                     reinterpret_cast<const u8*>(kGetRootRequest),
+                                                     sizeof(kGetRootRequest) - 1,
+                                                     nullptr));
+        REQUIRE_EQ(static_cast<u8>(yielded.action), static_cast<u8>(HandlerAction::Yield));
+        ctx.state = yielded.next_state;
+        ctx.resume_event_kind = static_cast<u32>(c.resume_kind);
+        ctx.resume_event_result = 1;
+        auto matched = HandlerResult::unpack(handler(nullptr,
+                                                     &ctx,
+                                                     reinterpret_cast<const u8*>(kGetRootRequest),
+                                                     sizeof(kGetRootRequest) - 1,
+                                                     nullptr));
+        CHECK_EQ(static_cast<u8>(matched.action), static_cast<u8>(HandlerAction::ReturnStatus));
+        CHECK_EQ(matched.status_code, 204);
+
+        ctx.resume_event_kind = static_cast<u32>(YieldKind::Timer);
+        if (c.resume_kind == YieldKind::Timer)
+            ctx.resume_event_kind = static_cast<u32>(YieldKind::Recv);
+        auto missed = HandlerResult::unpack(handler(nullptr,
+                                                    &ctx,
+                                                    reinterpret_cast<const u8*>(kGetRootRequest),
+                                                    sizeof(kGetRootRequest) - 1,
+                                                    nullptr));
+        CHECK_EQ(static_cast<u8>(missed.action), static_cast<u8>(HandlerAction::ReturnStatus));
+        CHECK_EQ(missed.status_code, 500);
+
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
+TEST(jit, frontend_route_wait_result_fields_survive_later_waits) {
+    const auto src = R"rut(
+route GET "/x" {
+    let first = wait(any(downstream.recv(), timer(250)))
+    let second = wait(downstream.recv())
+    if first.timer {
+        if second.recv { return 204 } else { return 501 }
+    } else {
+        return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
+    ctx.state = 0;
+    auto first_yield = HandlerResult::unpack(handler(nullptr,
+                                                     &ctx,
+                                                     reinterpret_cast<const u8*>(kGetRootRequest),
+                                                     sizeof(kGetRootRequest) - 1,
+                                                     nullptr));
+    REQUIRE_EQ(static_cast<u8>(first_yield.action), static_cast<u8>(HandlerAction::Yield));
+    CHECK_EQ(static_cast<u8>(first_yield.yield_kind), static_cast<u8>(YieldKind::Any));
+
+    ctx.state = first_yield.next_state;
+    ctx.resume_event_kind = static_cast<u32>(YieldKind::Timer);
+    ctx.resume_event_result = 0;
+    auto second_yield = HandlerResult::unpack(handler(nullptr,
+                                                      &ctx,
+                                                      reinterpret_cast<const u8*>(kGetRootRequest),
+                                                      sizeof(kGetRootRequest) - 1,
+                                                      nullptr));
+    REQUIRE_EQ(static_cast<u8>(second_yield.action), static_cast<u8>(HandlerAction::Yield));
+    CHECK_EQ(static_cast<u8>(second_yield.yield_kind), static_cast<u8>(YieldKind::Recv));
+
+    ctx.state = second_yield.next_state;
+    ctx.resume_event_kind = static_cast<u32>(YieldKind::Recv);
+    ctx.resume_event_result = 8;
+    auto done = HandlerResult::unpack(handler(nullptr,
+                                              &ctx,
+                                              reinterpret_cast<const u8*>(kGetRootRequest),
+                                              sizeof(kGetRootRequest) - 1,
+                                              nullptr));
+    CHECK_EQ(static_cast<u8>(done.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(done.status_code, 204);
+
+    engine.shutdown();
+    rir.destroy();
 }
 
 TEST(jit, frontend_route_multiple_waits_chain_through_states) {
@@ -14595,7 +14886,8 @@ route GET "/sleep" { wait(500) wait(1000) return 201 }
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
     ctx.handler_idx = 0;
 
@@ -14653,7 +14945,8 @@ route GET "/" {
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
     auto r0 = HandlerResult::unpack(handler(nullptr,
                                             &ctx,
@@ -14728,7 +15021,8 @@ route GET "/sleep" { wait(1500) return 200 }
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
 
     // First call: TimerYield carrying raw 1500 ms payload.
@@ -14784,7 +15078,8 @@ route GET "/long" { wait(100000) return 200 }
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
     auto outcome = invoke_jit_handler(handler,
                                       nullptr,

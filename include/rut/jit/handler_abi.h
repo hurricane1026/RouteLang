@@ -123,7 +123,7 @@ struct HandlerResult {
 // Each slot is 8-byte aligned. The number and types of slots are
 // determined at compile time by the state-splitting pass.
 
-struct HandlerCtx {
+struct alignas(alignof(u64)) HandlerCtx {
     u16 state;                // current state machine state
     u16 handler_idx;          // index into CompiledHandlers::handlers[]
     u32 slot_count;           // number of 8-byte slots following this header
@@ -155,6 +155,9 @@ struct HandlerCtx {
 };
 
 static_assert(sizeof(HandlerCtx) == 16, "HandlerCtx header must be 16 bytes");
+static_assert(alignof(HandlerCtx) >= alignof(u64), "HandlerCtx must be 8-byte aligned");
+static_assert(sizeof(HandlerCtx) % alignof(u64) == 0,
+              "HandlerCtx slots must start at an 8-byte-aligned offset");
 
 // ── Handler Function Pointer ───────────────────────────────────────
 // JIT-compiled handlers return u64 (not a struct) to guarantee

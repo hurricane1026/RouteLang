@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 #include <deque>
@@ -761,7 +762,7 @@ struct HirRoute {
     static constexpr u32 kMaxGuards = 8;
     static constexpr u32 kMaxExprs = 64;
     static constexpr u32 kMaxDecorators = 8;
-    static constexpr u32 kMaxWaits = 4;
+    static constexpr u32 kMaxWaits = kMaxRouteWaits;
     // 2 for-loops per route covers realistic DSL patterns (one allowlist
     // check + one server-pool iteration) while keeping HirRoute under the
     // stack budget. Each HirForLoop is ~10 KB even at kMaxGuards=2; a

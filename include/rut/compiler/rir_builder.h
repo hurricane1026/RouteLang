@@ -453,6 +453,13 @@ struct Builder {
         return TRY(emit(Opcode::ResumeEventResult, ty, loc)).vid;
     }
 
+    Result<ValueId> emit_ctx_load_slot_i32(u32 slot, SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(Opcode::CtxLoadSlotI32, ty, loc));
+        inst->imm.i32_val = static_cast<i32>(slot);
+        return vid;
+    }
+
     Result<ValueId> emit_req_remote_addr(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::IP));
         return TRY(emit(Opcode::ReqRemoteAddr, ty, loc)).vid;
@@ -486,6 +493,15 @@ struct Builder {
         if (!val_has_type(path, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));
         r.inst->operands[0] = path;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
+    VoidResult emit_ctx_store_slot_i32(u32 slot, ValueId value, SourceLoc loc = {}) {
+        if (!val_has_type(value, TypeKind::I32)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::CtxStoreSlotI32, nullptr, loc));
+        r.inst->imm.i32_val = static_cast<i32>(slot);
+        r.inst->operands[0] = value;
         r.inst->operand_count = 1;
         return {};
     }

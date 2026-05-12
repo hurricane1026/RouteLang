@@ -4420,15 +4420,16 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (base->is_wait_result) {
             if (base->kind != HirExprKind::LocalRef)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-            if (base->wait_index + 1 != route->waits.len)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
             out.kind = HirExprKind::WaitField;
             out.span = expr.span;
             out.str_value = expr.name;
             out.is_wait_result = false;
             if (expr.name.eq({"kind", 4}) || expr.name.eq({"result", 6})) {
                 out.type = HirTypeKind::I32;
-            } else if (expr.name.eq({"ok", 2}) || expr.name.eq({"eof", 3})) {
+            } else if (expr.name.eq({"ok", 2}) || expr.name.eq({"eof", 3}) ||
+                       expr.name.eq({"timer", 5}) || expr.name.eq({"recv", 4}) ||
+                       expr.name.eq({"send", 4}) || expr.name.eq({"upstream_connect", 16}) ||
+                       expr.name.eq({"upstream_recv", 13}) || expr.name.eq({"upstream_send", 13})) {
                 out.type = HirTypeKind::Bool;
             } else {
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
@@ -7565,6 +7566,76 @@ static FrontendResult<WaitSpec> analyze_wait_stmt_spec(const AstStatement& stmt,
     return analyze_wait_io_op_spec(expr, mod);
 }
 
+static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& stmt,
+                                                          HirRoute& route,
+                                                          const HirModule& mod) {
+    if (stmt.match_arms.len != 2)
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+
+    u32 timer_ms = 0;
+    const AstStatement* timer_stmt = nullptr;
+    const AstStatement* recv_stmt = nullptr;
+    for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+        const auto& arm = stmt.match_arms[ai];
+        u32 arm_timer_ms = 0;
+        if (wait_timer_call_ms(arm.pattern, arm_timer_ms)) {
+            if (timer_stmt != nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+            timer_ms = arm_timer_ms;
+            timer_stmt = arm.stmt;
+            continue;
+        }
+        auto event_spec = analyze_wait_io_op_spec(arm.pattern, mod);
+        if (!event_spec) return core::make_unexpected(event_spec.error());
+        if (event_spec->kind != WaitEventKind::Recv || event_spec->payload != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+        if (recv_stmt != nullptr) return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+        recv_stmt = arm.stmt;
+    }
+    if (timer_stmt == nullptr || recv_stmt == nullptr || timer_ms == 0)
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    if (timer_stmt->kind != AstStmtKind::ReturnStatus &&
+        timer_stmt->kind != AstStmtKind::ForwardUpstream)
+        return frontend_error(FrontendError::UnsupportedSyntax, timer_stmt->span);
+    if (recv_stmt->kind != AstStmtKind::ReturnStatus &&
+        recv_stmt->kind != AstStmtKind::ForwardUpstream)
+        return frontend_error(FrontendError::UnsupportedSyntax, recv_stmt->span);
+
+    HirRoute::Wait wait{};
+    wait.span = stmt.span;
+    wait.event_kind = WaitEventKind::Any;
+    wait.ms = timer_ms;
+    const u32 wait_index = route.waits.len;
+    if (!route.waits.push(wait)) return frontend_error(FrontendError::TooManyItems, stmt.span);
+
+    HirExpr base{};
+    base.kind = HirExprKind::WaitResult;
+    base.type = HirTypeKind::Unknown;
+    base.span = stmt.span;
+    base.is_wait_result = true;
+    base.wait_event_kind = WaitEventKind::Any;
+    base.wait_payload = timer_ms;
+    base.wait_index = wait_index;
+    if (!route.exprs.push(base)) return frontend_error(FrontendError::TooManyItems, stmt.span);
+
+    HirExpr cond{};
+    cond.kind = HirExprKind::WaitField;
+    cond.type = HirTypeKind::Bool;
+    cond.span = stmt.span;
+    cond.str_value = {"timer", 5};
+    cond.lhs = &route.exprs[route.exprs.len - 1];
+
+    route.control.kind = HirControlKind::If;
+    route.control.cond = cond;
+    auto then_term = analyze_term(*timer_stmt, mod);
+    if (!then_term) return core::make_unexpected(then_term.error());
+    auto else_term = analyze_term(*recv_stmt, mod);
+    if (!else_term) return core::make_unexpected(else_term.error());
+    route.control.then_term = then_term.value();
+    route.control.else_term = else_term.value();
+    return {};
+}
+
 static FrontendResult<HirModule*> analyze_file_internal(
     const AstFile& file,
     Str source_path,
@@ -10258,6 +10329,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!route.guards.push(guard))
                     return frontend_error(FrontendError::TooManyItems, stmt.span);
                 continue;
+            }
+            if (stmt.kind == AstStmtKind::WaitAny) {
+                if (seen_for) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                auto wait_any = analyze_wait_any_stmt_control(stmt, route, mod);
+                if (!wait_any) return core::make_unexpected(wait_any.error());
+                seen_wait = true;
+                if (si + 1 != item.route.statements.len)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.route.statements[si + 1].span);
+                break;
             }
             if (stmt.kind == AstStmtKind::For) {
                 seen_for = true;

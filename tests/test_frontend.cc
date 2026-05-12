@@ -1305,8 +1305,35 @@ TEST(frontend, analyze_wait_any_statement_lowers_to_any_wait_and_if_control) {
     CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::If));
     CHECK_EQ(static_cast<u8>(hir->routes[0].control.cond.kind),
              static_cast<u8>(HirExprKind::WaitField));
+    REQUIRE(hir->routes[0].control.cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.cond.lhs->kind),
+             static_cast<u8>(HirExprKind::WaitResult));
+    CHECK_EQ(hir->routes[0].locals.len, 0u);
     CHECK_EQ(hir->routes[0].control.then_term.status_code, 408u);
     CHECK_EQ(hir->routes[0].control.else_term.status_code, 204u);
+}
+
+TEST(frontend, wait_any_statement_does_not_consume_local_slot) {
+    const char* src =
+        "route GET \"/x\" { "
+        "let a0 = 0 let a1 = 1 let a2 = 2 let a3 = 3 "
+        "let a4 = 4 let a5 = 5 let a6 = 6 let a7 = 7 "
+        "let a8 = 8 let a9 = 9 let a10 = 10 let a11 = 11 "
+        "let a12 = 12 let a13 = 13 let a14 = 14 "
+        "wait any { downstream.recv() => { return 204 } timer(250) => { return 408 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 15u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::If));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 15u);
 }
 
 TEST(frontend, analyze_records_multiple_waits_in_order) {

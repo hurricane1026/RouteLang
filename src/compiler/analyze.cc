@@ -7608,28 +7608,10 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
     const u32 wait_index = route.waits.len;
     if (!route.waits.push(wait)) return frontend_error(FrontendError::TooManyItems, stmt.span);
 
-    HirLocal local{};
-    local.span = stmt.span;
-    local.ref_index = next_local_ref_index(&route, route.locals.data, route.locals.len);
-    local.type = HirTypeKind::Unknown;
-    local.is_wait_result = true;
-    local.wait_event_kind = WaitEventKind::Any;
-    local.wait_payload = timer_ms;
-    local.wait_index = wait_index;
-    local.init.kind = HirExprKind::WaitResult;
-    local.init.type = HirTypeKind::Unknown;
-    local.init.span = stmt.span;
-    local.init.is_wait_result = true;
-    local.init.wait_event_kind = WaitEventKind::Any;
-    local.init.wait_payload = timer_ms;
-    local.init.wait_index = wait_index;
-    if (!route.locals.push(local)) return frontend_error(FrontendError::TooManyItems, stmt.span);
-
     HirExpr base{};
-    base.kind = HirExprKind::LocalRef;
+    base.kind = HirExprKind::WaitResult;
     base.type = HirTypeKind::Unknown;
     base.span = stmt.span;
-    base.local_index = local.ref_index;
     base.is_wait_result = true;
     base.wait_event_kind = WaitEventKind::Any;
     base.wait_payload = timer_ms;

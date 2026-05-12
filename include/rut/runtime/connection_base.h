@@ -94,9 +94,8 @@ struct ConnectionBase {
     i32 resume_event_result;
     void* handler_ctx;
     jit::HandlerFn pending_handler_fn;
-    alignas(alignof(u64)) u8
-        handler_ctx_storage[sizeof(jit::HandlerCtx) +
-                            static_cast<size_t>(kMaxJitHandlerSlots) * 8]{};
+    alignas(alignof(u64)) u8 handler_ctx_storage[sizeof(jit::HandlerCtx) +
+                                                 static_cast<size_t>(kMaxJitHandlerSlots) * 8]{};
 
     jit::HandlerCtx* reset_jit_ctx() {
         __builtin_memset(handler_ctx_storage, 0, sizeof(handler_ctx_storage));

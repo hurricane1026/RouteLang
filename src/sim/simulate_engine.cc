@@ -209,12 +209,49 @@ static void init_sim_handler_frame(SimHandlerFrame& frame) {
     frame.ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots;
 }
 
+static i32 synthetic_resume_result(jit::YieldKind kind) {
+    switch (kind) {
+        case jit::YieldKind::Timer:
+        case jit::YieldKind::UpstreamConnect:
+            return 0;
+        case jit::YieldKind::Recv:
+        case jit::YieldKind::Send:
+        case jit::YieldKind::UpstreamRecv:
+        case jit::YieldKind::UpstreamSend:
+        case jit::YieldKind::HttpGet:
+        case jit::YieldKind::HttpPost:
+        case jit::YieldKind::Forward:
+        case jit::YieldKind::Any:
+            return 1;
+    }
+    return 1;
+}
+
 static void apply_synthetic_resume(jit::HandlerCtx& ctx,
                                    const jit::HandlerResult& yielded,
                                    jit::YieldKind kind) {
     ctx.resume_event_kind = static_cast<u32>(kind);
-    ctx.resume_event_result = (kind == jit::YieldKind::Timer) ? 0 : 1;
+    ctx.resume_event_result = synthetic_resume_result(kind);
     ctx.state = yielded.next_state;
+}
+
+static u8 non_match_verdict_rank(Verdict verdict) {
+    switch (verdict) {
+        case Verdict::Mismatch:
+            return 0;
+        case Verdict::Unsupported:
+            return 1;
+        case Verdict::Failed:
+            return 2;
+        case Verdict::Match:
+            return 3;
+    }
+    return 2;
+}
+
+static SimulateResult prefer_non_match_result(const SimulateResult& lhs,
+                                              const SimulateResult& rhs) {
+    return non_match_verdict_rank(lhs.verdict) <= non_match_verdict_rank(rhs.verdict) ? lhs : rhs;
 }
 
 static const char* verdict_str(Verdict verdict) {
@@ -554,19 +591,121 @@ static SimulateResult finalize_handler_result(const Engine& engine,
     return result;
 }
 
+static SimulateResult drive_handler_to_completion(const Engine& engine,
+                                                  const Engine::CompiledRoute& route,
+                                                  const CaptureEntry& entry,
+                                                  Connection& conn,
+                                                  SimHandlerFrame frame,
+                                                  SimulateResult result,
+                                                  u32 max_yields);
+
+template <u32 N>
+static void copy_char_array(char (&dst)[N], const char (&src)[N]) {
+    for (u32 i = 0; i < N; i++) dst[i] = src[i];
+}
+
+static Str copy_req_path_canon(const Connection& src, Connection& dst) {
+    const char* src_begin = src.req_path;
+    const char* src_end = src.req_path + Connection::kMaxReqPathLen;
+    if (src.req_path_canon.ptr >= src_begin && src.req_path_canon.ptr < src_end) {
+        const auto offset = static_cast<u32>(src.req_path_canon.ptr - src_begin);
+        if (offset < Connection::kMaxReqPathLen) {
+            return {dst.req_path + offset, src.req_path_canon.len};
+        }
+    }
+    return src.req_path_canon;
+}
+
+static void copy_sim_connection_state(Connection& dst, const Connection& src) {
+    dst.reset();
+
+    dst.on_recv = src.on_recv;
+    dst.on_send = src.on_send;
+    dst.on_upstream_recv = src.on_upstream_recv;
+    dst.on_upstream_send = src.on_upstream_send;
+    dst.fd = src.fd;
+    dst.id = src.id;
+    dst.state = src.state;
+    dst.shard_id = src.shard_id;
+    dst.flags = src.flags;
+    dst.timer_slot = src.timer_slot;
+    dst.upstream_fd = src.upstream_fd;
+    dst.upstream_idx = src.upstream_idx;
+    dst.handler_state = src.handler_state;
+    dst.pending_yield_kind = src.pending_yield_kind;
+    dst.resume_event_kind = src.resume_event_kind;
+    dst.resume_event_result = src.resume_event_result;
+    dst.handler_ctx = nullptr;
+    dst.pending_handler_fn = src.pending_handler_fn;
+    dst.handler_gen = src.handler_gen;
+    dst.request_config = src.request_config;
+    dst.yield_timespec = src.yield_timespec;
+    dst.yield_timer_gen = src.yield_timer_gen;
+    dst.keep_alive = src.keep_alive;
+    dst.tls_active = src.tls_active;
+    dst.tls_handshake_complete = src.tls_handshake_complete;
+    dst.tls = src.tls;
+    dst.pipeline_depth = src.pipeline_depth;
+    dst.pipeline_stash_len = src.pipeline_stash_len;
+    dst.req_header_end = src.req_header_end;
+    dst.req_content_length = src.req_content_length;
+    dst.req_initial_send_len = src.req_initial_send_len;
+    dst.req_malformed = src.req_malformed;
+    dst.req_body_mode = src.req_body_mode;
+    dst.req_body_remaining = src.req_body_remaining;
+    dst.req_chunk_parser = src.req_chunk_parser;
+    dst.resp_body_mode = src.resp_body_mode;
+    dst.resp_body_remaining = src.resp_body_remaining;
+    dst.resp_chunk_parser = src.resp_chunk_parser;
+    dst.resp_body_sent = src.resp_body_sent;
+    dst.upstream_send_len = src.upstream_send_len;
+    dst.recv_armed = src.recv_armed;
+    dst.send_armed = src.send_armed;
+    dst.upstream_recv_armed = src.upstream_recv_armed;
+    dst.upstream_send_armed = src.upstream_send_armed;
+    dst.yield_armed = src.yield_armed;
+    dst.yield_timeout_armed = src.yield_timeout_armed;
+    dst.resp_status = src.resp_status;
+    dst.req_method = src.req_method;
+    dst.req_size = src.req_size;
+    dst.peer_addr = src.peer_addr;
+    copy_char_array(dst.req_path, src.req_path);
+    dst.req_path_canon = copy_req_path_canon(src, dst);
+    dst.upstream_us = src.upstream_us;
+    copy_char_array(dst.upstream_name, src.upstream_name);
+    dst.upstream_start_us = src.upstream_start_us;
+    dst.capture_buf = src.capture_buf;
+    dst.capture_header_len = src.capture_header_len;
+    dst.req_start_us = src.req_start_us;
+    dst.pending_ops = src.pending_ops;
+}
+
 static SimulateResult simulate_resume_candidate(const Engine& engine,
                                                 const Engine::CompiledRoute& route,
                                                 const CaptureEntry& entry,
+                                                Connection& conn,
                                                 SimHandlerFrame frame,
                                                 const jit::HandlerResult& yielded,
                                                 jit::YieldKind resume_kind,
                                                 SimulateResult result,
                                                 u32 max_yields) {
-    Connection conn;
-    conn.reset();
     apply_synthetic_resume(frame.ctx, yielded, resume_kind);
+    return drive_handler_to_completion(engine, route, entry, conn, frame, result, max_yields);
+}
 
-    jit::HandlerResult unpacked = yielded;
+static SimulateResult drive_handler_to_completion(const Engine& engine,
+                                                  const Engine::CompiledRoute& route,
+                                                  const CaptureEntry& entry,
+                                                  Connection& conn,
+                                                  SimHandlerFrame frame,
+                                                  SimulateResult result,
+                                                  u32 max_yields) {
+    if (result.yield_count >= max_yields) {
+        result.verdict = Verdict::Failed;
+        return result;
+    }
+
+    jit::HandlerResult unpacked{};
     for (u32 iter = result.yield_count; iter < max_yields; iter++) {
         const u64 kPacked =
             route.fn(&conn, &frame.ctx, entry.raw_headers, entry.raw_header_len, nullptr);
@@ -574,12 +713,38 @@ static SimulateResult simulate_resume_candidate(const Engine& engine,
         if (unpacked.action != jit::HandlerAction::Yield) break;
         result.yield_count++;
 
-        jit::YieldKind next_kind = unpacked.yield_kind;
-        if (next_kind == jit::YieldKind::Any) {
-            next_kind =
-                (unpacked.yield_payload_u32() == 0u) ? jit::YieldKind::Recv : jit::YieldKind::Timer;
+        if (unpacked.yield_kind == jit::YieldKind::Any && unpacked.yield_payload_u32() != 0u) {
+            Connection recv_conn;
+            copy_sim_connection_state(recv_conn, conn);
+            const SimulateResult recv_result = simulate_resume_candidate(engine,
+                                                                         route,
+                                                                         entry,
+                                                                         recv_conn,
+                                                                         frame,
+                                                                         unpacked,
+                                                                         jit::YieldKind::Recv,
+                                                                         result,
+                                                                         max_yields);
+            if (recv_result.verdict == Verdict::Match) return recv_result;
+
+            Connection timer_conn;
+            copy_sim_connection_state(timer_conn, conn);
+            const SimulateResult timer_result = simulate_resume_candidate(engine,
+                                                                          route,
+                                                                          entry,
+                                                                          timer_conn,
+                                                                          frame,
+                                                                          unpacked,
+                                                                          jit::YieldKind::Timer,
+                                                                          result,
+                                                                          max_yields);
+            if (timer_result.verdict == Verdict::Match) return timer_result;
+            return prefer_non_match_result(recv_result, timer_result);
         }
-        apply_synthetic_resume(frame.ctx, unpacked, next_kind);
+
+        jit::YieldKind resume_kind = unpacked.yield_kind;
+        if (resume_kind == jit::YieldKind::Any) resume_kind = jit::YieldKind::Recv;
+        apply_synthetic_resume(frame.ctx, unpacked, resume_kind);
     }
 
     return finalize_handler_result(engine, entry, result, unpacked);
@@ -674,7 +839,6 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     conn.reset();
     SimHandlerFrame frame;
     init_sim_handler_frame(frame);
-    jit::HandlerCtx& ctx = frame.ctx;
 
     // Drive the handler's state machine to completion. Yields are the
     // handler's signal "I need I/O, resume me with state=next_state".
@@ -688,51 +852,8 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     // is deliberately small: real handlers yield at most a handful of times
     // per spec (submit + wait batches, not loops).
     static constexpr u32 kMaxHandlerYields = 32;
-    jit::HandlerResult unpacked{};
-    for (u32 iter = 0; iter < kMaxHandlerYields; iter++) {
-        const u64 kPacked =
-            route->fn(&conn, &ctx, entry.raw_headers, entry.raw_header_len, nullptr);
-        unpacked = jit::HandlerResult::unpack(kPacked);
-        if (unpacked.action != jit::HandlerAction::Yield) break;
-        result.yield_count++;
-
-        if (unpacked.yield_kind == jit::YieldKind::Any && unpacked.yield_payload_u32() != 0u) {
-            const SimulateResult recv_result = simulate_resume_candidate(engine,
-                                                                         *route,
-                                                                         entry,
-                                                                         frame,
-                                                                         unpacked,
-                                                                         jit::YieldKind::Recv,
-                                                                         result,
-                                                                         kMaxHandlerYields);
-            if (recv_result.verdict == Verdict::Match) return recv_result;
-
-            const SimulateResult timer_result = simulate_resume_candidate(engine,
-                                                                          *route,
-                                                                          entry,
-                                                                          frame,
-                                                                          unpacked,
-                                                                          jit::YieldKind::Timer,
-                                                                          result,
-                                                                          kMaxHandlerYields);
-            if (timer_result.verdict == Verdict::Match) return timer_result;
-            return recv_result;
-        }
-
-        // Advance to the continuation segment. Simulate mode treats the
-        // requested wait as immediately completed and sets the synthetic
-        // wake-up event. For wait(any), choose a concrete event kind so
-        // event predicates observe a deterministic branch in offline tests.
-        jit::YieldKind resume_kind = unpacked.yield_kind;
-        if (resume_kind == jit::YieldKind::Any) {
-            // Use the timeout winner when a timer arm exists (Any with
-            // non-zero payload), otherwise fall back to recv.
-            resume_kind = (unpacked.yield_payload_u32() == 0u) ? jit::YieldKind::Recv
-                                                                : jit::YieldKind::Timer;
-        }
-        apply_synthetic_resume(ctx, unpacked, resume_kind);
-    }
-    return finalize_handler_result(engine, entry, result, unpacked);
+    return drive_handler_to_completion(
+        engine, *route, entry, conn, frame, result, kMaxHandlerYields);
 }
 
 SimulateSummary simulate_file(Engine& engine, ReplayReader& reader) {

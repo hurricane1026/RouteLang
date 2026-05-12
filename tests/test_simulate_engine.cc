@@ -472,7 +472,7 @@ TEST(simulate_engine, wait_result_fields_survive_later_waits) {
     Engine engine;
     REQUIRE(engine.init(rir.module, nullptr, 0));
 
-    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 408));
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
     CHECK_EQ(result.verdict, Verdict::Match);
     CHECK_EQ(result.actual_status, 204u);
     CHECK_EQ(result.yield_count, 2u);

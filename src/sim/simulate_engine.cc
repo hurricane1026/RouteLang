@@ -198,6 +198,25 @@ static u32 visible_path_len(Str path) {
     return n;
 }
 
+struct SimHandlerFrame {
+    jit::HandlerCtx ctx{};
+    u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
+};
+
+static void init_sim_handler_frame(SimHandlerFrame& frame) {
+    frame.ctx.state = 0;
+    frame.ctx.handler_idx = 0;
+    frame.ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots;
+}
+
+static void apply_synthetic_resume(jit::HandlerCtx& ctx,
+                                   const jit::HandlerResult& yielded,
+                                   jit::YieldKind kind) {
+    ctx.resume_event_kind = static_cast<u32>(kind);
+    ctx.resume_event_result = (kind == jit::YieldKind::Timer) ? 0 : 1;
+    ctx.state = yielded.next_state;
+}
+
 static const char* verdict_str(Verdict verdict) {
     switch (verdict) {
         case Verdict::Match:
@@ -499,6 +518,73 @@ bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
     return true;
 }
 
+static SimulateResult finalize_handler_result(const Engine& engine,
+                                              const CaptureEntry& entry,
+                                              SimulateResult result,
+                                              const jit::HandlerResult& unpacked) {
+    if (unpacked.action == jit::HandlerAction::Yield) {
+        result.verdict = Verdict::Failed;
+        return result;
+    }
+
+    result.action = unpacked.action;
+    if (unpacked.action == jit::HandlerAction::ReturnStatus) {
+        result.actual_status = unpacked.status_code;
+        result.verdict =
+            (unpacked.status_code == entry.resp_status && entry.upstream_name[0] == '\0')
+                ? Verdict::Match
+                : Verdict::Mismatch;
+        return result;
+    }
+
+    if (unpacked.action == jit::HandlerAction::Forward) {
+        const auto* upstream = find_upstream(engine, unpacked.upstream_id);
+        if (!upstream) {
+            result.verdict = Verdict::Failed;
+            return result;
+        }
+        copy_cstr(result.actual_upstream, sizeof(result.actual_upstream), upstream->name);
+        result.verdict = streq(result.actual_upstream, result.expected_upstream)
+                             ? Verdict::Match
+                             : Verdict::Mismatch;
+        return result;
+    }
+
+    result.verdict = Verdict::Unsupported;
+    return result;
+}
+
+static SimulateResult simulate_resume_candidate(const Engine& engine,
+                                                const Engine::CompiledRoute& route,
+                                                const CaptureEntry& entry,
+                                                SimHandlerFrame frame,
+                                                const jit::HandlerResult& yielded,
+                                                jit::YieldKind resume_kind,
+                                                SimulateResult result,
+                                                u32 max_yields) {
+    Connection conn;
+    conn.reset();
+    apply_synthetic_resume(frame.ctx, yielded, resume_kind);
+
+    jit::HandlerResult unpacked = yielded;
+    for (u32 iter = result.yield_count; iter < max_yields; iter++) {
+        const u64 kPacked =
+            route.fn(&conn, &frame.ctx, entry.raw_headers, entry.raw_header_len, nullptr);
+        unpacked = jit::HandlerResult::unpack(kPacked);
+        if (unpacked.action != jit::HandlerAction::Yield) break;
+        result.yield_count++;
+
+        jit::YieldKind next_kind = unpacked.yield_kind;
+        if (next_kind == jit::YieldKind::Any) {
+            next_kind =
+                (unpacked.yield_payload_u32() == 0u) ? jit::YieldKind::Recv : jit::YieldKind::Timer;
+        }
+        apply_synthetic_resume(frame.ctx, unpacked, next_kind);
+    }
+
+    return finalize_handler_result(engine, entry, result, unpacked);
+}
+
 bool Engine::init(const rir::Module& module,
                   const ManifestUpstream* upstream_list,
                   u32 upstreams_len) {
@@ -586,14 +672,9 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
 
     Connection conn;
     conn.reset();
-    struct HandlerFrame {
-        jit::HandlerCtx ctx{};
-        u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
-    } frame;
+    SimHandlerFrame frame;
+    init_sim_handler_frame(frame);
     jit::HandlerCtx& ctx = frame.ctx;
-    ctx.state = 0;
-    ctx.handler_idx = 0;
-    ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots;
 
     // Drive the handler's state machine to completion. Yields are the
     // handler's signal "I need I/O, resume me with state=next_state".
@@ -614,6 +695,30 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
         unpacked = jit::HandlerResult::unpack(kPacked);
         if (unpacked.action != jit::HandlerAction::Yield) break;
         result.yield_count++;
+
+        if (unpacked.yield_kind == jit::YieldKind::Any && unpacked.yield_payload_u32() != 0u) {
+            const SimulateResult recv_result = simulate_resume_candidate(engine,
+                                                                         *route,
+                                                                         entry,
+                                                                         frame,
+                                                                         unpacked,
+                                                                         jit::YieldKind::Recv,
+                                                                         result,
+                                                                         kMaxHandlerYields);
+            if (recv_result.verdict == Verdict::Match) return recv_result;
+
+            const SimulateResult timer_result = simulate_resume_candidate(engine,
+                                                                          *route,
+                                                                          entry,
+                                                                          frame,
+                                                                          unpacked,
+                                                                          jit::YieldKind::Timer,
+                                                                          result,
+                                                                          kMaxHandlerYields);
+            if (timer_result.verdict == Verdict::Match) return timer_result;
+            return recv_result;
+        }
+
         // Advance to the continuation segment. Simulate mode treats the
         // requested wait as immediately completed and sets the synthetic
         // wake-up event. For wait(any), choose a concrete event kind so
@@ -625,42 +730,9 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
             resume_kind = (unpacked.yield_payload_u32() == 0u) ? jit::YieldKind::Recv
                                                                 : jit::YieldKind::Timer;
         }
-        ctx.resume_event_kind = static_cast<u32>(resume_kind);
-        ctx.resume_event_result = (resume_kind == jit::YieldKind::Timer) ? 0 : 1;
-        ctx.state = unpacked.next_state;
+        apply_synthetic_resume(ctx, unpacked, resume_kind);
     }
-    if (unpacked.action == jit::HandlerAction::Yield) {
-        // Exceeded the cap — treat as failure rather than silently
-        // returning a stale state.
-        result.verdict = Verdict::Failed;
-        return result;
-    }
-    result.action = unpacked.action;
-
-    if (unpacked.action == jit::HandlerAction::ReturnStatus) {
-        result.actual_status = unpacked.status_code;
-        result.verdict =
-            (unpacked.status_code == entry.resp_status && entry.upstream_name[0] == '\0')
-                ? Verdict::Match
-                : Verdict::Mismatch;
-        return result;
-    }
-
-    if (unpacked.action == jit::HandlerAction::Forward) {
-        const auto* upstream = find_upstream(engine, unpacked.upstream_id);
-        if (!upstream) {
-            result.verdict = Verdict::Failed;
-            return result;
-        }
-        copy_cstr(result.actual_upstream, sizeof(result.actual_upstream), upstream->name);
-        result.verdict = streq(result.actual_upstream, result.expected_upstream)
-                             ? Verdict::Match
-                             : Verdict::Mismatch;
-        return result;
-    }
-
-    result.verdict = Verdict::Unsupported;
-    return result;
+    return finalize_handler_result(engine, entry, result, unpacked);
 }
 
 SimulateSummary simulate_file(Engine& engine, ReplayReader& reader) {

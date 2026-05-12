@@ -504,6 +504,25 @@ TEST(simulate_engine, wait_any_statement_uses_concrete_wait_kind) {
     rir.destroy();
 }
 
+TEST(simulate_engine, wait_any_statement_can_match_recv_winner) {
+    const char* src =
+        "route GET \"/x\" { wait any { downstream.recv() => { return 204 } timer(50) => { return "
+        "408 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, wait_any_expression_can_resume_with_timer_predicate) {
     const char* src =
         "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(50))) if ev.timer { "
@@ -517,6 +536,25 @@ TEST(simulate_engine, wait_any_expression_can_resume_with_timer_predicate) {
     const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 408));
     CHECK_EQ(result.verdict, Verdict::Match);
     CHECK_EQ(result.actual_status, 408u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, wait_any_expression_can_match_recv_predicate) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(50))) if ev.timer { "
+        "return 408 } else { return 204 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
     CHECK_EQ(result.yield_count, 1u);
 
     engine.shutdown();

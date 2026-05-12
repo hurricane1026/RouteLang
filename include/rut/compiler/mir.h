@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 
@@ -243,7 +244,7 @@ struct MirFunction {
     static constexpr u32 kMaxLocals = 16;
     static constexpr u32 kMaxBlocks = 16;
     static constexpr u32 kMaxValues = 64;
-    static constexpr u32 kMaxWaits = 4;
+    static constexpr u32 kMaxWaits = kMaxRouteWaits;
     FixedVec<MirValue, kMaxValues> values;
     FixedVec<MirLocal, kMaxLocals> locals;
     FixedVec<MirBlock, kMaxBlocks> blocks;

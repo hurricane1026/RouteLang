@@ -859,12 +859,6 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMTypeRef slot_ptr_ty = LLVMPointerType(c.i64_ty, 0);
             LLVMValueRef slot_ptr = LLVMBuildBitCast(c.builder, ptr, slot_ptr_ty, "ctx.slot.ptr64");
 
-            if (!c.ctx_store_sink) {
-                LLVMBasicBlockRef sink_bb = LLVMGetInsertBlock(c.builder);
-                c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
-                LLVMPositionBuilderAtEnd(c.builder, sink_bb);
-            }
-
             LLVMValueRef slot_store_ptr =
                 LLVMBuildSelect(c.builder, has_slot, slot_ptr, c.ctx_store_sink, "ctx.slot.store.ptr");
             LLVMValueRef value64 =
@@ -1086,6 +1080,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         LLVMMoveBasicBlockBefore(dispatch_bb, c.block_map[fn.blocks[0].id.id]);
 
         LLVMPositionBuilderAtEnd(c.builder, dispatch_bb);
+        c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
         // HandlerCtx layout: state (u16) @ offset 0.
         LLVMValueRef state = LLVMBuildLoad2(c.builder, c.i16_ty, c.param_ctx, "state");
 
@@ -1134,6 +1129,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
             LLVMBuildRet(c.builder, result);
             LLVMAddCase(sw, LLVMConstInt(c.i16_ty, si, 0), yield_bb);
         }
+    } else {
+        LLVMPositionBuilderAtEnd(c.builder, c.block_map[fn.blocks[0].id.id]);
+        c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
     }
 
     // Emit instructions block by block.

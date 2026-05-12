@@ -2,7 +2,7 @@
 
 #include "rut/common/buffer.h"
 #include "rut/common/types.h"
-#include "rut/compiler/mir.h"
+#include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
@@ -34,9 +34,9 @@ struct ConnectionBase {
     static constexpr u32 kMaxReqPathLen = 64;
     static constexpr u32 kMaxUpstreamNameLen = 24;
     static constexpr u16 kMaxPipelineDepth = 16;
-    // Keep persistent wait fields coupled to compiler wait limit: every wait
-    // stores kind/result in two i64 slots.
-    static constexpr u32 kMaxJitHandlerSlots = MirFunction::kMaxWaits * 2u;
+    // Keep persistent wait fields coupled to the shared route wait limit:
+    // every wait stores kind/result in two i64 slots.
+    static constexpr u32 kMaxJitHandlerSlots = rut::kMaxJitHandlerSlots;
     static_assert(kMaxJitHandlerSlots >= 2u, "JIT wait frame must hold at least one wait result");
     // Event callback type — void* loop to avoid circular dependency.
     using Callback = void (*)(void* loop, ConnectionBase& conn, IoEvent ev);
@@ -94,7 +94,7 @@ struct ConnectionBase {
     i32 resume_event_result;
     void* handler_ctx;
     jit::HandlerFn pending_handler_fn;
-    alignas(alignof(jit::HandlerCtx)) u8
+    alignas(alignof(u64)) u8
         handler_ctx_storage[sizeof(jit::HandlerCtx) +
                             static_cast<size_t>(kMaxJitHandlerSlots) * 8]{};
 

@@ -8086,6 +8086,23 @@ TEST(frontend, route_match_arm_guard_can_use_payload_binding) {
     REQUIRE(lowered);
     rir.destroy();
 }
+TEST(frontend, route_match_arm_guard_after_route_guards_falls_through_to_next_test) {
+    const char* src =
+        "route GET \"/users\" { guard true else { return 401 } guard true else { return 402 } let "
+        "code = 200 match code { case 200 if false: return 500 case 201: return 201 case _: "
+        "return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_GE(mir->functions[0].blocks.len, 8u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.else_block, 3u);
+}
 TEST(frontend, analyze_rejects_route_match_arm_guard_without_wildcard) {
     const char* src =
         "route GET \"/users\" { let code = 200 match code { case 200 if true: return 200 } }\n";
@@ -8138,6 +8155,21 @@ TEST(frontend, route_match_arm_nested_match_with_block_prefix_lowers) {
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
     rir.destroy();
+}
+TEST(frontend, route_match_arm_block_prefix_without_nested_match_inserts_local_once) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok match auth { case .ok: { let path = "
+        "\"/users\" if path == \"/users\" { return 200 } else { return 404 } } case .denied: "
+        "return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[1].name.eq(lit("path")));
 }
 TEST(frontend, route_match_arm_nested_bool_match_is_exhaustive) {
     const char* src =
@@ -8287,6 +8319,18 @@ TEST(frontend, guard_match_lowers_to_fail_side_match_arms) {
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     CHECK(mir->functions[0].blocks.len >= 5u);
+}
+TEST(frontend, analyze_rejects_guard_match_arm_guard) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
+        ".timeout if true: return 503 case _: return 500 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, analyze_rejects_guard_match_without_wildcard) {
     const char* src =

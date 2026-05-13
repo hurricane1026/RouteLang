@@ -1697,7 +1697,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 auto subject = mir_value(module.routes[i].control.match_expr, module, &fn);
                 if (!subject) return core::make_unexpected(subject.error());
                 auto arm_fallthrough_target = [&](u32 ai) {
-                    if (ai + 1 < test_count) return ai + 2;
+                    if (ai + 1 < test_count) return guard_count + ai + 1;
                     if (ai + 1 < arm_count) return arm_block_index[ai + 1];
                     return arm_block_index[ai];
                 };
@@ -1714,7 +1714,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     test_block.term.rhs = arm_pattern.value();
                     test_block.term.then_block = arm_block_index[ai];
                     test_block.term.else_block =
-                        ai + 1 < test_count ? (ai + 2) : arm_block_index[test_count];
+                        ai + 1 < test_count ? guard_count + ai + 1 : arm_block_index[test_count];
                     if (!fn.blocks.push(test_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }

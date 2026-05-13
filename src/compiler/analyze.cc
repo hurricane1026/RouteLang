@@ -6641,6 +6641,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
                         const auto& arm = stmt.match_arms[ai];
                         if (arm.is_wildcard) {
+                            if (arm.has_guard)
+                                return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                             wildcard_arm = &arm;
                             continue;
                         }
@@ -6684,6 +6686,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 } else {
                     for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
                         if (stmt.match_arms[ai].is_wildcard) {
+                            if (stmt.match_arms[ai].has_guard)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      stmt.match_arms[ai].span);
                             wildcard_arm = &stmt.match_arms[ai];
                             break;
                         }

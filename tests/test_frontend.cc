@@ -8203,6 +8203,20 @@ TEST(frontend, route_match_arm_nested_match_with_block_prefix_lowers) {
     REQUIRE(lowered);
     rir.destroy();
 }
+TEST(frontend, analyze_rejects_route_match_arm_nested_match_after_guard_prefix) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: { "
+        "guard true else { return 401 } match path { case \"/users\": return 200 case _: return "
+        "404 } } case .denied: return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, route_match_arm_nested_match_const_selects_inner_case_only) {
     const char* src =
         "variant Auth { ok, denied }\n"

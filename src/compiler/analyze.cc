@@ -6167,6 +6167,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
         return analyze_match_arm_body(
             *selected_arm->stmt, arm, route, mod, locals, local_count, selected_binding_ptr);
     }
+    if (stmt.kind == AstStmtKind::Match)
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
     if (stmt.kind == AstStmtKind::Block) {
         FixedVec<HirLocal, HirRoute::kMaxLocals> scoped_locals;
         for (u32 i = 0; i < local_count; i++) {

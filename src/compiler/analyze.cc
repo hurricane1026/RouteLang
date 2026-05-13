@@ -5571,13 +5571,20 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     }
     HirExpr analyzed_args[AstExpr::kMaxArgs]{};
     u32 placeholder_count = 0;
+    const HirExpr* placeholder_source = pipe_lhs;
     for (u32 i = 0; i < expr.args.len; i++) {
         const auto& arg_expr = *expr.args[i];
         if (arg_expr.kind == AstExprKind::Placeholder) {
             if (pipe_lhs == nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, arg_expr.span);
             placeholder_count++;
-            auto slot_expr = placeholder_slot_expr(*pipe_lhs, arg_expr.int_value, arg_expr.span);
+            if (placeholder_source == pipe_lhs) {
+                if (!route->exprs.push(*pipe_lhs))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                placeholder_source = &route->exprs[route->exprs.len - 1];
+            }
+            auto slot_expr =
+                placeholder_slot_expr(*placeholder_source, arg_expr.int_value, arg_expr.span);
             if (!slot_expr) return core::make_unexpected(slot_expr.error());
             analyzed_args[i] = slot_expr.value();
         } else {

@@ -7364,6 +7364,26 @@ TEST(frontend, known_named_error_match_selects_error_case) {
     REQUIRE(lowered);
     rir.destroy();
 }
+TEST(frontend, known_named_error_match_arm_guard_uses_runtime_fallthrough) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout if "
+        "false: "
+        "return 503 case _: return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
 TEST(frontend, if_const_selects_then_without_checking_else) {
     const char* src =
         "route GET \"/users\" { if const true { return 200 } else { return forward(missing) } }\n";
@@ -8168,6 +8188,23 @@ TEST(frontend, route_match_arm_nested_match_with_block_prefix_lowers) {
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
     rir.destroy();
+}
+TEST(frontend, route_match_arm_nested_match_const_selects_inner_case_only) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: "
+        "match const path { case \"/users\": return 200 case \"/admin\": return forward(missing) } "
+        "case .denied: return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    CHECK_FALSE(hir->routes[0].control.match_arms[0].has_arm_guard);
+    CHECK_EQ(hir->routes[0].control.match_arms[0].direct_term.status_code, 200);
 }
 TEST(frontend, route_match_arm_block_prefix_without_nested_match_inserts_local_once) {
     const char* src =

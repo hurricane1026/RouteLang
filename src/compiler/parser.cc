@@ -113,6 +113,14 @@ struct Parser {
                     if (!pattern) return core::make_unexpected(pattern.error());
                     arm.pattern = pattern.value();
                 }
+                if (take(TokenType::KwIf)) {
+                    auto guard = parse_expr();
+                    if (!guard) return core::make_unexpected(guard.error());
+                    auto guard_ptr = alloc_expr(guard.value());
+                    if (!guard_ptr) return core::make_unexpected(guard_ptr.error());
+                    arm.has_guard = true;
+                    arm.guard = guard_ptr.value();
+                }
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
                 auto arm_stmt = parse_func_body_stmt();
@@ -816,6 +824,14 @@ struct Parser {
                         if (!pattern) return core::make_unexpected(pattern.error());
                         arm.pattern = pattern.value();
                     }
+                    if (take(TokenType::KwIf)) {
+                        auto guard = parse_expr();
+                        if (!guard) return core::make_unexpected(guard.error());
+                        auto guard_ptr = alloc_expr(guard.value());
+                        if (!guard_ptr) return core::make_unexpected(guard_ptr.error());
+                        arm.has_guard = true;
+                        arm.guard = guard_ptr.value();
+                    }
                     auto colon = expect(TokenType::Colon);
                     if (!colon) return core::make_unexpected(colon.error());
                     auto arm_stmt = parse_stmt();
@@ -1198,12 +1214,19 @@ struct Parser {
                     if (!pattern) return core::make_unexpected(pattern.error());
                     arm.pattern = pattern.value();
                 }
+                if (take(TokenType::KwIf)) {
+                    auto guard = parse_expr();
+                    if (!guard) return core::make_unexpected(guard.error());
+                    auto guard_ptr = alloc_expr(guard.value());
+                    if (!guard_ptr) return core::make_unexpected(guard_ptr.error());
+                    arm.has_guard = true;
+                    arm.guard = guard_ptr.value();
+                }
                 auto colon = expect(TokenType::Colon);
                 if (!colon) return core::make_unexpected(colon.error());
                 auto arm_stmt = parse_stmt();
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
-                if (arm_stmt->kind == AstStmtKind::Let || arm_stmt->kind == AstStmtKind::Guard ||
-                    arm_stmt->kind == AstStmtKind::Match) {
+                if (arm_stmt->kind == AstStmtKind::Let || arm_stmt->kind == AstStmtKind::Guard) {
                     return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
                 }
                 auto arm_ptr = alloc_stmt(arm_stmt.value());
@@ -1399,6 +1422,14 @@ struct Parser {
                     auto pattern = parse_primary_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
                     arm.pattern = pattern.value();
+                }
+                if (take(TokenType::KwIf)) {
+                    auto guard = parse_expr();
+                    if (!guard) return core::make_unexpected(guard.error());
+                    auto guard_ptr = alloc_expr(guard.value());
+                    if (!guard_ptr) return core::make_unexpected(guard_ptr.error());
+                    arm.has_guard = true;
+                    arm.guard = guard_ptr.value();
                 }
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());

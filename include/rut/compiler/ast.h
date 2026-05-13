@@ -180,6 +180,8 @@ struct AstStatement {
         Span span{};
         bool is_wildcard = false;
         AstExpr pattern{};
+        bool has_guard = false;
+        AstExpr* guard = nullptr;
         AstStatement* stmt = nullptr;
     };
     FixedVec<MatchArm, kMaxMatchArms> match_arms;
@@ -453,6 +455,7 @@ private:
         }
         for (u32 i = 0; i < stmt.match_arms.len; i++) {
             rebase_expr(other, stmt.match_arms[i].pattern);
+            rebase_expr_ptr(other, stmt.match_arms[i].guard);
             rebase_stmt_ptr(other, stmt.match_arms[i].stmt);
         }
     }

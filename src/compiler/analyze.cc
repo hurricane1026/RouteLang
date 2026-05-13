@@ -238,6 +238,7 @@ struct ConstValue {
     HirTypeKind type = HirTypeKind::Unknown;
     bool bool_value = false;
     i32 int_value = 0;
+    Str str_value{};
     u32 variant_index = 0;
     u32 case_index = 0;
 };
@@ -3532,6 +3533,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
 
         for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
             const auto& arm = stmt.match_arms[ai];
+            if (arm.has_guard) return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
             if (arm.is_wildcard) {
                 wildcard_arm = &arm;
                 continue;
@@ -3546,6 +3548,9 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             } else if (pattern->kind == HirExprKind::IntLit &&
                        subject_value.type == HirTypeKind::I32) {
                 matched = pattern->int_value == subject_value.int_value;
+            } else if (pattern->kind == HirExprKind::StrLit &&
+                       subject_value.type == HirTypeKind::Str) {
+                matched = pattern->str_value.eq(subject_value.str_value);
             } else if (pattern->kind == HirExprKind::VariantCase &&
                        subject_value.type == HirTypeKind::Variant) {
                 matched = pattern->variant_index == subject_value.variant_index &&
@@ -3635,14 +3640,63 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         const HirExpr* subject_ptr = &scratch->exprs[scratch->exprs.len - 1];
 
         bool seen_wildcard = false;
+        bool seen_guarded_arm = false;
+        bool seen_bool_true = false;
+        bool seen_bool_false = false;
         bool seen_variant_cases[HirVariant::kMaxCases]{};
         u32 seen_variant_case_count = 0;
         HirExpr result{};
         bool have_result = false;
+        auto make_ifelse_expr = [&](Span span,
+                                    const HirExpr& cond,
+                                    const HirExpr& then_expr,
+                                    const HirExpr& else_expr) -> FrontendResult<HirExpr> {
+            HirExpr merged_shape{};
+            if (!merge_expr_shape(then_expr, else_expr, &merged_shape))
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            HirExpr out{};
+            out.kind = HirExprKind::IfElse;
+            out.type = merged_shape.type;
+            out.generic_index = merged_shape.generic_index;
+            out.generic_has_error_constraint = merged_shape.generic_has_error_constraint;
+            out.generic_has_eq_constraint = merged_shape.generic_has_eq_constraint;
+            out.generic_has_ord_constraint = merged_shape.generic_has_ord_constraint;
+            out.generic_protocol_index = merged_shape.generic_protocol_index;
+            out.generic_protocol_count = merged_shape.generic_protocol_count;
+            for (u32 cpi = 0; cpi < out.generic_protocol_count; cpi++)
+                out.generic_protocol_indices[cpi] = merged_shape.generic_protocol_indices[cpi];
+            out.may_nil = merged_shape.may_nil;
+            out.may_error = merged_shape.may_error;
+            out.variant_index = merged_shape.variant_index;
+            out.struct_index = merged_shape.struct_index;
+            out.tuple_len = merged_shape.tuple_len;
+            for (u32 i = 0; i < merged_shape.tuple_len; i++) {
+                out.tuple_types[i] = merged_shape.tuple_types[i];
+                out.tuple_variant_indices[i] = merged_shape.tuple_variant_indices[i];
+                out.tuple_struct_indices[i] = merged_shape.tuple_struct_indices[i];
+            }
+            out.error_struct_index = merged_shape.error_struct_index;
+            out.error_variant_index = merged_shape.error_variant_index;
+            out.shape_index = merged_shape.shape_index;
+            out.span = span;
+            if (!scratch->exprs.push(cond))
+                return frontend_error(FrontendError::TooManyItems, span);
+            out.lhs = &scratch->exprs[scratch->exprs.len - 1];
+            if (!scratch->exprs.push(then_expr))
+                return frontend_error(FrontendError::TooManyItems, span);
+            out.rhs = &scratch->exprs[scratch->exprs.len - 1];
+            if (!scratch->exprs.push(else_expr))
+                return frontend_error(FrontendError::TooManyItems, span);
+            if (!out.args.push(&scratch->exprs[scratch->exprs.len - 1]))
+                return frontend_error(FrontendError::TooManyItems, span);
+            return out;
+        };
 
         for (i32 ai = static_cast<i32>(stmt.match_arms.len) - 1; ai >= 0; ai--) {
             const auto& arm = stmt.match_arms[static_cast<u32>(ai)];
             if (arm.is_wildcard) {
+                if (arm.has_guard)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 if (seen_wildcard)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 seen_wildcard = true;
@@ -3658,7 +3712,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 arm.pattern, subject.value(), scratch, mod, locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
             if (pattern->kind != HirExprKind::BoolLit && pattern->kind != HirExprKind::IntLit &&
-                pattern->kind != HirExprKind::VariantCase)
+                pattern->kind != HirExprKind::StrLit && pattern->kind != HirExprKind::VariantCase)
                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
             if (pattern->type != subject->type)
                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
@@ -3672,6 +3726,11 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 seen_variant_cases[case_index] = true;
                 seen_variant_case_count++;
+            } else if (pattern->type == HirTypeKind::Bool) {
+                if (pattern->bool_value)
+                    seen_bool_true = true;
+                else
+                    seen_bool_false = true;
             }
 
             MatchPayloadBinding arm_binding{};
@@ -3714,14 +3773,26 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             auto body = analyze_function_body_stmt(
                 *arm.stmt, scratch, mod, locals, local_count, arm_binding_ptr);
             if (!body) return core::make_unexpected(body.error());
+            HirExpr body_expr = body.value();
+            if (arm.has_guard) {
+                if (!have_result) return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                if (arm.guard == nullptr)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                auto guard =
+                    analyze_expr(*arm.guard, scratch, mod, locals, local_count, arm_binding_ptr);
+                if (!guard) return core::make_unexpected(guard.error());
+                if (guard->type != HirTypeKind::Bool)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.guard->span);
+                auto guarded = make_ifelse_expr(arm.span, guard.value(), body_expr, result);
+                if (!guarded) return core::make_unexpected(guarded.error());
+                body_expr = guarded.value();
+                seen_guarded_arm = true;
+            }
             if (!have_result) {
-                result = body.value();
+                result = body_expr;
                 have_result = true;
                 continue;
             }
-            HirExpr merged_shape{};
-            if (!merge_expr_shape(body.value(), result, &merged_shape))
-                return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
 
             HirExpr cond{};
             cond.kind = HirExprKind::Eq;
@@ -3734,48 +3805,19 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 return frontend_error(FrontendError::TooManyItems, arm.span);
             cond.rhs = &scratch->exprs[scratch->exprs.len - 1];
 
-            HirExpr out{};
-            out.kind = HirExprKind::IfElse;
-            out.type = merged_shape.type;
-            out.generic_index = merged_shape.generic_index;
-            out.generic_has_error_constraint = merged_shape.generic_has_error_constraint;
-            out.generic_has_eq_constraint = merged_shape.generic_has_eq_constraint;
-            out.generic_has_ord_constraint = merged_shape.generic_has_ord_constraint;
-            out.generic_protocol_index = merged_shape.generic_protocol_index;
-            out.generic_protocol_count = merged_shape.generic_protocol_count;
-            for (u32 cpi = 0; cpi < out.generic_protocol_count; cpi++)
-                out.generic_protocol_indices[cpi] = merged_shape.generic_protocol_indices[cpi];
-            out.may_nil = merged_shape.may_nil;
-            out.may_error = merged_shape.may_error;
-            out.variant_index = merged_shape.variant_index;
-            out.struct_index = merged_shape.struct_index;
-            out.tuple_len = merged_shape.tuple_len;
-            for (u32 i = 0; i < merged_shape.tuple_len; i++) {
-                out.tuple_types[i] = merged_shape.tuple_types[i];
-                out.tuple_variant_indices[i] = merged_shape.tuple_variant_indices[i];
-                out.tuple_struct_indices[i] = merged_shape.tuple_struct_indices[i];
-            }
-            out.error_struct_index = merged_shape.error_struct_index;
-            out.error_variant_index = merged_shape.error_variant_index;
-            out.shape_index = merged_shape.shape_index;
-            out.span = stmt.span;
-            if (!scratch->exprs.push(cond))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
-            out.lhs = &scratch->exprs[scratch->exprs.len - 1];
-            if (!scratch->exprs.push(body.value()))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
-            out.rhs = &scratch->exprs[scratch->exprs.len - 1];
-            if (!scratch->exprs.push(result))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
-            if (!out.args.push(&scratch->exprs[scratch->exprs.len - 1]))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
-            result = out;
+            auto out = make_ifelse_expr(stmt.span, cond, body_expr, result);
+            if (!out) return core::make_unexpected(out.error());
+            result = out.value();
         }
 
         if (!have_result) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
         if (result.type == HirTypeKind::Unknown && !result.may_nil && !result.may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
         if (!seen_wildcard) {
+            if (seen_guarded_arm)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            if (subject->type == HirTypeKind::Bool && seen_bool_true && seen_bool_false)
+                return result;
             if (subject->type != HirTypeKind::Variant)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
             const auto& variant = mod.variants[subject->variant_index];
@@ -5905,6 +5947,11 @@ static bool const_eval_expr(
         out->int_value = expr.int_value;
         return true;
     }
+    if (expr.kind == HirExprKind::StrLit) {
+        out->type = HirTypeKind::Str;
+        out->str_value = expr.str_value;
+        return true;
+    }
     if (expr.kind == HirExprKind::ConstMethod) {
         // Method literals (POST, GET, …) are compile-time constants;
         // fold them so `if const POST == GET { ... }` works.
@@ -5937,6 +5984,10 @@ static bool const_eval_expr(
             }
             if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::Method) {
                 out->bool_value = lhs.int_value == rhs.int_value;
+                return true;
+            }
+            if (lhs.type == HirTypeKind::Str) {
+                out->bool_value = lhs.str_value.eq(rhs.str_value);
                 return true;
             }
             if (lhs.type == HirTypeKind::Variant) {
@@ -6320,6 +6371,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
 
         for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
             const auto& arm = stmt.match_arms[ai];
+            if (arm.has_guard) return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
             if (arm.is_wildcard) {
                 wildcard_arm = &arm;
                 continue;
@@ -6334,6 +6386,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             } else if (pattern->kind == HirExprKind::IntLit &&
                        subject_value.type == HirTypeKind::I32) {
                 matched = pattern->int_value == subject_value.int_value;
+            } else if (pattern->kind == HirExprKind::StrLit &&
+                       subject_value.type == HirTypeKind::Str) {
+                matched = pattern->str_value.eq(subject_value.str_value);
             } else if (pattern->kind == HirExprKind::VariantCase &&
                        subject_value.type == HirTypeKind::Variant) {
                 matched = pattern->variant_index == subject_value.variant_index &&
@@ -6539,24 +6594,214 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->control.kind = HirControlKind::Match;
         route->control.match_expr = subject.value();
         bool seen_wildcard = false;
+        bool seen_guarded_arm = false;
+        bool seen_bool_true = false;
+        bool seen_bool_false = false;
         bool seen_variant_cases[HirVariant::kMaxCases]{};
         u32 seen_variant_case_count = 0;
         route->control.match_arms.len = 0;
         for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
             const auto& arm = stmt.match_arms[ai];
+            const AstStatement* nested_match_stmt = nullptr;
+            HirLocal nested_locals[HirRoute::kMaxLocals]{};
+            u32 nested_local_count = local_count;
+            for (u32 li = 0; li < local_count; li++) nested_locals[li] = locals[li];
+            const bool can_expand_nested_match =
+                !arm.is_wildcard && !arm.has_guard && arm.pattern.lhs == nullptr;
+            if (can_expand_nested_match && arm.stmt != nullptr &&
+                arm.stmt->kind == AstStmtKind::Match) {
+                nested_match_stmt = arm.stmt;
+            } else if (can_expand_nested_match && arm.stmt != nullptr &&
+                       arm.stmt->kind == AstStmtKind::Block && arm.stmt->block_stmts.len != 0) {
+                bool prefix_ok = true;
+                for (u32 bi = 0; bi + 1 < arm.stmt->block_stmts.len; bi++) {
+                    const auto& prefix = *arm.stmt->block_stmts[bi];
+                    if (prefix.kind != AstStmtKind::Let) {
+                        prefix_ok = false;
+                        break;
+                    }
+                    auto init = analyze_expr(
+                        prefix.expr, route, mod, nested_locals, nested_local_count, binding);
+                    if (!init) return core::make_unexpected(init.error());
+                    if (init->kind == HirExprKind::ArrayLit)
+                        return frontend_error(FrontendError::UnsupportedSyntax, prefix.expr.span);
+                    auto typed = apply_declared_type_to_expr(&init.value(), mod, prefix);
+                    if (!typed) return core::make_unexpected(typed.error());
+                    if (nested_local_count >= HirRoute::kMaxLocals)
+                        return frontend_error(FrontendError::TooManyItems, prefix.span);
+                    HirLocal local{};
+                    local.span = prefix.span;
+                    local.name = prefix.name;
+                    local.ref_index =
+                        next_local_ref_index(route, nested_locals, nested_local_count);
+                    local.type = init->type;
+                    local.generic_index = init->generic_index;
+                    local.generic_has_error_constraint = init->generic_has_error_constraint;
+                    local.generic_has_eq_constraint = init->generic_has_eq_constraint;
+                    local.generic_has_ord_constraint = init->generic_has_ord_constraint;
+                    local.generic_protocol_index = init->generic_protocol_index;
+                    local.generic_protocol_count = init->generic_protocol_count;
+                    for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
+                        local.generic_protocol_indices[cpi] = init->generic_protocol_indices[cpi];
+                    local.may_nil = init->may_nil;
+                    local.may_error = init->may_error;
+                    local.variant_index = init->variant_index;
+                    local.struct_index = init->struct_index;
+                    local.tuple_len = init->tuple_len;
+                    for (u32 ti = 0; ti < init->tuple_len; ti++) {
+                        local.tuple_types[ti] = init->tuple_types[ti];
+                        local.tuple_variant_indices[ti] = init->tuple_variant_indices[ti];
+                        local.tuple_struct_indices[ti] = init->tuple_struct_indices[ti];
+                    }
+                    local.error_struct_index = init->error_struct_index;
+                    local.error_variant_index = init->error_variant_index;
+                    local.shape_index = init->shape_index;
+                    local.init = init.value();
+                    if (!route->locals.push(local))
+                        return frontend_error(FrontendError::TooManyItems, prefix.span);
+                    nested_locals[nested_local_count++] = local;
+                }
+                const auto* last = arm.stmt->block_stmts[arm.stmt->block_stmts.len - 1];
+                if (prefix_ok && last->kind == AstStmtKind::Match) nested_match_stmt = last;
+            }
+            if (nested_match_stmt != nullptr) {
+                if (seen_wildcard)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                auto outer_pattern = analyze_match_pattern(
+                    arm.pattern, subject.value(), route, mod, locals, local_count);
+                if (!outer_pattern) return core::make_unexpected(outer_pattern.error());
+                if (outer_pattern->kind != HirExprKind::BoolLit &&
+                    outer_pattern->kind != HirExprKind::IntLit &&
+                    outer_pattern->kind != HirExprKind::StrLit &&
+                    outer_pattern->kind != HirExprKind::VariantCase)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                if (outer_pattern->type != subject->type &&
+                    !(subject_is_error_kind && outer_pattern->kind == HirExprKind::VariantCase))
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                if (outer_pattern->kind == HirExprKind::BoolLit) {
+                    if (outer_pattern->bool_value)
+                        seen_bool_true = true;
+                    else
+                        seen_bool_false = true;
+                }
+                if (outer_pattern->kind == HirExprKind::VariantCase) {
+                    const u32 case_index = static_cast<u32>(outer_pattern->int_value);
+                    if (case_index >= HirVariant::kMaxCases)
+                        return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                    if (!seen_variant_cases[case_index]) {
+                        seen_variant_cases[case_index] = true;
+                        seen_variant_case_count++;
+                    }
+                }
+                auto inner_subject = analyze_expr(nested_match_stmt->expr,
+                                                  route,
+                                                  mod,
+                                                  nested_locals,
+                                                  nested_local_count,
+                                                  binding);
+                if (!inner_subject) return core::make_unexpected(inner_subject.error());
+                bool inner_seen_wildcard = false;
+                bool inner_seen_bool_true = false;
+                bool inner_seen_bool_false = false;
+                bool inner_seen_variant_cases[HirVariant::kMaxCases]{};
+                u32 inner_seen_variant_case_count = 0;
+                for (u32 iai = 0; iai < nested_match_stmt->match_arms.len; iai++) {
+                    const auto& inner_arm = nested_match_stmt->match_arms[iai];
+                    if (inner_arm.has_guard || inner_arm.pattern.lhs != nullptr)
+                        return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
+                    if (inner_seen_wildcard)
+                        return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
+                    HirMatchArm hir_arm{};
+                    hir_arm.span = inner_arm.span;
+                    hir_arm.pattern = outer_pattern.value();
+                    if (!inner_arm.is_wildcard) {
+                        auto inner_pattern = analyze_match_pattern(inner_arm.pattern,
+                                                                   inner_subject.value(),
+                                                                   route,
+                                                                   mod,
+                                                                   nested_locals,
+                                                                   nested_local_count);
+                        if (!inner_pattern) return core::make_unexpected(inner_pattern.error());
+                        if (inner_pattern->kind != HirExprKind::BoolLit &&
+                            inner_pattern->kind != HirExprKind::IntLit &&
+                            inner_pattern->kind != HirExprKind::StrLit &&
+                            inner_pattern->kind != HirExprKind::VariantCase)
+                            return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
+                        if (inner_pattern->type != inner_subject->type)
+                            return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
+                        if (inner_pattern->kind == HirExprKind::BoolLit) {
+                            if (inner_pattern->bool_value)
+                                inner_seen_bool_true = true;
+                            else
+                                inner_seen_bool_false = true;
+                        }
+                        if (inner_pattern->kind == HirExprKind::VariantCase) {
+                            const u32 case_index = static_cast<u32>(inner_pattern->int_value);
+                            if (case_index >= HirVariant::kMaxCases)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      inner_arm.span);
+                            if (inner_seen_variant_cases[case_index])
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      inner_arm.span);
+                            inner_seen_variant_cases[case_index] = true;
+                            inner_seen_variant_case_count++;
+                        }
+                        HirExpr cond{};
+                        cond.kind = HirExprKind::Eq;
+                        cond.type = HirTypeKind::Bool;
+                        cond.span = inner_arm.span;
+                        if (!route->exprs.push(inner_subject.value()))
+                            return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                        cond.lhs = &route->exprs[route->exprs.len - 1];
+                        if (!route->exprs.push(inner_pattern.value()))
+                            return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                        cond.rhs = &route->exprs[route->exprs.len - 1];
+                        hir_arm.has_arm_guard = true;
+                        hir_arm.arm_guard = cond;
+                    } else {
+                        inner_seen_wildcard = true;
+                    }
+                    auto body = analyze_match_arm_body(*inner_arm.stmt,
+                                                       &hir_arm,
+                                                       route,
+                                                       mod,
+                                                       nested_locals,
+                                                       nested_local_count,
+                                                       binding);
+                    if (!body) return core::make_unexpected(body.error());
+                    if (!route->control.match_arms.push(hir_arm))
+                        return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                }
+                if (!inner_seen_wildcard) {
+                    if (inner_subject->type == HirTypeKind::Bool && inner_seen_bool_true &&
+                        inner_seen_bool_false) {
+                        continue;
+                    }
+                    if (inner_subject->type != HirTypeKind::Variant)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              nested_match_stmt->span);
+                    const auto& variant = mod.variants[inner_subject->variant_index];
+                    if (inner_seen_variant_case_count != variant.cases.len)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              nested_match_stmt->span);
+                }
+                continue;
+            }
             HirMatchArm hir_arm{};
             hir_arm.span = arm.span;
             hir_arm.is_wildcard = arm.is_wildcard;
             MatchPayloadBinding arm_binding{};
             const MatchPayloadBinding* arm_binding_ptr = binding;
             if (seen_wildcard) return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+            if (arm.is_wildcard && arm.has_guard)
+                return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
             if (!arm.is_wildcard) {
                 auto analyzed_pattern = analyze_match_pattern(
                     arm.pattern, subject.value(), route, mod, locals, local_count);
                 if (!analyzed_pattern) return core::make_unexpected(analyzed_pattern.error());
                 HirExpr pattern = analyzed_pattern.value();
                 if (pattern.kind != HirExprKind::BoolLit && pattern.kind != HirExprKind::IntLit &&
-                    pattern.kind != HirExprKind::VariantCase)
+                    pattern.kind != HirExprKind::StrLit && pattern.kind != HirExprKind::VariantCase)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 if (pattern.type != subject->type &&
                     !(subject_is_error_kind && pattern.kind == HirExprKind::VariantCase))
@@ -6566,6 +6811,12 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                       pattern.variant_index != subject->error_variant_index) ||
                      (!subject_is_error_kind && pattern.variant_index != subject->variant_index)))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                if (pattern.kind == HirExprKind::BoolLit) {
+                    if (pattern.bool_value)
+                        seen_bool_true = true;
+                    else
+                        seen_bool_false = true;
+                }
                 if (pattern.kind == HirExprKind::VariantCase) {
                     const u32 case_index = static_cast<u32>(pattern.int_value);
                     if (case_index >= HirVariant::kMaxCases)
@@ -6626,6 +6877,18 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             } else {
                 seen_wildcard = true;
             }
+            if (arm.has_guard) {
+                if (arm.guard == nullptr)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                auto guard =
+                    analyze_expr(*arm.guard, route, mod, locals, local_count, arm_binding_ptr);
+                if (!guard) return core::make_unexpected(guard.error());
+                if (guard->type != HirTypeKind::Bool)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.guard->span);
+                hir_arm.has_arm_guard = true;
+                hir_arm.arm_guard = guard.value();
+                seen_guarded_arm = true;
+            }
             auto body = analyze_match_arm_body(
                 *arm.stmt, &hir_arm, route, mod, locals, local_count, arm_binding_ptr);
             if (!body) return core::make_unexpected(body.error());
@@ -6633,6 +6896,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::TooManyItems, arm.span);
         }
         if (!seen_wildcard) {
+            if (seen_guarded_arm)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            if (subject->type == HirTypeKind::Bool && seen_bool_true && seen_bool_false) return {};
             if (subject->type != HirTypeKind::Variant && !subject_is_error_kind)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
             const auto& variant = mod.variants[subject_is_error_kind ? subject->error_variant_index

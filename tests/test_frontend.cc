@@ -6213,7 +6213,6 @@ TEST(frontend, analyze_rejects_non_error_struct_in_error_constructor) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, analyze_rejects_custom_error_constructor_missing_extra_fields) {
     const char* src =
@@ -6226,7 +6225,6 @@ TEST(frontend, analyze_rejects_custom_error_constructor_missing_extra_fields) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, analyze_rejects_custom_error_constructor_unknown_extra_field) {
     const char* src =
@@ -7411,6 +7409,31 @@ TEST(frontend, match_const_selects_variant_case_without_checking_other_arms) {
     REQUIRE(lowered);
     rir.destroy();
 }
+TEST(frontend, match_const_selects_string_case_without_checking_other_arms) {
+    const char* src =
+        "route GET \"/users\" { let path = \"/users\" match const path { case \"/users\": return "
+        "200 case \"/admin\": return forward(missing) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
+}
+TEST(frontend, analyze_rejects_match_const_arm_guard) {
+    const char* src =
+        "route GET \"/users\" { let path = \"/users\" match const path { case \"/users\" if true: "
+        "return 200 case _: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, function_match_const_preserves_outer_payload_binding) {
     const char* src =
         "variant Result { ok(i32), err }\n"
@@ -7988,6 +8011,212 @@ TEST(frontend, match_lowers_to_cmp_eq_chain) {
     CHECK_EQ(static_cast<u8>(fn.blocks[1].insts[1].op), static_cast<u8>(rir::Opcode::RetForward));
     CHECK_EQ(static_cast<u8>(fn.blocks[2].insts[0].op), static_cast<u8>(rir::Opcode::RetStatus));
     rir.destroy();
+}
+TEST(frontend, string_match_lowers_to_cmp_eq_chain) {
+    const char* src =
+        "route GET \"/users\" { let path = \"/users\" match path { case \"/users\": return 200 "
+        "case _: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    REQUIRE_EQ(fn.block_count, 3u);
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[2].op), static_cast<u8>(rir::Opcode::CmpEq));
+    rir.destroy();
+}
+TEST(frontend, bool_match_true_false_cases_are_exhaustive) {
+    const char* src =
+        "route GET \"/users\" { let ok = true match ok { case true: return 200 case false: return "
+        "500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+}
+TEST(frontend, route_match_arm_guard_falls_through_to_default) {
+    const char* src =
+        "route GET \"/users\" { let code = 200 match code { case 200 if false: return 500 case _: "
+        "return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.functions[0].block_count, 4u);
+    rir.destroy();
+}
+TEST(frontend, route_match_arm_guard_can_use_payload_binding) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(code) if code "
+        "== 200: return 200 case _: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+TEST(frontend, analyze_rejects_route_match_arm_guard_without_wildcard) {
+    const char* src =
+        "route GET \"/users\" { let code = 200 match code { case 200 if true: return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, route_match_arm_direct_nested_match_lowers) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: "
+        "match path { case \"/users\": return 200 case _: return 404 } case .denied: return 403 } "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 3u);
+    CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+TEST(frontend, route_match_arm_nested_match_with_block_prefix_lowers) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok match auth { case .ok: { let path = "
+        "\"/users\" match path { case \"/users\": return 200 case _: return 404 } } case .denied: "
+        "return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 3u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+TEST(frontend, route_match_arm_nested_bool_match_is_exhaustive) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let allowed = true match auth { case .ok: match "
+        "allowed { case true: return 200 case false: return 404 } case .denied: return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 3u);
+}
+TEST(frontend, analyze_rejects_route_nested_match_inner_arm_guard) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: "
+        "match path { case \"/users\" if true: return 200 case _: return 404 } case .denied: "
+        "return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, analyze_rejects_route_nested_match_inner_payload_binding) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/users\" { let auth = Auth.ok let result = Result.ok(200) match auth { case "
+        ".ok: match result { case .ok(code): return 200 case _: return 404 } case .denied: return "
+        "403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, analyze_rejects_route_nested_match_after_guard_prefix) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok match auth { case .ok: { guard true else { "
+        "return 401 } match true { case true: return 200 case false: return 404 } } case .denied: "
+        "return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+TEST(frontend, analyze_rejects_guarded_outer_arm_with_nested_match) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok match auth { case .ok if true: match true { "
+        "case true: return 200 case false: return 404 } case .denied: return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+TEST(frontend, analyze_rejects_wildcard_outer_arm_with_nested_match) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok match auth { case .ok: return 200 case _: "
+        "match true { case true: return 201 case false: return 404 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
 }
 TEST(frontend, guard_then_match_lowers_to_guard_and_match_blocks) {
     const char* src =
@@ -13438,6 +13667,110 @@ route GET "/users" {
     CHECK_EQ(static_cast<u8>(hir->functions[0].body.kind), static_cast<u8>(HirExprKind::IfElse));
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
+}
+TEST(frontend, source_function_match_arm_guard_inlines) {
+    const auto src = R"(
+func pick(x: i32) -> i32 {
+    match x {
+        case 200 if false => 201
+        case _ => 404
+    }
+}
+route GET "/users" {
+    let code = pick(200)
+    if code == 404 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->functions[0].body.kind), static_cast<u8>(HirExprKind::IfElse));
+}
+TEST(frontend, source_function_match_arm_guard_can_use_payload_binding) {
+    const auto src = R"(
+variant Result { ok(i32), err }
+func pick(result: Result) -> i32 {
+    match result {
+        case .ok(code) if code == 200 => code
+        case _ => 404
+    }
+}
+route GET "/users" {
+    let code = pick(Result.ok(200))
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->functions[0].body.kind), static_cast<u8>(HirExprKind::IfElse));
+}
+TEST(frontend, source_function_bool_match_true_false_cases_are_exhaustive) {
+    const auto src = R"(
+func pick(ok: bool) -> i32 {
+    match ok {
+        case true => 200
+        case false => 500
+    }
+}
+route GET "/users" {
+    let code = pick(true)
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, analyze_rejects_source_function_match_arm_guard_without_wildcard) {
+    const auto src = R"(
+func pick(x: i32) -> i32 {
+    match x {
+        case 200 if true => 200
+    }
+}
+route GET "/users" { let code = pick(200) return 200 }
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, source_function_string_match_inlines) {
+    const auto src = R"(
+func pick(path: str) -> i32 {
+    match path {
+        case "/users" => 200
+        case _ => 404
+    }
+}
+route GET "/users" {
+    let code = pick("/users")
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->functions[0].body.kind), static_cast<u8>(HirExprKind::IfElse));
 }
 TEST(frontend, source_function_infers_optional_return_from_match_without_annotation) {
     const auto src = R"(

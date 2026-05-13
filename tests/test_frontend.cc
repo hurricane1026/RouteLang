@@ -8161,6 +8161,35 @@ TEST(frontend, analyze_rejects_route_match_arm_guard_without_wildcard) {
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
+TEST(frontend, build_mir_rejects_last_match_arm_guard_fallthrough) {
+    auto* hir = new HirModule{};
+    HirRoute route{};
+    route.span = {1, 1, 1, 1};
+    route.method = 'G';
+    route.path = lit("/users");
+    route.control.kind = HirControlKind::Match;
+    route.control.match_expr.kind = HirExprKind::BoolLit;
+    route.control.match_expr.type = HirTypeKind::Bool;
+    route.control.match_expr.bool_value = true;
+
+    HirMatchArm arm{};
+    arm.span = route.span;
+    arm.pattern.kind = HirExprKind::BoolLit;
+    arm.pattern.type = HirTypeKind::Bool;
+    arm.pattern.bool_value = true;
+    arm.has_arm_guard = true;
+    arm.arm_guard.kind = HirExprKind::BoolLit;
+    arm.arm_guard.type = HirTypeKind::Bool;
+    arm.arm_guard.bool_value = false;
+    arm.direct_term.kind = HirTerminatorKind::ReturnStatus;
+    arm.direct_term.status_code = 200;
+    REQUIRE(route.control.match_arms.push(arm));
+    REQUIRE(hir->routes.push(route));
+
+    auto mir = build_mir(*hir);
+    REQUIRE_FALSE(mir.has_value());
+    CHECK_EQ(static_cast<u8>(mir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, route_match_arm_direct_nested_match_lowers) {
     const char* src =
         "variant Auth { ok, denied }\n"

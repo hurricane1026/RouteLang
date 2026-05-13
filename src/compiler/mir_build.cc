@@ -1114,10 +1114,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             } else if (module.routes[i].control.kind == HirControlKind::Match) {
                 auto subject = mir_value(module.routes[i].control.match_expr, module, &fn);
                 if (!subject) return core::make_unexpected(subject.error());
-                auto arm_fallthrough_target = [&](u32 ai) {
+                auto arm_fallthrough_target = [&](u32 ai) -> FrontendResult<u32> {
                     if (ai + 1 < match_test_count) return terminal_index + ai + 1;
                     if (ai + 1 < match_arm_count) return match_arm_block_index[ai + 1];
-                    return match_arm_body_index[ai];
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          module.routes[i].control.match_arms[ai].span);
                 };
                 if (match_test_count == 0) {
                     MirBlock case_block{};
@@ -1132,7 +1133,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         case_block.term.then_block = arm.guards.len != 0
                                                          ? match_arm_guard_index[0][0]
                                                          : match_arm_body_index[0];
-                        case_block.term.else_block = arm_fallthrough_target(0);
+                        auto fallback = arm_fallthrough_target(0);
+                        if (!fallback) return core::make_unexpected(fallback.error());
+                        case_block.term.else_block = fallback.value();
                     } else if (arm.guards.len != 0) {
                         auto cond = mir_value(arm.guards[0].cond, module, &fn);
                         if (!cond) return core::make_unexpected(cond.error());
@@ -1239,7 +1242,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             case_block.term.then_block = arm.guards.len != 0
                                                              ? match_arm_guard_index[ai][0]
                                                              : match_arm_body_index[ai];
-                            case_block.term.else_block = arm_fallthrough_target(ai);
+                            auto fallback = arm_fallthrough_target(ai);
+                            if (!fallback) return core::make_unexpected(fallback.error());
+                            case_block.term.else_block = fallback.value();
                         } else if (arm.guards.len != 0) {
                             auto cond = mir_value(arm.guards[0].cond, module, &fn);
                             if (!cond) return core::make_unexpected(cond.error());
@@ -1696,10 +1701,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
                 auto subject = mir_value(module.routes[i].control.match_expr, module, &fn);
                 if (!subject) return core::make_unexpected(subject.error());
-                auto arm_fallthrough_target = [&](u32 ai) {
+                auto arm_fallthrough_target = [&](u32 ai) -> FrontendResult<u32> {
                     if (ai + 1 < test_count) return guard_count + ai + 1;
                     if (ai + 1 < arm_count) return arm_block_index[ai + 1];
-                    return arm_body_index[ai];
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          module.routes[i].control.match_arms[ai].span);
                 };
                 for (u32 ai = 0; ai < test_count; ai++) {
                     MirBlock test_block{};
@@ -1731,7 +1737,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         case_block.term.cond = cond.value();
                         case_block.term.then_block =
                             arm.guards.len != 0 ? arm_guard_index[ai][0] : arm_body_index[ai];
-                        case_block.term.else_block = arm_fallthrough_target(ai);
+                        auto fallback = arm_fallthrough_target(ai);
+                        if (!fallback) return core::make_unexpected(fallback.error());
+                        case_block.term.else_block = fallback.value();
                     } else if (arm.guards.len != 0) {
                         auto cond = mir_value(arm.guards[0].cond, module, &fn);
                         if (!cond) return core::make_unexpected(cond.error());
@@ -1867,10 +1875,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             }
             auto subject = mir_value(module.routes[i].control.match_expr, module, &fn);
             if (!subject) return core::make_unexpected(subject.error());
-            auto arm_fallthrough_target = [&](u32 ai) {
+            auto arm_fallthrough_target = [&](u32 ai) -> FrontendResult<u32> {
                 if (ai + 1 < test_count) return ai + 1;
                 if (ai + 1 < arm_count) return arm_block_index[ai + 1];
-                return arm_body_index[ai];
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      module.routes[i].control.match_arms[ai].span);
             };
             if (test_count == 0) {
                 MirBlock case_block{};
@@ -1884,7 +1893,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     case_block.term.cond = cond.value();
                     case_block.term.then_block =
                         arm.guards.len != 0 ? arm_guard_index[0][0] : arm_body_index[0];
-                    case_block.term.else_block = arm_fallthrough_target(0);
+                    auto fallback = arm_fallthrough_target(0);
+                    if (!fallback) return core::make_unexpected(fallback.error());
+                    case_block.term.else_block = fallback.value();
                 } else if (arm.guards.len != 0) {
                     auto cond = mir_value(arm.guards[0].cond, module, &fn);
                     if (!cond) return core::make_unexpected(cond.error());
@@ -1986,7 +1997,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         case_block.term.cond = cond.value();
                         case_block.term.then_block =
                             arm.guards.len != 0 ? arm_guard_index[ai][0] : arm_body_index[ai];
-                        case_block.term.else_block = arm_fallthrough_target(ai);
+                        auto fallback = arm_fallthrough_target(ai);
+                        if (!fallback) return core::make_unexpected(fallback.error());
+                        case_block.term.else_block = fallback.value();
                     } else if (arm.guards.len != 0) {
                         auto cond = mir_value(arm.guards[0].cond, module, &fn);
                         if (!cond) return core::make_unexpected(cond.error());

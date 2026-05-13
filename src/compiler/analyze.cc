@@ -5721,6 +5721,16 @@ static FrontendResult<void> collect_named_error_cases(
         auto rhs = collect_named_error_cases(*expr.rhs, cases);
         if (!rhs) return rhs;
     }
+    for (u32 i = 0; i < expr.field_inits.len; i++) {
+        if (expr.field_inits[i].value == nullptr) continue;
+        auto value = collect_named_error_cases(*expr.field_inits[i].value, cases);
+        if (!value) return value;
+    }
+    for (u32 i = 0; i < expr.args.len; i++) {
+        if (expr.args[i] == nullptr) continue;
+        auto arg = collect_named_error_cases(*expr.args[i], cases);
+        if (!arg) return arg;
+    }
     return {};
 }
 
@@ -5752,6 +5762,14 @@ static void patch_named_error_variant(
     }
     if (expr->lhs != nullptr) patch_named_error_variant(expr->lhs, variant_index, cases);
     if (expr->rhs != nullptr) patch_named_error_variant(expr->rhs, variant_index, cases);
+    for (u32 i = 0; i < expr->field_inits.len; i++) {
+        if (expr->field_inits[i].value != nullptr)
+            patch_named_error_variant(expr->field_inits[i].value, variant_index, cases);
+    }
+    for (u32 i = 0; i < expr->args.len; i++) {
+        if (expr->args[i] != nullptr)
+            patch_named_error_variant(expr->args[i], variant_index, cases);
+    }
 }
 
 static void patch_error_variant_refs(HirExpr* expr, u32 variant_index) {
@@ -5760,6 +5778,13 @@ static void patch_error_variant_refs(HirExpr* expr, u32 variant_index) {
         expr->error_variant_index = variant_index;
     if (expr->lhs != nullptr) patch_error_variant_refs(expr->lhs, variant_index);
     if (expr->rhs != nullptr) patch_error_variant_refs(expr->rhs, variant_index);
+    for (u32 i = 0; i < expr->field_inits.len; i++) {
+        if (expr->field_inits[i].value != nullptr)
+            patch_error_variant_refs(expr->field_inits[i].value, variant_index);
+    }
+    for (u32 i = 0; i < expr->args.len; i++) {
+        if (expr->args[i] != nullptr) patch_error_variant_refs(expr->args[i], variant_index);
+    }
 }
 
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, const HirModule& mod) {
@@ -6662,17 +6687,21 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                         if (matched && arm.has_guard) {
                             if (arm.guard == nullptr)
                                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                            const u32 expr_len_before_guard = route->exprs.len;
                             auto guard =
                                 analyze_expr(*arm.guard, route, mod, locals, local_count, binding);
                             if (!guard) return core::make_unexpected(guard.error());
                             if (guard->type != HirTypeKind::Bool || guard->may_nil ||
-                                guard->may_error)
+                                guard->may_error) {
+                                route->exprs.len = expr_len_before_guard;
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       arm.guard->span);
+                            }
                             ConstValue guard_value{};
-                            if (!const_eval_expr(
-                                    guard.value(), locals, local_count, &guard_value, 0) ||
-                                guard_value.type != HirTypeKind::Bool) {
+                            const bool const_guard = const_eval_expr(
+                                guard.value(), locals, local_count, &guard_value, 0);
+                            route->exprs.len = expr_len_before_guard;
+                            if (!const_guard || guard_value.type != HirTypeKind::Bool) {
                                 can_use_known_error_shortcut = false;
                                 break;
                             }
@@ -10932,6 +10961,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 collected = collect_named_error_cases(route.control.match_arms[ai].pattern,
                                                       named_error_cases);
                 if (!collected) return core::make_unexpected(collected.error());
+                if (route.control.match_arms[ai].has_arm_guard) {
+                    collected = collect_named_error_cases(route.control.match_arms[ai].arm_guard,
+                                                          named_error_cases);
+                    if (!collected) return core::make_unexpected(collected.error());
+                }
                 for (u32 gi = 0; gi < route.control.match_arms[ai].guards.len; gi++) {
                     collected = collect_named_error_cases(
                         route.control.match_arms[ai].guards[gi].cond, named_error_cases);
@@ -11009,6 +11043,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                               named_error_cases);
                     patch_error_variant_refs(&route.control.match_arms[ai].pattern,
                                              route.error_variant_index);
+                    if (route.control.match_arms[ai].has_arm_guard) {
+                        patch_named_error_variant(&route.control.match_arms[ai].arm_guard,
+                                                  route.error_variant_index,
+                                                  named_error_cases);
+                        patch_error_variant_refs(&route.control.match_arms[ai].arm_guard,
+                                                 route.error_variant_index);
+                    }
                     for (u32 gi = 0; gi < route.control.match_arms[ai].guards.len; gi++) {
                         patch_named_error_variant(&route.control.match_arms[ai].guards[gi].cond,
                                                   route.error_variant_index,

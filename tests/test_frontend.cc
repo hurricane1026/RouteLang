@@ -8320,17 +8320,15 @@ TEST(frontend, guard_match_lowers_to_fail_side_match_arms) {
     REQUIRE(mir);
     CHECK(mir->functions[0].blocks.len >= 5u);
 }
-TEST(frontend, analyze_rejects_guard_match_arm_guard) {
+TEST(frontend, parse_rejects_guard_match_arm_guard) {
     const char* src =
         "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
         ".timeout if true: return 503 case _: return 500 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, analyze_rejects_guard_match_without_wildcard) {
     const char* src =

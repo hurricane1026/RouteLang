@@ -6213,6 +6213,7 @@ TEST(frontend, analyze_rejects_non_error_struct_in_error_constructor) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, analyze_rejects_custom_error_constructor_missing_extra_fields) {
     const char* src =
@@ -6225,6 +6226,7 @@ TEST(frontend, analyze_rejects_custom_error_constructor_missing_extra_fields) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, analyze_rejects_custom_error_constructor_unknown_extra_field) {
     const char* src =
@@ -7364,7 +7366,7 @@ TEST(frontend, known_named_error_match_selects_error_case) {
     REQUIRE(lowered);
     rir.destroy();
 }
-TEST(frontend, known_named_error_match_arm_guard_uses_runtime_fallthrough) {
+TEST(frontend, known_named_error_match_arm_guard_false_selects_wildcard) {
     const char* src =
         "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout if "
         "false: "

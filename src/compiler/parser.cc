@@ -113,8 +113,8 @@ struct Parser {
                     if (!pattern) return core::make_unexpected(pattern.error());
                     arm.pattern = pattern.value();
                 }
-                if (take(TokenType::KwIf))
-                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                if (const Token* kw_if = take(TokenType::KwIf))
+                    return frontend_error(FrontendError::UnsupportedSyntax, span_from(*kw_if));
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
                 auto arm_stmt = parse_func_body_stmt();
@@ -818,8 +818,8 @@ struct Parser {
                         if (!pattern) return core::make_unexpected(pattern.error());
                         arm.pattern = pattern.value();
                     }
-                    if (take(TokenType::KwIf))
-                        return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                    if (const Token* kw_if = take(TokenType::KwIf))
+                        return frontend_error(FrontendError::UnsupportedSyntax, span_from(*kw_if));
                     auto colon = expect(TokenType::Colon);
                     if (!colon) return core::make_unexpected(colon.error());
                     auto arm_stmt = parse_stmt();

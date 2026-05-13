@@ -6807,10 +6807,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     const u32 case_index = static_cast<u32>(outer_pattern->int_value);
                     if (case_index >= HirVariant::kMaxCases)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    if (!seen_variant_cases[case_index]) {
-                        seen_variant_cases[case_index] = true;
-                        seen_variant_case_count++;
-                    }
+                    if (seen_variant_cases[case_index])
+                        return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                    seen_variant_cases[case_index] = true;
+                    seen_variant_case_count++;
                 }
                 auto inner_subject = analyze_expr(nested_match_stmt->expr,
                                                   route,

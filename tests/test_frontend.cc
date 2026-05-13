@@ -8208,6 +8208,20 @@ TEST(frontend, route_match_arm_nested_match_const_selects_inner_case_only) {
     CHECK_FALSE(hir->routes[0].control.match_arms[0].has_arm_guard);
     CHECK_EQ(hir->routes[0].control.match_arms[0].direct_term.status_code, 200);
 }
+TEST(frontend, analyze_rejects_route_nested_match_duplicate_outer_variant_case) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: "
+        "match path { case \"/users\": return 200 case _: return 404 } case .ok: return 201 case "
+        ".denied: return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, route_match_arm_block_prefix_without_nested_match_inserts_local_once) {
     const char* src =
         "variant Auth { ok, denied }\n"

@@ -6819,6 +6819,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                                   nested_local_count,
                                                   binding);
                 if (!inner_subject) return core::make_unexpected(inner_subject.error());
+                if (inner_subject->may_nil || inner_subject->may_error)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          nested_match_stmt->expr.span);
                 bool inner_seen_wildcard = false;
                 bool inner_seen_bool_true = false;
                 bool inner_seen_bool_false = false;

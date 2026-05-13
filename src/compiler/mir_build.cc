@@ -1117,7 +1117,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 auto arm_fallthrough_target = [&](u32 ai) {
                     if (ai + 1 < match_test_count) return terminal_index + ai + 1;
                     if (ai + 1 < match_arm_count) return match_arm_block_index[ai + 1];
-                    return match_arm_block_index[ai];
+                    return match_arm_body_index[ai];
                 };
                 if (match_test_count == 0) {
                     MirBlock case_block{};
@@ -1699,7 +1699,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 auto arm_fallthrough_target = [&](u32 ai) {
                     if (ai + 1 < test_count) return guard_count + ai + 1;
                     if (ai + 1 < arm_count) return arm_block_index[ai + 1];
-                    return arm_block_index[ai];
+                    return arm_body_index[ai];
                 };
                 for (u32 ai = 0; ai < test_count; ai++) {
                     MirBlock test_block{};
@@ -1870,7 +1870,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             auto arm_fallthrough_target = [&](u32 ai) {
                 if (ai + 1 < test_count) return ai + 1;
                 if (ai + 1 < arm_count) return arm_block_index[ai + 1];
-                return arm_block_index[ai];
+                return arm_body_index[ai];
             };
             if (test_count == 0) {
                 MirBlock case_block{};

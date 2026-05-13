@@ -3781,7 +3781,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 auto guard =
                     analyze_expr(*arm.guard, scratch, mod, locals, local_count, arm_binding_ptr);
                 if (!guard) return core::make_unexpected(guard.error());
-                if (guard->type != HirTypeKind::Bool)
+                if (guard->type != HirTypeKind::Bool || guard->may_nil || guard->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.guard->span);
                 auto guarded = make_ifelse_expr(arm.span, guard.value(), body_expr, result);
                 if (!guarded) return core::make_unexpected(guarded.error());
@@ -6676,6 +6676,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 }
             }
             if (nested_match_stmt != nullptr) {
+                const u32 expanded_arm_start = route->control.match_arms.len;
                 if (seen_wildcard)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 auto outer_pattern = analyze_match_pattern(
@@ -6784,17 +6785,27 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                         return frontend_error(FrontendError::TooManyItems, inner_arm.span);
                 }
                 if (!inner_seen_wildcard) {
+                    bool inner_is_exhaustive = false;
                     if (inner_subject->type == HirTypeKind::Bool && inner_seen_bool_true &&
                         inner_seen_bool_false) {
-                        continue;
+                        inner_is_exhaustive = true;
+                    } else if (inner_subject->type == HirTypeKind::Variant) {
+                        const auto& variant = mod.variants[inner_subject->variant_index];
+                        inner_is_exhaustive = inner_seen_variant_case_count == variant.cases.len;
+                    } else {
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              nested_match_stmt->span);
                     }
-                    if (inner_subject->type != HirTypeKind::Variant)
+                    if (!inner_is_exhaustive)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->span);
-                    const auto& variant = mod.variants[inner_subject->variant_index];
-                    if (inner_seen_variant_case_count != variant.cases.len)
+                    if (route->control.match_arms.len <= expanded_arm_start)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->span);
+                    auto& fallback_arm =
+                        route->control.match_arms[route->control.match_arms.len - 1];
+                    fallback_arm.has_arm_guard = false;
+                    fallback_arm.arm_guard = HirExpr{};
                 }
                 continue;
             }
@@ -6894,7 +6905,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 auto guard =
                     analyze_expr(*arm.guard, route, mod, locals, local_count, arm_binding_ptr);
                 if (!guard) return core::make_unexpected(guard.error());
-                if (guard->type != HirTypeKind::Bool)
+                if (guard->type != HirTypeKind::Bool || guard->may_nil || guard->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.guard->span);
                 hir_arm.has_arm_guard = true;
                 hir_arm.arm_guard = guard.value();

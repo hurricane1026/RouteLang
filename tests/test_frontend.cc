@@ -8103,6 +8103,19 @@ TEST(frontend, route_match_arm_guard_after_route_guards_falls_through_to_next_te
     CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 3u);
     CHECK_EQ(mir->functions[0].blocks[4].term.else_block, 3u);
 }
+TEST(frontend, analyze_rejects_route_match_arm_optional_error_guard) {
+    const char* src =
+        "func maybe(ok: bool) -> bool { if ok { true } else { error(.timeout) } }\n"
+        "route GET \"/users\" { let cond = maybe(false) let code = 200 match code { case 200 if "
+        "cond: return 200 case _: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, analyze_rejects_route_match_arm_guard_without_wildcard) {
     const char* src =
         "route GET \"/users\" { let code = 200 match code { case 200 if true: return 200 } }\n";
@@ -8183,6 +8196,8 @@ TEST(frontend, route_match_arm_nested_bool_match_is_exhaustive) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].control.match_arms.len, 3u);
+    CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
+    CHECK_FALSE(hir->routes[0].control.match_arms[1].has_arm_guard);
 }
 TEST(frontend, analyze_rejects_route_nested_match_inner_arm_guard) {
     const char* src =
@@ -13521,6 +13536,24 @@ route GET "/users" {
     CHECK_FALSE(hir->functions[1].body.may_nil);
     CHECK_FALSE(hir->functions[1].body.may_error);
 }
+TEST(frontend, parse_rejects_function_block_guard_match_arm_guard) {
+    const auto src = R"(
+func maybefail(ok: bool) -> i32 {
+    if ok { 200 } else { error(.timeout) }
+}
+func wrap(ok: bool) -> i32 {
+    let y = maybefail(ok)
+    guard match y else { case .timeout if true => 401 case _ => 500 }
+    200
+}
+route GET "/users" { return 200 }
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, analyze_rejects_function_block_guard_match_without_wildcard) {
     const auto src = R"(
 func maybefail(ok: bool) -> i32 {
@@ -13783,6 +13816,31 @@ func pick(x: i32) -> i32 {
     }
 }
 route GET "/users" { let code = pick(200) return 200 }
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, analyze_rejects_source_function_match_arm_optional_error_guard) {
+    const auto src = R"(
+func maybe(ok: bool) -> bool {
+    if ok { true } else { error(.timeout) }
+}
+func pick(x: i32) -> i32 {
+    let cond = maybe(false)
+    match x {
+        case 200 if cond => 200
+        case _ => 404
+    }
+}
+route GET "/users" {
+    let code = pick(200)
+    return 200
+}
 )";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);

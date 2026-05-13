@@ -113,14 +113,8 @@ struct Parser {
                     if (!pattern) return core::make_unexpected(pattern.error());
                     arm.pattern = pattern.value();
                 }
-                if (take(TokenType::KwIf)) {
-                    auto guard = parse_expr();
-                    if (!guard) return core::make_unexpected(guard.error());
-                    auto guard_ptr = alloc_expr(guard.value());
-                    if (!guard_ptr) return core::make_unexpected(guard_ptr.error());
-                    arm.has_guard = true;
-                    arm.guard = guard_ptr.value();
-                }
+                if (take(TokenType::KwIf))
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
                 auto arm_stmt = parse_func_body_stmt();

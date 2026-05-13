@@ -195,3 +195,7 @@ func pick(result: Result) -> i32 {
     }
 }
 ```
+
+If any function match arm uses an `if` guard, include a wildcard arm so unmatched or
+guard-false values have an explicit result. Unguarded boolean and variant matches may omit
+the wildcard only when all cases are exhaustive.

@@ -7386,6 +7386,54 @@ TEST(frontend, known_named_error_match_arm_guard_false_selects_wildcard) {
     REQUIRE(lowered);
     rir.destroy();
 }
+TEST(frontend, known_named_error_match_runtime_arm_guard_falls_back_to_match) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(.timeout) let allow = req.method == GET match "
+        "failed { case .timeout if allow: return 503 case _: return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
+    CHECK_EQ(hir->routes[0].control.match_arms[0].pattern.variant_index,
+             hir->routes[0].error_variant_index);
+    CHECK_EQ(hir->routes[0].control.match_arms[0].pattern.case_index, 0u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+TEST(frontend, known_named_error_match_runtime_guard_keeps_other_named_error_cases) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(.timeout) let allow = req.method == GET match "
+        "failed { case .denied: return 403 case .timeout if allow: return 503 case _: return 200 "
+        "} }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 3u);
+    CHECK_EQ(hir->routes[0].control.match_arms[0].pattern.variant_index,
+             hir->routes[0].error_variant_index);
+    CHECK_EQ(hir->routes[0].control.match_arms[0].pattern.case_index, 1u);
+    CHECK_EQ(hir->routes[0].control.match_arms[1].pattern.case_index, 0u);
+    CHECK(hir->routes[0].control.match_arms[1].has_arm_guard);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
 TEST(frontend, analyze_rejects_known_named_error_match_wildcard_arm_guard) {
     const char* src =
         "route GET \"/users\" { let failed = error(.timeout) match failed { case .denied: return "

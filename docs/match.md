@@ -144,31 +144,9 @@ route GET "/nested" {
 }
 ```
 
-Blocks may put `let` statements before the final nested match.
-
-```rut
-variant Auth { ok, denied }
-
-route GET "/nested-block" {
-    let auth = Auth.ok
-    match auth {
-    case .ok: {
-        let path = "/users"
-        match path {
-        case "/users":
-            return 200
-        case _:
-            return 404
-        }
-    }
-    case .denied:
-        return 403
-    }
-}
-```
-
-Nested route match currently rejects inner arm guards and inner payload bindings. Prefix `guard`
-statements before the nested match are also unsupported.
+Nested route match currently rejects inner arm guards, inner payload bindings, and prefix
+statements before the nested match. Keep any values used by the inner match in route scope instead
+of declaring them inside the outer arm.
 
 ## Source Function Match
 

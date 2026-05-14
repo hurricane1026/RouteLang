@@ -8302,7 +8302,7 @@ TEST(frontend, route_match_arm_direct_nested_match_lowers) {
     REQUIRE(lowered);
     rir.destroy();
 }
-TEST(frontend, route_match_arm_nested_match_with_block_prefix_lowers) {
+TEST(frontend, analyze_rejects_route_match_arm_nested_match_with_let_prefix) {
     const char* src =
         "variant Auth { ok, denied }\n"
         "route GET \"/users\" { let auth = Auth.ok match auth { case .ok: { let path = "
@@ -8313,8 +8313,24 @@ TEST(frontend, route_match_arm_nested_match_with_block_prefix_lowers) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, route_match_arm_guarded_same_case_can_fall_through_to_nested_match) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok if "
+        "req.method == POST: return 401 case .ok: match path { case \"/users\": return 200 case "
+        "_: return 404 } case .denied: return 403 case _: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 3u);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 5u);
+    CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
+    CHECK(hir->routes[0].control.match_arms[1].has_arm_guard);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};

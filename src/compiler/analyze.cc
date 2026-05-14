@@ -6829,6 +6829,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     }
                 }
                 const auto* last = arm.stmt->block_stmts[arm.stmt->block_stmts.len - 1];
+                if (prefix_ok && last->kind == AstStmtKind::Match && !last->is_const &&
+                    arm.stmt->block_stmts.len > 1) {
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                }
                 if (prefix_ok && last->kind == AstStmtKind::Match && !last->is_const) {
                     for (u32 bi = 0; bi + 1 < arm.stmt->block_stmts.len; bi++) {
                         const auto& prefix = *arm.stmt->block_stmts[bi];
@@ -6911,11 +6915,13 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     const u32 case_index = static_cast<u32>(outer_pattern->int_value);
                     if (case_index >= HirVariant::kMaxCases)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    if (seen_variant_cases[case_index])
+                    if (seen_unguarded_variant_cases[case_index])
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    seen_variant_cases[case_index] = true;
+                    if (!seen_variant_cases[case_index]) {
+                        seen_variant_cases[case_index] = true;
+                        seen_variant_case_count++;
+                    }
                     seen_unguarded_variant_cases[case_index] = true;
-                    seen_variant_case_count++;
                 }
                 auto inner_subject = analyze_expr(nested_match_stmt->expr,
                                                   route,

@@ -14009,6 +14009,12 @@ route GET "/users" {
     REQUIRE(hir);
     REQUIRE_EQ(hir->functions.len, 1u);
     CHECK_EQ(static_cast<u8>(hir->functions[0].body.kind), static_cast<u8>(HirExprKind::IfElse));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
 }
 TEST(frontend, source_function_match_arm_guard_can_use_payload_binding) {
     const auto src = R"(
@@ -14032,6 +14038,12 @@ route GET "/users" {
     REQUIRE(hir);
     REQUIRE_EQ(hir->functions.len, 1u);
     CHECK_EQ(static_cast<u8>(hir->functions[0].body.kind), static_cast<u8>(HirExprKind::IfElse));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
 }
 TEST(frontend, source_function_guarded_variant_case_falls_through_to_same_case) {
     const auto src = R"(

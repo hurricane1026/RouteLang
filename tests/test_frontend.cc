@@ -8299,6 +8299,21 @@ TEST(frontend, analyze_rejects_route_nested_match_duplicate_outer_variant_case) 
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
+TEST(frontend, analyze_rejects_route_nested_match_foreign_outer_variant_case) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "variant Other { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case "
+        "Other.ok: match path { case \"/users\": return 200 case _: return 404 } case .denied: "
+        "return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, route_match_arm_block_prefix_without_nested_match_inserts_local_once) {
     const char* src =
         "variant Auth { ok, denied }\n"
@@ -8350,6 +8365,22 @@ TEST(frontend, analyze_rejects_route_nested_match_inner_payload_binding) {
         "route GET \"/users\" { let auth = Auth.ok let result = Result.ok(200) match auth { case "
         ".ok: match result { case .ok(code): return 200 case _: return 404 } case .denied: return "
         "403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, analyze_rejects_route_nested_match_foreign_inner_variant_case) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "variant Result { ok, err }\n"
+        "variant Other { ok, err }\n"
+        "route GET \"/users\" { let auth = Auth.ok let result = Result.ok match auth { case .ok: "
+        "match result { case Other.ok: return 200 case _: return 404 } case .denied: return 403 } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());

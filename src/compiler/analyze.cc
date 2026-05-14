@@ -6850,6 +6850,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                         seen_bool_false = true;
                 }
                 if (outer_pattern->kind == HirExprKind::VariantCase) {
+                    if ((subject_is_error_kind &&
+                         outer_pattern->variant_index != subject->error_variant_index) ||
+                        (!subject_is_error_kind &&
+                         outer_pattern->variant_index != subject->variant_index))
+                        return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                     const u32 case_index = static_cast<u32>(outer_pattern->int_value);
                     if (case_index >= HirVariant::kMaxCases)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
@@ -6905,6 +6910,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                 inner_seen_bool_false = true;
                         }
                         if (inner_pattern->kind == HirExprKind::VariantCase) {
+                            if (inner_pattern->variant_index != inner_subject->variant_index)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      inner_arm.span);
                             const u32 case_index = static_cast<u32>(inner_pattern->int_value);
                             if (case_index >= HirVariant::kMaxCases)
                                 return frontend_error(FrontendError::UnsupportedSyntax,

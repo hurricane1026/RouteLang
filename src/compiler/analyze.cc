@@ -6820,11 +6820,14 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 nested_match_stmt = arm.stmt;
             } else if (can_expand_nested_match && arm.stmt != nullptr &&
                        arm.stmt->kind == AstStmtKind::Block && arm.stmt->block_stmts.len != 0) {
-                const auto* last = arm.stmt->block_stmts[arm.stmt->block_stmts.len - 1];
-                if (last->kind == AstStmtKind::Match && !last->is_const) {
-                    if (arm.stmt->block_stmts.len != 1)
+                if (arm.stmt->block_stmts.len == 1) {
+                    const auto* only = arm.stmt->block_stmts[0];
+                    if (only->kind == AstStmtKind::Match && !only->is_const)
+                        nested_match_stmt = only;
+                } else {
+                    const auto* last = arm.stmt->block_stmts[arm.stmt->block_stmts.len - 1];
+                    if (last->kind == AstStmtKind::Match && !last->is_const)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    nested_match_stmt = last;
                 }
             }
             if (nested_match_stmt != nullptr) {

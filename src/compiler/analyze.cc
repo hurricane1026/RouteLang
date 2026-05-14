@@ -3722,10 +3722,12 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 const u32 case_index = static_cast<u32>(pattern->int_value);
                 if (case_index >= HirVariant::kMaxCases)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                if (seen_variant_cases[case_index])
+                if (seen_variant_cases[case_index] && !arm.has_guard)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                seen_variant_cases[case_index] = true;
-                seen_variant_case_count++;
+                if (!seen_variant_cases[case_index]) {
+                    seen_variant_cases[case_index] = true;
+                    seen_variant_case_count++;
+                }
             } else if (pattern->type == HirTypeKind::Bool) {
                 if (pattern->bool_value)
                     seen_bool_true = true;
@@ -6749,6 +6751,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         bool seen_bool_true = false;
         bool seen_bool_false = false;
         bool seen_variant_cases[HirVariant::kMaxCases]{};
+        bool seen_unguarded_variant_cases[HirVariant::kMaxCases]{};
         u32 seen_variant_case_count = 0;
         route->control.match_arms.len = 0;
         for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
@@ -6853,6 +6856,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     if (seen_variant_cases[case_index])
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                     seen_variant_cases[case_index] = true;
+                    seen_unguarded_variant_cases[case_index] = true;
                     seen_variant_case_count++;
                 }
                 auto inner_subject = analyze_expr(nested_match_stmt->expr,
@@ -6996,10 +7000,13 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     const u32 case_index = static_cast<u32>(pattern.int_value);
                     if (case_index >= HirVariant::kMaxCases)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    if (seen_variant_cases[case_index])
+                    if (seen_unguarded_variant_cases[case_index])
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    seen_variant_cases[case_index] = true;
-                    seen_variant_case_count++;
+                    if (!seen_variant_cases[case_index]) {
+                        seen_variant_cases[case_index] = true;
+                        seen_variant_case_count++;
+                    }
+                    if (!arm.has_guard) seen_unguarded_variant_cases[case_index] = true;
                     const auto& variant = mod.variants[pattern.variant_index];
                     const auto& case_decl = variant.cases[case_index];
                     if (case_decl.has_payload && arm.pattern.lhs != nullptr) {

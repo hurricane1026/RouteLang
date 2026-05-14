@@ -8120,6 +8120,28 @@ TEST(frontend, route_match_arm_guard_can_use_payload_binding) {
     REQUIRE(lowered);
     rir.destroy();
 }
+TEST(frontend, route_match_guarded_variant_case_falls_through_to_same_case) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/users\" { let state = Result.ok(201) match state { case .ok(code) if code "
+        "== 200: return 200 case .ok(code): return 201 case _: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 3u);
+    CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
+    CHECK_FALSE(hir->routes[0].control.match_arms[1].has_arm_guard);
+    CHECK(hir->routes[0].control.match_arms[1].bind_payload);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
 TEST(frontend, route_match_arm_guard_after_route_guards_falls_through_to_next_test) {
     const char* src =
         "route GET \"/users\" { guard true else { return 401 } guard true else { return 402 } let "
@@ -13900,6 +13922,30 @@ func pick(result: Result) -> i32 {
 route GET "/users" {
     let code = pick(Result.ok(200))
     if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->functions[0].body.kind), static_cast<u8>(HirExprKind::IfElse));
+}
+TEST(frontend, source_function_guarded_variant_case_falls_through_to_same_case) {
+    const auto src = R"(
+variant Result { ok(i32), err }
+func pick(result: Result) -> i32 {
+    match result {
+        case .ok(code) if code == 200 => 200
+        case .ok(code) => code
+        case _ => 404
+    }
+}
+route GET "/users" {
+    let code = pick(Result.ok(201))
+    if code == 201 { return 200 } else { return 500 }
 }
 )";
     auto lexed = lex(lit(src));

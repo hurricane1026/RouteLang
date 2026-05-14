@@ -5691,6 +5691,10 @@ static FrontendResult<void> collect_named_error_cases_ast(
     for (u32 i = 0; i < stmt.match_arms.len; i++) {
         auto pattern_cases = collect_named_error_cases_ast_expr(stmt.match_arms[i].pattern, cases);
         if (!pattern_cases) return pattern_cases;
+        if (stmt.match_arms[i].guard != nullptr) {
+            auto guard_cases = collect_named_error_cases_ast_expr(*stmt.match_arms[i].guard, cases);
+            if (!guard_cases) return guard_cases;
+        }
         if (stmt.match_arms[i].stmt != nullptr) {
             auto body_cases = collect_named_error_cases_ast(*stmt.match_arms[i].stmt, cases);
             if (!body_cases) return body_cases;

@@ -6820,68 +6820,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 nested_match_stmt = arm.stmt;
             } else if (can_expand_nested_match && arm.stmt != nullptr &&
                        arm.stmt->kind == AstStmtKind::Block && arm.stmt->block_stmts.len != 0) {
-                bool prefix_ok = true;
-                for (u32 bi = 0; bi + 1 < arm.stmt->block_stmts.len; bi++) {
-                    const auto& prefix = *arm.stmt->block_stmts[bi];
-                    if (prefix.kind != AstStmtKind::Let) {
-                        prefix_ok = false;
-                        break;
-                    }
-                }
                 const auto* last = arm.stmt->block_stmts[arm.stmt->block_stmts.len - 1];
-                if (prefix_ok && last->kind == AstStmtKind::Match && !last->is_const &&
-                    arm.stmt->block_stmts.len > 1) {
-                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                }
-                if (prefix_ok && last->kind == AstStmtKind::Match && !last->is_const) {
-                    for (u32 bi = 0; bi + 1 < arm.stmt->block_stmts.len; bi++) {
-                        const auto& prefix = *arm.stmt->block_stmts[bi];
-                        auto init = analyze_expr(
-                            prefix.expr, route, mod, nested_locals, nested_local_count, binding);
-                        if (!init) return core::make_unexpected(init.error());
-                        if (init->kind == HirExprKind::ArrayLit)
-                            return frontend_error(FrontendError::UnsupportedSyntax,
-                                                  prefix.expr.span);
-                        auto typed = apply_declared_type_to_expr(&init.value(), mod, prefix);
-                        if (!typed) return core::make_unexpected(typed.error());
-                        HirLocal local{};
-                        local.span = prefix.span;
-                        local.name = prefix.name;
-                        local.ref_index =
-                            next_local_ref_index(route, nested_locals, nested_local_count);
-                        local.type = init->type;
-                        local.generic_index = init->generic_index;
-                        local.generic_has_error_constraint = init->generic_has_error_constraint;
-                        local.generic_has_eq_constraint = init->generic_has_eq_constraint;
-                        local.generic_has_ord_constraint = init->generic_has_ord_constraint;
-                        local.generic_protocol_index = init->generic_protocol_index;
-                        local.generic_protocol_count = init->generic_protocol_count;
-                        for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
-                            local.generic_protocol_indices[cpi] =
-                                init->generic_protocol_indices[cpi];
-                        local.may_nil = init->may_nil;
-                        local.may_error = init->may_error;
-                        local.variant_index = init->variant_index;
-                        local.struct_index = init->struct_index;
-                        local.tuple_len = init->tuple_len;
-                        for (u32 ti = 0; ti < init->tuple_len; ti++) {
-                            local.tuple_types[ti] = init->tuple_types[ti];
-                            local.tuple_variant_indices[ti] = init->tuple_variant_indices[ti];
-                            local.tuple_struct_indices[ti] = init->tuple_struct_indices[ti];
-                        }
-                        local.error_struct_index = init->error_struct_index;
-                        local.error_variant_index = init->error_variant_index;
-                        local.shape_index = init->shape_index;
-                        local.init = init.value();
-                        if (!route->locals.push(local))
-                            return frontend_error(FrontendError::TooManyItems, prefix.span);
-                        auto inserted = insert_scoped_local(nested_locals,
-                                                            nested_local_count,
-                                                            HirRoute::kMaxLocals,
-                                                            local,
-                                                            prefix.span);
-                        if (!inserted) return core::make_unexpected(inserted.error());
-                    }
+                if (last->kind == AstStmtKind::Match && !last->is_const) {
+                    if (arm.stmt->block_stmts.len != 1)
+                        return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                     nested_match_stmt = last;
                 }
             }

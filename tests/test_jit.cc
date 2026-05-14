@@ -2128,6 +2128,94 @@ TEST(jit, frontend_variant_match) {
     rir.destroy();
 }
 
+TEST(jit, frontend_string_match_returns_matching_status_and_fallback) {
+    const char* src =
+        "route GET \"/users\" { let path = req.path match path { case \"/api/users\": return 200 "
+        "case _: return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto matched = HandlerResult::unpack(handler(nullptr,
+                                                 nullptr,
+                                                 reinterpret_cast<const u8*>(kGetApiRequest),
+                                                 sizeof(kGetApiRequest) - 1,
+                                                 nullptr));
+    CHECK(matched.action == HandlerAction::ReturnStatus);
+    CHECK(matched.status_code == 200);
+
+    auto fallback = HandlerResult::unpack(handler(nullptr,
+                                                  nullptr,
+                                                  reinterpret_cast<const u8*>(kGetRootRequest),
+                                                  sizeof(kGetRootRequest) - 1,
+                                                  nullptr));
+    CHECK(fallback.action == HandlerAction::ReturnStatus);
+    CHECK(fallback.status_code == 404);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_route_match_arm_guard_false_falls_through) {
+    const char* src =
+        "route GET \"/users\" { let code = 200 match code { case 200 if req.method == POST: "
+        "return 500 case _: return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 404);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_variant_single_payload_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"

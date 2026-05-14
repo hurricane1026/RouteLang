@@ -8480,6 +8480,19 @@ TEST(frontend, analyze_rejects_route_nested_match_duplicate_bool_case) {
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
+TEST(frontend, analyze_rejects_route_nested_match_duplicate_outer_bool_case) {
+    const char* src =
+        "route GET \"/users\" { let ok = true let allowed = true match ok { case true: match "
+        "allowed { case true: return 200 case false: return 404 } case true: return 201 case "
+        "false: return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, analyze_rejects_route_nested_match_inner_arm_guard) {
     const char* src =
         "variant Auth { ok, denied }\n"
@@ -8565,6 +8578,7 @@ TEST(frontend, analyze_rejects_guarded_outer_arm_with_nested_match) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, analyze_rejects_wildcard_outer_arm_with_nested_match) {
     const char* src =
@@ -8577,6 +8591,7 @@ TEST(frontend, analyze_rejects_wildcard_outer_arm_with_nested_match) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, guard_then_match_lowers_to_guard_and_match_blocks) {
     const char* src =

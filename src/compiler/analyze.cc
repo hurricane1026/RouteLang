@@ -6738,14 +6738,16 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     !(subject_is_error_kind && outer_pattern->kind == HirExprKind::VariantCase))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 if (outer_pattern->kind == HirExprKind::BoolLit) {
-                    bool& seen_bool_case =
-                        outer_pattern->bool_value ? seen_bool_true : seen_bool_false;
-                    if (seen_bool_case)
+                    bool& seen_unguarded_bool_case = outer_pattern->bool_value
+                                                         ? seen_unguarded_bool_true
+                                                         : seen_unguarded_bool_false;
+                    if (seen_unguarded_bool_case)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                     if (outer_pattern->bool_value)
                         seen_bool_true = true;
                     else
                         seen_bool_false = true;
+                    seen_unguarded_bool_case = true;
                 }
                 if (outer_pattern->kind == HirExprKind::VariantCase) {
                     if ((subject_is_error_kind &&

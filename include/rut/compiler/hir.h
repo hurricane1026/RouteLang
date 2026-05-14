@@ -87,6 +87,7 @@ enum class HirExprKind : u8 {
     ValueOf,
     MissingOf,
     MatchPayload,
+    VariantTag,
     ProtocolCall,
     WaitResult,
     WaitField,

@@ -3670,6 +3670,44 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 return frontend_error(FrontendError::TooManyItems, span);
             return out;
         };
+        auto make_match_condition = [&](Span span,
+                                        const HirExpr& subject_expr,
+                                        const HirExpr& pattern_expr) -> FrontendResult<HirExpr> {
+            HirExpr cond{};
+            cond.kind = HirExprKind::Eq;
+            cond.type = HirTypeKind::Bool;
+            cond.span = span;
+            if (pattern_expr.kind == HirExprKind::VariantCase) {
+                HirExpr tag{};
+                tag.kind = HirExprKind::VariantTag;
+                tag.type = HirTypeKind::I32;
+                tag.span = span;
+                tag.variant_index = pattern_expr.variant_index;
+                if (!scratch->exprs.push(subject_expr))
+                    return frontend_error(FrontendError::TooManyItems, span);
+                tag.lhs = &scratch->exprs[scratch->exprs.len - 1];
+
+                HirExpr case_index{};
+                case_index.kind = HirExprKind::IntLit;
+                case_index.type = HirTypeKind::I32;
+                case_index.span = span;
+                case_index.int_value = pattern_expr.int_value;
+                if (!scratch->exprs.push(tag))
+                    return frontend_error(FrontendError::TooManyItems, span);
+                cond.lhs = &scratch->exprs[scratch->exprs.len - 1];
+                if (!scratch->exprs.push(case_index))
+                    return frontend_error(FrontendError::TooManyItems, span);
+                cond.rhs = &scratch->exprs[scratch->exprs.len - 1];
+                return cond;
+            }
+            if (!scratch->exprs.push(subject_expr))
+                return frontend_error(FrontendError::TooManyItems, span);
+            cond.lhs = &scratch->exprs[scratch->exprs.len - 1];
+            if (!scratch->exprs.push(pattern_expr))
+                return frontend_error(FrontendError::TooManyItems, span);
+            cond.rhs = &scratch->exprs[scratch->exprs.len - 1];
+            return cond;
+        };
 
         for (i32 ai = static_cast<i32>(stmt.match_arms.len) - 1; ai >= 0; ai--) {
             const auto& arm = stmt.match_arms[static_cast<u32>(ai)];
@@ -3720,11 +3758,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 const u32 case_index = static_cast<u32>(pattern->int_value);
                 const auto& case_decl = mod.variants[pattern->variant_index].cases[case_index];
                 if (case_decl.has_payload && arm.pattern.lhs != nullptr) {
-                    bind_match_payload(&arm_binding,
-                                       arm.pattern.lhs->name,
-                                       case_decl,
-                                       case_index,
-                                       subject_ptr);
+                    bind_match_payload(
+                        &arm_binding, arm.pattern.lhs->name, case_decl, case_index, subject_ptr);
                     arm_binding_ptr = &arm_binding;
                 }
             }
@@ -3753,18 +3788,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 continue;
             }
 
-            HirExpr cond{};
-            cond.kind = HirExprKind::Eq;
-            cond.type = HirTypeKind::Bool;
-            cond.span = arm.span;
-            if (!scratch->exprs.push(*subject_ptr))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
-            cond.lhs = &scratch->exprs[scratch->exprs.len - 1];
-            if (!scratch->exprs.push(pattern.value()))
-                return frontend_error(FrontendError::TooManyItems, arm.span);
-            cond.rhs = &scratch->exprs[scratch->exprs.len - 1];
+            auto cond = make_match_condition(arm.span, *subject_ptr, pattern.value());
+            if (!cond) return core::make_unexpected(cond.error());
 
-            auto out = make_ifelse_expr(stmt.span, cond, body_expr, result);
+            auto out = make_ifelse_expr(stmt.span, cond.value(), body_expr, result);
             if (!out) return core::make_unexpected(out.error());
             result = out.value();
         }
@@ -6555,25 +6582,25 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             (subject->error_variant_index != 0xffffffffu ||
              (state == KnownValueState::Error && err_name.len != 0))) {
             if (state != KnownValueState::Unknown) {
-            const AstStatement::MatchArm* wildcard_arm = nullptr;
-            const AstStatement::MatchArm* selected_arm = nullptr;
-            bool can_use_known_error_shortcut = true;
-            for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
-                if (stmt.match_arms[ai].is_wildcard && stmt.match_arms[ai].has_guard)
-                    return frontend_error(FrontendError::UnsupportedSyntax,
-                                          stmt.match_arms[ai].span);
-            }
-            if (state == KnownValueState::Error) {
-                const auto err_case = known_error_case(subject.value(), locals, local_count, 0);
-                if (!err_case.known)
-                    if (err_name.len == 0)
-                        return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+                const AstStatement::MatchArm* wildcard_arm = nullptr;
+                const AstStatement::MatchArm* selected_arm = nullptr;
+                bool can_use_known_error_shortcut = true;
                 for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
-                    const auto& arm = stmt.match_arms[ai];
-                    if (arm.is_wildcard) {
-                        wildcard_arm = &arm;
-                        continue;
-                    }
+                    if (stmt.match_arms[ai].is_wildcard && stmt.match_arms[ai].has_guard)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              stmt.match_arms[ai].span);
+                }
+                if (state == KnownValueState::Error) {
+                    const auto err_case = known_error_case(subject.value(), locals, local_count, 0);
+                    if (!err_case.known)
+                        if (err_name.len == 0)
+                            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+                    for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+                        const auto& arm = stmt.match_arms[ai];
+                        if (arm.is_wildcard) {
+                            wildcard_arm = &arm;
+                            continue;
+                        }
                         if (arm.pattern.kind != AstExprKind::VariantCase)
                             return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                         bool matched = false;
@@ -6636,11 +6663,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                         }
                     }
                 } else {
-                for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
-                    if (stmt.match_arms[ai].is_wildcard) {
-                        wildcard_arm = &stmt.match_arms[ai];
-                        break;
-                    }
+                    for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+                        if (stmt.match_arms[ai].is_wildcard) {
+                            wildcard_arm = &stmt.match_arms[ai];
+                            break;
+                        }
                     }
                 }
 

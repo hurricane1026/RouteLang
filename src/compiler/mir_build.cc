@@ -550,6 +550,17 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         apply_expr_shape_if_available(module, expr, &v);
         return v;
     }
+    if (expr.kind == HirExprKind::VariantTag) {
+        auto lhs = mir_value(*expr.lhs, module, fn, ctx);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        if (!fn->values.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = MirValueKind::VariantTag;
+        v.type = MirTypeKind::I32;
+        v.variant_index = expr.variant_index;
+        v.lhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
     if (expr.kind == HirExprKind::LocalRef) {
         // For-loop unroll (Phase 4b): when lowering a body expression for
         // iteration j, ctx carries the loop var's ref_index and the element

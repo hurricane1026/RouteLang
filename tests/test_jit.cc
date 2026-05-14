@@ -2364,6 +2364,60 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_route_nested_match_payload_variant_case_compares_tag) {
+    const auto src = R"(
+variant Auth { ok, denied }
+variant Result { ok(i32), err }
+route GET "/users" {
+    let auth = Auth.ok
+    let result = Result.ok(200)
+    match auth {
+    case .ok:
+        match result {
+        case .ok: return 200
+        case _: return 404
+        }
+    case .denied:
+        return 403
+    }
+}
+)";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_variant_single_payload_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"

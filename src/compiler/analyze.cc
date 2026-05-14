@@ -6818,12 +6818,35 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                         cond.kind = HirExprKind::Eq;
                         cond.type = HirTypeKind::Bool;
                         cond.span = inner_arm.span;
-                        if (!route->exprs.push(inner_subject.value()))
-                            return frontend_error(FrontendError::TooManyItems, inner_arm.span);
-                        cond.lhs = &route->exprs[route->exprs.len - 1];
-                        if (!route->exprs.push(inner_pattern.value()))
-                            return frontend_error(FrontendError::TooManyItems, inner_arm.span);
-                        cond.rhs = &route->exprs[route->exprs.len - 1];
+                        if (inner_pattern->kind == HirExprKind::VariantCase) {
+                            HirExpr tag{};
+                            tag.kind = HirExprKind::VariantTag;
+                            tag.type = HirTypeKind::I32;
+                            tag.span = inner_arm.span;
+                            tag.variant_index = inner_pattern->variant_index;
+                            if (!route->exprs.push(inner_subject.value()))
+                                return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                            tag.lhs = &route->exprs[route->exprs.len - 1];
+
+                            HirExpr case_index{};
+                            case_index.kind = HirExprKind::IntLit;
+                            case_index.type = HirTypeKind::I32;
+                            case_index.span = inner_arm.span;
+                            case_index.int_value = inner_pattern->int_value;
+                            if (!route->exprs.push(tag))
+                                return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                            cond.lhs = &route->exprs[route->exprs.len - 1];
+                            if (!route->exprs.push(case_index))
+                                return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                            cond.rhs = &route->exprs[route->exprs.len - 1];
+                        } else {
+                            if (!route->exprs.push(inner_subject.value()))
+                                return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                            cond.lhs = &route->exprs[route->exprs.len - 1];
+                            if (!route->exprs.push(inner_pattern.value()))
+                                return frontend_error(FrontendError::TooManyItems, inner_arm.span);
+                            cond.rhs = &route->exprs[route->exprs.len - 1];
+                        }
                         hir_arm.has_arm_guard = true;
                         hir_arm.arm_guard = cond;
                     } else {

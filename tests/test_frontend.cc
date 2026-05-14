@@ -8484,6 +8484,7 @@ TEST(frontend, analyze_rejects_route_nested_match_after_guard_prefix) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, analyze_rejects_guarded_outer_arm_with_nested_match) {
     const char* src =

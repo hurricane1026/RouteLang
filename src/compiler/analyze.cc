@@ -2896,6 +2896,34 @@ static FrontendResult<HirExpr> analyze_match_pattern(const AstExpr& pattern_expr
     return analyze_expr(pattern_expr, route, mod, locals, local_count, nullptr);
 }
 
+static void bind_match_payload(MatchPayloadBinding* binding,
+                               Str name,
+                               const HirVariant::CaseDecl& case_decl,
+                               u32 case_index,
+                               const HirExpr* subject) {
+    binding->name = name;
+    binding->type = case_decl.payload_type;
+    binding->generic_index = case_decl.payload_generic_index;
+    binding->generic_has_error_constraint = case_decl.payload_generic_has_error_constraint;
+    binding->generic_has_eq_constraint = case_decl.payload_generic_has_eq_constraint;
+    binding->generic_has_ord_constraint = case_decl.payload_generic_has_ord_constraint;
+    binding->generic_protocol_index = case_decl.payload_generic_protocol_index;
+    binding->generic_protocol_count = case_decl.payload_generic_protocol_count;
+    for (u32 cpi = 0; cpi < binding->generic_protocol_count; cpi++)
+        binding->generic_protocol_indices[cpi] = case_decl.payload_generic_protocol_indices[cpi];
+    binding->variant_index = case_decl.payload_variant_index;
+    binding->struct_index = case_decl.payload_struct_index;
+    binding->shape_index = case_decl.payload_shape_index;
+    binding->case_index = case_index;
+    binding->tuple_len = case_decl.payload_tuple_len;
+    for (u32 ti = 0; ti < case_decl.payload_tuple_len; ti++) {
+        binding->tuple_types[ti] = case_decl.payload_tuple_types[ti];
+        binding->tuple_variant_indices[ti] = case_decl.payload_tuple_variant_indices[ti];
+        binding->tuple_struct_indices[ti] = case_decl.payload_tuple_struct_indices[ti];
+    }
+    binding->subject = subject;
+}
+
 static u8 route_method_key_from_token(u8 token_type) {
     switch (static_cast<TokenType>(token_type)) {
         case TokenType::KwGet:
@@ -6690,22 +6718,42 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                         if (arm.pattern.kind != AstExprKind::VariantCase)
                             return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                         bool matched = false;
-                        if (err_case.known && arm.pattern.name.len != 0) {
+                        HirExpr matched_pattern{};
+                        bool has_matched_pattern = false;
+                        if (err_case.known) {
                             auto pattern = analyze_match_pattern(
                                 arm.pattern, subject.value(), route, mod, locals, local_count);
                             if (!pattern) return core::make_unexpected(pattern.error());
                             matched = pattern->kind == HirExprKind::VariantCase &&
                                       pattern->variant_index == err_case.variant_index &&
                                       pattern->case_index == err_case.case_index;
+                            if (matched) {
+                                matched_pattern = pattern.value();
+                                has_matched_pattern = true;
+                            }
                         } else {
                             matched = arm.pattern.str_value.eq(err_name);
                         }
                         if (matched && arm.has_guard) {
                             if (arm.guard == nullptr)
                                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                            MatchPayloadBinding arm_binding{};
+                            const MatchPayloadBinding* arm_binding_ptr = binding;
+                            if (has_matched_pattern && arm.pattern.lhs != nullptr) {
+                                const auto& case_decl = mod.variants[matched_pattern.variant_index]
+                                                            .cases[matched_pattern.case_index];
+                                if (case_decl.has_payload) {
+                                    bind_match_payload(&arm_binding,
+                                                       arm.pattern.lhs->name,
+                                                       case_decl,
+                                                       matched_pattern.case_index,
+                                                       &subject.value());
+                                    arm_binding_ptr = &arm_binding;
+                                }
+                            }
                             const u32 expr_len_before_guard = route->exprs.len;
-                            auto guard =
-                                analyze_expr(*arm.guard, route, mod, locals, local_count, binding);
+                            auto guard = analyze_expr(
+                                *arm.guard, route, mod, locals, local_count, arm_binding_ptr);
                             if (!guard) return core::make_unexpected(guard.error());
                             if (guard->type != HirTypeKind::Bool || guard->may_nil ||
                                 guard->may_error) {

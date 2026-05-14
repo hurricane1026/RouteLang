@@ -7386,6 +7386,26 @@ TEST(frontend, known_named_error_match_arm_guard_false_selects_wildcard) {
     REQUIRE(lowered);
     rir.destroy();
 }
+TEST(frontend, known_explicit_error_match_arm_guard_false_selects_wildcard) {
+    const char* src =
+        "variant AuthError { timeout, denied }\n"
+        "route GET \"/users\" { let failed = error(AuthError.timeout) match failed { case .timeout "
+        "if false: return 503 case _: return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
 TEST(frontend, known_named_error_match_runtime_arm_guard_falls_back_to_match) {
     const char* src =
         "route GET \"/users\" { let failed = error(.timeout) let allow = req.method == GET match "

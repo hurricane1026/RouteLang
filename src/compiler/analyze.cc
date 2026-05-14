@@ -3589,62 +3589,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             if (pattern->kind == HirExprKind::VariantCase &&
                 mod.variants[pattern->variant_index].cases[pattern->case_index].has_payload &&
                 arm.pattern.lhs != nullptr) {
-                selected_binding.name = arm.pattern.lhs->name;
-                selected_binding.type =
-                    mod.variants[pattern->variant_index].cases[pattern->case_index].payload_type;
-                selected_binding.generic_index = mod.variants[pattern->variant_index]
-                                                     .cases[pattern->case_index]
-                                                     .payload_generic_index;
-                selected_binding.generic_has_error_constraint =
-                    mod.variants[pattern->variant_index]
-                        .cases[pattern->case_index]
-                        .payload_generic_has_error_constraint;
-                selected_binding.generic_has_eq_constraint = mod.variants[pattern->variant_index]
-                                                                 .cases[pattern->case_index]
-                                                                 .payload_generic_has_eq_constraint;
-                selected_binding.generic_has_ord_constraint =
-                    mod.variants[pattern->variant_index]
-                        .cases[pattern->case_index]
-                        .payload_generic_has_ord_constraint;
-                selected_binding.generic_protocol_index = mod.variants[pattern->variant_index]
-                                                              .cases[pattern->case_index]
-                                                              .payload_generic_protocol_index;
-                selected_binding.generic_protocol_count = mod.variants[pattern->variant_index]
-                                                              .cases[pattern->case_index]
-                                                              .payload_generic_protocol_count;
-                for (u32 cpi = 0; cpi < selected_binding.generic_protocol_count; cpi++) {
-                    selected_binding.generic_protocol_indices[cpi] =
-                        mod.variants[pattern->variant_index]
-                            .cases[pattern->case_index]
-                            .payload_generic_protocol_indices[cpi];
-                }
-                selected_binding.variant_index = mod.variants[pattern->variant_index]
-                                                     .cases[pattern->case_index]
-                                                     .payload_variant_index;
-                selected_binding.struct_index = mod.variants[pattern->variant_index]
-                                                    .cases[pattern->case_index]
-                                                    .payload_struct_index;
-                selected_binding.shape_index = mod.variants[pattern->variant_index]
-                                                   .cases[pattern->case_index]
-                                                   .payload_shape_index;
-                selected_binding.tuple_len = mod.variants[pattern->variant_index]
-                                                 .cases[pattern->case_index]
-                                                 .payload_tuple_len;
-                for (u32 ti = 0; ti < selected_binding.tuple_len; ti++) {
-                    selected_binding.tuple_types[ti] = mod.variants[pattern->variant_index]
-                                                           .cases[pattern->case_index]
-                                                           .payload_tuple_types[ti];
-                    selected_binding.tuple_variant_indices[ti] =
-                        mod.variants[pattern->variant_index]
-                            .cases[pattern->case_index]
-                            .payload_tuple_variant_indices[ti];
-                    selected_binding.tuple_struct_indices[ti] =
-                        mod.variants[pattern->variant_index]
-                            .cases[pattern->case_index]
-                            .payload_tuple_struct_indices[ti];
-                }
-                selected_binding.case_index = pattern->case_index;
-                selected_binding.subject = subject_ptr;
+                const auto& case_decl =
+                    mod.variants[pattern->variant_index].cases[pattern->case_index];
+                bind_match_payload(&selected_binding,
+                                   arm.pattern.lhs->name,
+                                   case_decl,
+                                   pattern->case_index,
+                                   subject_ptr);
                 selected_binding_ptr = &selected_binding;
             }
             break;
@@ -3769,33 +3720,11 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 const u32 case_index = static_cast<u32>(pattern->int_value);
                 const auto& case_decl = mod.variants[pattern->variant_index].cases[case_index];
                 if (case_decl.has_payload && arm.pattern.lhs != nullptr) {
-                    arm_binding.name = arm.pattern.lhs->name;
-                    arm_binding.type = case_decl.payload_type;
-                    arm_binding.generic_index = case_decl.payload_generic_index;
-                    arm_binding.generic_has_error_constraint =
-                        case_decl.payload_generic_has_error_constraint;
-                    arm_binding.generic_has_eq_constraint =
-                        case_decl.payload_generic_has_eq_constraint;
-                    arm_binding.generic_has_ord_constraint =
-                        case_decl.payload_generic_has_ord_constraint;
-                    arm_binding.generic_protocol_index = case_decl.payload_generic_protocol_index;
-                    arm_binding.generic_protocol_count = case_decl.payload_generic_protocol_count;
-                    for (u32 cpi = 0; cpi < arm_binding.generic_protocol_count; cpi++)
-                        arm_binding.generic_protocol_indices[cpi] =
-                            case_decl.payload_generic_protocol_indices[cpi];
-                    arm_binding.variant_index = case_decl.payload_variant_index;
-                    arm_binding.struct_index = case_decl.payload_struct_index;
-                    arm_binding.shape_index = case_decl.payload_shape_index;
-                    arm_binding.tuple_len = case_decl.payload_tuple_len;
-                    for (u32 ti = 0; ti < arm_binding.tuple_len; ti++) {
-                        arm_binding.tuple_types[ti] = case_decl.payload_tuple_types[ti];
-                        arm_binding.tuple_variant_indices[ti] =
-                            case_decl.payload_tuple_variant_indices[ti];
-                        arm_binding.tuple_struct_indices[ti] =
-                            case_decl.payload_tuple_struct_indices[ti];
-                    }
-                    arm_binding.case_index = case_index;
-                    arm_binding.subject = subject_ptr;
+                    bind_match_payload(&arm_binding,
+                                       arm.pattern.lhs->name,
+                                       case_decl,
+                                       case_index,
+                                       subject_ptr);
                     arm_binding_ptr = &arm_binding;
                 }
             }
@@ -6171,34 +6100,11 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 inner_arm.pattern.lhs != nullptr) {
                 const auto& case_decl =
                     mod.variants[pattern->variant_index].cases[pattern->case_index];
-                selected_binding = {};
-                selected_binding.name = inner_arm.pattern.lhs->name;
-                selected_binding.type = case_decl.payload_type;
-                selected_binding.generic_index = case_decl.payload_generic_index;
-                selected_binding.generic_has_error_constraint =
-                    case_decl.payload_generic_has_error_constraint;
-                selected_binding.generic_has_eq_constraint =
-                    case_decl.payload_generic_has_eq_constraint;
-                selected_binding.generic_has_ord_constraint =
-                    case_decl.payload_generic_has_ord_constraint;
-                selected_binding.generic_protocol_index = case_decl.payload_generic_protocol_index;
-                selected_binding.generic_protocol_count = case_decl.payload_generic_protocol_count;
-                for (u32 cpi = 0; cpi < selected_binding.generic_protocol_count; cpi++)
-                    selected_binding.generic_protocol_indices[cpi] =
-                        case_decl.payload_generic_protocol_indices[cpi];
-                selected_binding.variant_index = case_decl.payload_variant_index;
-                selected_binding.struct_index = case_decl.payload_struct_index;
-                selected_binding.shape_index = case_decl.payload_shape_index;
-                selected_binding.case_index = pattern->case_index;
-                selected_binding.tuple_len = case_decl.payload_tuple_len;
-                for (u32 ti = 0; ti < case_decl.payload_tuple_len; ti++) {
-                    selected_binding.tuple_types[ti] = case_decl.payload_tuple_types[ti];
-                    selected_binding.tuple_variant_indices[ti] =
-                        case_decl.payload_tuple_variant_indices[ti];
-                    selected_binding.tuple_struct_indices[ti] =
-                        case_decl.payload_tuple_struct_indices[ti];
-                }
-                selected_binding.subject = subject_ptr;
+                bind_match_payload(&selected_binding,
+                                   inner_arm.pattern.lhs->name,
+                                   case_decl,
+                                   pattern->case_index,
+                                   subject_ptr);
                 selected_binding_ptr = &selected_binding;
             }
             break;
@@ -6555,63 +6461,13 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             if (pattern->kind == HirExprKind::VariantCase &&
                 mod.variants[pattern->variant_index].cases[pattern->case_index].has_payload &&
                 arm.pattern.lhs != nullptr) {
-                selected_binding = {};
-                selected_binding.name = arm.pattern.lhs->name;
-                selected_binding.type =
-                    mod.variants[pattern->variant_index].cases[pattern->case_index].payload_type;
-                selected_binding.generic_index = mod.variants[pattern->variant_index]
-                                                     .cases[pattern->case_index]
-                                                     .payload_generic_index;
-                selected_binding.generic_has_error_constraint =
-                    mod.variants[pattern->variant_index]
-                        .cases[pattern->case_index]
-                        .payload_generic_has_error_constraint;
-                selected_binding.generic_has_eq_constraint = mod.variants[pattern->variant_index]
-                                                                 .cases[pattern->case_index]
-                                                                 .payload_generic_has_eq_constraint;
-                selected_binding.generic_has_ord_constraint =
-                    mod.variants[pattern->variant_index]
-                        .cases[pattern->case_index]
-                        .payload_generic_has_ord_constraint;
-                selected_binding.generic_protocol_index = mod.variants[pattern->variant_index]
-                                                              .cases[pattern->case_index]
-                                                              .payload_generic_protocol_index;
-                selected_binding.generic_protocol_count = mod.variants[pattern->variant_index]
-                                                              .cases[pattern->case_index]
-                                                              .payload_generic_protocol_count;
-                for (u32 cpi = 0; cpi < selected_binding.generic_protocol_count; cpi++) {
-                    selected_binding.generic_protocol_indices[cpi] =
-                        mod.variants[pattern->variant_index]
-                            .cases[pattern->case_index]
-                            .payload_generic_protocol_indices[cpi];
-                }
-                selected_binding.variant_index = mod.variants[pattern->variant_index]
-                                                     .cases[pattern->case_index]
-                                                     .payload_variant_index;
-                selected_binding.struct_index = mod.variants[pattern->variant_index]
-                                                    .cases[pattern->case_index]
-                                                    .payload_struct_index;
-                selected_binding.shape_index = mod.variants[pattern->variant_index]
-                                                   .cases[pattern->case_index]
-                                                   .payload_shape_index;
-                selected_binding.tuple_len = mod.variants[pattern->variant_index]
-                                                 .cases[pattern->case_index]
-                                                 .payload_tuple_len;
-                for (u32 ti = 0; ti < selected_binding.tuple_len; ti++) {
-                    selected_binding.tuple_types[ti] = mod.variants[pattern->variant_index]
-                                                           .cases[pattern->case_index]
-                                                           .payload_tuple_types[ti];
-                    selected_binding.tuple_variant_indices[ti] =
-                        mod.variants[pattern->variant_index]
-                            .cases[pattern->case_index]
-                            .payload_tuple_variant_indices[ti];
-                    selected_binding.tuple_struct_indices[ti] =
-                        mod.variants[pattern->variant_index]
-                            .cases[pattern->case_index]
-                            .payload_tuple_struct_indices[ti];
-                }
-                selected_binding.case_index = pattern->case_index;
-                selected_binding.subject = subject_ptr;
+                const auto& case_decl =
+                    mod.variants[pattern->variant_index].cases[pattern->case_index];
+                bind_match_payload(&selected_binding,
+                                   arm.pattern.lhs->name,
+                                   case_decl,
+                                   pattern->case_index,
+                                   subject_ptr);
                 selected_binding_ptr = &selected_binding;
             }
             break;
@@ -6699,22 +6555,25 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             (subject->error_variant_index != 0xffffffffu ||
              (state == KnownValueState::Error && err_name.len != 0))) {
             if (state != KnownValueState::Unknown) {
-                const AstStatement::MatchArm* wildcard_arm = nullptr;
-                const AstStatement::MatchArm* selected_arm = nullptr;
-                bool can_use_known_error_shortcut = true;
-                if (state == KnownValueState::Error) {
-                    const auto err_case = known_error_case(subject.value(), locals, local_count, 0);
-                    if (!err_case.known)
-                        if (err_name.len == 0)
-                            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
-                    for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
-                        const auto& arm = stmt.match_arms[ai];
-                        if (arm.is_wildcard) {
-                            if (arm.has_guard)
-                                return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                            wildcard_arm = &arm;
-                            continue;
-                        }
+            const AstStatement::MatchArm* wildcard_arm = nullptr;
+            const AstStatement::MatchArm* selected_arm = nullptr;
+            bool can_use_known_error_shortcut = true;
+            for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+                if (stmt.match_arms[ai].is_wildcard && stmt.match_arms[ai].has_guard)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          stmt.match_arms[ai].span);
+            }
+            if (state == KnownValueState::Error) {
+                const auto err_case = known_error_case(subject.value(), locals, local_count, 0);
+                if (!err_case.known)
+                    if (err_name.len == 0)
+                        return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+                for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+                    const auto& arm = stmt.match_arms[ai];
+                    if (arm.is_wildcard) {
+                        wildcard_arm = &arm;
+                        continue;
+                    }
                         if (arm.pattern.kind != AstExprKind::VariantCase)
                             return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                         bool matched = false;
@@ -6777,14 +6636,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                         }
                     }
                 } else {
-                    for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
-                        if (stmt.match_arms[ai].is_wildcard) {
-                            if (stmt.match_arms[ai].has_guard)
-                                return frontend_error(FrontendError::UnsupportedSyntax,
-                                                      stmt.match_arms[ai].span);
-                            wildcard_arm = &stmt.match_arms[ai];
-                            break;
-                        }
+                for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+                    if (stmt.match_arms[ai].is_wildcard) {
+                        wildcard_arm = &stmt.match_arms[ai];
+                        break;
+                    }
                     }
                 }
 

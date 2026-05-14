@@ -3746,9 +3746,12 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     seen_variant_case_count++;
                 }
             } else if (pattern->type == HirTypeKind::Bool) {
-                if (pattern->bool_value)
+                bool& seen_bool_case = pattern->bool_value ? seen_bool_true : seen_bool_false;
+                if (seen_bool_case && !arm.has_guard)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                if (pattern->bool_value && !seen_bool_case)
                     seen_bool_true = true;
-                else
+                else if (!pattern->bool_value && !seen_bool_case)
                     seen_bool_false = true;
             }
 
@@ -6690,6 +6693,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         bool seen_guarded_arm = false;
         bool seen_bool_true = false;
         bool seen_bool_false = false;
+        bool seen_unguarded_bool_true = false;
+        bool seen_unguarded_bool_false = false;
         bool seen_variant_cases[HirVariant::kMaxCases]{};
         bool seen_unguarded_variant_cases[HirVariant::kMaxCases]{};
         u32 seen_variant_case_count = 0;
@@ -6733,6 +6738,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     !(subject_is_error_kind && outer_pattern->kind == HirExprKind::VariantCase))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 if (outer_pattern->kind == HirExprKind::BoolLit) {
+                    bool& seen_bool_case =
+                        outer_pattern->bool_value ? seen_bool_true : seen_bool_false;
+                    if (seen_bool_case)
+                        return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                     if (outer_pattern->bool_value)
                         seen_bool_true = true;
                     else
@@ -6795,6 +6804,12 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                         if (inner_pattern->type != inner_subject->type)
                             return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
                         if (inner_pattern->kind == HirExprKind::BoolLit) {
+                            bool& seen_bool_case = inner_pattern->bool_value
+                                                       ? inner_seen_bool_true
+                                                       : inner_seen_bool_false;
+                            if (seen_bool_case)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      inner_arm.span);
                             if (inner_pattern->bool_value)
                                 inner_seen_bool_true = true;
                             else
@@ -6928,10 +6943,16 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                      (!subject_is_error_kind && pattern.variant_index != subject->variant_index)))
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 if (pattern.kind == HirExprKind::BoolLit) {
-                    if (pattern.bool_value)
+                    bool& seen_bool_case = pattern.bool_value ? seen_bool_true : seen_bool_false;
+                    bool& seen_unguarded_bool_case =
+                        pattern.bool_value ? seen_unguarded_bool_true : seen_unguarded_bool_false;
+                    if (seen_unguarded_bool_case)
+                        return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                    if (pattern.bool_value && !seen_bool_case)
                         seen_bool_true = true;
-                    else
+                    else if (!pattern.bool_value && !seen_bool_case)
                         seen_bool_false = true;
+                    if (!arm.has_guard) seen_unguarded_bool_case = true;
                 }
                 if (pattern.kind == HirExprKind::VariantCase) {
                     if (pattern.variant_index == 0xffffffffu) {

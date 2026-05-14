@@ -7683,6 +7683,18 @@ TEST(frontend, analyze_rejects_duplicate_variant_match_case) {
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
+TEST(frontend, analyze_rejects_duplicate_bool_match_case) {
+    const char* src =
+        "route GET \"/users\" { let ok = true match ok { case true: return 200 case true: return "
+        "403 case false: return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, lower_forward_route_to_rir) {
     const char* src = "upstream api\nroute GET \"/users\" { return forward(api) }\n";
     auto lexed = lex(lit(src));
@@ -8160,6 +8172,20 @@ TEST(frontend, bool_match_true_false_cases_are_exhaustive) {
     CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
     REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
 }
+TEST(frontend, route_bool_match_guarded_duplicate_case_can_fall_through) {
+    const char* src =
+        "route GET \"/users\" { let ok = true match ok { case true if false: return 403 case true: "
+        "return 200 case _: return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 3u);
+    CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
+}
 TEST(frontend, route_match_arm_guard_falls_through_to_default) {
     const char* src =
         "route GET \"/users\" { let code = 200 match code { case 200 if false: return 500 case _: "
@@ -8439,6 +8465,20 @@ TEST(frontend, route_match_arm_nested_bool_match_is_exhaustive) {
     REQUIRE_EQ(hir->routes[0].control.match_arms.len, 3u);
     CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
     CHECK_FALSE(hir->routes[0].control.match_arms[1].has_arm_guard);
+}
+TEST(frontend, analyze_rejects_route_nested_match_duplicate_bool_case) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let allowed = true match auth { case .ok: match "
+        "allowed { case true: return 200 case true: return 201 case false: return 404 } case "
+        ".denied: return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, analyze_rejects_route_nested_match_inner_arm_guard) {
     const char* src =
@@ -14115,6 +14155,43 @@ route GET "/users" {
     let code = pick(true)
     if code == 200 { return 200 } else { return 500 }
 }
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, analyze_rejects_source_function_duplicate_bool_match_case) {
+    const auto src = R"(
+func pick(ok: bool) -> i32 {
+    match ok {
+        case true => 200
+        case true => 201
+        case false => 500
+    }
+}
+route GET "/users" { let code = pick(true) return 200 }
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, source_function_bool_match_guarded_duplicate_case_can_fall_through) {
+    const auto src = R"(
+func pick(ok: bool) -> i32 {
+    match ok {
+        case true if false => 201
+        case true => 200
+        case _ => 500
+    }
+}
+route GET "/users" { let code = pick(true) return 200 }
 )";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);

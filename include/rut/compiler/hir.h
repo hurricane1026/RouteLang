@@ -87,6 +87,7 @@ enum class HirExprKind : u8 {
     ValueOf,
     MissingOf,
     MatchPayload,
+    VariantTag,
     ProtocolCall,
     WaitResult,
     WaitField,
@@ -673,6 +674,8 @@ struct HirMatchArm {
     HirTypeKind bind_tuple_types[kMaxTupleSlots]{};
     u32 bind_tuple_variant_indices[kMaxTupleSlots]{};
     u32 bind_tuple_struct_indices[kMaxTupleSlots]{};
+    bool has_arm_guard = false;
+    HirExpr arm_guard{};
     BodyKind body_kind = BodyKind::Direct;
     static constexpr u32 kMaxPreludeGuards = 4;
     FixedVec<HirGuard, kMaxPreludeGuards> guards;
@@ -887,6 +890,7 @@ private:
         rebase_expr(control.match_expr, other);
         for (u32 i = 0; i < control.match_arms.len; i++) {
             rebase_expr(control.match_arms[i].pattern, other);
+            rebase_expr(control.match_arms[i].arm_guard, other);
             for (u32 gi = 0; gi < control.match_arms[i].guards.len; gi++) {
                 rebase_expr(control.match_arms[i].guards[gi].cond, other);
             }

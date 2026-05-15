@@ -45,6 +45,7 @@ enum class MirValueKind : u8 {
     ValueOf,
     MissingOf,
     MatchPayload,
+    VariantTag,
     WaitResult,
     WaitField,
 };

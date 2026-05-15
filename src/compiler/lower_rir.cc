@@ -2053,6 +2053,34 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!unwrapped) return frontend_error(FrontendError::OutOfMemory, span);
         return unwrapped.value();
     }
+    if (value.kind == MirValueKind::VariantTag) {
+        auto subject = materialize_value(*value.lhs,
+                                         mir,
+                                         variant_infos,
+                                         tuple_infos,
+                                         tuple_info_count,
+                                         error_scalar_infos,
+                                         error_variant_infos,
+                                         error_struct_infos,
+                                         user_struct_defs,
+                                         b,
+                                         locals,
+                                         local_count,
+                                         span);
+        if (!subject) return core::make_unexpected(subject.error());
+        const auto subject_shape = resolved_shape(mir, *value.lhs);
+        if (subject_shape.type != MirTypeKind::Variant ||
+            subject_shape.variant_index >= mir.variants.len)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        if (variant_infos[subject_shape.variant_index].struct_type == nullptr)
+            return subject.value();
+        auto i32_ty = b.make_type(rir::TypeKind::I32);
+        if (!i32_ty) return frontend_error(FrontendError::OutOfMemory, span);
+        auto tag =
+            b.emit_struct_field(subject.value(), lit("tag"), i32_ty.value(), {span.line, span.col});
+        if (!tag) return frontend_error(FrontendError::OutOfMemory, span);
+        return tag.value();
+    }
     if (value.kind == MirValueKind::Eq || value.kind == MirValueKind::Lt ||
         value.kind == MirValueKind::Gt) {
         const MirValue& lhs_expr = *value.lhs;

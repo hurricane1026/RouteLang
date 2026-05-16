@@ -13,6 +13,7 @@ enum class AstItemKind : u8 {
     Variant,
     Protocol,
     Using,
+    TypeAlias,
     Impl,
     Route,
 };
@@ -267,6 +268,10 @@ struct AstVariantDecl {
 struct AstProtocolDecl {
     static constexpr u32 kMaxMethods = 8;
     static constexpr u32 kMaxParams = 8;
+    static constexpr u32 kMaxAssociatedTypes = 8;
+    struct AssociatedTypeDecl {
+        Str name{};
+    };
     struct MethodDecl {
         struct ParamDecl {
             Str name{};
@@ -281,6 +286,7 @@ struct AstProtocolDecl {
     };
     Span span{};
     Str name{};
+    FixedVec<AssociatedTypeDecl, kMaxAssociatedTypes> associated_types;
     FixedVec<MethodDecl, kMaxMethods> methods;
 };
 
@@ -306,13 +312,41 @@ struct AstUsingDecl {
     FixedVec<Str, kMaxTargetParts> target_parts;
 };
 
+struct AstTypeAliasDecl {
+    static constexpr u32 kMaxTypeParams = 4;
+    static constexpr u32 kMaxArms = 8;
+    struct ArmDecl {
+        bool is_wildcard = false;
+        bool is_type_equality = false;
+        Str type_param{};
+        Str associated_name{};
+        Str rhs_type_param{};
+        Str rhs_associated_name{};
+        Str constraint_namespace{};
+        Str constraint{};
+        AstTypeRef type{};
+    };
+    Span span{};
+    Str name{};
+    FixedVec<Str, kMaxTypeParams> type_params;
+    bool is_match = false;
+    AstTypeRef target{};
+    FixedVec<ArmDecl, kMaxArms> arms;
+};
+
 struct AstImplDecl {
     static constexpr u32 kMaxProtocols = 4;
     static constexpr u32 kMaxMethods = 8;
+    static constexpr u32 kMaxAssociatedTypes = 8;
+    struct AssociatedTypeBinding {
+        Str name{};
+        AstTypeRef type{};
+    };
     Span span{};
     AstTypeRef target{};
     FixedVec<Str, kMaxProtocols> protocol_namespaces;
     FixedVec<Str, kMaxProtocols> protocols;
+    FixedVec<AssociatedTypeBinding, kMaxAssociatedTypes> associated_types;
     FixedVec<AstFunctionDecl, kMaxMethods> methods;
 };
 
@@ -343,6 +377,7 @@ struct AstItem {
     AstVariantDecl variant{};
     AstProtocolDecl protocol{};
     AstUsingDecl using_decl{};
+    AstTypeAliasDecl type_alias{};
     AstImplDecl impl_decl{};
     AstRouteDecl route{};
 };
@@ -493,8 +528,18 @@ private:
 
     void rebase_impl(const AstFile& other, AstImplDecl& decl) {
         rebase_type_ref(other, decl.target);
+        for (u32 i = 0; i < decl.associated_types.len; i++) {
+            rebase_type_ref(other, decl.associated_types[i].type);
+        }
         for (u32 i = 0; i < decl.methods.len; i++) {
             rebase_func(other, decl.methods[i]);
+        }
+    }
+
+    void rebase_type_alias(const AstFile& other, AstTypeAliasDecl& decl) {
+        rebase_type_ref(other, decl.target);
+        for (u32 i = 0; i < decl.arms.len; i++) {
+            rebase_type_ref(other, decl.arms[i].type);
         }
     }
 
@@ -515,6 +560,9 @@ private:
                     break;
                 case AstItemKind::Protocol:
                     rebase_protocol(other, items[i].protocol);
+                    break;
+                case AstItemKind::TypeAlias:
+                    rebase_type_alias(other, items[i].type_alias);
                     break;
                 case AstItemKind::Impl:
                     rebase_impl(other, items[i].impl_decl);

@@ -49,6 +49,28 @@ struct HirAlias {
     FixedVec<Str, kMaxTargetParts> target_parts;
 };
 
+struct HirTypeAlias {
+    static constexpr u32 kMaxTypeParams = AstTypeAliasDecl::kMaxTypeParams;
+    static constexpr u32 kMaxArms = AstTypeAliasDecl::kMaxArms;
+    struct ArmDecl {
+        bool is_wildcard = false;
+        bool is_type_equality = false;
+        Str type_param{};
+        Str associated_name{};
+        Str rhs_type_param{};
+        Str rhs_associated_name{};
+        Str constraint_namespace{};
+        Str constraint{};
+        AstTypeRef type{};
+    };
+    Span span{};
+    Str name{};
+    FixedVec<Str, kMaxTypeParams> type_params;
+    bool is_match = false;
+    AstTypeRef target{};
+    FixedVec<ArmDecl, kMaxArms> arms;
+};
+
 enum class HirExprKind : u8 {
     BoolLit,
     IntLit,
@@ -99,6 +121,7 @@ enum class HirTypeKind : u8 {
     I32,
     Str,
     Generic,
+    Associated,
     Variant,
     Tuple,
     Struct,
@@ -134,11 +157,16 @@ struct HirTypeShape {
 
 struct HirProtocol {
     static constexpr u32 kMaxMethods = 8;
+    static constexpr u32 kMaxAssociatedTypes = 8;
+    struct AssociatedTypeDecl {
+        Str name{};
+    };
     struct MethodDecl {
         struct ParamDecl {
             Str type_name{};
             HirTypeKind type = HirTypeKind::Unknown;
             u32 generic_index = 0xffffffffu;
+            Str associated_name{};
             u32 variant_index = 0xffffffffu;
             u32 struct_index = 0xffffffffu;
             u32 tuple_len = 0;
@@ -153,6 +181,7 @@ struct HirProtocol {
         Str return_type_name{};
         HirTypeKind return_type = HirTypeKind::Unknown;
         u32 return_generic_index = 0xffffffffu;
+        Str return_associated_name{};
         u32 return_variant_index = 0xffffffffu;
         u32 return_struct_index = 0xffffffffu;
         u32 return_tuple_len = 0;
@@ -169,6 +198,7 @@ struct HirProtocol {
     Span span{};
     Str name{};
     HirProtocolKind kind = HirProtocolKind::Custom;
+    FixedVec<AssociatedTypeDecl, kMaxAssociatedTypes> associated_types;
     FixedVec<MethodDecl, kMaxMethods> methods;
 };
 
@@ -306,6 +336,7 @@ struct HirExpr {
     Str msg{};
     u32 local_index = 0;
     u32 generic_index = 0xffffffffu;
+    Str associated_name{};
     bool generic_has_error_constraint = false;
     bool generic_has_eq_constraint = false;
     bool generic_has_ord_constraint = false;
@@ -367,6 +398,7 @@ struct HirFunction {
         Str name{};
         HirTypeKind type = HirTypeKind::Unknown;
         u32 generic_index = 0xffffffffu;
+        Str associated_name{};
         bool generic_has_error_constraint = false;
         bool generic_has_eq_constraint = false;
         bool generic_has_ord_constraint = false;
@@ -391,6 +423,7 @@ struct HirFunction {
     Str name{};
     HirTypeKind return_type = HirTypeKind::Unknown;
     u32 return_generic_index = 0xffffffffu;
+    Str return_associated_name{};
     u32 return_template_variant_index = 0xffffffffu;
     u32 return_template_struct_index = 0xffffffffu;
     u32 return_type_arg_count = 0;
@@ -415,6 +448,7 @@ struct HirFunction {
           name(other.name),
           return_type(other.return_type),
           return_generic_index(other.return_generic_index),
+          return_associated_name(other.return_associated_name),
           return_template_variant_index(other.return_template_variant_index),
           return_template_struct_index(other.return_template_struct_index),
           return_type_arg_count(other.return_type_arg_count),
@@ -442,6 +476,7 @@ struct HirFunction {
         name = other.name;
         return_type = other.return_type;
         return_generic_index = other.return_generic_index;
+        return_associated_name = other.return_associated_name;
         return_template_variant_index = other.return_template_variant_index;
         return_template_struct_index = other.return_template_struct_index;
         return_type_arg_count = other.return_type_arg_count;
@@ -469,6 +504,7 @@ struct HirFunction {
           name(other.name),
           return_type(other.return_type),
           return_generic_index(other.return_generic_index),
+          return_associated_name(other.return_associated_name),
           return_template_variant_index(other.return_template_variant_index),
           return_template_struct_index(other.return_template_struct_index),
           return_type_arg_count(other.return_type_arg_count),
@@ -496,6 +532,7 @@ struct HirFunction {
         name = other.name;
         return_type = other.return_type;
         return_generic_index = other.return_generic_index;
+        return_associated_name = other.return_associated_name;
         return_template_variant_index = other.return_template_variant_index;
         return_template_struct_index = other.return_template_struct_index;
         return_type_arg_count = other.return_type_arg_count;
@@ -552,6 +589,7 @@ struct HirLocal {
     u32 ref_index = 0;
     HirTypeKind type = HirTypeKind::Unknown;
     u32 generic_index = 0xffffffffu;
+    Str associated_name{};
     bool generic_has_error_constraint = false;
     bool generic_has_eq_constraint = false;
     bool generic_has_ord_constraint = false;
@@ -904,13 +942,28 @@ struct HirImplMethod {
     u32 function_index = 0xffffffffu;
 };
 
+struct HirAssociatedTypeBinding {
+    Str name{};
+    HirTypeKind type = HirTypeKind::Unknown;
+    u32 generic_index = 0xffffffffu;
+    u32 variant_index = 0xffffffffu;
+    u32 struct_index = 0xffffffffu;
+    u32 tuple_len = 0;
+    HirTypeKind tuple_types[kMaxTupleSlots]{};
+    u32 tuple_variant_indices[kMaxTupleSlots]{};
+    u32 tuple_struct_indices[kMaxTupleSlots]{};
+    u32 shape_index = 0xffffffffu;
+};
+
 struct HirImpl {
     static constexpr u32 kMaxMethods = 8;
+    static constexpr u32 kMaxAssociatedTypes = 8;
     Span span{};
     u32 protocol_index = 0xffffffffu;
     HirTypeKind type = HirTypeKind::Unknown;
     u32 struct_index = 0xffffffffu;
     bool is_generic_template = false;
+    FixedVec<HirAssociatedTypeBinding, kMaxAssociatedTypes> associated_types;
     FixedVec<HirImplMethod, kMaxMethods> methods;
 };
 
@@ -918,6 +971,7 @@ struct HirModule {
     static constexpr u32 kMaxUpstreams = 32;
     static constexpr u32 kMaxImports = 64;
     static constexpr u32 kMaxAliases = 64;
+    static constexpr u32 kMaxTypeAliases = 64;
     static constexpr u32 kMaxFunctions = 64;
     static constexpr u32 kMaxStructs = 64;
     static constexpr u32 kMaxVariants = 64;
@@ -931,6 +985,8 @@ struct HirModule {
     FixedVec<HirUpstream, kMaxUpstreams> upstreams;
     FixedVec<HirImport, kMaxImports> imports;
     FixedVec<HirAlias, kMaxAliases> aliases;
+    std::deque<AstTypeRef> type_ref_storage;
+    FixedVec<HirTypeAlias, kMaxTypeAliases> type_aliases;
     FixedVec<HirFunction, kMaxFunctions> functions;
     FixedVec<HirStruct, kMaxStructs> structs;
     FixedVec<HirVariant, kMaxVariants> variants;
@@ -950,6 +1006,8 @@ struct HirModule {
         : upstreams(other.upstreams),
           imports(other.imports),
           aliases(other.aliases),
+          type_ref_storage(other.type_ref_storage),
+          type_aliases(other.type_aliases),
           functions(other.functions),
           structs(other.structs),
           variants(other.variants),
@@ -962,12 +1020,16 @@ struct HirModule {
           owned_strings(other.owned_strings),
           has_package_decl(other.has_package_decl),
           package_span(other.package_span),
-          package_name(other.package_name) {}
+          package_name(other.package_name) {
+        rebase_type_alias_storage_ptrs(other);
+    }
     HirModule& operator=(const HirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
         imports = other.imports;
         aliases = other.aliases;
+        type_ref_storage = other.type_ref_storage;
+        type_aliases = other.type_aliases;
         functions = other.functions;
         structs = other.structs;
         variants = other.variants;
@@ -981,44 +1043,40 @@ struct HirModule {
         has_package_decl = other.has_package_decl;
         package_span = other.package_span;
         package_name = other.package_name;
+        rebase_type_alias_storage_ptrs(other);
         return *this;
     }
-    HirModule(HirModule&& other) noexcept
-        : upstreams(other.upstreams),
-          imports(other.imports),
-          aliases(other.aliases),
-          functions(other.functions),
-          structs(other.structs),
-          variants(other.variants),
-          protocols(other.protocols),
-          conformances(other.conformances),
-          impls(other.impls),
-          guard_match_arms(other.guard_match_arms),
-          routes(other.routes),
-          type_shapes(other.type_shapes),
-          owned_strings(other.owned_strings),
-          has_package_decl(other.has_package_decl),
-          package_span(other.package_span),
-          package_name(other.package_name) {}
-    HirModule& operator=(HirModule&& other) noexcept {
-        if (this == &other) return *this;
-        upstreams = other.upstreams;
-        imports = other.imports;
-        aliases = other.aliases;
-        functions = other.functions;
-        structs = other.structs;
-        variants = other.variants;
-        protocols = other.protocols;
-        conformances = other.conformances;
-        impls = other.impls;
-        guard_match_arms = other.guard_match_arms;
-        routes = other.routes;
-        type_shapes = other.type_shapes;
-        owned_strings = other.owned_strings;
-        has_package_decl = other.has_package_decl;
-        package_span = other.package_span;
-        package_name = other.package_name;
-        return *this;
+    HirModule(HirModule&& other) noexcept = delete;
+    HirModule& operator=(HirModule&& other) noexcept = delete;
+
+    void rebase_type_alias_storage_ptrs(const HirModule& other) {
+        for (u32 i = 0; i < type_aliases.len; i++) {
+            rebase_type_ref_tree_ptrs(other, type_aliases[i].target);
+            for (u32 arm_i = 0; arm_i < type_aliases[i].arms.len; arm_i++)
+                rebase_type_ref_tree_ptrs(other, type_aliases[i].arms[arm_i].type);
+        }
+    }
+
+    void rebase_type_ref_storage_ptr(const HirModule& other, AstTypeRef*& ptr) {
+        if (ptr == nullptr) return;
+        for (std::size_t i = 0; i < other.type_ref_storage.size(); i++) {
+            if (ptr == &other.type_ref_storage[i]) {
+                ptr = &type_ref_storage[i];
+                return;
+            }
+        }
+    }
+
+    void rebase_type_ref_tree_ptrs(const HirModule& other, AstTypeRef& ref) {
+        for (u32 i = 0; i < ref.type_args.len; i++) {
+            rebase_type_ref_storage_ptr(other, ref.type_args[i]);
+            if (ref.type_args[i] != nullptr) rebase_type_ref_tree_ptrs(other, *ref.type_args[i]);
+        }
+        for (u32 i = 0; i < ref.tuple_elem_types.len; i++) {
+            rebase_type_ref_storage_ptr(other, ref.tuple_elem_types[i]);
+            if (ref.tuple_elem_types[i] != nullptr)
+                rebase_type_ref_tree_ptrs(other, *ref.tuple_elem_types[i]);
+        }
     }
 };
 

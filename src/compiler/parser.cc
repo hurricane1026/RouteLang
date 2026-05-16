@@ -1598,6 +1598,22 @@ struct Parser {
         item.func.name = name.value()->text;
         item.func.span = span_from(*kw.value());
 
+        auto append_constraint = [&](AstFunctionDecl::TypeParamDecl& target,
+                                     Str constraint_namespace,
+                                     Str constraint_name,
+                                     Span span) -> FrontendResult<void> {
+            target.has_constraint = true;
+            if (target.constraints.len == 0) {
+                target.constraint_namespace = constraint_namespace;
+                target.constraint = constraint_name;
+            }
+            if (!target.constraint_namespaces.push(constraint_namespace))
+                return frontend_error(FrontendError::TooManyItems, span);
+            if (!target.constraints.push(constraint_name))
+                return frontend_error(FrontendError::TooManyItems, span);
+            return {};
+        };
+
         if (take(TokenType::Lt)) {
             while (true) {
                 auto type_param = expect(TokenType::Ident);
@@ -1616,17 +1632,11 @@ struct Parser {
                             if (!member) return core::make_unexpected(member.error());
                             constraint_name = member.value()->text;
                         }
-                        decl.has_constraint = true;
-                        if (decl.constraints.len == 0) {
-                            decl.constraint_namespace = constraint_namespace;
-                            decl.constraint = constraint_name;
-                        }
-                        if (!decl.constraint_namespaces.push(constraint_namespace))
-                            return frontend_error(FrontendError::TooManyItems,
-                                                  span_from(*constraint.value()));
-                        if (!decl.constraints.push(constraint_name))
-                            return frontend_error(FrontendError::TooManyItems,
-                                                  span_from(*constraint.value()));
+                        auto appended = append_constraint(decl,
+                                                          constraint_namespace,
+                                                          constraint_name,
+                                                          span_from(*constraint.value()));
+                        if (!appended) return core::make_unexpected(appended.error());
                         if (cur().type != TokenType::Comma || peek(1).type == TokenType::Gt) break;
                         auto comma = expect(TokenType::Comma);
                         if (!comma) return core::make_unexpected(comma.error());
@@ -1671,6 +1681,43 @@ struct Parser {
             if (!ret_type) return core::make_unexpected(ret_type.error());
             item.func.has_return_type = true;
             item.func.return_type = ret_type.value();
+        }
+        if (take(TokenType::KwWhere)) {
+            while (true) {
+                auto constraint = expect(TokenType::Ident);
+                if (!constraint) return core::make_unexpected(constraint.error());
+                Str constraint_namespace{};
+                Str constraint_name = constraint.value()->text;
+                if (take(TokenType::Dot)) {
+                    constraint_namespace = constraint_name;
+                    auto member = expect(TokenType::Ident);
+                    if (!member) return core::make_unexpected(member.error());
+                    constraint_name = member.value()->text;
+                }
+                auto lparen = expect(TokenType::LParen);
+                if (!lparen) return core::make_unexpected(lparen.error());
+                auto type_param = expect(TokenType::Ident);
+                if (!type_param) return core::make_unexpected(type_param.error());
+                auto rparen = expect(TokenType::RParen);
+                if (!rparen) return core::make_unexpected(rparen.error());
+
+                AstFunctionDecl::TypeParamDecl* target = nullptr;
+                for (u32 ti = 0; ti < item.func.type_params.len; ti++) {
+                    if (item.func.type_params[ti].name.eq(type_param.value()->text)) {
+                        target = &item.func.type_params[ti];
+                        break;
+                    }
+                }
+                if (target == nullptr)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*type_param.value()),
+                                          type_param.value()->text);
+                auto appended = append_constraint(
+                    *target, constraint_namespace, constraint_name, span_from(*constraint.value()));
+                if (!appended) return core::make_unexpected(appended.error());
+
+                if (!take(TokenType::Comma)) break;
+            }
         }
         AstStatement body_stmt{};
         if (take(TokenType::Arrow)) {
@@ -1759,6 +1806,18 @@ struct Parser {
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+            if (cur().type == TokenType::Ident && cur().text.eq({"type", 4})) {
+                auto type_kw = expect(TokenType::Ident);
+                if (!type_kw) return core::make_unexpected(type_kw.error());
+                auto assoc_name = expect(TokenType::Ident);
+                if (!assoc_name) return core::make_unexpected(assoc_name.error());
+                AstProtocolDecl::AssociatedTypeDecl assoc{};
+                assoc.name = assoc_name.value()->text;
+                if (!item.protocol.associated_types.push(assoc))
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*assoc_name.value()));
+                continue;
+            }
             auto func_kw = expect(TokenType::KwFunc);
             if (!func_kw) return core::make_unexpected(func_kw.error());
             auto method_name = expect(TokenType::Ident);
@@ -1849,6 +1908,23 @@ struct Parser {
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+            if (cur().type == TokenType::Ident && cur().text.eq({"type", 4})) {
+                auto type_kw = expect(TokenType::Ident);
+                if (!type_kw) return core::make_unexpected(type_kw.error());
+                auto assoc_name = expect(TokenType::Ident);
+                if (!assoc_name) return core::make_unexpected(assoc_name.error());
+                auto eq = expect(TokenType::Eq);
+                if (!eq) return core::make_unexpected(eq.error());
+                auto type_ref = parse_func_type_ref();
+                if (!type_ref) return core::make_unexpected(type_ref.error());
+                AstImplDecl::AssociatedTypeBinding assoc{};
+                assoc.name = assoc_name.value()->text;
+                assoc.type = type_ref.value();
+                if (!item.impl_decl.associated_types.push(assoc))
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*assoc_name.value()));
+                continue;
+            }
             auto method = parse_func();
             if (!method) return core::make_unexpected(method.error());
             if (method->kind != AstItemKind::Func)
@@ -1942,6 +2018,104 @@ struct Parser {
         item.span =
             Span{kw.value()->start, toks->tokens[pos - 1].end, kw.value()->line, kw.value()->col};
         item.using_decl.span = item.span;
+        return item;
+    }
+
+    FrontendResult<AstItem> parse_type_alias() {
+        auto type_kw = expect(TokenType::Ident);
+        if (!type_kw) return core::make_unexpected(type_kw.error());
+        if (!type_kw.value()->text.eq({"type", 4}))
+            return frontend_error(
+                FrontendError::UnexpectedToken, span_from(*type_kw.value()), type_kw.value()->text);
+        auto name = expect(TokenType::Ident);
+        if (!name) return core::make_unexpected(name.error());
+
+        AstItem item{};
+        item.kind = AstItemKind::TypeAlias;
+        item.span = span_from(*type_kw.value());
+        item.type_alias.span = item.span;
+        item.type_alias.name = name.value()->text;
+
+        if (take(TokenType::Lt)) {
+            while (true) {
+                auto type_param = expect(TokenType::Ident);
+                if (!type_param) return core::make_unexpected(type_param.error());
+                if (!item.type_alias.type_params.push(type_param.value()->text))
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*type_param.value()));
+                if (take(TokenType::Gt)) break;
+                auto comma = expect(TokenType::Comma);
+                if (!comma) return core::make_unexpected(comma.error());
+            }
+        }
+
+        if (take(TokenType::Eq)) {
+            auto target = parse_func_type_ref();
+            if (!target) return core::make_unexpected(target.error());
+            item.type_alias.target = target.value();
+            return item;
+        }
+
+        auto match_kw = expect(TokenType::KwMatch);
+        if (!match_kw) return core::make_unexpected(match_kw.error());
+        item.type_alias.is_match = true;
+        auto lbrace = expect(TokenType::LBrace);
+        if (!lbrace) return core::make_unexpected(lbrace.error());
+        while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+            auto case_kw = expect(TokenType::KwCase);
+            if (!case_kw) return core::make_unexpected(case_kw.error());
+            AstTypeAliasDecl::ArmDecl arm{};
+            if (take(TokenType::Underscore)) {
+                arm.is_wildcard = true;
+            } else {
+                auto type_param = expect(TokenType::Ident);
+                if (!type_param) return core::make_unexpected(type_param.error());
+                arm.type_param = type_param.value()->text;
+                if (take(TokenType::Dot)) {
+                    auto associated_name = expect(TokenType::Ident);
+                    if (!associated_name) return core::make_unexpected(associated_name.error());
+                    arm.associated_name = associated_name.value()->text;
+                }
+                if (take(TokenType::EqEq)) {
+                    arm.is_type_equality = true;
+                    auto rhs_type_param = expect(TokenType::Ident);
+                    if (!rhs_type_param) return core::make_unexpected(rhs_type_param.error());
+                    arm.rhs_type_param = rhs_type_param.value()->text;
+                    if (take(TokenType::Dot)) {
+                        auto rhs_associated_name = expect(TokenType::Ident);
+                        if (!rhs_associated_name)
+                            return core::make_unexpected(rhs_associated_name.error());
+                        arm.rhs_associated_name = rhs_associated_name.value()->text;
+                    }
+                } else {
+                    if (arm.associated_name.len != 0)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*type_param.value()));
+                    auto colon = expect(TokenType::Colon);
+                    if (!colon) return core::make_unexpected(colon.error());
+                    auto constraint = expect(TokenType::Ident);
+                    if (!constraint) return core::make_unexpected(constraint.error());
+                    arm.constraint = constraint.value()->text;
+                    if (take(TokenType::Dot)) {
+                        arm.constraint_namespace = arm.constraint;
+                        auto member = expect(TokenType::Ident);
+                        if (!member) return core::make_unexpected(member.error());
+                        arm.constraint = member.value()->text;
+                    }
+                }
+            }
+            auto arrow = expect(TokenType::Arrow);
+            if (!arrow) return core::make_unexpected(arrow.error());
+            auto target = parse_func_type_ref();
+            if (!target) return core::make_unexpected(target.error());
+            arm.type = target.value();
+            if (!item.type_alias.arms.push(arm))
+                return frontend_error(FrontendError::TooManyItems, span_from(*case_kw.value()));
+        }
+        auto rbrace = expect(TokenType::RBrace);
+        if (!rbrace) return core::make_unexpected(rbrace.error());
+        if (item.type_alias.arms.len == 0)
+            return frontend_error(FrontendError::UnexpectedToken, span_from(*rbrace.value()));
         return item;
     }
 
@@ -2176,6 +2350,10 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 item = p.parse_route();
                 break;
             default:
+                if (p.cur().type == TokenType::Ident && p.cur().text.eq({"type", 4})) {
+                    item = p.parse_type_alias();
+                    break;
+                }
                 if (p.cur().type == TokenType::Ident || p.cur().type == TokenType::LParen) {
                     item = p.parse_impl();
                     break;

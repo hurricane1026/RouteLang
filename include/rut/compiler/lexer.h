@@ -48,6 +48,7 @@ enum class TokenType : u8 {
     KwPackage,
     KwUsing,
     KwAs,
+    KwWhere,
     KwFire,
     KwNotify,
     KwDefer,

@@ -165,13 +165,15 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
         shape.is_concrete = true;
         for (u32 i = 0; i < tuple_len; i++) {
             const auto elem_type = tuple_types[i];
+            const u32 elem_generic_index =
+                elem_type == HirTypeKind::Generic ? tuple_struct_indices[i] : 0xffffffffu;
             const u32 elem_variant_index =
                 elem_type == HirTypeKind::Variant ? tuple_variant_indices[i] : 0xffffffffu;
             const u32 elem_struct_index =
                 elem_type == HirTypeKind::Struct ? tuple_struct_indices[i] : 0xffffffffu;
             auto elem_shape = intern_hir_type_shape(mod,
                                                     elem_type,
-                                                    0xffffffffu,
+                                                    elem_generic_index,
                                                     elem_variant_index,
                                                     elem_struct_index,
                                                     0,
@@ -300,6 +302,12 @@ static FrontendResult<void> fill_bound_binding_from_type_metadata(GenericBinding
                                                                   u32 shape_index,
                                                                   Span span);
 
+static bool resolve_alias_associated_binding(GenericBinding* out,
+                                             const HirModule& mod,
+                                             const GenericBinding& binding,
+                                             Str associated_name,
+                                             Span span);
+
 static bool conformance_matches_binding(const HirModule& mod,
                                         const HirConformance& c,
                                         const GenericBinding& binding) {
@@ -316,6 +324,12 @@ static bool conformance_matches_binding(const HirModule& mod,
 static bool generic_binding_satisfies_custom_protocol(const HirModule& mod,
                                                       const GenericBinding& binding,
                                                       u32 protocol_index) {
+    if (binding.type == HirTypeKind::Generic) {
+        for (u32 cpi = 0; cpi < binding.generic_protocol_count; cpi++) {
+            if (binding.generic_protocol_indices[cpi] == protocol_index) return true;
+        }
+        return false;
+    }
     for (u32 i = 0; i < mod.conformances.len; i++) {
         const auto& c = mod.conformances[i];
         if (c.protocol_index != protocol_index) continue;
@@ -326,6 +340,7 @@ static bool generic_binding_satisfies_custom_protocol(const HirModule& mod,
 
 static bool generic_binding_satisfies_error_constraint(const HirModule& mod,
                                                        const GenericBinding& binding) {
+    if (binding.type == HirTypeKind::Generic) return binding.generic_has_error_constraint;
     if (binding.type == HirTypeKind::Struct && binding.struct_index < mod.structs.len)
         return mod.structs[binding.struct_index].conforms_error;
     return false;
@@ -342,6 +357,8 @@ static bool hir_type_shape_satisfies_eq_constraint(const HirModule& mod,
                                                    bool* struct_visiting,
                                                    bool* variant_visiting) {
     switch (type) {
+        case HirTypeKind::Generic:
+            return false;
         case HirTypeKind::Bool:
         case HirTypeKind::I32:
         case HirTypeKind::Str:
@@ -420,6 +437,7 @@ static bool hir_type_shape_satisfies_eq_constraint(const HirModule& mod,
 
 static bool generic_binding_satisfies_eq_constraint(const HirModule& mod,
                                                     const GenericBinding& binding) {
+    if (binding.type == HirTypeKind::Generic) return binding.generic_has_eq_constraint;
     bool struct_visiting[HirModule::kMaxStructs]{};
     bool variant_visiting[HirModule::kMaxVariants]{};
     return hir_type_shape_satisfies_eq_constraint(mod,
@@ -445,6 +463,8 @@ static bool hir_type_shape_satisfies_ord_constraint(const HirModule& mod,
                                                     bool* struct_visiting,
                                                     bool* variant_visiting) {
     switch (type) {
+        case HirTypeKind::Generic:
+            return false;
         case HirTypeKind::I32:
         case HirTypeKind::Str:
             return true;
@@ -523,6 +543,7 @@ static bool hir_type_shape_satisfies_ord_constraint(const HirModule& mod,
 
 static bool generic_binding_satisfies_ord_constraint(const HirModule& mod,
                                                      const GenericBinding& binding) {
+    if (binding.type == HirTypeKind::Generic) return binding.generic_has_ord_constraint;
     bool struct_visiting[HirModule::kMaxStructs]{};
     bool variant_visiting[HirModule::kMaxVariants]{};
     return hir_type_shape_satisfies_ord_constraint(mod,
@@ -535,6 +556,22 @@ static bool generic_binding_satisfies_ord_constraint(const HirModule& mod,
                                                    binding.tuple_struct_indices,
                                                    struct_visiting,
                                                    variant_visiting);
+}
+
+static bool same_generic_binding_type_shape(const GenericBinding& lhs, const GenericBinding& rhs) {
+    if (lhs.type != rhs.type) return false;
+    if (lhs.generic_index != rhs.generic_index) return false;
+    if (lhs.variant_index != rhs.variant_index) return false;
+    if (lhs.struct_index != rhs.struct_index) return false;
+    if (lhs.tuple_len != rhs.tuple_len) return false;
+    if (lhs.shape_index != 0xffffffffu && rhs.shape_index != 0xffffffffu)
+        return lhs.shape_index == rhs.shape_index;
+    for (u32 ti = 0; ti < lhs.tuple_len; ti++) {
+        if (lhs.tuple_types[ti] != rhs.tuple_types[ti]) return false;
+        if (lhs.tuple_variant_indices[ti] != rhs.tuple_variant_indices[ti]) return false;
+        if (lhs.tuple_struct_indices[ti] != rhs.tuple_struct_indices[ti]) return false;
+    }
+    return true;
 }
 
 static bool same_variant_instance_shape(const HirVariant& variant,
@@ -1153,6 +1190,62 @@ static const HirAlias* find_alias(const HirModule& mod, Str name) {
     return nullptr;
 }
 
+static const HirTypeAlias* find_type_alias(const HirModule& mod, Str name) {
+    for (u32 i = 0; i < mod.type_aliases.len; i++) {
+        if (mod.type_aliases[i].name.eq(name)) return &mod.type_aliases[i];
+    }
+    return nullptr;
+}
+
+static FrontendResult<AstTypeRef*> clone_type_alias_ref_tree(HirModule* mod,
+                                                             const AstTypeRef& ref) {
+    mod->type_ref_storage.emplace_back(ref);
+    auto* out = &mod->type_ref_storage.back();
+    for (u32 i = 0; i < out->type_args.len; i++) {
+        if (out->type_args[i] == nullptr) continue;
+        auto cloned = clone_type_alias_ref_tree(mod, *out->type_args[i]);
+        if (!cloned) return core::make_unexpected(cloned.error());
+        out->type_args[i] = cloned.value();
+    }
+    for (u32 i = 0; i < out->tuple_elem_types.len; i++) {
+        if (out->tuple_elem_types[i] == nullptr) continue;
+        auto cloned = clone_type_alias_ref_tree(mod, *out->tuple_elem_types[i]);
+        if (!cloned) return core::make_unexpected(cloned.error());
+        out->tuple_elem_types[i] = cloned.value();
+    }
+    return out;
+}
+
+static FrontendResult<void> detach_type_alias_ref_pointers(HirModule* mod, AstTypeRef& ref) {
+    for (u32 i = 0; i < ref.type_args.len; i++) {
+        if (ref.type_args[i] == nullptr) continue;
+        auto cloned = clone_type_alias_ref_tree(mod, *ref.type_args[i]);
+        if (!cloned) return core::make_unexpected(cloned.error());
+        ref.type_args[i] = cloned.value();
+        const AstTypeRef& arg = *ref.type_args[i];
+        if (i < ref.type_arg_namespaces.len)
+            ref.type_arg_namespaces[i] = arg.namespace_name;
+        else if (!ref.type_arg_namespaces.push(arg.namespace_name))
+            return frontend_error(FrontendError::TooManyItems, {});
+        if (i < ref.type_arg_names.len)
+            ref.type_arg_names[i] = arg.name;
+        else if (!ref.type_arg_names.push(arg.name))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
+    for (u32 i = 0; i < ref.tuple_elem_types.len; i++) {
+        if (ref.tuple_elem_types[i] == nullptr) continue;
+        auto cloned = clone_type_alias_ref_tree(mod, *ref.tuple_elem_types[i]);
+        if (!cloned) return core::make_unexpected(cloned.error());
+        ref.tuple_elem_types[i] = cloned.value();
+        const AstTypeRef& elem = *ref.tuple_elem_types[i];
+        if (i < ref.tuple_elem_names.len)
+            ref.tuple_elem_names[i] = elem.name;
+        else if (!ref.tuple_elem_names.push(elem.name))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
+    return {};
+}
+
 static Str resolve_alias_target_leaf(const HirModule& mod, Str name) {
     const auto* alias = find_alias(mod, name);
     if (alias == nullptr || alias->target_parts.len == 0) return name;
@@ -1282,6 +1375,11 @@ static FrontendResult<void> validate_import_namespace_bindings(
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, imports[ii].span, ns);
                 }
+                for (u32 ai = 0; ai < other.module->type_aliases.len; ai++) {
+                    if (other.module->type_aliases[ai].name.eq(ns))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, imports[ii].span, ns);
+                }
                 continue;
             }
             for (u32 si = 0; si < other.selected_names.len; si++) {
@@ -1358,6 +1456,32 @@ static HirProtocol::MethodDecl* find_protocol_method_mut(HirProtocol& proto, Str
         if (proto.methods[i].name.eq(name)) return &proto.methods[i];
     }
     return nullptr;
+}
+
+static const HirProtocol::AssociatedTypeDecl* find_protocol_associated_type(
+    const HirProtocol& proto, Str name) {
+    for (u32 i = 0; i < proto.associated_types.len; i++) {
+        if (proto.associated_types[i].name.eq(name)) return &proto.associated_types[i];
+    }
+    return nullptr;
+}
+
+static const HirAssociatedTypeBinding* find_impl_associated_type(const HirImpl& impl, Str name) {
+    for (u32 i = 0; i < impl.associated_types.len; i++) {
+        if (impl.associated_types[i].name.eq(name)) return &impl.associated_types[i];
+    }
+    return nullptr;
+}
+
+static bool type_param_constraints_have_associated_type(
+    const HirModule& mod, const HirFunction::TypeParamDecl& type_param, Str name) {
+    for (u32 cpi = 0; cpi < type_param.custom_protocol_count; cpi++) {
+        const u32 protocol_index = type_param.custom_protocol_indices[cpi];
+        if (protocol_index >= mod.protocols.len) continue;
+        if (find_protocol_associated_type(mod.protocols[protocol_index], name) != nullptr)
+            return true;
+    }
+    return false;
 }
 
 static bool impl_matches_type(const HirModule& mod,
@@ -1591,18 +1715,39 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
     u32* tuple_variant_indices,
     u32* tuple_struct_indices,
     Span span,
-    u32* array_elem_shape_index_out = nullptr) {
+    u32* array_elem_shape_index_out = nullptr,
+    Str* associated_name_out = nullptr,
+    FixedVec<Str, 16>* alias_stack = nullptr) {
+    FixedVec<Str, 16> local_alias_stack;
+    if (alias_stack == nullptr) alias_stack = &local_alias_stack;
     if (generic_index) *generic_index = 0xffffffffu;
+    if (associated_name_out) *associated_name_out = {};
     variant_index = 0xffffffffu;
     struct_index = 0xffffffffu;
     tuple_len = 0;
     if (array_elem_shape_index_out) *array_elem_shape_index_out = 0xffffffffu;
     if (!ref.is_tuple) {
         Str resolved_name = ref.name;
+        bool resolved_import_namespace_type = false;
+        if (type_params != nullptr && ref.namespace_name.len != 0) {
+            const u32 base_generic_index =
+                find_generic_param_index(*type_params, ref.namespace_name);
+            if (base_generic_index < type_params->len) {
+                if (ref.type_arg_names.len != 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
+                if (!type_param_constraints_have_associated_type(
+                        mod, (*type_params)[base_generic_index], ref.name))
+                    return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
+                if (generic_index) *generic_index = base_generic_index;
+                if (associated_name_out) *associated_name_out = ref.name;
+                return HirTypeKind::Associated;
+            }
+        }
         if (ref.namespace_name.len != 0) {
             if (!resolve_import_namespace_type_name(
                     mod, ref.namespace_name, ref.name, resolved_name))
                 return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
+            resolved_import_namespace_type = true;
         }
         // Array<T> detection — must come before the type-param / named-type
         // checks because "Array" is a reserved builtin, not a user-defined
@@ -1638,8 +1783,12 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
                                                    elem_tuple_variant_indices,
                                                    elem_tuple_struct_indices,
                                                    span,
-                                                   &elem_nested_array_shape);
+                                                   &elem_nested_array_shape,
+                                                   nullptr,
+                                                   alias_stack);
             if (!elem_kind) return core::make_unexpected(elem_kind.error());
+            if (elem_kind.value() == HirTypeKind::Associated)
+                return frontend_error(FrontendError::UnsupportedSyntax, span, elem_ref.name);
             // Nested arrays (`[[Int]]`): element kind is itself Array, and
             // its element shape lives in elem_nested_array_shape. Pass that
             // through so intern_hir_type_shape builds the right nested shape.
@@ -1667,6 +1816,234 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
                 return HirTypeKind::Generic;
             }
         }
+        if (ref.namespace_name.len == 0 || resolved_import_namespace_type) {
+            const HirTypeAlias* alias = find_type_alias(mod, resolved_name);
+            if (alias != nullptr) {
+                if (ref.type_arg_names.len != alias->type_params.len)
+                    return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
+
+                FixedVec<AstTypeRef, 32> scratch_refs;
+                auto push_scratch_ref =
+                    [&](const AstTypeRef& value) -> FrontendResult<AstTypeRef*> {
+                    if (!scratch_refs.push(value))
+                        return frontend_error(FrontendError::TooManyItems, span, ref.name);
+                    return &scratch_refs[scratch_refs.len - 1];
+                };
+                std::function<FrontendResult<AstTypeRef>(const AstTypeRef&)> substitute_ref =
+                    [&](const AstTypeRef& input) -> FrontendResult<AstTypeRef> {
+                    if (!input.is_tuple && input.namespace_name.len == 0 &&
+                        input.type_arg_names.len == 0) {
+                        for (u32 ai = 0; ai < alias->type_params.len; ai++) {
+                            if (input.name.eq(alias->type_params[ai]))
+                                return get_ast_type_arg_ref(ref, ai);
+                        }
+                    }
+                    AstTypeRef out = input;
+                    out.type_args.len = 0;
+                    out.tuple_elem_types.len = 0;
+                    if (input.is_tuple) {
+                        const u32 tuple_count =
+                            input.tuple_elem_types.len > input.tuple_elem_names.len
+                                ? input.tuple_elem_types.len
+                                : input.tuple_elem_names.len;
+                        for (u32 ti = 0; ti < tuple_count; ti++) {
+                            AstTypeRef elem_ref = get_ast_tuple_elem_ref(input, ti);
+                            auto substituted = substitute_ref(elem_ref);
+                            if (!substituted) return core::make_unexpected(substituted.error());
+                            auto elem_ptr = push_scratch_ref(substituted.value());
+                            if (!elem_ptr) return core::make_unexpected(elem_ptr.error());
+                            if (ti < out.tuple_elem_names.len)
+                                out.tuple_elem_names[ti] = substituted->name;
+                            else if (!out.tuple_elem_names.push(substituted->name))
+                                return frontend_error(FrontendError::TooManyItems, span, ref.name);
+                            if (!out.tuple_elem_types.push(elem_ptr.value()))
+                                return frontend_error(FrontendError::TooManyItems, span, ref.name);
+                        }
+                    }
+                    const u32 arg_count = input.type_args.len > input.type_arg_names.len
+                                              ? input.type_args.len
+                                              : input.type_arg_names.len;
+                    for (u32 ai = 0; ai < arg_count; ai++) {
+                        AstTypeRef arg_ref = get_ast_type_arg_ref(input, ai);
+                        auto substituted = substitute_ref(arg_ref);
+                        if (!substituted) return core::make_unexpected(substituted.error());
+                        auto arg_ptr = push_scratch_ref(substituted.value());
+                        if (!arg_ptr) return core::make_unexpected(arg_ptr.error());
+                        if (ai < out.type_arg_namespaces.len)
+                            out.type_arg_namespaces[ai] = substituted->namespace_name;
+                        else if (!out.type_arg_namespaces.push(substituted->namespace_name))
+                            return frontend_error(FrontendError::TooManyItems, span, ref.name);
+                        if (ai < out.type_arg_names.len)
+                            out.type_arg_names[ai] = substituted->name;
+                        else if (!out.type_arg_names.push(substituted->name))
+                            return frontend_error(FrontendError::TooManyItems, span, ref.name);
+                        if (!out.type_args.push(arg_ptr.value()))
+                            return frontend_error(FrontendError::TooManyItems, span, ref.name);
+                    }
+                    return out;
+                };
+
+                const AstTypeRef* selected_target = &alias->target;
+                if (alias->is_match) {
+                    GenericBinding alias_bindings[HirTypeAlias::kMaxTypeParams]{};
+                    for (u32 bi = 0; bi < alias->type_params.len; bi++) {
+                        AstTypeRef arg_ref = get_ast_type_arg_ref(ref, bi);
+                        u32 arg_generic_index = 0xffffffffu;
+                        u32 arg_variant_index = 0xffffffffu;
+                        u32 arg_struct_index = 0xffffffffu;
+                        u32 arg_tuple_len = 0;
+                        HirTypeKind arg_tuple_types[kMaxTupleSlots]{};
+                        u32 arg_tuple_variant_indices[kMaxTupleSlots]{};
+                        u32 arg_tuple_struct_indices[kMaxTupleSlots]{};
+                        auto arg_type = resolve_func_type_ref(mod,
+                                                              arg_ref,
+                                                              type_params,
+                                                              &arg_generic_index,
+                                                              arg_variant_index,
+                                                              arg_struct_index,
+                                                              arg_tuple_len,
+                                                              arg_tuple_types,
+                                                              arg_tuple_variant_indices,
+                                                              arg_tuple_struct_indices,
+                                                              span,
+                                                              nullptr,
+                                                              nullptr,
+                                                              alias_stack);
+                        if (!arg_type) return core::make_unexpected(arg_type.error());
+                        if (arg_type.value() == HirTypeKind::Associated)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax, span, arg_ref.name);
+                        auto filled =
+                            fill_bound_binding_from_type_metadata(&alias_bindings[bi],
+                                                                  const_cast<HirModule*>(&mod),
+                                                                  arg_type.value(),
+                                                                  arg_generic_index,
+                                                                  arg_variant_index,
+                                                                  arg_struct_index,
+                                                                  arg_tuple_len,
+                                                                  arg_tuple_types,
+                                                                  arg_tuple_variant_indices,
+                                                                  arg_tuple_struct_indices,
+                                                                  0xffffffffu,
+                                                                  span);
+                        if (!filled) return core::make_unexpected(filled.error());
+                        if (type_params != nullptr)
+                            copy_binding_constraints_from_type_params(&alias_bindings[bi],
+                                                                      *type_params);
+                    }
+                    auto find_alias_param_index = [&](Str name) -> u32 {
+                        for (u32 bi = 0; bi < alias->type_params.len; bi++) {
+                            if (alias->type_params[bi].eq(name)) return bi;
+                        }
+                        return 0xffffffffu;
+                    };
+
+                    selected_target = nullptr;
+                    for (u32 ai = 0; ai < alias->arms.len; ai++) {
+                        const auto& arm = alias->arms[ai];
+                        if (arm.is_wildcard) {
+                            selected_target = &arm.type;
+                            break;
+                        }
+                        const u32 lhs_index = find_alias_param_index(arm.type_param);
+                        if (lhs_index >= alias->type_params.len)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax, alias->span, arm.type_param);
+                        if (arm.is_type_equality) {
+                            const u32 rhs_index = find_alias_param_index(arm.rhs_type_param);
+                            if (rhs_index >= alias->type_params.len)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      alias->span,
+                                                      arm.rhs_type_param);
+                            GenericBinding lhs_binding = alias_bindings[lhs_index];
+                            GenericBinding rhs_binding = alias_bindings[rhs_index];
+                            if (arm.associated_name.len != 0 &&
+                                !resolve_alias_associated_binding(&lhs_binding,
+                                                                  mod,
+                                                                  alias_bindings[lhs_index],
+                                                                  arm.associated_name,
+                                                                  alias->span))
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      alias->span,
+                                                      arm.associated_name);
+                            if (arm.rhs_associated_name.len != 0 &&
+                                !resolve_alias_associated_binding(&rhs_binding,
+                                                                  mod,
+                                                                  alias_bindings[rhs_index],
+                                                                  arm.rhs_associated_name,
+                                                                  alias->span))
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      alias->span,
+                                                      arm.rhs_associated_name);
+                            if (same_generic_binding_type_shape(lhs_binding, rhs_binding)) {
+                                selected_target = &arm.type;
+                                break;
+                            }
+                            continue;
+                        }
+                        Str protocol_name = arm.constraint;
+                        if (arm.constraint_namespace.len != 0 &&
+                            !resolve_import_namespace_type_name(
+                                mod, arm.constraint_namespace, arm.constraint, protocol_name))
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax, alias->span, arm.constraint);
+                        const u32 protocol_index = find_protocol_index(mod, protocol_name);
+                        if (protocol_index >= mod.protocols.len)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax, alias->span, protocol_name);
+                        const auto kind = mod.protocols[protocol_index].kind;
+                        bool matched = false;
+                        if (kind == HirProtocolKind::Error)
+                            matched = generic_binding_satisfies_error_constraint(
+                                mod, alias_bindings[lhs_index]);
+                        else if (kind == HirProtocolKind::Eq)
+                            matched = generic_binding_satisfies_eq_constraint(
+                                mod, alias_bindings[lhs_index]);
+                        else if (kind == HirProtocolKind::Ord)
+                            matched = generic_binding_satisfies_ord_constraint(
+                                mod, alias_bindings[lhs_index]);
+                        else
+                            matched = generic_binding_satisfies_custom_protocol(
+                                mod, alias_bindings[lhs_index], protocol_index);
+                        if (matched) {
+                            selected_target = &arm.type;
+                            break;
+                        }
+                    }
+                    if (selected_target == nullptr)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, alias->span, alias->name);
+                }
+
+                auto substituted = substitute_ref(*selected_target);
+                if (!substituted) return core::make_unexpected(substituted.error());
+                if (!substituted->is_tuple && substituted->namespace_name.len == 0 &&
+                    substituted->name.eq(alias->name))
+                    return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
+                for (u32 si = 0; si < alias_stack->len; si++) {
+                    if ((*alias_stack)[si].eq(alias->name))
+                        return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
+                }
+                if (!alias_stack->push(alias->name))
+                    return frontend_error(FrontendError::TooManyItems, span, ref.name);
+                auto resolved = resolve_func_type_ref(mod,
+                                                      substituted.value(),
+                                                      type_params,
+                                                      generic_index,
+                                                      variant_index,
+                                                      struct_index,
+                                                      tuple_len,
+                                                      tuple_types,
+                                                      tuple_variant_indices,
+                                                      tuple_struct_indices,
+                                                      span,
+                                                      array_elem_shape_index_out,
+                                                      associated_name_out,
+                                                      alias_stack);
+                alias_stack->len--;
+                return resolved;
+            }
+        }
         const auto kind = resolve_named_type(mod, resolved_name, variant_index, struct_index);
         if (kind == HirTypeKind::Unknown)
             return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
@@ -1676,6 +2053,7 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
                 return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
             GenericBinding bindings[HirVariant::kMaxTypeParams]{};
             for (u32 i = 0; i < ref.type_arg_names.len; i++) {
+                u32 type_generic_index = 0xffffffffu;
                 u32 type_variant_index = 0xffffffffu;
                 u32 type_struct_index = 0xffffffffu;
                 u32 elem_tuple_len = 0;
@@ -1686,21 +2064,25 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
                 auto type_arg = resolve_func_type_ref(mod,
                                                       type_arg_ref,
                                                       type_params,
-                                                      nullptr,
+                                                      &type_generic_index,
                                                       type_variant_index,
                                                       type_struct_index,
                                                       elem_tuple_len,
                                                       elem_tuple_types,
                                                       elem_tuple_variant_indices,
                                                       elem_tuple_struct_indices,
-                                                      span);
+                                                      span,
+                                                      nullptr,
+                                                      nullptr,
+                                                      alias_stack);
                 if (!type_arg) return core::make_unexpected(type_arg.error());
-                if (type_arg.value() == HirTypeKind::Generic)
-                    return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
+                if (type_arg.value() == HirTypeKind::Associated)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, span, type_arg_ref.name);
                 auto filled = fill_bound_binding_from_type_metadata(&bindings[i],
                                                                     const_cast<HirModule*>(&mod),
                                                                     type_arg.value(),
-                                                                    0xffffffffu,
+                                                                    type_generic_index,
                                                                     type_variant_index,
                                                                     type_struct_index,
                                                                     elem_tuple_len,
@@ -1710,6 +2092,8 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
                                                                     0xffffffffu,
                                                                     span);
                 if (!filled) return core::make_unexpected(filled.error());
+                if (type_params != nullptr)
+                    copy_binding_constraints_from_type_params(&bindings[i], *type_params);
             }
             auto concrete_index = instantiate_variant(const_cast<HirModule*>(&mod),
                                                       variant_index,
@@ -1726,6 +2110,7 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
                 return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
             GenericBinding bindings[HirStruct::kMaxTypeParams]{};
             for (u32 i = 0; i < ref.type_arg_names.len; i++) {
+                u32 type_generic_index = 0xffffffffu;
                 u32 type_variant_index = 0xffffffffu;
                 u32 type_struct_index = 0xffffffffu;
                 u32 elem_tuple_len = 0;
@@ -1736,21 +2121,25 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
                 auto type_arg = resolve_func_type_ref(mod,
                                                       type_arg_ref,
                                                       type_params,
-                                                      nullptr,
+                                                      &type_generic_index,
                                                       type_variant_index,
                                                       type_struct_index,
                                                       elem_tuple_len,
                                                       elem_tuple_types,
                                                       elem_tuple_variant_indices,
                                                       elem_tuple_struct_indices,
-                                                      span);
+                                                      span,
+                                                      nullptr,
+                                                      nullptr,
+                                                      alias_stack);
                 if (!type_arg) return core::make_unexpected(type_arg.error());
-                if (type_arg.value() == HirTypeKind::Generic)
-                    return frontend_error(FrontendError::UnsupportedSyntax, span, ref.name);
+                if (type_arg.value() == HirTypeKind::Associated)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, span, type_arg_ref.name);
                 auto filled = fill_bound_binding_from_type_metadata(&bindings[i],
                                                                     const_cast<HirModule*>(&mod),
                                                                     type_arg.value(),
-                                                                    0xffffffffu,
+                                                                    type_generic_index,
                                                                     type_variant_index,
                                                                     type_struct_index,
                                                                     elem_tuple_len,
@@ -1760,6 +2149,8 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
                                                                     0xffffffffu,
                                                                     span);
                 if (!filled) return core::make_unexpected(filled.error());
+                if (type_params != nullptr)
+                    copy_binding_constraints_from_type_params(&bindings[i], *type_params);
             }
             auto concrete_index = instantiate_struct(
                 const_cast<HirModule*>(&mod), struct_index, bindings, ref.type_arg_names.len, span);
@@ -1777,6 +2168,7 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
         ref.tuple_elem_types.len != 0 ? ref.tuple_elem_types.len : ref.tuple_elem_names.len;
     tuple_len = elem_count;
     for (u32 i = 0; i < elem_count; i++) {
+        u32 elem_generic_index = 0xffffffffu;
         u32 elem_variant_index = 0xffffffffu;
         u32 elem_struct_index = 0xffffffffu;
         u32 elem_tuple_len = 0;
@@ -1787,22 +2179,27 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
         auto kind = resolve_func_type_ref(mod,
                                           elem_ref,
                                           type_params,
-                                          nullptr,
+                                          &elem_generic_index,
                                           elem_variant_index,
                                           elem_struct_index,
                                           elem_tuple_len,
                                           elem_tuple_types,
                                           elem_tuple_variant_indices,
                                           elem_tuple_struct_indices,
-                                          span);
+                                          span,
+                                          nullptr,
+                                          nullptr,
+                                          alias_stack);
         if (!kind) return core::make_unexpected(kind.error());
-        if (kind.value() == HirTypeKind::Generic || kind.value() == HirTypeKind::Tuple)
+        if (kind.value() == HirTypeKind::Tuple || kind.value() == HirTypeKind::Associated)
             return frontend_error(FrontendError::UnsupportedSyntax, span, elem_ref.name);
         tuple_types[i] = kind.value();
         tuple_variant_indices[i] =
             kind.value() == HirTypeKind::Variant ? elem_variant_index : 0xffffffffu;
         tuple_struct_indices[i] =
-            kind.value() == HirTypeKind::Struct ? elem_struct_index : 0xffffffffu;
+            kind.value() == HirTypeKind::Struct
+                ? elem_struct_index
+                : (kind.value() == HirTypeKind::Generic ? elem_generic_index : 0xffffffffu);
     }
     return HirTypeKind::Tuple;
 }
@@ -1810,12 +2207,18 @@ static FrontendResult<HirTypeKind> resolve_func_type_ref(
 static bool same_hir_type_shape(const HirExpr& lhs, const HirExpr& rhs) {
     if (lhs.type != rhs.type) return false;
     if (lhs.type == HirTypeKind::Generic) return lhs.generic_index == rhs.generic_index;
+    if (lhs.type == HirTypeKind::Associated)
+        return lhs.generic_index == rhs.generic_index &&
+               lhs.associated_name.eq(rhs.associated_name);
     if (lhs.type == HirTypeKind::Variant) return lhs.variant_index == rhs.variant_index;
     if (lhs.type == HirTypeKind::Struct) return lhs.struct_index == rhs.struct_index;
     if (lhs.type == HirTypeKind::Tuple) {
         if (lhs.tuple_len != rhs.tuple_len) return false;
         for (u32 i = 0; i < lhs.tuple_len; i++) {
             if (lhs.tuple_types[i] != rhs.tuple_types[i]) return false;
+            if (lhs.tuple_types[i] == HirTypeKind::Generic &&
+                lhs.tuple_struct_indices[i] != rhs.tuple_struct_indices[i])
+                return false;
             if (lhs.tuple_types[i] == HirTypeKind::Variant &&
                 lhs.tuple_variant_indices[i] != rhs.tuple_variant_indices[i])
                 return false;
@@ -1864,15 +2267,38 @@ static bool same_hir_shape_index(const HirModule& mod, u32 lhs_shape_index, u32 
 }
 
 static bool same_hir_type_shape(const HirModule& mod, const HirExpr& lhs, const HirExpr& rhs) {
+    if (lhs.type == HirTypeKind::Associated || rhs.type == HirTypeKind::Associated)
+        return same_hir_type_shape(lhs, rhs);
     if (lhs.shape_index != 0xffffffffu && rhs.shape_index != 0xffffffffu)
         if (same_hir_shape_index(mod, lhs.shape_index, rhs.shape_index)) return true;
     return same_hir_type_shape(lhs, rhs);
+}
+
+static bool replace_protocol_self_associated_type(HirExpr* expected, const HirImpl& impl) {
+    if (expected->type != HirTypeKind::Associated) return true;
+    if (expected->generic_index != 0xffffffffu) return true;
+    const auto* assoc = find_impl_associated_type(impl, expected->associated_name);
+    if (assoc == nullptr) return false;
+    expected->type = assoc->type;
+    expected->generic_index = assoc->generic_index;
+    expected->associated_name = {};
+    expected->variant_index = assoc->variant_index;
+    expected->struct_index = assoc->struct_index;
+    expected->shape_index = assoc->shape_index;
+    expected->tuple_len = assoc->tuple_len;
+    for (u32 ti = 0; ti < assoc->tuple_len; ti++) {
+        expected->tuple_types[ti] = assoc->tuple_types[ti];
+        expected->tuple_variant_indices[ti] = assoc->tuple_variant_indices[ti];
+        expected->tuple_struct_indices[ti] = assoc->tuple_struct_indices[ti];
+    }
+    return true;
 }
 
 static HirExpr make_expected_param_expr(const HirFunction::ParamDecl& param) {
     HirExpr expected{};
     expected.type = param.type;
     expected.generic_index = param.generic_index;
+    expected.associated_name = param.associated_name;
     expected.generic_has_error_constraint = param.generic_has_error_constraint;
     expected.generic_has_eq_constraint = param.generic_has_eq_constraint;
     expected.generic_has_ord_constraint = param.generic_has_ord_constraint;
@@ -2072,15 +2498,322 @@ static HirExpr make_instance_arg_expr(HirTypeKind type,
     return out;
 }
 
+static bool impl_matches_binding(const HirModule& mod,
+                                 const HirImpl& impl,
+                                 const GenericBinding& binding) {
+    if (impl.type != binding.type) return false;
+    if (impl.type != HirTypeKind::Struct) return impl.struct_index == 0xffffffffu;
+    if (!impl.is_generic_template) return impl.struct_index == binding.struct_index;
+    if (binding.struct_index >= mod.structs.len) return false;
+    return mod.structs[binding.struct_index].template_struct_index == impl.struct_index;
+}
+
+static void fill_binding_from_struct_instance_arg(GenericBinding* binding,
+                                                  const HirStruct& st,
+                                                  u32 arg_index) {
+    binding->bound = true;
+    binding->type = st.instance_type_args[arg_index];
+    binding->generic_index = binding->type == HirTypeKind::Generic
+                                 ? st.instance_generic_indices[arg_index]
+                                 : 0xffffffffu;
+    binding->variant_index = binding->type == HirTypeKind::Variant
+                                 ? st.instance_variant_indices[arg_index]
+                                 : 0xffffffffu;
+    binding->struct_index =
+        binding->type == HirTypeKind::Struct ? st.instance_struct_indices[arg_index] : 0xffffffffu;
+    binding->shape_index = st.instance_shape_indices[arg_index];
+    binding->tuple_len =
+        binding->type == HirTypeKind::Tuple ? st.instance_tuple_lens[arg_index] : 0;
+    for (u32 ti = 0; ti < binding->tuple_len; ti++) {
+        binding->tuple_types[ti] = st.instance_tuple_types[arg_index][ti];
+        binding->tuple_variant_indices[ti] = st.instance_tuple_variant_indices[arg_index][ti];
+        binding->tuple_struct_indices[ti] = st.instance_tuple_struct_indices[arg_index][ti];
+    }
+}
+
+static void apply_binding_metadata_to_expr(HirExpr* out, const GenericBinding& binding) {
+    out->type = binding.type;
+    out->generic_index = binding.type == HirTypeKind::Generic ? binding.generic_index : 0xffffffffu;
+    out->generic_has_error_constraint = binding.generic_has_error_constraint;
+    out->generic_has_eq_constraint = binding.generic_has_eq_constraint;
+    out->generic_has_ord_constraint = binding.generic_has_ord_constraint;
+    out->generic_protocol_index = binding.generic_protocol_index;
+    out->generic_protocol_count = binding.generic_protocol_count;
+    for (u32 cpi = 0; cpi < binding.generic_protocol_count; cpi++)
+        out->generic_protocol_indices[cpi] = binding.generic_protocol_indices[cpi];
+    out->associated_name = {};
+    out->variant_index = binding.type == HirTypeKind::Variant ? binding.variant_index : 0xffffffffu;
+    out->struct_index = binding.type == HirTypeKind::Struct ? binding.struct_index : 0xffffffffu;
+    out->shape_index = binding.shape_index;
+    out->tuple_len = binding.type == HirTypeKind::Tuple ? binding.tuple_len : 0;
+    for (u32 ti = 0; ti < binding.tuple_len; ti++) {
+        out->tuple_types[ti] = binding.tuple_types[ti];
+        out->tuple_variant_indices[ti] = binding.tuple_variant_indices[ti];
+        out->tuple_struct_indices[ti] = binding.tuple_struct_indices[ti];
+    }
+}
+
+static FrontendResult<void> concretize_tuple_associated_shape(
+    HirExpr* expr,
+    const HirModule& mod,
+    const GenericBinding* generic_bindings,
+    u32 generic_binding_count) {
+    if (expr->type != HirTypeKind::Tuple) return {};
+    for (u32 ti = 0; ti < expr->tuple_len; ti++) {
+        HirExpr elem{};
+        elem.span = expr->span;
+        elem.type = expr->tuple_types[ti];
+        elem.generic_index =
+            elem.type == HirTypeKind::Generic ? expr->tuple_struct_indices[ti] : 0xffffffffu;
+        elem.variant_index =
+            elem.type == HirTypeKind::Variant ? expr->tuple_variant_indices[ti] : 0xffffffffu;
+        elem.struct_index =
+            elem.type == HirTypeKind::Struct ? expr->tuple_struct_indices[ti] : 0xffffffffu;
+        if (elem.type == HirTypeKind::Generic) {
+            if (elem.generic_index >= generic_binding_count ||
+                !generic_bindings[elem.generic_index].bound)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr->span);
+            apply_binding_metadata_to_expr(&elem, generic_bindings[elem.generic_index]);
+            if (elem.type == HirTypeKind::Tuple)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr->span);
+        } else if (elem.type == HirTypeKind::Struct || elem.type == HirTypeKind::Variant) {
+            auto concretized = concretize_named_instance_shape(
+                &elem, mod, generic_bindings, generic_binding_count);
+            if (!concretized) return core::make_unexpected(concretized.error());
+        }
+        expr->tuple_types[ti] = elem.type;
+        expr->tuple_variant_indices[ti] =
+            elem.type == HirTypeKind::Variant ? elem.variant_index : 0xffffffffu;
+        expr->tuple_struct_indices[ti] =
+            elem.type == HirTypeKind::Struct
+                ? elem.struct_index
+                : (elem.type == HirTypeKind::Generic ? elem.generic_index : 0xffffffffu);
+    }
+    auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                       expr->type,
+                                       expr->generic_index,
+                                       expr->variant_index,
+                                       expr->struct_index,
+                                       expr->tuple_len,
+                                       expr->tuple_types,
+                                       expr->tuple_variant_indices,
+                                       expr->tuple_struct_indices,
+                                       expr->span);
+    if (!shape) return core::make_unexpected(shape.error());
+    expr->shape_index = shape.value();
+    return {};
+}
+
+static bool resolve_associated_binding_expr(HirExpr* out,
+                                            const HirModule& mod,
+                                            const HirExpr& expr,
+                                            const GenericBinding* generic_bindings,
+                                            u32 generic_binding_count,
+                                            bool* ambiguous_out = nullptr) {
+    if (ambiguous_out) *ambiguous_out = false;
+    if (expr.type != HirTypeKind::Associated) return false;
+    if (expr.generic_index >= generic_binding_count || !generic_bindings[expr.generic_index].bound)
+        return false;
+    const auto& binding = generic_bindings[expr.generic_index];
+    bool found = false;
+    HirExpr resolved_expr{};
+    for (u32 cpi = 0; cpi < expr.generic_protocol_count; cpi++) {
+        const u32 protocol_index = expr.generic_protocol_indices[cpi];
+        if (protocol_index >= mod.protocols.len) continue;
+        if (find_protocol_associated_type(mod.protocols[protocol_index], expr.associated_name) ==
+            nullptr)
+            continue;
+        for (u32 ii = 0; ii < mod.impls.len; ii++) {
+            const auto& impl = mod.impls[ii];
+            if (impl.protocol_index != protocol_index) continue;
+            if (!impl_matches_binding(mod, impl, binding)) continue;
+            const auto* assoc = find_impl_associated_type(impl, expr.associated_name);
+            if (assoc == nullptr) continue;
+
+            HirExpr candidate{};
+            candidate.span = expr.span;
+            candidate.type = assoc->type;
+            candidate.generic_index = assoc->generic_index;
+            candidate.generic_has_error_constraint = false;
+            candidate.generic_has_eq_constraint = false;
+            candidate.generic_has_ord_constraint = false;
+            candidate.generic_protocol_index = 0xffffffffu;
+            candidate.generic_protocol_count = 0;
+            candidate.associated_name = {};
+            candidate.variant_index = assoc->variant_index;
+            candidate.struct_index = assoc->struct_index;
+            candidate.tuple_len = assoc->tuple_len;
+            for (u32 ti = 0; ti < assoc->tuple_len; ti++) {
+                candidate.tuple_types[ti] = assoc->tuple_types[ti];
+                candidate.tuple_variant_indices[ti] = assoc->tuple_variant_indices[ti];
+                candidate.tuple_struct_indices[ti] = assoc->tuple_struct_indices[ti];
+            }
+            candidate.shape_index = assoc->shape_index;
+            if (impl.is_generic_template && binding.type == HirTypeKind::Struct &&
+                binding.struct_index < mod.structs.len) {
+                const auto& concrete = mod.structs[binding.struct_index];
+                if (concrete.template_struct_index == impl.struct_index) {
+                    GenericBinding impl_bindings[HirStruct::kMaxTypeParams]{};
+                    for (u32 bi = 0; bi < concrete.instance_type_arg_count; bi++)
+                        fill_binding_from_struct_instance_arg(&impl_bindings[bi], concrete, bi);
+                    if (assoc->type == HirTypeKind::Generic &&
+                        assoc->generic_index < concrete.instance_type_arg_count) {
+                        apply_binding_metadata_to_expr(&candidate,
+                                                       impl_bindings[assoc->generic_index]);
+                    } else if (candidate.type == HirTypeKind::Struct ||
+                               candidate.type == HirTypeKind::Variant) {
+                        auto concretized = concretize_named_instance_shape(
+                            &candidate, mod, impl_bindings, concrete.instance_type_arg_count);
+                        if (!concretized) return false;
+                    } else if (candidate.type == HirTypeKind::Tuple) {
+                        auto concretized = concretize_tuple_associated_shape(
+                            &candidate, mod, impl_bindings, concrete.instance_type_arg_count);
+                        if (!concretized) return false;
+                    }
+                }
+            }
+            if (found) {
+                if (ambiguous_out) *ambiguous_out = true;
+                return false;
+            }
+            resolved_expr = candidate;
+            found = true;
+        }
+    }
+    if (!found) return false;
+    *out = resolved_expr;
+    return true;
+}
+
+static bool resolve_alias_associated_binding(GenericBinding* out,
+                                             const HirModule& mod,
+                                             const GenericBinding& binding,
+                                             Str associated_name,
+                                             Span span) {
+    bool found = false;
+    GenericBinding resolved_binding{};
+    for (u32 ii = 0; ii < mod.impls.len; ii++) {
+        const auto& impl = mod.impls[ii];
+        if (!impl_matches_binding(mod, impl, binding)) continue;
+        const auto* assoc = find_impl_associated_type(impl, associated_name);
+        if (assoc == nullptr) continue;
+
+        HirExpr resolved{};
+        resolved.span = span;
+        resolved.type = assoc->type;
+        resolved.generic_index = assoc->generic_index;
+        resolved.variant_index = assoc->variant_index;
+        resolved.struct_index = assoc->struct_index;
+        resolved.tuple_len = assoc->tuple_len;
+        for (u32 ti = 0; ti < assoc->tuple_len; ti++) {
+            resolved.tuple_types[ti] = assoc->tuple_types[ti];
+            resolved.tuple_variant_indices[ti] = assoc->tuple_variant_indices[ti];
+            resolved.tuple_struct_indices[ti] = assoc->tuple_struct_indices[ti];
+        }
+        resolved.shape_index = assoc->shape_index;
+
+        if (impl.is_generic_template && binding.type == HirTypeKind::Struct &&
+            binding.struct_index < mod.structs.len) {
+            const auto& concrete = mod.structs[binding.struct_index];
+            if (concrete.template_struct_index == impl.struct_index) {
+                GenericBinding impl_bindings[HirStruct::kMaxTypeParams]{};
+                for (u32 bi = 0; bi < concrete.instance_type_arg_count; bi++)
+                    fill_binding_from_struct_instance_arg(&impl_bindings[bi], concrete, bi);
+                if (assoc->type == HirTypeKind::Generic &&
+                    assoc->generic_index < concrete.instance_type_arg_count) {
+                    apply_binding_metadata_to_expr(&resolved, impl_bindings[assoc->generic_index]);
+                } else if (resolved.type == HirTypeKind::Struct ||
+                           resolved.type == HirTypeKind::Variant) {
+                    auto concretized = concretize_named_instance_shape(
+                        &resolved, mod, impl_bindings, concrete.instance_type_arg_count);
+                    if (!concretized) return false;
+                } else if (resolved.type == HirTypeKind::Tuple) {
+                    auto concretized = concretize_tuple_associated_shape(
+                        &resolved, mod, impl_bindings, concrete.instance_type_arg_count);
+                    if (!concretized) return false;
+                }
+            }
+        }
+
+        auto filled = fill_bound_binding_from_type_metadata(out,
+                                                            const_cast<HirModule*>(&mod),
+                                                            resolved.type,
+                                                            resolved.generic_index,
+                                                            resolved.variant_index,
+                                                            resolved.struct_index,
+                                                            resolved.tuple_len,
+                                                            resolved.tuple_types,
+                                                            resolved.tuple_variant_indices,
+                                                            resolved.tuple_struct_indices,
+                                                            resolved.shape_index,
+                                                            span);
+        if (!filled) return false;
+        if (found) return false;
+        resolved_binding = *out;
+        found = true;
+    }
+    if (!found) return false;
+    *out = resolved_binding;
+    return true;
+}
+
 static HirExpr apply_generic_binding_to_expr(const HirExpr& expr,
                                              const GenericBinding* generic_bindings,
-                                             u32 generic_binding_count) {
+                                             u32 generic_binding_count,
+                                             const HirModule* mod = nullptr) {
     HirExpr out = expr;
+    auto ambiguous_associated_type = [&](HirExpr candidate) {
+        candidate.type = HirTypeKind::Unknown;
+        candidate.generic_index = 0xffffffffu;
+        candidate.associated_name = {};
+        candidate.variant_index = 0xffffffffu;
+        candidate.struct_index = 0xffffffffu;
+        candidate.shape_index = 0xffffffffu;
+        candidate.tuple_len = 0;
+        return candidate;
+    };
+    if (mod != nullptr && out.type == HirTypeKind::Associated) {
+        if (out.generic_index < generic_binding_count &&
+            generic_bindings[out.generic_index].bound) {
+            const auto& binding = generic_bindings[out.generic_index];
+            if (out.generic_protocol_count == 0 && binding.generic_protocol_count != 0) {
+                HirExpr inferred = out;
+                inferred.generic_protocol_count = binding.generic_protocol_count;
+                for (u32 cpi = 0; cpi < inferred.generic_protocol_count; cpi++)
+                    inferred.generic_protocol_indices[cpi] = binding.generic_protocol_indices[cpi];
+                inferred.generic_protocol_index = binding.generic_protocol_index;
+                bool ambiguous = false;
+                if (resolve_associated_binding_expr(&inferred,
+                                                    *mod,
+                                                    inferred,
+                                                    generic_bindings,
+                                                    generic_binding_count,
+                                                    &ambiguous)) {
+                    return inferred;
+                }
+                if (ambiguous) return ambiguous_associated_type(inferred);
+            }
+            bool ambiguous = false;
+            if (resolve_associated_binding_expr(
+                    &out, *mod, expr, generic_bindings, generic_binding_count, &ambiguous)) {
+                return out;
+            }
+            if (ambiguous) return ambiguous_associated_type(out);
+        }
+    }
+    bool ambiguous = false;
+    if (mod != nullptr &&
+        resolve_associated_binding_expr(
+            &out, *mod, expr, generic_bindings, generic_binding_count, &ambiguous)) {
+        return out;
+    }
+    if (ambiguous) return ambiguous_associated_type(out);
     if (expr.type == HirTypeKind::Generic && expr.generic_index < generic_binding_count &&
         generic_bindings[expr.generic_index].bound) {
         const auto& binding = generic_bindings[expr.generic_index];
         out.type = binding.type;
-        out.generic_index = 0xffffffffu;
+        out.generic_index =
+            binding.type == HirTypeKind::Generic ? binding.generic_index : 0xffffffffu;
         out.generic_has_error_constraint = false;
         out.generic_has_eq_constraint = false;
         out.generic_has_ord_constraint = false;
@@ -2104,6 +2837,7 @@ static bool bind_generic_shape(GenericBinding* generic_bindings,
                                u32 generic_index,
                                const HirExpr& actual) {
     if (generic_index >= generic_binding_count) return false;
+    if (actual.type == HirTypeKind::Associated) return false;
     auto& binding = generic_bindings[generic_index];
     if (!binding.bound) {
         binding.bound = true;
@@ -2575,6 +3309,48 @@ static FrontendResult<HirExpr> analyze_method_call_expr(const AstExpr& expr,
             matched_req = req;
         }
         if (matched_protocol_index != 0xffffffffu && matched_req != nullptr) {
+            GenericBinding recv_bindings[HirFunction::kMaxTypeParams]{};
+            u32 recv_binding_count = 0;
+            if (recv->generic_index < HirFunction::kMaxTypeParams) {
+                recv_binding_count = recv->generic_index + 1;
+                auto bound = fill_bound_binding_from_type_metadata(
+                    &recv_bindings[recv->generic_index],
+                    const_cast<HirModule*>(&mod),
+                    recv->type,
+                    recv->type == HirTypeKind::Generic ? recv->generic_index : 0xffffffffu,
+                    recv->variant_index,
+                    recv->struct_index,
+                    recv->tuple_len,
+                    recv->tuple_types,
+                    recv->tuple_variant_indices,
+                    recv->tuple_struct_indices,
+                    recv->shape_index,
+                    expr.span);
+                if (!bound) return core::make_unexpected(bound.error());
+                recv_bindings[recv->generic_index].generic_has_error_constraint =
+                    recv->generic_has_error_constraint;
+                recv_bindings[recv->generic_index].generic_has_eq_constraint =
+                    recv->generic_has_eq_constraint;
+                recv_bindings[recv->generic_index].generic_has_ord_constraint =
+                    recv->generic_has_ord_constraint;
+                recv_bindings[recv->generic_index].generic_protocol_index =
+                    recv->generic_protocol_index;
+                recv_bindings[recv->generic_index].generic_protocol_count =
+                    recv->generic_protocol_count;
+                for (u32 cpi = 0; cpi < recv->generic_protocol_count; cpi++)
+                    recv_bindings[recv->generic_index].generic_protocol_indices[cpi] =
+                        recv->generic_protocol_indices[cpi];
+            }
+            auto concretize_protocol_associated_expr = [&](HirExpr* expected) -> bool {
+                if (recv_binding_count == 0) return true;
+                auto concrete = apply_generic_binding_to_expr(
+                    *expected, recv_bindings, recv_binding_count, &mod);
+                auto concretized = concretize_named_instance_shape(
+                    &concrete, mod, recv_bindings, recv_binding_count);
+                if (!concretized) return false;
+                *expected = concrete;
+                return true;
+            };
             HirExpr out{};
             out.kind = HirExprKind::ProtocolCall;
             out.span = expr.span;
@@ -2584,19 +3360,54 @@ static FrontendResult<HirExpr> analyze_method_call_expr(const AstExpr& expr,
             if (!route->exprs.push(recv.value()))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             out.lhs = &route->exprs[route->exprs.len - 1];
+            auto bind_req_self_associated = [&](HirExpr* expected) {
+                if (expected->type == HirTypeKind::Associated &&
+                    expected->generic_index == 0xffffffffu) {
+                    expected->generic_index = recv->generic_index;
+                    expected->generic_has_error_constraint = recv->generic_has_error_constraint;
+                    expected->generic_has_eq_constraint = recv->generic_has_eq_constraint;
+                    expected->generic_has_ord_constraint = recv->generic_has_ord_constraint;
+                    expected->generic_protocol_index = recv->generic_protocol_index;
+                    expected->generic_protocol_count = recv->generic_protocol_count;
+                    for (u32 cpi = 0; cpi < recv->generic_protocol_count; cpi++)
+                        expected->generic_protocol_indices[cpi] =
+                            recv->generic_protocol_indices[cpi];
+                }
+            };
             for (u32 i = 0; i < expr.args.len; i++) {
+                if (i >= matched_req->params.len)
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
                 auto arg = analyze_expr(*expr.args[i], route, mod, locals, local_count, binding);
                 if (!arg) return core::make_unexpected(arg.error());
                 if (arg->may_nil || arg->may_error)
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                HirExpr expected =
+                    make_expected_type_expr(matched_req->params[i].type,
+                                            matched_req->params[i].variant_index,
+                                            matched_req->params[i].struct_index,
+                                            matched_req->params[i].tuple_len,
+                                            matched_req->params[i].tuple_types,
+                                            matched_req->params[i].tuple_variant_indices,
+                                            matched_req->params[i].tuple_struct_indices,
+                                            matched_req->params[i].shape_index);
+                expected.generic_index = matched_req->params[i].generic_index;
+                expected.associated_name = matched_req->params[i].associated_name;
+                bind_req_self_associated(&expected);
+                if (!concretize_protocol_associated_expr(&expected))
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+                if (!same_hir_type_shape(mod, arg.value(), expected))
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
                 if (!route->exprs.push(arg.value()))
                     return frontend_error(FrontendError::TooManyItems, expr.span);
                 if (!out.args.push(&route->exprs[route->exprs.len - 1]))
                     return frontend_error(FrontendError::TooManyItems, expr.span);
             }
+            if (expr.args.len != matched_req->params.len)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             if (matched_req->has_return_type) {
                 out.type = matched_req->return_type;
                 out.generic_index = matched_req->return_generic_index;
+                out.associated_name = matched_req->return_associated_name;
                 out.variant_index = matched_req->return_variant_index;
                 out.struct_index = matched_req->return_struct_index;
                 out.shape_index = matched_req->return_shape_index;
@@ -2610,6 +3421,9 @@ static FrontendResult<HirExpr> analyze_method_call_expr(const AstExpr& expr,
                 out.may_error = matched_req->return_may_error;
                 out.error_struct_index = matched_req->return_error_struct_index;
                 out.error_variant_index = matched_req->return_error_variant_index;
+                bind_req_self_associated(&out);
+                if (!concretize_protocol_associated_expr(&out))
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             }
             return out;
         }
@@ -2952,7 +3766,8 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          u32 arg_count,
                                                          const GenericBinding* generic_bindings,
                                                          u32 generic_binding_count) {
-    HirExpr out = apply_generic_binding_to_expr(expr, generic_bindings, generic_binding_count);
+    HirExpr out =
+        apply_generic_binding_to_expr(expr, generic_bindings, generic_binding_count, &mod);
     auto concretized =
         concretize_named_instance_shape(&out, mod, generic_bindings, generic_binding_count);
     if (!concretized) return core::make_unexpected(concretized.error());
@@ -3045,6 +3860,7 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             HirExpr expected{};
             expected.type = fn.return_type;
             expected.generic_index = fn.return_generic_index;
+            expected.associated_name = fn.return_associated_name;
             expected.shape_index = fn.return_shape_index;
             expected.variant_index = fn.return_variant_index;
             expected.struct_index = fn.return_struct_index;
@@ -3072,12 +3888,13 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                         fn.type_params[fn.return_generic_index].custom_protocol_indices[cpi];
             }
             auto concrete =
-                apply_generic_binding_to_expr(expected, impl_bindings, impl_binding_count);
+                apply_generic_binding_to_expr(expected, impl_bindings, impl_binding_count, &mod);
             auto concretized =
                 concretize_named_instance_shape(&concrete, mod, impl_bindings, impl_binding_count);
             if (!concretized) return core::make_unexpected(concretized.error());
             inlined->type = concrete.type;
             inlined->generic_index = concrete.generic_index;
+            inlined->associated_name = concrete.associated_name;
             inlined->generic_has_error_constraint = concrete.generic_has_error_constraint;
             inlined->generic_has_eq_constraint = concrete.generic_has_eq_constraint;
             inlined->generic_has_ord_constraint = concrete.generic_has_ord_constraint;
@@ -3145,6 +3962,10 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         if (!route->exprs.push(rhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         out_or.rhs = &route->exprs[route->exprs.len - 1];
+        out_or.may_nil = false;
+        out_or.may_error = false;
+        out_or.error_struct_index = 0xffffffffu;
+        out_or.error_variant_index = 0xffffffffu;
         out_or.span = expr.span;
         return out_or;
     }
@@ -4413,6 +5234,36 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.type = HirTypeKind::Str;
                 return out;
             }
+            struct ReqHeaderAlias {
+                Str field;
+                Str header;
+            };
+            static constexpr ReqHeaderAlias kHeaderAliases[] = {
+                {{"authorization", 13}, {"Authorization", 13}},
+                {{"host", 4}, {"Host", 4}},
+                {{"userAgent", 9}, {"User-Agent", 10}},
+                {{"origin", 6}, {"Origin", 6}},
+                {{"accept", 6}, {"Accept", 6}},
+                {{"acceptLanguage", 14}, {"Accept-Language", 15}},
+                {{"acceptEncoding", 14}, {"Accept-Encoding", 15}},
+                {{"cacheControl", 12}, {"Cache-Control", 13}},
+                {{"contentType", 11}, {"Content-Type", 12}},
+                {{"ifModifiedSince", 15}, {"If-Modified-Since", 17}},
+                {{"referer", 7}, {"Referer", 7}},
+                {{"forwarded", 9}, {"Forwarded", 9}},
+                {{"xForwardedFor", 13}, {"X-Forwarded-For", 15}},
+                {{"xForwardedProto", 15}, {"X-Forwarded-Proto", 17}},
+                {{"xRealIp", 7}, {"X-Real-IP", 9}},
+                {{"xRequestId", 10}, {"X-Request-ID", 12}},
+            };
+            for (const auto& alias : kHeaderAliases) {
+                if (!expr.name.eq(alias.field)) continue;
+                out.kind = HirExprKind::ReqHeader;
+                out.type = HirTypeKind::Str;
+                out.may_nil = true;
+                out.str_value = alias.header;
+                return out;
+            }
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
         }
         // Otherwise fall through to the generic Field path so the
@@ -4810,8 +5661,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 elem->type == HirTypeKind::Tuple)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
             out.tuple_types[i] = elem->type;
-            out.tuple_variant_indices[i] = elem->variant_index;
-            out.tuple_struct_indices[i] = elem->struct_index;
+            out.tuple_variant_indices[i] =
+                elem->type == HirTypeKind::Variant ? elem->variant_index : 0xffffffffu;
+            out.tuple_struct_indices[i] =
+                elem->type == HirTypeKind::Struct
+                    ? elem->struct_index
+                    : (elem->type == HirTypeKind::Generic ? elem->generic_index : 0xffffffffu);
             if (!route->exprs.push(elem.value()))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             if (!out.args.push(&route->exprs[route->exprs.len - 1]))
@@ -5015,6 +5870,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                            expr.span);
         if (!shape) return core::make_unexpected(shape.error());
         out.shape_index = shape.value();
+        out.may_nil = false;
+        out.may_error = false;
+        out.error_struct_index = 0xffffffffu;
+        out.error_variant_index = 0xffffffffu;
         return out;
     }
     if (expr.kind == AstExprKind::Pipe) {
@@ -5088,6 +5947,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.wait_payload = locals[i].wait_payload;
             out.wait_index = locals[i].wait_index;
             out.generic_index = locals[i].generic_index;
+            out.associated_name = locals[i].associated_name;
             out.generic_has_error_constraint = locals[i].generic_has_error_constraint;
             out.generic_has_eq_constraint = locals[i].generic_has_eq_constraint;
             out.generic_has_ord_constraint = locals[i].generic_has_ord_constraint;
@@ -5168,13 +6028,21 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const HirExpr* pipe_lhs) {
     const Str callee_name = resolve_alias_target_leaf(mod, expr.name);
     const u32 fn_index = find_function_index(mod, callee_name);
-    if (fn_index == mod.functions.len)
-        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+    const auto fail_call =
+        [&](Span span, const char* reason, const Str* detail) -> FrontendResult<HirExpr> {
+        (void)reason;
+        if (detail) return frontend_error(FrontendError::UnsupportedSyntax, span, *detail);
+        return frontend_error(FrontendError::UnsupportedSyntax, span);
+    };
+    const auto fail_with_name = [&](Span span, const char* reason) -> FrontendResult<HirExpr> {
+        return fail_call(span, reason, &expr.name);
+    };
+
+    if (fn_index == mod.functions.len) return fail_with_name(expr.span, "unknown function");
     const auto& fn = mod.functions[fn_index];
-    if (expr.args.len != fn.params.len)
-        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+    if (expr.args.len != fn.params.len) return fail_with_name(expr.span, "argument count mismatch");
     if (expr.type_args.len != 0 && expr.type_args.len != fn.type_params.len)
-        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        return fail_with_name(expr.span, "type argument count mismatch");
     GenericBinding generic_bindings[HirFunction::kMaxTypeParams]{};
     for (u32 i = 0; i < expr.type_args.len; i++) {
         u32 variant_index = 0xffffffffu;
@@ -5210,18 +6078,23 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!filled) return core::make_unexpected(filled.error());
         if (fn.type_params[i].has_error_constraint &&
             !generic_binding_satisfies_error_constraint(mod, generic_bindings[i]))
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            return fail_with_name(expr.span, "type arg error constraint failed");
         if (fn.type_params[i].has_eq_constraint &&
             !generic_binding_satisfies_eq_constraint(mod, generic_bindings[i]))
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            return fail_with_name(expr.span, "type arg eq constraint failed");
         if (fn.type_params[i].has_ord_constraint &&
             !generic_binding_satisfies_ord_constraint(mod, generic_bindings[i]))
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            return fail_with_name(expr.span, "type arg ord constraint failed");
     }
     auto concrete_return_expr = [&]() -> FrontendResult<HirExpr> {
+        if (fn.return_generic_index < fn.type_params.len &&
+            !generic_bindings[fn.return_generic_index].bound) {
+            return fail_call(expr.span, "return generic unbound", nullptr);
+        }
         HirExpr expected{};
         expected.type = fn.return_type;
         expected.generic_index = fn.return_generic_index;
+        expected.associated_name = fn.return_associated_name;
         expected.shape_index = fn.return_shape_index;
         if (fn.return_generic_index < fn.type_params.len)
             expected.generic_has_error_constraint =
@@ -5249,31 +6122,65 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             expected.tuple_variant_indices[i] = fn.return_tuple_variant_indices[i];
             expected.tuple_struct_indices[i] = fn.return_tuple_struct_indices[i];
         }
-        auto out = apply_generic_binding_to_expr(expected, generic_bindings, fn.type_params.len);
+        auto out =
+            apply_generic_binding_to_expr(expected, generic_bindings, fn.type_params.len, &mod);
         auto concretized =
             concretize_named_instance_shape(&out, mod, generic_bindings, fn.type_params.len);
         if (!concretized) return core::make_unexpected(concretized.error());
         return out;
     };
+    const auto apply_return_type = [&](HirExpr& target,
+                                       const char* context) -> FrontendResult<void> {
+        (void)context;
+        auto ret = concrete_return_expr();
+        if (!ret) return core::make_unexpected(ret.error());
+        if (!same_hir_type_shape(mod, target, ret.value())) {
+            auto mismatch = fail_call(expr.span, "return type mismatch", nullptr);
+            return core::make_unexpected(mismatch.error());
+        }
+        target.type = ret->type;
+        target.associated_name = ret->associated_name;
+        target.generic_index = ret->generic_index;
+        target.generic_has_error_constraint = ret->generic_has_error_constraint;
+        target.generic_has_eq_constraint = ret->generic_has_eq_constraint;
+        target.generic_has_ord_constraint = ret->generic_has_ord_constraint;
+        target.generic_protocol_index = ret->generic_protocol_index;
+        target.generic_protocol_count = ret->generic_protocol_count;
+        for (u32 cpi = 0; cpi < target.generic_protocol_count; cpi++)
+            target.generic_protocol_indices[cpi] = ret->generic_protocol_indices[cpi];
+        target.variant_index = ret->variant_index;
+        target.struct_index = ret->struct_index;
+        target.shape_index = ret->shape_index;
+        target.tuple_len = ret->tuple_len;
+        for (u32 i = 0; i < ret->tuple_len; i++) {
+            target.tuple_types[i] = ret->tuple_types[i];
+            target.tuple_variant_indices[i] = ret->tuple_variant_indices[i];
+            target.tuple_struct_indices[i] = ret->tuple_struct_indices[i];
+        }
+        return {};
+    };
     auto placeholder_slot_expr =
         [&](const HirExpr& source, i32 slot, Span span) -> FrontendResult<HirExpr> {
         if (slot <= 0 || slot > static_cast<i32>(kMaxTupleSlots))
-            return frontend_error(FrontendError::UnsupportedSyntax, span);
+            return fail_call(span, "placeholder slot out of range", nullptr);
         if (source.type != HirTypeKind::Tuple) {
-            if (slot != 1) return frontend_error(FrontendError::UnsupportedSyntax, span);
+            if (slot != 1)
+                return fail_call(span, "non-tuple source with non-unit placeholder", nullptr);
             return source;
         }
         if (slot > static_cast<i32>(source.tuple_len))
-            return frontend_error(FrontendError::UnsupportedSyntax, span);
+            return fail_call(span, "placeholder slot exceeds tuple arity", nullptr);
         const u32 slot_index = static_cast<u32>(slot - 1);
         if (source.args.len == source.tuple_len && source.args[slot_index] != nullptr)
             return *source.args[slot_index];
         HirExpr out{};
         out.kind = HirExprKind::TupleSlot;
         out.type = source.tuple_types[slot_index];
-        if (out.type == HirTypeKind::Struct)
+        if (out.type == HirTypeKind::Generic)
+            out.generic_index = source.tuple_struct_indices[slot_index];
+        else if (out.type == HirTypeKind::Struct)
             out.struct_index = source.tuple_struct_indices[slot_index];
-        else
+        else if (out.type == HirTypeKind::Variant)
             out.variant_index = source.tuple_variant_indices[slot_index];
         auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                            out.type,
@@ -5294,6 +6201,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     };
     auto concrete_param_expr = [&](const HirFunction::ParamDecl& param) -> FrontendResult<HirExpr> {
         auto expected = make_expected_param_expr(param);
+        expected =
+            apply_generic_binding_to_expr(expected, generic_bindings, fn.type_params.len, &mod);
         auto concretized =
             concretize_named_instance_shape(&expected, mod, generic_bindings, fn.type_params.len);
         if (!concretized) return core::make_unexpected(concretized.error());
@@ -5330,7 +6239,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
         if (lhs_state == KnownValueState::Error) {
             const HirExpr* err_expr = known_error_expr(*pipe_lhs, locals, local_count, 0);
-            if (!err_expr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (!err_expr) return fail_call(expr.span, "unknown error variant source", nullptr);
             HirExpr folded = *err_expr;
             auto ret = concrete_return_expr();
             if (!ret) return core::make_unexpected(ret.error());
@@ -5364,7 +6273,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 if (arg_expr.kind == AstExprKind::Placeholder) {
                     placeholder_count++;
                     if (arg_expr.int_value != 1)
-                        return frontend_error(FrontendError::UnsupportedSyntax, arg_expr.span);
+                        return fail_call(arg_expr.span,
+                                         "placeholder value in conditional pipe must be 1",
+                                         nullptr);
                 }
             }
             if (!route->exprs.push(*pipe_lhs))
@@ -5405,7 +6316,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     auto arg = analyze_expr(arg_expr, route, mod, locals, local_count, binding);
                     if (!arg) return core::make_unexpected(arg.error());
                     if (arg->may_nil || arg->may_error)
-                        return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                        return fail_call(expr.args[i]->span, "arg has nil or error", nullptr);
                     analyzed_args[i] = arg.value();
                 }
                 if (fn.params[i].type == HirTypeKind::Generic) {
@@ -5413,31 +6324,34 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                             fn.type_params.len,
                                             fn.params[i].generic_index,
                                             analyzed_args[i]))
-                        return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                        return fail_call(
+                            expr.args[i]->span, "failed to bind generic param", nullptr);
                     if (fn.type_params[fn.params[i].generic_index].has_error_constraint &&
                         !generic_binding_satisfies_error_constraint(
                             mod, generic_bindings[fn.params[i].generic_index]))
-                        return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                        return fail_call(
+                            expr.args[i]->span, "generic param error constraint failed", nullptr);
                     if (fn.type_params[fn.params[i].generic_index].has_eq_constraint &&
                         !generic_binding_satisfies_eq_constraint(
                             mod, generic_bindings[fn.params[i].generic_index]))
-                        return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                        return fail_call(
+                            expr.args[i]->span, "generic param eq constraint failed", nullptr);
                     if (fn.type_params[fn.params[i].generic_index].has_ord_constraint &&
                         !generic_binding_satisfies_ord_constraint(
                             mod, generic_bindings[fn.params[i].generic_index]))
-                        return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
-                    if (fn.type_params[fn.params[i].generic_index].has_constraint &&
-                        fn.type_params[fn.params[i].generic_index].constraint_kind ==
-                            HirProtocolKind::Custom &&
-                        !generic_binding_satisfies_custom_protocol(
-                            mod,
-                            generic_bindings[fn.params[i].generic_index],
-                            find_protocol_index(
-                                mod, fn.type_params[fn.params[i].generic_index].constraint)))
-                        return frontend_error(
-                            FrontendError::UnsupportedSyntax,
-                            expr.args[i]->span,
-                            fn.type_params[fn.params[i].generic_index].constraint);
+                        return fail_call(
+                            expr.args[i]->span, "generic param ord constraint failed", nullptr);
+                    for (u32 cpi = 0;
+                         cpi < fn.type_params[fn.params[i].generic_index].custom_protocol_count;
+                         cpi++) {
+                        const u32 proto_index =
+                            fn.type_params[fn.params[i].generic_index].custom_protocol_indices[cpi];
+                        if (!generic_binding_satisfies_custom_protocol(
+                                mod, generic_bindings[fn.params[i].generic_index], proto_index))
+                            return fail_call(expr.args[i]->span,
+                                             "generic param custom protocol failed",
+                                             &mod.protocols[proto_index].name);
+                    }
                 } else if (fn.params[i].template_variant_index != 0xffffffffu ||
                            fn.params[i].template_struct_index != 0xffffffffu) {
                     const auto expected_shape = make_expected_param_expr(fn.params[i]);
@@ -5446,26 +6360,29 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                   fn.type_params.len,
                                                   expected_shape,
                                                   analyzed_args[i]))
-                        return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                        return fail_call(
+                            expr.args[i]->span, "template generic shape mismatch", nullptr);
                     auto expected = concrete_param_expr(fn.params[i]);
                     if (!expected) return core::make_unexpected(expected.error());
                     if (!same_hir_type_shape(mod, analyzed_args[i], expected.value()))
-                        return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                        return fail_call(
+                            expr.args[i]->span, "template generic arg shape mismatch", nullptr);
                 } else {
                     auto expected = concrete_param_expr(fn.params[i]);
                     if (!expected) return core::make_unexpected(expected.error());
                     if (!same_hir_type_shape(mod, analyzed_args[i], expected.value()))
-                        return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                        return fail_call(
+                            expr.args[i]->span, "concrete param shape mismatch", nullptr);
                 }
             }
             if (placeholder_count != 1)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+                return fail_call(expr.span, "placeholder pipe count mismatch", nullptr);
 
             auto ret = concrete_return_expr();
             if (!ret) return core::make_unexpected(ret.error());
             if (ret->type != HirTypeKind::I32 && ret->type != HirTypeKind::Str &&
                 ret->type != HirTypeKind::Variant)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+                return fail_call(expr.span, "pipe return type unsupported", nullptr);
 
             auto then_expr = instantiate_function_expr(fn.body,
                                                        route,
@@ -5475,10 +6392,12 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                        generic_bindings,
                                                        fn.type_params.len);
             if (!then_expr) return core::make_unexpected(then_expr.error());
+            auto pipe_then_typed = apply_return_type(then_expr.value(), "pipe conditional");
+            if (!pipe_then_typed) return core::make_unexpected(pipe_then_typed.error());
             if (pipe_lhs->may_error && then_expr->may_error &&
                 (pipe_lhs->error_struct_index != then_expr->error_struct_index ||
                  pipe_lhs->error_variant_index != then_expr->error_variant_index))
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+                return fail_call(expr.span, "pipe error variant mismatch", nullptr);
             if (!route->exprs.push(then_expr.value()))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             HirExpr* then_ptr = &route->exprs[route->exprs.len - 1];
@@ -5565,7 +6484,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         const auto& arg_expr = *expr.args[i];
         if (arg_expr.kind == AstExprKind::Placeholder) {
             if (pipe_lhs == nullptr)
-                return frontend_error(FrontendError::UnsupportedSyntax, arg_expr.span);
+                return fail_call(arg_expr.span, "placeholder outside pipe", nullptr);
             placeholder_count++;
             if (placeholder_source == pipe_lhs) {
                 if (!route->exprs.push(*pipe_lhs))
@@ -5580,7 +6499,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             auto arg = analyze_expr(arg_expr, route, mod, locals, local_count, binding);
             if (!arg) return core::make_unexpected(arg.error());
             if (arg->may_nil || arg->may_error)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                return fail_call(expr.args[i]->span, "arg has nil or error", nullptr);
             analyzed_args[i] = arg.value();
         }
         if (fn.params[i].type == HirTypeKind::Generic) {
@@ -5588,19 +6507,21 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                     fn.type_params.len,
                                     fn.params[i].generic_index,
                                     analyzed_args[i]))
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                return fail_call(expr.args[i]->span, "failed to bind generic param", nullptr);
             if (fn.type_params[fn.params[i].generic_index].has_error_constraint &&
                 !generic_binding_satisfies_error_constraint(
                     mod, generic_bindings[fn.params[i].generic_index]))
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                return fail_call(
+                    expr.args[i]->span, "generic param error constraint failed", nullptr);
             if (fn.type_params[fn.params[i].generic_index].has_eq_constraint &&
                 !generic_binding_satisfies_eq_constraint(
                     mod, generic_bindings[fn.params[i].generic_index]))
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                return fail_call(expr.args[i]->span, "generic param eq constraint failed", nullptr);
             if (fn.type_params[fn.params[i].generic_index].has_ord_constraint &&
                 !generic_binding_satisfies_ord_constraint(
                     mod, generic_bindings[fn.params[i].generic_index]))
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                return fail_call(
+                    expr.args[i]->span, "generic param ord constraint failed", nullptr);
             for (u32 cpi = 0;
                  cpi < fn.type_params[fn.params[i].generic_index].custom_protocol_count;
                  cpi++) {
@@ -5608,32 +6529,36 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     fn.type_params[fn.params[i].generic_index].custom_protocol_indices[cpi];
                 if (!generic_binding_satisfies_custom_protocol(
                         mod, generic_bindings[fn.params[i].generic_index], proto_index))
-                    return frontend_error(FrontendError::UnsupportedSyntax,
-                                          expr.args[i]->span,
-                                          mod.protocols[proto_index].name);
+                    return fail_call(expr.args[i]->span,
+                                     "generic param custom protocol failed",
+                                     &mod.protocols[proto_index].name);
             }
         } else if (fn.params[i].template_variant_index != 0xffffffffu ||
                    fn.params[i].template_struct_index != 0xffffffffu) {
             const auto expected_shape = make_expected_param_expr(fn.params[i]);
             if (!bind_named_generic_shape(
                     mod, generic_bindings, fn.type_params.len, expected_shape, analyzed_args[i]))
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                return fail_call(expr.args[i]->span, "template generic shape mismatch", nullptr);
             auto expected = concrete_param_expr(fn.params[i]);
             if (!expected) return core::make_unexpected(expected.error());
             if (!same_hir_type_shape(mod, analyzed_args[i], expected.value()))
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                return fail_call(expr.args[i]->span, "template arg shape mismatch", nullptr);
         } else {
             auto expected = concrete_param_expr(fn.params[i]);
             if (!expected) return core::make_unexpected(expected.error());
             if (!same_hir_type_shape(mod, analyzed_args[i], expected.value()))
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                return fail_call(expr.args[i]->span, "concrete param shape mismatch", nullptr);
         }
     }
     if (pipe_lhs != nullptr && placeholder_count == 0)
-        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        return fail_call(expr.span, "pipe call missing placeholder", nullptr);
     auto inlined = instantiate_function_expr(
         fn.body, route, mod, analyzed_args, expr.args.len, generic_bindings, fn.type_params.len);
-    if (!inlined) return core::make_unexpected(inlined.error());
+    if (!inlined) {
+        return core::make_unexpected(inlined.error());
+    }
+    auto return_typed = apply_return_type(inlined.value(), "direct");
+    if (!return_typed) return core::make_unexpected(return_typed.error());
     inlined->span = expr.span;
     return inlined.value();
 }
@@ -7141,6 +8066,9 @@ static bool imported_module_exports_selected_name(const HirModule& mod, Str name
         const auto& variant = mod.variants[vi];
         if (variant.template_variant_index == 0xffffffffu && variant.name.eq(name)) return true;
     }
+    for (u32 ai = 0; ai < mod.type_aliases.len; ai++) {
+        if (mod.type_aliases[ai].name.eq(name)) return true;
+    }
     return false;
 }
 
@@ -7335,6 +8263,147 @@ static FrontendResult<void> merge_imported_simple_decls(
         arg->shape_index = shape.value();
         return {};
     };
+    auto imported_type_symbol_visible_name =
+        [](const ImportedModuleInfo& imported, Str original, Str& visible) -> bool {
+        if (!imported.selective || imported.has_namespace_alias) {
+            visible = import_visible_name(imported, original);
+            return true;
+        }
+        for (u32 si = 0; si < imported.selected_names.len; si++) {
+            const auto& selected = imported.selected_names[si];
+            if (!selected.name.eq(original)) continue;
+            visible = selected.has_alias ? selected.alias : selected.name;
+            return true;
+        }
+        return false;
+    };
+    auto imported_module_exports_type_symbol = [](const HirModule& imported_mod, Str name) -> bool {
+        for (u32 si = 0; si < imported_mod.structs.len; si++) {
+            const auto& st = imported_mod.structs[si];
+            if (st.template_struct_index == 0xffffffffu && st.name.eq(name)) return true;
+        }
+        for (u32 vi = 0; vi < imported_mod.variants.len; vi++) {
+            const auto& variant = imported_mod.variants[vi];
+            if (variant.template_variant_index == 0xffffffffu && variant.name.eq(name)) return true;
+        }
+        for (u32 ai = 0; ai < imported_mod.type_aliases.len; ai++) {
+            if (imported_mod.type_aliases[ai].name.eq(name)) return true;
+        }
+        return false;
+    };
+    auto imported_module_exports_custom_protocol = [](const HirModule& imported_mod,
+                                                      Str name) -> bool {
+        for (u32 pi = 0; pi < imported_mod.protocols.len; pi++) {
+            const auto& proto = imported_mod.protocols[pi];
+            if (proto.kind == HirProtocolKind::Custom && proto.name.eq(name)) return true;
+        }
+        return false;
+    };
+    auto alias_has_type_param = [](const HirTypeAlias& alias, Str name) -> bool {
+        for (u32 ti = 0; ti < alias.type_params.len; ti++) {
+            if (alias.type_params[ti].eq(name)) return true;
+        }
+        return false;
+    };
+    auto remap_imported_alias_symbol = [&](Str ns,
+                                           Str name,
+                                           const ImportedModuleInfo& imported,
+                                           const HirTypeAlias& alias,
+                                           Str& out_name,
+                                           Str* out_ns = nullptr) -> bool {
+        if (out_ns) *out_ns = ns;
+        Str source_name = name;
+        if (ns.len != 0) {
+            if (!resolve_import_namespace_type_name(*imported.module, ns, name, source_name))
+                return false;
+        } else if (alias_has_type_param(alias, name)) {
+            return false;
+        }
+        if (!imported_module_exports_type_symbol(*imported.module, source_name)) return false;
+        Str visible{};
+        if (!imported_type_symbol_visible_name(imported, source_name, visible)) return false;
+        out_name = visible;
+        if (out_ns) *out_ns = Str{};
+        return true;
+    };
+    std::function<FrontendResult<void>(AstTypeRef&, const ImportedModuleInfo&, const HirTypeAlias&)>
+        remap_imported_alias_type_ref = [&](AstTypeRef& ref,
+                                            const ImportedModuleInfo& imported,
+                                            const HirTypeAlias& alias) -> FrontendResult<void> {
+        if (!ref.is_tuple) {
+            Str ns = ref.namespace_name;
+            Str visible = ref.name;
+            if (remap_imported_alias_symbol(ns, ref.name, imported, alias, visible, &ns)) {
+                ref.namespace_name = ns;
+                ref.name = visible;
+            }
+        }
+        const u32 arg_count =
+            ref.type_args.len > ref.type_arg_names.len ? ref.type_args.len : ref.type_arg_names.len;
+        for (u32 arg_i = 0; arg_i < arg_count; arg_i++) {
+            if (arg_i < ref.type_args.len && ref.type_args[arg_i] != nullptr) {
+                auto remapped =
+                    remap_imported_alias_type_ref(*ref.type_args[arg_i], imported, alias);
+                if (!remapped) return remapped;
+                continue;
+            }
+            if (arg_i >= ref.type_arg_names.len) continue;
+            Str arg_name = ref.type_arg_names[arg_i];
+            Str arg_ns =
+                arg_i < ref.type_arg_namespaces.len ? ref.type_arg_namespaces[arg_i] : Str{};
+            Str visible = arg_name;
+            if (remap_imported_alias_symbol(arg_ns, arg_name, imported, alias, visible, &arg_ns)) {
+                if (arg_i < ref.type_arg_namespaces.len)
+                    ref.type_arg_namespaces[arg_i] = arg_ns;
+                else if (!ref.type_arg_namespaces.push(arg_ns))
+                    return frontend_error(FrontendError::TooManyItems, imported.span, arg_name);
+                ref.type_arg_names[arg_i] = visible;
+            }
+        }
+        const u32 tuple_count = ref.tuple_elem_types.len > ref.tuple_elem_names.len
+                                    ? ref.tuple_elem_types.len
+                                    : ref.tuple_elem_names.len;
+        for (u32 elem_i = 0; elem_i < tuple_count; elem_i++) {
+            if (elem_i < ref.tuple_elem_types.len && ref.tuple_elem_types[elem_i] != nullptr) {
+                auto remapped =
+                    remap_imported_alias_type_ref(*ref.tuple_elem_types[elem_i], imported, alias);
+                if (!remapped) return remapped;
+                continue;
+            }
+            if (elem_i >= ref.tuple_elem_names.len) continue;
+            Str elem_name = ref.tuple_elem_names[elem_i];
+            Str visible = elem_name;
+            if (remap_imported_alias_symbol(Str{}, elem_name, imported, alias, visible))
+                ref.tuple_elem_names[elem_i] = visible;
+        }
+        return {};
+    };
+    auto remap_imported_type_alias =
+        [&](HirTypeAlias& alias, const ImportedModuleInfo& imported) -> FrontendResult<void> {
+        auto target_remapped = remap_imported_alias_type_ref(alias.target, imported, alias);
+        if (!target_remapped) return target_remapped;
+        for (u32 arm_i = 0; arm_i < alias.arms.len; arm_i++) {
+            auto& arm = alias.arms[arm_i];
+            auto arm_remapped = remap_imported_alias_type_ref(arm.type, imported, alias);
+            if (!arm_remapped) return arm_remapped;
+            Str constraint_name = arm.constraint;
+            if (arm.constraint_namespace.len != 0) {
+                if (!resolve_import_namespace_type_name(*imported.module,
+                                                        arm.constraint_namespace,
+                                                        arm.constraint,
+                                                        constraint_name))
+                    continue;
+            }
+            if (imported_module_exports_custom_protocol(*imported.module, constraint_name)) {
+                Str visible{};
+                if (imported_type_symbol_visible_name(imported, constraint_name, visible)) {
+                    arm.constraint_namespace = Str{};
+                    arm.constraint = visible;
+                }
+            }
+        }
+        return {};
+    };
     for (u32 ii = 0; ii < imports.len; ii++) {
         const auto& imported = imports[ii];
         for (u32 pi = 0; pi < imported.module->protocols.len; pi++) {
@@ -7502,6 +8571,38 @@ static FrontendResult<void> merge_imported_simple_decls(
             }
             if (!ok) continue;
             if (!mod->variants.push(imported_variant))
+                return frontend_error(FrontendError::TooManyItems, imported.span);
+        }
+        for (u32 ai = 0; ai < imported.module->type_aliases.len; ai++) {
+            const auto& alias = imported.module->type_aliases[ai];
+            if (imported.selective) {
+                bool selected = false;
+                for (u32 xi = 0; xi < imported.selected_names.len; xi++) {
+                    if (imported.selected_names[xi].name.eq(alias.name)) {
+                        selected = true;
+                        break;
+                    }
+                }
+                if (!selected) continue;
+            }
+            HirTypeAlias imported_alias = alias;
+            imported_alias.name = import_visible_name(imported, alias.name);
+            auto remapped_alias = remap_imported_type_alias(imported_alias, imported);
+            if (!remapped_alias) return remapped_alias;
+            auto detached_target = detach_type_alias_ref_pointers(mod, imported_alias.target);
+            if (!detached_target) return core::make_unexpected(detached_target.error());
+            for (u32 arm_i = 0; arm_i < imported_alias.arms.len; arm_i++)
+                if (auto detached_arm =
+                        detach_type_alias_ref_pointers(mod, imported_alias.arms[arm_i].type);
+                    !detached_arm)
+                    return core::make_unexpected(detached_arm.error());
+            if (find_type_alias(*mod, imported_alias.name) != nullptr ||
+                find_struct_index(*mod, imported_alias.name) < mod->structs.len ||
+                find_variant_index(*mod, imported_alias.name) < mod->variants.len ||
+                find_protocol_index(*mod, imported_alias.name) < mod->protocols.len)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, imported.span, imported_alias.name);
+            if (!mod->type_aliases.push(imported_alias))
                 return frontend_error(FrontendError::TooManyItems, imported.span);
         }
     }
@@ -8297,77 +9398,29 @@ static FrontendResult<HirModule*> analyze_file_internal(
         proto.span = item.protocol.span;
         proto.name = item.protocol.name;
         proto.kind = HirProtocolKind::Custom;
+        for (u32 ai = 0; ai < item.protocol.associated_types.len; ai++) {
+            const auto& assoc_ast = item.protocol.associated_types[ai];
+            for (u32 seen = 0; seen < proto.associated_types.len; seen++) {
+                if (proto.associated_types[seen].name.eq(assoc_ast.name))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, item.protocol.span, assoc_ast.name);
+            }
+            HirProtocol::AssociatedTypeDecl assoc{};
+            assoc.name = assoc_ast.name;
+            if (!proto.associated_types.push(assoc))
+                return frontend_error(FrontendError::TooManyItems, item.protocol.span);
+        }
         for (u32 mi = 0; mi < item.protocol.methods.len; mi++) {
-            for (u32 seen = 0; seen < proto.methods.len; seen++) {
-                if (proto.methods[seen].name.eq(item.protocol.methods[mi].name))
+            if (find_protocol_associated_type(proto, item.protocol.methods[mi].name) != nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      item.protocol.span,
+                                      item.protocol.methods[mi].name);
+            for (u32 seen = 0; seen < mi; seen++) {
+                if (item.protocol.methods[seen].name.eq(item.protocol.methods[mi].name))
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           item.protocol.span,
                                           item.protocol.methods[mi].name);
             }
-            HirProtocol::MethodDecl method{};
-            method.name = item.protocol.methods[mi].name;
-            for (u32 pi = 0; pi < item.protocol.methods[mi].params.len; pi++) {
-                HirProtocol::MethodDecl::ParamDecl param{};
-                param.type_name = item.protocol.methods[mi].params[pi].type.name;
-                auto param_type = resolve_func_type_ref(mod,
-                                                        item.protocol.methods[mi].params[pi].type,
-                                                        nullptr,
-                                                        &param.generic_index,
-                                                        param.variant_index,
-                                                        param.struct_index,
-                                                        param.tuple_len,
-                                                        param.tuple_types,
-                                                        param.tuple_variant_indices,
-                                                        param.tuple_struct_indices,
-                                                        item.protocol.span);
-                if (!param_type) return core::make_unexpected(param_type.error());
-                param.type = param_type.value();
-                auto param_shape = intern_hir_type_shape(&mod,
-                                                         param.type,
-                                                         param.generic_index,
-                                                         param.variant_index,
-                                                         param.struct_index,
-                                                         param.tuple_len,
-                                                         param.tuple_types,
-                                                         param.tuple_variant_indices,
-                                                         param.tuple_struct_indices,
-                                                         item.protocol.span);
-                if (!param_shape) return core::make_unexpected(param_shape.error());
-                param.shape_index = param_shape.value();
-                if (!method.params.push(param))
-                    return frontend_error(FrontendError::TooManyItems, item.protocol.span);
-            }
-            method.has_return_type = item.protocol.methods[mi].has_return_type;
-            method.return_type_name = item.protocol.methods[mi].return_type.name;
-            if (method.has_return_type) {
-                auto return_type = resolve_func_type_ref(mod,
-                                                         item.protocol.methods[mi].return_type,
-                                                         nullptr,
-                                                         &method.return_generic_index,
-                                                         method.return_variant_index,
-                                                         method.return_struct_index,
-                                                         method.return_tuple_len,
-                                                         method.return_tuple_types,
-                                                         method.return_tuple_variant_indices,
-                                                         method.return_tuple_struct_indices,
-                                                         item.protocol.span);
-                if (!return_type) return core::make_unexpected(return_type.error());
-                method.return_type = return_type.value();
-                auto return_shape = intern_hir_type_shape(&mod,
-                                                          method.return_type,
-                                                          method.return_generic_index,
-                                                          method.return_variant_index,
-                                                          method.return_struct_index,
-                                                          method.return_tuple_len,
-                                                          method.return_tuple_types,
-                                                          method.return_tuple_variant_indices,
-                                                          method.return_tuple_struct_indices,
-                                                          item.protocol.span);
-                if (!return_shape) return core::make_unexpected(return_shape.error());
-                method.return_shape_index = return_shape.value();
-            }
-            if (!proto.methods.push(method))
-                return frontend_error(FrontendError::TooManyItems, item.protocol.span);
         }
         if (!mod.protocols.push(proto))
             return frontend_error(FrontendError::TooManyItems, item.protocol.span);
@@ -8402,6 +9455,192 @@ static FrontendResult<HirModule*> analyze_file_internal(
         variant.type_params = item.variant.type_params;
         if (!mod.variants.push(variant))
             return frontend_error(FrontendError::TooManyItems, item.variant.span);
+    }
+
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::TypeAlias) continue;
+        if (find_type_alias(mod, item.type_alias.name) != nullptr ||
+            find_struct_index(mod, item.type_alias.name) < mod.structs.len ||
+            find_variant_index(mod, item.type_alias.name) < mod.variants.len ||
+            find_protocol_index(mod, item.type_alias.name) < mod.protocols.len)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.type_alias.span, item.type_alias.name);
+        for (u32 ti = 0; ti < item.type_alias.type_params.len; ti++) {
+            for (u32 seen = 0; seen < ti; seen++) {
+                if (item.type_alias.type_params[seen].eq(item.type_alias.type_params[ti]))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.type_alias.span,
+                                          item.type_alias.type_params[ti]);
+            }
+        }
+        if (item.type_alias.is_match) {
+            bool has_wildcard = false;
+            for (u32 ai = 0; ai < item.type_alias.arms.len; ai++) {
+                const auto& arm = item.type_alias.arms[ai];
+                if (arm.is_wildcard) {
+                    has_wildcard = true;
+                    continue;
+                }
+                bool found_param = false;
+                bool found_rhs_param = !arm.is_type_equality;
+                for (u32 ti = 0; ti < item.type_alias.type_params.len; ti++) {
+                    if (item.type_alias.type_params[ti].eq(arm.type_param)) {
+                        found_param = true;
+                    }
+                    if (arm.is_type_equality &&
+                        item.type_alias.type_params[ti].eq(arm.rhs_type_param)) {
+                        found_rhs_param = true;
+                    }
+                }
+                if (!found_param)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, item.type_alias.span, arm.type_param);
+                if (!arm.is_type_equality && arm.associated_name.len != 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.type_alias.span,
+                                          arm.associated_name);
+                if (!found_rhs_param)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, item.type_alias.span, arm.rhs_type_param);
+            }
+            if (!has_wildcard)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.type_alias.span, item.type_alias.name);
+        }
+        HirTypeAlias alias{};
+        alias.span = item.type_alias.span;
+        alias.name = item.type_alias.name;
+        alias.type_params = item.type_alias.type_params;
+        alias.is_match = item.type_alias.is_match;
+        alias.target = item.type_alias.target;
+        auto detached_target = detach_type_alias_ref_pointers(&mod, alias.target);
+        if (!detached_target) return core::make_unexpected(detached_target.error());
+        for (u32 ai = 0; ai < item.type_alias.arms.len; ai++) {
+            HirTypeAlias::ArmDecl arm{};
+            arm.is_wildcard = item.type_alias.arms[ai].is_wildcard;
+            arm.is_type_equality = item.type_alias.arms[ai].is_type_equality;
+            arm.type_param = item.type_alias.arms[ai].type_param;
+            arm.associated_name = item.type_alias.arms[ai].associated_name;
+            arm.rhs_type_param = item.type_alias.arms[ai].rhs_type_param;
+            arm.rhs_associated_name = item.type_alias.arms[ai].rhs_associated_name;
+            arm.constraint_namespace = item.type_alias.arms[ai].constraint_namespace;
+            arm.constraint = item.type_alias.arms[ai].constraint;
+            arm.type = item.type_alias.arms[ai].type;
+            auto detached_arm = detach_type_alias_ref_pointers(&mod, arm.type);
+            if (!detached_arm) return core::make_unexpected(detached_arm.error());
+            if (!alias.arms.push(arm))
+                return frontend_error(FrontendError::TooManyItems, item.type_alias.span);
+        }
+        if (!mod.type_aliases.push(alias))
+            return frontend_error(FrontendError::TooManyItems, item.type_alias.span);
+    }
+
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::Protocol) continue;
+        const u32 protocol_index = find_protocol_index(mod, item.protocol.name);
+        if (protocol_index >= mod.protocols.len)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.protocol.span, item.protocol.name);
+        HirProtocol& proto = mod.protocols[protocol_index];
+        auto resolve_protocol_method_type_ref =
+            [&](const AstTypeRef& ref,
+                u32* generic_index,
+                Str* associated_name,
+                u32& variant_index,
+                u32& struct_index,
+                u32& tuple_len,
+                HirTypeKind* tuple_types,
+                u32* tuple_variant_indices,
+                u32* tuple_struct_indices) -> FrontendResult<HirTypeKind> {
+            if (!ref.is_tuple && ref.namespace_name.len == 0 && ref.type_arg_names.len == 0 &&
+                find_protocol_associated_type(proto, ref.name) != nullptr) {
+                if (generic_index) *generic_index = 0xffffffffu;
+                if (associated_name) *associated_name = ref.name;
+                variant_index = 0xffffffffu;
+                struct_index = 0xffffffffu;
+                tuple_len = 0;
+                return HirTypeKind::Associated;
+            }
+            return resolve_func_type_ref(mod,
+                                         ref,
+                                         nullptr,
+                                         generic_index,
+                                         variant_index,
+                                         struct_index,
+                                         tuple_len,
+                                         tuple_types,
+                                         tuple_variant_indices,
+                                         tuple_struct_indices,
+                                         item.protocol.span,
+                                         nullptr,
+                                         associated_name);
+        };
+        for (u32 mi = 0; mi < item.protocol.methods.len; mi++) {
+            HirProtocol::MethodDecl method{};
+            method.name = item.protocol.methods[mi].name;
+            for (u32 pi = 0; pi < item.protocol.methods[mi].params.len; pi++) {
+                HirProtocol::MethodDecl::ParamDecl param{};
+                param.type_name = item.protocol.methods[mi].params[pi].type.name;
+                auto param_type =
+                    resolve_protocol_method_type_ref(item.protocol.methods[mi].params[pi].type,
+                                                     &param.generic_index,
+                                                     &param.associated_name,
+                                                     param.variant_index,
+                                                     param.struct_index,
+                                                     param.tuple_len,
+                                                     param.tuple_types,
+                                                     param.tuple_variant_indices,
+                                                     param.tuple_struct_indices);
+                if (!param_type) return core::make_unexpected(param_type.error());
+                param.type = param_type.value();
+                auto param_shape = intern_hir_type_shape(&mod,
+                                                         param.type,
+                                                         param.generic_index,
+                                                         param.variant_index,
+                                                         param.struct_index,
+                                                         param.tuple_len,
+                                                         param.tuple_types,
+                                                         param.tuple_variant_indices,
+                                                         param.tuple_struct_indices,
+                                                         item.protocol.span);
+                if (!param_shape) return core::make_unexpected(param_shape.error());
+                param.shape_index = param_shape.value();
+                if (!method.params.push(param))
+                    return frontend_error(FrontendError::TooManyItems, item.protocol.span);
+            }
+            method.has_return_type = item.protocol.methods[mi].has_return_type;
+            method.return_type_name = item.protocol.methods[mi].return_type.name;
+            if (method.has_return_type) {
+                auto return_type =
+                    resolve_protocol_method_type_ref(item.protocol.methods[mi].return_type,
+                                                     &method.return_generic_index,
+                                                     &method.return_associated_name,
+                                                     method.return_variant_index,
+                                                     method.return_struct_index,
+                                                     method.return_tuple_len,
+                                                     method.return_tuple_types,
+                                                     method.return_tuple_variant_indices,
+                                                     method.return_tuple_struct_indices);
+                if (!return_type) return core::make_unexpected(return_type.error());
+                method.return_type = return_type.value();
+                auto return_shape = intern_hir_type_shape(&mod,
+                                                          method.return_type,
+                                                          method.return_generic_index,
+                                                          method.return_variant_index,
+                                                          method.return_struct_index,
+                                                          method.return_tuple_len,
+                                                          method.return_tuple_types,
+                                                          method.return_tuple_variant_indices,
+                                                          method.return_tuple_struct_indices,
+                                                          item.protocol.span);
+                if (!return_shape) return core::make_unexpected(return_shape.error());
+                method.return_shape_index = return_shape.value();
+            }
+            if (!proto.methods.push(method))
+                return frontend_error(FrontendError::TooManyItems, item.protocol.span);
+        }
     }
 
     for (u32 i = 0; i < file.items.len; i++) {
@@ -8968,7 +10207,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                               fn.return_tuple_types,
                                                               fn.return_tuple_variant_indices,
                                                               fn.return_tuple_struct_indices,
-                                                              span);
+                                                              span,
+                                                              nullptr,
+                                                              &fn.return_associated_name);
                         if (!ret_type) return core::make_unexpected(ret_type.error());
                         fn.return_type = ret_type.value();
                     }
@@ -8983,7 +10224,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                           fn.return_tuple_types,
                                                           fn.return_tuple_variant_indices,
                                                           fn.return_tuple_struct_indices,
-                                                          span);
+                                                          span,
+                                                          nullptr,
+                                                          &fn.return_associated_name);
                     if (!ret_type) return core::make_unexpected(ret_type.error());
                     fn.return_type = ret_type.value();
                 }
@@ -8998,7 +10241,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_types,
                                                       fn.return_tuple_variant_indices,
                                                       fn.return_tuple_struct_indices,
-                                                      span);
+                                                      span,
+                                                      nullptr,
+                                                      &fn.return_associated_name);
                 if (!ret_type) return core::make_unexpected(ret_type.error());
                 fn.return_type = ret_type.value();
             }
@@ -9108,7 +10353,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                 param.tuple_types,
                                                                 param.tuple_variant_indices,
                                                                 param.tuple_struct_indices,
-                                                                span);
+                                                                span,
+                                                                nullptr,
+                                                                &param.associated_name);
                         if (!param_type) return core::make_unexpected(param_type.error());
                         param.type = param_type.value();
                     }
@@ -9123,7 +10370,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                             param.tuple_types,
                                                             param.tuple_variant_indices,
                                                             param.tuple_struct_indices,
-                                                            span);
+                                                            span,
+                                                            nullptr,
+                                                            &param.associated_name);
                     if (!param_type) return core::make_unexpected(param_type.error());
                     param.type = param_type.value();
                 }
@@ -9138,14 +10387,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                         param.tuple_types,
                                                         param.tuple_variant_indices,
                                                         param.tuple_struct_indices,
-                                                        span);
+                                                        span,
+                                                        nullptr,
+                                                        &param.associated_name);
                 if (!param_type) return core::make_unexpected(param_type.error());
                 param.type = param_type.value();
             }
-            if (param.type == HirTypeKind::Generic && param.generic_index < fn.type_params.len)
+            if ((param.type == HirTypeKind::Generic || param.type == HirTypeKind::Associated) &&
+                param.generic_index < fn.type_params.len)
                 param.generic_has_error_constraint =
                     fn.type_params[param.generic_index].has_error_constraint;
-            if (param.type == HirTypeKind::Generic && param.generic_index < fn.type_params.len) {
+            if ((param.type == HirTypeKind::Generic || param.type == HirTypeKind::Associated) &&
+                param.generic_index < fn.type_params.len) {
                 param.generic_has_eq_constraint =
                     fn.type_params[param.generic_index].has_eq_constraint;
                 param.generic_has_ord_constraint =
@@ -9220,6 +10473,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param_locals[pi].ref_index = pi;
             param_locals[pi].type = fn.params[pi].type;
             param_locals[pi].generic_index = fn.params[pi].generic_index;
+            param_locals[pi].associated_name = fn.params[pi].associated_name;
             param_locals[pi].generic_has_error_constraint =
                 fn.params[pi].generic_has_error_constraint;
             param_locals[pi].generic_has_eq_constraint = fn.params[pi].generic_has_eq_constraint;
@@ -9242,6 +10496,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param_locals[pi].init.kind = HirExprKind::LocalRef;
             param_locals[pi].init.type = fn.params[pi].type;
             param_locals[pi].init.generic_index = fn.params[pi].generic_index;
+            param_locals[pi].init.associated_name = fn.params[pi].associated_name;
             param_locals[pi].init.generic_has_error_constraint =
                 fn.params[pi].generic_has_error_constraint;
             param_locals[pi].init.generic_has_eq_constraint =
@@ -9322,6 +10577,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (body->type == HirTypeKind::Unknown && (body->may_nil || body->may_error)) {
                 body->type = fn.return_type;
                 body->generic_index = fn.return_generic_index;
+                body->associated_name = fn.return_associated_name;
                 body->shape_index = fn.return_shape_index;
                 if (fn.return_generic_index < fn.type_params.len) {
                     body->generic_has_error_constraint =
@@ -9362,6 +10618,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                     fn.return_tuple_struct_indices,
                                                     fn.return_shape_index);
             expected.generic_index = fn.return_generic_index;
+            expected.associated_name = fn.return_associated_name;
             if (fn.return_generic_index < fn.type_params.len) {
                 expected.generic_has_error_constraint =
                     fn.type_params[fn.return_generic_index].has_error_constraint;
@@ -9411,6 +10668,285 @@ static FrontendResult<HirModule*> analyze_file_internal(
         fn.body = normalized.value();
         return {};
     };
+
+    auto resolve_impl_target_for_header =
+        [&](const AstImplDecl& decl,
+            HirTypeKind& out_type,
+            u32& out_struct_index,
+            bool& out_is_generic_template,
+            FixedVec<HirFunction::TypeParamDecl, HirFunction::kMaxTypeParams>& out_type_params)
+        -> FrontendResult<void> {
+        out_type = HirTypeKind::Unknown;
+        out_struct_index = 0xffffffffu;
+        out_is_generic_template = false;
+        out_type_params.len = 0;
+        if (!decl.target.is_tuple) {
+            const u32 templ_struct_index = find_struct_index(mod, decl.target.name);
+            if (templ_struct_index < mod.structs.len &&
+                mod.structs[templ_struct_index].type_params.len != 0 &&
+                decl.target.type_arg_names.len == mod.structs[templ_struct_index].type_params.len) {
+                bool all_are_placeholders = true;
+                for (u32 i = 0; i < decl.target.type_arg_names.len; i++) {
+                    if (decl.target.type_arg_names[i].len == 0)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, decl.span, decl.target.name);
+                    u32 concrete_variant_index = 0xffffffffu;
+                    u32 concrete_struct_index = 0xffffffffu;
+                    if (resolve_named_type(mod,
+                                           decl.target.type_arg_names[i],
+                                           concrete_variant_index,
+                                           concrete_struct_index) != HirTypeKind::Unknown) {
+                        all_are_placeholders = false;
+                        break;
+                    }
+                    for (u32 j = i + 1; j < decl.target.type_arg_names.len; j++) {
+                        if (decl.target.type_arg_names[i].eq(decl.target.type_arg_names[j]))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  decl.span,
+                                                  decl.target.type_arg_names[i]);
+                    }
+                }
+                if (all_are_placeholders) {
+                    out_type = HirTypeKind::Struct;
+                    out_struct_index = templ_struct_index;
+                    out_is_generic_template = true;
+                    for (u32 i = 0; i < decl.target.type_arg_names.len; i++) {
+                        HirFunction::TypeParamDecl tp{};
+                        tp.name = decl.target.type_arg_names[i];
+                        if (!out_type_params.push(tp))
+                            return frontend_error(FrontendError::TooManyItems, decl.span);
+                    }
+                    return {};
+                }
+            }
+        }
+        u32 target_variant_index = 0xffffffffu;
+        u32 target_tuple_len = 0;
+        HirTypeKind target_tuple_types[kMaxTupleSlots]{};
+        u32 target_tuple_variant_indices[kMaxTupleSlots]{};
+        u32 target_tuple_struct_indices[kMaxTupleSlots]{};
+        auto target_type = resolve_func_type_ref(mod,
+                                                 decl.target,
+                                                 nullptr,
+                                                 nullptr,
+                                                 target_variant_index,
+                                                 out_struct_index,
+                                                 target_tuple_len,
+                                                 target_tuple_types,
+                                                 target_tuple_variant_indices,
+                                                 target_tuple_struct_indices,
+                                                 decl.span);
+        if (!target_type) return core::make_unexpected(target_type.error());
+        out_type = target_type.value();
+        return {};
+    };
+
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::Impl) continue;
+        if (item.impl_decl.protocols.len == 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, item.impl_decl.span);
+        HirTypeKind target_type = HirTypeKind::Unknown;
+        u32 target_struct_index = 0xffffffffu;
+        bool target_is_generic_template = false;
+        FixedVec<HirFunction::TypeParamDecl, HirFunction::kMaxTypeParams> impl_target_type_params;
+        auto resolved_target = resolve_impl_target_for_header(item.impl_decl,
+                                                              target_type,
+                                                              target_struct_index,
+                                                              target_is_generic_template,
+                                                              impl_target_type_params);
+        if (!resolved_target) return core::make_unexpected(resolved_target.error());
+        if (!(target_type == HirTypeKind::Bool || target_type == HirTypeKind::I32 ||
+              target_type == HirTypeKind::Str || target_type == HirTypeKind::Struct))
+            return frontend_error(FrontendError::UnsupportedSyntax, item.impl_decl.span);
+
+        FixedVec<u32, AstImplDecl::kMaxProtocols> protocol_indices;
+        FixedVec<HirImpl*, AstImplDecl::kMaxProtocols> impl_headers;
+        for (u32 pi = 0; pi < item.impl_decl.protocols.len; pi++) {
+            const Str proto_name = item.impl_decl.protocols[pi];
+            Str resolved_proto_name = proto_name;
+            if (pi < item.impl_decl.protocol_namespaces.len &&
+                item.impl_decl.protocol_namespaces[pi].len != 0) {
+                if (!resolve_import_namespace_type_name(mod,
+                                                        item.impl_decl.protocol_namespaces[pi],
+                                                        proto_name,
+                                                        resolved_proto_name))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, item.impl_decl.span, proto_name);
+            }
+            const u32 protocol_index = find_protocol_index(mod, resolved_proto_name);
+            if (protocol_index >= mod.protocols.len)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.impl_decl.span, proto_name);
+            if (mod.protocols[protocol_index].kind != HirProtocolKind::Custom)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.impl_decl.span, proto_name);
+            for (u32 seen = 0; seen < protocol_indices.len; seen++) {
+                if (protocol_indices[seen] == protocol_index)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, item.impl_decl.span, proto_name);
+            }
+            for (u32 ii = 0; ii < mod.impls.len; ii++) {
+                if (mod.impls[ii].protocol_index == protocol_index &&
+                    impl_targets_overlap(mod,
+                                         mod.impls[ii],
+                                         target_type,
+                                         target_struct_index,
+                                         target_is_generic_template))
+                    return frontend_error(FrontendError::UnsupportedSyntax, item.impl_decl.span);
+            }
+            HirImpl impl{};
+            impl.span = item.impl_decl.span;
+            impl.protocol_index = protocol_index;
+            impl.type = target_type;
+            impl.struct_index = target_struct_index;
+            impl.is_generic_template = target_is_generic_template;
+            if (!mod.impls.push(impl))
+                return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+            if (!impl_headers.push(&mod.impls[mod.impls.len - 1]))
+                return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+            if (!protocol_indices.push(protocol_index))
+                return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+
+            HirConformance conf{};
+            conf.span = item.impl_decl.span;
+            conf.protocol_index = protocol_index;
+            conf.type = target_type;
+            conf.struct_index = target_struct_index;
+            conf.is_generic_template = target_is_generic_template;
+            if (!mod.conformances.push(conf))
+                return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+        }
+
+        for (u32 ai = 0; ai < item.impl_decl.associated_types.len; ai++) {
+            const auto& assoc_ast = item.impl_decl.associated_types[ai];
+            u32 matched_protocol_slot = 0xffffffffu;
+            for (u32 pi = 0; pi < protocol_indices.len; pi++) {
+                const auto* candidate = find_protocol_associated_type(
+                    mod.protocols[protocol_indices[pi]], assoc_ast.name);
+                if (candidate == nullptr) continue;
+                if (matched_protocol_slot != 0xffffffffu)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, item.impl_decl.span, assoc_ast.name);
+                matched_protocol_slot = pi;
+            }
+            if (matched_protocol_slot == 0xffffffffu)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.impl_decl.span, assoc_ast.name);
+            auto* impl = impl_headers[matched_protocol_slot];
+            if (find_impl_associated_type(*impl, assoc_ast.name) != nullptr)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.impl_decl.span, assoc_ast.name);
+            HirAssociatedTypeBinding assoc{};
+            assoc.name = assoc_ast.name;
+            bool assoc_type_resolved = false;
+            if (!assoc_ast.type.is_tuple && assoc_ast.type.namespace_name.len == 0 &&
+                assoc_ast.type.type_arg_names.len != 0) {
+                u32 template_variant_index = 0xffffffffu;
+                u32 template_struct_index = 0xffffffffu;
+                const auto named_kind = resolve_named_type(
+                    mod, assoc_ast.type.name, template_variant_index, template_struct_index);
+                const bool is_template_variant =
+                    named_kind == HirTypeKind::Variant &&
+                    template_variant_index < mod.variants.len &&
+                    mod.variants[template_variant_index].type_params.len ==
+                        assoc_ast.type.type_arg_names.len;
+                const bool is_template_struct =
+                    named_kind == HirTypeKind::Struct && template_struct_index < mod.structs.len &&
+                    mod.structs[template_struct_index].type_params.len ==
+                        assoc_ast.type.type_arg_names.len;
+                if (is_template_variant || is_template_struct) {
+                    GenericBinding bindings[HirFunction::kMaxTypeParams]{};
+                    for (u32 arg_i = 0; arg_i < assoc_ast.type.type_arg_names.len; arg_i++) {
+                        u32 arg_generic_index = 0xffffffffu;
+                        u32 arg_variant_index = 0xffffffffu;
+                        u32 arg_struct_index = 0xffffffffu;
+                        u32 arg_tuple_len = 0;
+                        HirTypeKind arg_tuple_types[kMaxTupleSlots]{};
+                        u32 arg_tuple_variant_indices[kMaxTupleSlots]{};
+                        u32 arg_tuple_struct_indices[kMaxTupleSlots]{};
+                        AstTypeRef arg_ref = get_ast_type_arg_ref(assoc_ast.type, arg_i);
+                        auto arg_type = resolve_func_type_ref(mod,
+                                                              arg_ref,
+                                                              &impl_target_type_params,
+                                                              &arg_generic_index,
+                                                              arg_variant_index,
+                                                              arg_struct_index,
+                                                              arg_tuple_len,
+                                                              arg_tuple_types,
+                                                              arg_tuple_variant_indices,
+                                                              arg_tuple_struct_indices,
+                                                              item.impl_decl.span);
+                        if (!arg_type) return core::make_unexpected(arg_type.error());
+                        auto filled = fill_bound_binding_from_type_metadata(
+                            &bindings[arg_i],
+                            &mod,
+                            arg_type.value(),
+                            arg_type.value() == HirTypeKind::Generic ? arg_generic_index
+                                                                     : 0xffffffffu,
+                            arg_variant_index,
+                            arg_struct_index,
+                            arg_tuple_len,
+                            arg_tuple_types,
+                            arg_tuple_variant_indices,
+                            arg_tuple_struct_indices,
+                            0xffffffffu,
+                            item.impl_decl.span);
+                        if (!filled) return core::make_unexpected(filled.error());
+                    }
+                    if (is_template_variant) {
+                        auto concrete = instantiate_variant(&mod,
+                                                            template_variant_index,
+                                                            bindings,
+                                                            assoc_ast.type.type_arg_names.len,
+                                                            item.impl_decl.span);
+                        if (!concrete) return core::make_unexpected(concrete.error());
+                        assoc.type = HirTypeKind::Variant;
+                        assoc.variant_index = concrete.value();
+                    } else {
+                        auto concrete = instantiate_struct(&mod,
+                                                           template_struct_index,
+                                                           bindings,
+                                                           assoc_ast.type.type_arg_names.len,
+                                                           item.impl_decl.span);
+                        if (!concrete) return core::make_unexpected(concrete.error());
+                        assoc.type = HirTypeKind::Struct;
+                        assoc.struct_index = concrete.value();
+                    }
+                    assoc_type_resolved = true;
+                }
+            }
+            if (!assoc_type_resolved) {
+                auto assoc_type = resolve_func_type_ref(mod,
+                                                        assoc_ast.type,
+                                                        &impl_target_type_params,
+                                                        &assoc.generic_index,
+                                                        assoc.variant_index,
+                                                        assoc.struct_index,
+                                                        assoc.tuple_len,
+                                                        assoc.tuple_types,
+                                                        assoc.tuple_variant_indices,
+                                                        assoc.tuple_struct_indices,
+                                                        item.impl_decl.span);
+                if (!assoc_type) return core::make_unexpected(assoc_type.error());
+                assoc.type = assoc_type.value();
+            }
+            auto assoc_shape = intern_hir_type_shape(&mod,
+                                                     assoc.type,
+                                                     assoc.generic_index,
+                                                     assoc.variant_index,
+                                                     assoc.struct_index,
+                                                     assoc.tuple_len,
+                                                     assoc.tuple_types,
+                                                     assoc.tuple_variant_indices,
+                                                     assoc.tuple_struct_indices,
+                                                     item.impl_decl.span);
+            if (!assoc_shape) return core::make_unexpected(assoc_shape.error());
+            assoc.shape_index = assoc_shape.value();
+            if (!impl->associated_types.push(assoc))
+                return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+        }
+    }
 
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
@@ -9568,7 +11104,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                               fn.return_tuple_types,
                                                               fn.return_tuple_variant_indices,
                                                               fn.return_tuple_struct_indices,
-                                                              item.func.span);
+                                                              item.func.span,
+                                                              nullptr,
+                                                              &fn.return_associated_name);
                         if (!ret_type) return core::make_unexpected(ret_type.error());
                         fn.return_type = ret_type.value();
                     }
@@ -9583,7 +11121,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                           fn.return_tuple_types,
                                                           fn.return_tuple_variant_indices,
                                                           fn.return_tuple_struct_indices,
-                                                          item.func.span);
+                                                          item.func.span,
+                                                          nullptr,
+                                                          &fn.return_associated_name);
                     if (!ret_type) return core::make_unexpected(ret_type.error());
                     fn.return_type = ret_type.value();
                 }
@@ -9598,7 +11138,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_types,
                                                       fn.return_tuple_variant_indices,
                                                       fn.return_tuple_struct_indices,
-                                                      item.func.span);
+                                                      item.func.span,
+                                                      nullptr,
+                                                      &fn.return_associated_name);
                 if (!ret_type) return core::make_unexpected(ret_type.error());
                 fn.return_type = ret_type.value();
             }
@@ -9709,7 +11251,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                 param.tuple_types,
                                                                 param.tuple_variant_indices,
                                                                 param.tuple_struct_indices,
-                                                                item.func.span);
+                                                                item.func.span,
+                                                                nullptr,
+                                                                &param.associated_name);
                         if (!param_type) return core::make_unexpected(param_type.error());
                         param.type = param_type.value();
                     }
@@ -9724,7 +11268,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                             param.tuple_types,
                                                             param.tuple_variant_indices,
                                                             param.tuple_struct_indices,
-                                                            item.func.span);
+                                                            item.func.span,
+                                                            nullptr,
+                                                            &param.associated_name);
                     if (!param_type) return core::make_unexpected(param_type.error());
                     param.type = param_type.value();
                 }
@@ -9739,14 +11285,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                         param.tuple_types,
                                                         param.tuple_variant_indices,
                                                         param.tuple_struct_indices,
-                                                        item.func.span);
+                                                        item.func.span,
+                                                        nullptr,
+                                                        &param.associated_name);
                 if (!param_type) return core::make_unexpected(param_type.error());
                 param.type = param_type.value();
             }
-            if (param.type == HirTypeKind::Generic && param.generic_index < fn.type_params.len)
+            if ((param.type == HirTypeKind::Generic || param.type == HirTypeKind::Associated) &&
+                param.generic_index < fn.type_params.len)
                 param.generic_has_error_constraint =
                     fn.type_params[param.generic_index].has_error_constraint;
-            if (param.type == HirTypeKind::Generic && param.generic_index < fn.type_params.len) {
+            if ((param.type == HirTypeKind::Generic || param.type == HirTypeKind::Associated) &&
+                param.generic_index < fn.type_params.len) {
                 param.generic_has_eq_constraint =
                     fn.type_params[param.generic_index].has_eq_constraint;
                 param.generic_has_ord_constraint =
@@ -9812,11 +11362,19 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, item.protocol.span, mangled.value());
 
+            const HirProtocol& proto = mod.protocols[protocol_index];
+            auto qualify_self_associated_type_ref = [&](AstTypeRef ref) -> AstTypeRef {
+                if (!ref.is_tuple && ref.namespace_name.len == 0 && ref.type_arg_names.len == 0 &&
+                    find_protocol_associated_type(proto, ref.name) != nullptr) {
+                    ref.namespace_name = Str{"Self", 4};
+                }
+                return ref;
+            };
             AstFunctionDecl synthetic{};
             synthetic.span = item.protocol.span;
             synthetic.name = mangled.value();
             synthetic.has_return_type = method_ast.has_return_type;
-            synthetic.return_type = method_ast.return_type;
+            synthetic.return_type = qualify_self_associated_type_ref(method_ast.return_type);
             AstFunctionDecl::ParamDecl self_param{};
             self_param.name = Str{"self", 4};
             self_param.type.name = Str{"Self", 4};
@@ -9825,7 +11383,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 pi = 0; pi < method_ast.params.len; pi++) {
                 AstFunctionDecl::ParamDecl param{};
                 param.name = method_ast.params[pi].name;
-                param.type = method_ast.params[pi].type;
+                param.type = qualify_self_associated_type_ref(method_ast.params[pi].type);
                 if (!synthetic.params.push(param))
                     return frontend_error(FrontendError::TooManyItems, item.protocol.span);
             }
@@ -9837,6 +11395,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
             self_tp.has_constraint = true;
             self_tp.constraint = item.protocol.name;
             self_tp.constraint_kind = HirProtocolKind::Custom;
+            self_tp.constraints[0] = item.protocol.name;
+            self_tp.constraint_kinds[0] = HirProtocolKind::Custom;
+            self_tp.custom_protocol_count = 1;
+            self_tp.custom_protocol_indices[0] = protocol_index;
             if (!extra_type_params.push(self_tp))
                 return frontend_error(FrontendError::TooManyItems, item.protocol.span);
 
@@ -9942,6 +11504,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
         FixedVec<u32, AstImplDecl::kMaxProtocols> protocol_indices;
         FixedVec<HirImpl, AstImplDecl::kMaxProtocols> pending_impls;
+        FixedVec<u32, AstImplDecl::kMaxProtocols> pending_impl_indices;
         for (u32 pi = 0; pi < item.impl_decl.protocols.len; pi++) {
             const Str proto_name = item.impl_decl.protocols[pi];
             Str resolved_proto_name = proto_name;
@@ -9966,47 +11529,77 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, item.impl_decl.span, proto_name);
             }
+            u32 existing_impl_index = 0xffffffffu;
             for (u32 ii = 0; ii < mod.impls.len; ii++) {
                 if (mod.impls[ii].protocol_index == protocol_index &&
                     impl_targets_overlap(mod,
                                          mod.impls[ii],
                                          target_type,
                                          target_struct_index,
-                                         target_is_generic_template))
+                                         target_is_generic_template)) {
+                    if (mod.impls[ii].span.start == item.impl_decl.span.start &&
+                        mod.impls[ii].span.end == item.impl_decl.span.end) {
+                        existing_impl_index = ii;
+                        break;
+                    }
                     return frontend_error(FrontendError::UnsupportedSyntax, item.impl_decl.span);
+                }
             }
             if (!protocol_indices.push(protocol_index))
                 return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
             HirImpl impl{};
-            impl.span = item.impl_decl.span;
-            impl.protocol_index = protocol_index;
-            impl.type = target_type;
-            impl.struct_index = target_struct_index;
-            impl.is_generic_template = target_is_generic_template;
+            if (existing_impl_index != 0xffffffffu) {
+                impl = mod.impls[existing_impl_index];
+            } else {
+                impl.span = item.impl_decl.span;
+                impl.protocol_index = protocol_index;
+                impl.type = target_type;
+                impl.struct_index = target_struct_index;
+                impl.is_generic_template = target_is_generic_template;
+            }
             if (!pending_impls.push(impl))
                 return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+            if (!pending_impl_indices.push(existing_impl_index))
+                return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+            bool existing_conformance = false;
             for (u32 ci = 0; ci < mod.conformances.len; ci++) {
                 const auto& existing = mod.conformances[ci];
                 if (existing.protocol_index == protocol_index && existing.type == target_type &&
                     existing.struct_index == target_struct_index &&
-                    existing.is_generic_template == target_is_generic_template)
+                    existing.is_generic_template == target_is_generic_template) {
+                    if (existing.span.start == item.impl_decl.span.start &&
+                        existing.span.end == item.impl_decl.span.end) {
+                        existing_conformance = true;
+                        break;
+                    }
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, item.impl_decl.span, proto_name);
+                }
             }
-            HirConformance conf{};
-            conf.span = item.impl_decl.span;
-            conf.protocol_index = protocol_index;
-            conf.type = target_type;
-            conf.struct_index = target_struct_index;
-            conf.is_generic_template = target_is_generic_template;
-            if (!mod.conformances.push(conf))
-                return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+            if (!existing_conformance) {
+                HirConformance conf{};
+                conf.span = item.impl_decl.span;
+                conf.protocol_index = protocol_index;
+                conf.type = target_type;
+                conf.struct_index = target_struct_index;
+                conf.is_generic_template = target_is_generic_template;
+                if (!mod.conformances.push(conf))
+                    return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+            }
         }
 
         for (u32 pi = 0; pi < protocol_indices.len; pi++) {
             const auto& lhs = mod.protocols[protocol_indices[pi]];
             for (u32 pj = pi + 1; pj < protocol_indices.len; pj++) {
                 const auto& rhs = mod.protocols[protocol_indices[pj]];
+                for (u32 li = 0; li < lhs.associated_types.len; li++) {
+                    for (u32 ri = 0; ri < rhs.associated_types.len; ri++) {
+                        if (lhs.associated_types[li].name.eq(rhs.associated_types[ri].name))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  item.impl_decl.span,
+                                                  lhs.associated_types[li].name);
+                    }
+                }
                 for (u32 li = 0; li < lhs.methods.len; li++) {
                     for (u32 ri = 0; ri < rhs.methods.len; ri++) {
                         if (lhs.methods[li].name.eq(rhs.methods[ri].name))
@@ -10016,6 +11609,135 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
             }
+        }
+
+        for (u32 ai = 0; ai < item.impl_decl.associated_types.len; ai++) {
+            const auto& assoc_ast = item.impl_decl.associated_types[ai];
+            u32 matched_protocol_slot = 0xffffffffu;
+            for (u32 pi = 0; pi < protocol_indices.len; pi++) {
+                const auto* candidate = find_protocol_associated_type(
+                    mod.protocols[protocol_indices[pi]], assoc_ast.name);
+                if (candidate == nullptr) continue;
+                if (matched_protocol_slot != 0xffffffffu)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, item.impl_decl.span, assoc_ast.name);
+                matched_protocol_slot = pi;
+            }
+            if (matched_protocol_slot == 0xffffffffu)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.impl_decl.span, assoc_ast.name);
+
+            auto& impl = pending_impls[matched_protocol_slot];
+            if (find_impl_associated_type(impl, assoc_ast.name) != nullptr) continue;
+
+            HirAssociatedTypeBinding assoc{};
+            assoc.name = assoc_ast.name;
+            bool assoc_type_resolved = false;
+            if (!assoc_ast.type.is_tuple && assoc_ast.type.namespace_name.len == 0 &&
+                assoc_ast.type.type_arg_names.len != 0) {
+                u32 template_variant_index = 0xffffffffu;
+                u32 template_struct_index = 0xffffffffu;
+                const auto named_kind = resolve_named_type(
+                    mod, assoc_ast.type.name, template_variant_index, template_struct_index);
+                const bool is_template_variant =
+                    named_kind == HirTypeKind::Variant &&
+                    template_variant_index < mod.variants.len &&
+                    mod.variants[template_variant_index].type_params.len ==
+                        assoc_ast.type.type_arg_names.len;
+                const bool is_template_struct =
+                    named_kind == HirTypeKind::Struct && template_struct_index < mod.structs.len &&
+                    mod.structs[template_struct_index].type_params.len ==
+                        assoc_ast.type.type_arg_names.len;
+                if (is_template_variant || is_template_struct) {
+                    GenericBinding bindings[HirFunction::kMaxTypeParams]{};
+                    for (u32 ai = 0; ai < assoc_ast.type.type_arg_names.len; ai++) {
+                        u32 arg_generic_index = 0xffffffffu;
+                        u32 arg_variant_index = 0xffffffffu;
+                        u32 arg_struct_index = 0xffffffffu;
+                        u32 arg_tuple_len = 0;
+                        HirTypeKind arg_tuple_types[kMaxTupleSlots]{};
+                        u32 arg_tuple_variant_indices[kMaxTupleSlots]{};
+                        u32 arg_tuple_struct_indices[kMaxTupleSlots]{};
+                        AstTypeRef arg_ref = get_ast_type_arg_ref(assoc_ast.type, ai);
+                        auto arg_type = resolve_func_type_ref(mod,
+                                                              arg_ref,
+                                                              &impl_target_type_params,
+                                                              &arg_generic_index,
+                                                              arg_variant_index,
+                                                              arg_struct_index,
+                                                              arg_tuple_len,
+                                                              arg_tuple_types,
+                                                              arg_tuple_variant_indices,
+                                                              arg_tuple_struct_indices,
+                                                              item.impl_decl.span);
+                        if (!arg_type) return core::make_unexpected(arg_type.error());
+                        auto filled = fill_bound_binding_from_type_metadata(
+                            &bindings[ai],
+                            &mod,
+                            arg_type.value(),
+                            arg_type.value() == HirTypeKind::Generic ? arg_generic_index
+                                                                     : 0xffffffffu,
+                            arg_variant_index,
+                            arg_struct_index,
+                            arg_tuple_len,
+                            arg_tuple_types,
+                            arg_tuple_variant_indices,
+                            arg_tuple_struct_indices,
+                            0xffffffffu,
+                            item.impl_decl.span);
+                        if (!filled) return core::make_unexpected(filled.error());
+                    }
+                    if (is_template_variant) {
+                        auto concrete = instantiate_variant(&mod,
+                                                            template_variant_index,
+                                                            bindings,
+                                                            assoc_ast.type.type_arg_names.len,
+                                                            item.impl_decl.span);
+                        if (!concrete) return core::make_unexpected(concrete.error());
+                        assoc.type = HirTypeKind::Variant;
+                        assoc.variant_index = concrete.value();
+                    } else {
+                        auto concrete = instantiate_struct(&mod,
+                                                           template_struct_index,
+                                                           bindings,
+                                                           assoc_ast.type.type_arg_names.len,
+                                                           item.impl_decl.span);
+                        if (!concrete) return core::make_unexpected(concrete.error());
+                        assoc.type = HirTypeKind::Struct;
+                        assoc.struct_index = concrete.value();
+                    }
+                    assoc_type_resolved = true;
+                }
+            }
+            if (!assoc_type_resolved) {
+                auto assoc_type = resolve_func_type_ref(mod,
+                                                        assoc_ast.type,
+                                                        &impl_target_type_params,
+                                                        &assoc.generic_index,
+                                                        assoc.variant_index,
+                                                        assoc.struct_index,
+                                                        assoc.tuple_len,
+                                                        assoc.tuple_types,
+                                                        assoc.tuple_variant_indices,
+                                                        assoc.tuple_struct_indices,
+                                                        item.impl_decl.span);
+                if (!assoc_type) return core::make_unexpected(assoc_type.error());
+                assoc.type = assoc_type.value();
+            }
+            auto assoc_shape = intern_hir_type_shape(&mod,
+                                                     assoc.type,
+                                                     assoc.generic_index,
+                                                     assoc.variant_index,
+                                                     assoc.struct_index,
+                                                     assoc.tuple_len,
+                                                     assoc.tuple_types,
+                                                     assoc.tuple_variant_indices,
+                                                     assoc.tuple_struct_indices,
+                                                     item.impl_decl.span);
+            if (!assoc_shape) return core::make_unexpected(assoc_shape.error());
+            assoc.shape_index = assoc_shape.value();
+            if (!impl.associated_types.push(assoc))
+                return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
         }
 
         for (u32 mi = 0; mi < item.impl_decl.methods.len; mi++) {
@@ -10053,6 +11775,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, method_ast.span, method_ast.name);
             for (u32 pi = 0; pi < req->params.len; pi++) {
+                u32 method_generic_index = 0xffffffffu;
                 u32 method_variant_index = 0xffffffffu;
                 u32 method_struct_index = 0xffffffffu;
                 u32 method_tuple_len = 0;
@@ -10061,8 +11784,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 u32 method_tuple_struct_indices[kMaxTupleSlots]{};
                 auto method_type = resolve_func_type_ref(mod,
                                                          method_ast.params[pi + 1].type,
-                                                         nullptr,
-                                                         nullptr,
+                                                         &impl_target_type_params,
+                                                         &method_generic_index,
                                                          method_variant_index,
                                                          method_struct_index,
                                                          method_tuple_len,
@@ -10073,7 +11796,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!method_type) return core::make_unexpected(method_type.error());
                 auto method_shape = intern_hir_type_shape(&mod,
                                                           method_type.value(),
-                                                          0xffffffffu,
+                                                          method_generic_index,
                                                           method_variant_index,
                                                           method_struct_index,
                                                           method_tuple_len,
@@ -10084,6 +11807,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!method_shape) return core::make_unexpected(method_shape.error());
                 HirExpr actual{};
                 actual.type = method_type.value();
+                actual.generic_index = method_generic_index;
                 actual.variant_index = method_variant_index;
                 actual.struct_index = method_struct_index;
                 actual.shape_index = method_shape.value();
@@ -10100,11 +11824,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 expected.struct_index = req->params[pi].struct_index;
                 expected.shape_index = req->params[pi].shape_index;
                 expected.tuple_len = req->params[pi].tuple_len;
+                expected.associated_name = req->params[pi].associated_name;
                 for (u32 ti = 0; ti < req->params[pi].tuple_len; ti++) {
                     expected.tuple_types[ti] = req->params[pi].tuple_types[ti];
                     expected.tuple_variant_indices[ti] = req->params[pi].tuple_variant_indices[ti];
                     expected.tuple_struct_indices[ti] = req->params[pi].tuple_struct_indices[ti];
                 }
+                if (!replace_protocol_self_associated_type(&expected, impl))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, method_ast.span, method_ast.name);
                 if (!same_hir_type_shape(mod, actual, expected))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, method_ast.span, method_ast.name);
@@ -10113,6 +11841,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, method_ast.span, method_ast.name);
             if (req->has_return_type) {
+                u32 method_generic_index = 0xffffffffu;
                 u32 method_variant_index = 0xffffffffu;
                 u32 method_struct_index = 0xffffffffu;
                 u32 method_tuple_len = 0;
@@ -10121,8 +11850,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 u32 method_tuple_struct_indices[kMaxTupleSlots]{};
                 auto method_type = resolve_func_type_ref(mod,
                                                          method_ast.return_type,
-                                                         nullptr,
-                                                         nullptr,
+                                                         &impl_target_type_params,
+                                                         &method_generic_index,
                                                          method_variant_index,
                                                          method_struct_index,
                                                          method_tuple_len,
@@ -10133,7 +11862,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!method_type) return core::make_unexpected(method_type.error());
                 auto method_shape = intern_hir_type_shape(&mod,
                                                           method_type.value(),
-                                                          0xffffffffu,
+                                                          method_generic_index,
                                                           method_variant_index,
                                                           method_struct_index,
                                                           method_tuple_len,
@@ -10144,6 +11873,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!method_shape) return core::make_unexpected(method_shape.error());
                 HirExpr actual{};
                 actual.type = method_type.value();
+                actual.generic_index = method_generic_index;
                 actual.variant_index = method_variant_index;
                 actual.struct_index = method_struct_index;
                 actual.shape_index = method_shape.value();
@@ -10160,11 +11890,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 expected.struct_index = req->return_struct_index;
                 expected.shape_index = req->return_shape_index;
                 expected.tuple_len = req->return_tuple_len;
+                expected.associated_name = req->return_associated_name;
                 for (u32 ti = 0; ti < req->return_tuple_len; ti++) {
                     expected.tuple_types[ti] = req->return_tuple_types[ti];
                     expected.tuple_variant_indices[ti] = req->return_tuple_variant_indices[ti];
                     expected.tuple_struct_indices[ti] = req->return_tuple_struct_indices[ti];
                 }
+                if (!replace_protocol_self_associated_type(&expected, impl))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, method_ast.span, method_ast.name);
                 if (!same_hir_type_shape(mod, actual, expected))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, method_ast.span, method_ast.name);
@@ -10209,6 +11943,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         for (u32 pi = 0; pi < pending_impls.len; pi++) {
             const auto& proto = mod.protocols[pending_impls[pi].protocol_index];
+            for (u32 ai = 0; ai < proto.associated_types.len; ai++) {
+                const auto& req = proto.associated_types[ai];
+                if (find_impl_associated_type(pending_impls[pi], req.name) != nullptr) continue;
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.impl_decl.span, req.name);
+            }
             for (u32 mi = 0; mi < proto.methods.len; mi++) {
                 const auto& req = proto.methods[mi];
                 if (req.function_index != 0xffffffffu) continue;
@@ -10216,8 +11956,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, item.impl_decl.span, req.name);
             }
-            if (!mod.impls.push(pending_impls[pi]))
-                return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+            if (pending_impl_indices[pi] != 0xffffffffu) {
+                mod.impls[pending_impl_indices[pi]] = pending_impls[pi];
+            } else {
+                if (!mod.impls.push(pending_impls[pi]))
+                    return frontend_error(FrontendError::TooManyItems, item.impl_decl.span);
+            }
         }
     }
 
@@ -10253,6 +11997,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param_locals[pi].ref_index = pi;
             param_locals[pi].type = fn.params[pi].type;
             param_locals[pi].generic_index = fn.params[pi].generic_index;
+            param_locals[pi].associated_name = fn.params[pi].associated_name;
             param_locals[pi].generic_has_error_constraint =
                 fn.params[pi].generic_has_error_constraint;
             param_locals[pi].generic_has_eq_constraint = fn.params[pi].generic_has_eq_constraint;
@@ -10275,6 +12020,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param_locals[pi].init.kind = HirExprKind::LocalRef;
             param_locals[pi].init.type = fn.params[pi].type;
             param_locals[pi].init.generic_index = fn.params[pi].generic_index;
+            param_locals[pi].init.associated_name = fn.params[pi].associated_name;
             param_locals[pi].init.generic_has_error_constraint =
                 fn.params[pi].generic_has_error_constraint;
             param_locals[pi].init.generic_has_eq_constraint =
@@ -10355,6 +12101,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (body->type == HirTypeKind::Unknown && (body->may_nil || body->may_error)) {
                 body->type = fn.return_type;
                 body->generic_index = fn.return_generic_index;
+                body->associated_name = fn.return_associated_name;
                 body->shape_index = fn.return_shape_index;
                 if (fn.return_generic_index < fn.type_params.len) {
                     body->generic_has_error_constraint =
@@ -10395,6 +12142,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                     fn.return_tuple_struct_indices,
                                                     fn.return_shape_index);
             expected.generic_index = fn.return_generic_index;
+            expected.associated_name = fn.return_associated_name;
             if (fn.return_generic_index < fn.type_params.len) {
                 expected.generic_has_error_constraint =
                     fn.type_params[fn.return_generic_index].has_error_constraint;

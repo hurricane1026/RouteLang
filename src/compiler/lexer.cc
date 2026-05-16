@@ -33,6 +33,7 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"package", 7})) return TokenType::KwPackage;
     if (text.eq({"using", 5})) return TokenType::KwUsing;
     if (text.eq({"as", 2})) return TokenType::KwAs;
+    if (text.eq({"where", 5})) return TokenType::KwWhere;
     if (text.eq({"variant", 7})) return TokenType::KwVariant;
     if (text.eq({"struct", 6})) return TokenType::KwStruct;
     if (text.eq({"match", 5})) return TokenType::KwMatch;

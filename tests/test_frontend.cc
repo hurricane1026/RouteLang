@@ -3469,6 +3469,334 @@ route GET "/users" { if run(Box(value: 1)) == 1 { return 200 } else { return 500
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
+TEST(frontend, import_relative_file_merges_type_match_alias_symbol) {
+    const std::string dir = "/tmp/rut_import_type_match_alias_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/traits.rut", std::ios::binary);
+        out << "struct Inline<T> { value: T }\n";
+        out << "struct Ref<T> { value: i32 }\n";
+        out << "type Storage<T> match {\n";
+        out << "    case T: Eq => Inline<T>\n";
+        out << "    case _ => Ref<T>\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "traits.rut"
+func accept(x: Storage<i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(Inline(value: 201))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Inline")));
+}
+TEST(frontend, selective_import_relative_file_merges_selected_type_match_alias_symbol) {
+    const std::string dir = "/tmp/rut_selective_import_type_match_alias_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/traits.rut", std::ios::binary);
+        out << "struct Inline<T> { value: T }\n";
+        out << "struct Ref<T> { value: i32 }\n";
+        out << "type Storage<T> match {\n";
+        out << "    case T: Eq => Inline<T>\n";
+        out << "    case _ => Ref<T>\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import { Inline, Storage } from "traits.rut"
+func accept(x: Storage<i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(Inline(value: 201))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Inline")));
+}
+TEST(frontend, import_namespace_alias_rewrites_type_match_alias_target_symbols) {
+    const std::string dir = "/tmp/rut_namespace_import_type_match_alias_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/traits.rut", std::ios::binary);
+        out << "struct Inline<T> { value: T }\n";
+        out << "struct Ref<T> { value: i32 }\n";
+        out << "type Storage<T> match {\n";
+        out << "    case T: Eq => Inline<T>\n";
+        out << "    case _ => Ref<T>\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import * as traits from "traits.rut"
+func accept(x: traits.Storage<i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(traits.Inline(value: 201))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("traits__Inline")));
+}
+TEST(frontend, selective_import_alias_rewrites_type_match_alias_target_symbols) {
+    const std::string dir = "/tmp/rut_selective_import_renamed_type_match_alias_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/traits.rut", std::ios::binary);
+        out << "struct Inline<T> { value: T }\n";
+        out << "struct Ref<T> { value: i32 }\n";
+        out << "type Storage<T> match {\n";
+        out << "    case T: Eq => Inline<T>\n";
+        out << "    case _ => Ref<T>\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import { Inline as I, Storage as S } from "traits.rut"
+func accept(x: S<i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(I(value: 201))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("I")));
+}
+TEST(frontend, import_namespace_alias_rewrites_type_match_alias_protocol_constraints) {
+    const std::string dir = "/tmp/rut_namespace_import_type_match_alias_protocol_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/traits.rut", std::ios::binary);
+        out << "protocol Hashable {}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "struct Inline<T> { value: T }\n";
+        out << "struct Ref<T> { value: i32 }\n";
+        out << "Box<i32> impl Hashable {}\n";
+        out << "type Storage<T> match {\n";
+        out << "    case T: Hashable => Inline<T>\n";
+        out << "    case _ => Ref<T>\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import * as traits from "traits.rut"
+func accept(x: traits.Storage<traits.Box<i32>>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(traits.Inline(value: traits.Box(value: 201)))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("traits__Inline")));
+}
+TEST(frontend, selective_import_alias_rewrites_type_match_alias_protocol_constraints) {
+    const std::string dir = "/tmp/rut_selective_import_renamed_type_match_alias_protocol_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/traits.rut", std::ios::binary);
+        out << "protocol Hashable {}\n";
+        out << "struct Box<T> { value: T }\n";
+        out << "struct Inline<T> { value: T }\n";
+        out << "struct Ref<T> { value: i32 }\n";
+        out << "Box<i32> impl Hashable {}\n";
+        out << "type Storage<T> match {\n";
+        out << "    case T: Hashable => Inline<T>\n";
+        out << "    case _ => Ref<T>\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import { Hashable as H, Box as B, Inline as I, Storage as S } from "traits.rut"
+func accept(x: S<B<i32>>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(I(value: B(value: 201)))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("I")));
+}
+TEST(frontend, imported_type_match_alias_rewrites_qualified_target_symbols) {
+    const std::string dir = "/tmp/rut_qualified_import_type_match_alias_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box<T> { value: T }\n";
+        out << "struct Ref<T> { value: i32 }\n";
+    }
+    {
+        std::ofstream out(dir + "/traits.rut", std::ios::binary);
+        out << "import * as proto from \"proto.rut\"\n";
+        out << "type Storage<T> match {\n";
+        out << "    case T: Eq => proto.Box<T>\n";
+        out << "    case _ => proto.Ref<T>\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "traits.rut"
+func accept(x: Storage<i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("proto__Box")));
+}
+TEST(frontend, imported_type_match_alias_rewrites_qualified_protocol_constraints) {
+    const std::string dir = "/tmp/rut_qualified_import_type_match_alias_protocol_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "protocol Hashable {}\n";
+        out << "struct Inline<T> { value: T }\n";
+        out << "struct Ref<T> { value: i32 }\n";
+        out << "i32 impl Hashable {}\n";
+    }
+    {
+        std::ofstream out(dir + "/traits.rut", std::ios::binary);
+        out << "import * as proto from \"proto.rut\"\n";
+        out << "type Storage<T> match {\n";
+        out << "    case T: proto.Hashable => proto.Inline<T>\n";
+        out << "    case _ => proto.Ref<T>\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "traits.rut"
+func accept(x: Storage<i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("proto__Inline")));
+}
+TEST(frontend, imported_alias_rewrites_qualified_member_named_like_type_param) {
+    const std::string dir = "/tmp/rut_qualified_import_alias_type_param_collision_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct T { value: i32 }\n";
+    }
+    {
+        std::ofstream out(dir + "/traits.rut", std::ios::binary);
+        out << "import * as proto from \"proto.rut\"\n";
+        out << "type Wrap<T> = proto.T\n";
+    }
+    const auto src = R"rut(
+import "traits.rut"
+func accept(x: Wrap<i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("proto__T")));
+}
 TEST(frontend, selective_import_relative_file_aliases_selected_function_symbol) {
     const std::string dir = "/tmp/rut_selective_import_alias_frontend";
     std::filesystem::create_directories(dir);
@@ -4970,8 +5298,14 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_block) {
         REQUIRE(hir);
     }
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK(hir->routes[0].locals[1].name.eq(lit("y")));
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].type), static_cast<u8>(HirTypeKind::I32));
+    bool saw_y = false;
+    for (u32 i = 0; i < hir->routes[0].locals.len; i++) {
+        const auto& local = hir->routes[0].locals[i];
+        if (!local.name.eq(lit("y"))) continue;
+        saw_y = true;
+        CHECK_EQ(local.type, HirTypeKind::I32);
+    }
+    CHECK(saw_y);
     CHECK_EQ(static_cast<u8>(hir->routes[0].control.match_arms[0].body_kind),
              static_cast<u8>(HirMatchArm::BodyKind::If));
     auto mir = build_mir_heap(hir.value());
@@ -7994,6 +8328,132 @@ TEST(frontend, req_header_flows_as_optional_str) {
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[1].op), static_cast<u8>(rir::Opcode::ConstStr));
     rir.destroy();
 }
+
+TEST(frontend, req_standard_header_alias_flows_as_optional_str) {
+    const char* src =
+        "route GET \"/users\" { let auth = req.authorization let ua = req.userAgent let ct = "
+        "req.contentType let lang = req.acceptLanguage let enc = req.acceptEncoding let cache = "
+        "req.cacheControl let ref = req.referer let fwd = req.forwarded let xff = "
+        "req.xForwardedFor let proto = req.xForwardedProto let real = req.xRealIp let rid = "
+        "req.xRequestId let value = or(auth, \"\") return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 13u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Str));
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[0].init.str_value.eq({"Authorization", 13}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[1].init.str_value.eq({"User-Agent", 10}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[2].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[2].init.str_value.eq({"Content-Type", 12}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[3].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[3].init.str_value.eq({"Accept-Language", 15}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[4].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[4].init.str_value.eq({"Accept-Encoding", 15}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[5].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[5].init.str_value.eq({"Cache-Control", 13}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[6].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[6].init.str_value.eq({"Referer", 7}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[7].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[7].init.str_value.eq({"Forwarded", 9}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[8].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[8].init.str_value.eq({"X-Forwarded-For", 15}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[9].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[9].init.str_value.eq({"X-Forwarded-Proto", 17}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[10].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[10].init.str_value.eq({"X-Real-IP", 9}));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[11].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeader));
+    CHECK(hir->routes[0].locals[11].init.str_value.eq({"X-Request-ID", 12}));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 13u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[0].init.str_value.eq({"Authorization", 13}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[1].init.str_value.eq({"User-Agent", 10}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[2].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[2].init.str_value.eq({"Content-Type", 12}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[3].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[3].init.str_value.eq({"Accept-Language", 15}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[4].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[4].init.str_value.eq({"Accept-Encoding", 15}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[5].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[5].init.str_value.eq({"Cache-Control", 13}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[6].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[6].init.str_value.eq({"Referer", 7}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[7].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[7].init.str_value.eq({"Forwarded", 9}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[8].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[8].init.str_value.eq({"X-Forwarded-For", 15}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[9].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[9].init.str_value.eq({"X-Forwarded-Proto", 17}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[10].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[10].init.str_value.eq({"X-Real-IP", 9}));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[11].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeader));
+    CHECK(mir->functions[0].locals[11].init.str_value.eq({"X-Request-ID", 12}));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[0].imm.str_val.eq({"Authorization", 13}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[1].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[1].imm.str_val.eq({"User-Agent", 10}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[2].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[2].imm.str_val.eq({"Content-Type", 12}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[3].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[3].imm.str_val.eq({"Accept-Language", 15}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[4].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[4].imm.str_val.eq({"Accept-Encoding", 15}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[5].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[5].imm.str_val.eq({"Cache-Control", 13}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[6].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[6].imm.str_val.eq({"Referer", 7}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[7].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[7].imm.str_val.eq({"Forwarded", 9}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[8].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[8].imm.str_val.eq({"X-Forwarded-For", 15}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[9].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[9].imm.str_val.eq({"X-Forwarded-Proto", 17}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[10].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[10].imm.str_val.eq({"X-Real-IP", 9}));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[11].op), static_cast<u8>(rir::Opcode::ReqHeader));
+    CHECK(fn.blocks[0].insts[11].imm.str_val.eq({"X-Request-ID", 12}));
+    rir.destroy();
+}
+
 TEST(frontend, req_header_alias_flows_as_optional_str) {
     const char* src =
         "route GET \"/users\" { let host = req.header(\"Host\") let alias = host let value = "
@@ -9507,6 +9967,41 @@ route GET "/users" {
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
 }
+TEST(frontend, source_generic_function_accepts_explicit_return_type_argument) {
+    const auto src = R"rut(
+func make<T>() -> T => nil
+route GET "/users" {
+    let code = or(make<i32>(), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+}
+TEST(frontend, source_generic_function_rejects_unbound_return_type_argument) {
+    const auto src = R"rut(
+func make<T>() -> T => nil
+route GET "/users" {
+    let code = make()
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
 TEST(frontend, source_generic_function_supports_nested_generic_param_and_return_shapes) {
     const auto src = R"rut(
 variant Result<T> { ok(T), err }
@@ -9563,6 +10058,1265 @@ route GET "/users" {
     CHECK_EQ(hir->protocols[3].methods[0].params.len, 0u);
     CHECK(hir->protocols[3].methods[0].return_type_name.eq(lit("i32")));
 }
+TEST(frontend, protocol_associated_type_requirements_are_recorded_in_hir) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box { value: i32 }
+Box impl Iterable {
+    type Elem = i32
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->protocols.len, 4u);
+    const auto& proto = hir->protocols[3];
+    REQUIRE_EQ(proto.associated_types.len, 1u);
+    CHECK(proto.associated_types[0].name.eq(lit("Elem")));
+    REQUIRE_EQ(hir->impls.len, 1u);
+    REQUIRE_EQ(hir->impls[0].associated_types.len, 1u);
+    CHECK(hir->impls[0].associated_types[0].name.eq(lit("Elem")));
+    CHECK_EQ(hir->impls[0].associated_types[0].type, HirTypeKind::I32);
+}
+TEST(frontend, generic_impl_associated_type_binding_can_reference_target_type_param) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->impls.len, 1u);
+    REQUIRE_EQ(hir->impls[0].associated_types.len, 1u);
+    CHECK_EQ(hir->impls[0].associated_types[0].type, HirTypeKind::Generic);
+    CHECK_EQ(hir->impls[0].associated_types[0].generic_index, 0u);
+}
+TEST(frontend, type_match_alias_expands_in_generic_impl_associated_type_binding) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Inline<T> { value: T }
+struct Ref<T> { value: i32 }
+type Storage<T> match {
+    case T: Eq => Inline<T>
+    case _ => Ref<T>
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = Storage<T>
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->impls.len, 1u);
+    REQUIRE_EQ(hir->impls[0].associated_types.len, 1u);
+    const auto& assoc = hir->impls[0].associated_types[0];
+    CHECK_EQ(assoc.type, HirTypeKind::Struct);
+    REQUIRE_LT(assoc.struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[assoc.struct_index];
+    CHECK(resolved.name.eq(lit("Ref")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[0], 0u);
+}
+TEST(frontend, type_alias_preserves_nested_generic_type_tree) {
+    const auto src = R"rut(
+struct Box<T> { value: T }
+struct Holder<T> { value: T }
+type Nested<T> = Holder<Box<T>>
+func accept(x: Nested<i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(Holder(value: Box(value: 1)))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+TEST(frontend, analyze_rejects_indirect_type_alias_cycle) {
+    const auto src = R"rut(
+type A = B
+type B = A
+func accept(x: A) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, function_return_type_supports_associated_type_projection) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+i32 impl Iterable {
+    type Elem = i32
+}
+func maybeFirst<C>(c: C) -> C.Elem where Iterable(C) {
+    nil
+}
+route GET "/users" {
+    let x = maybeFirst(200)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(hir->functions[0].return_type, HirTypeKind::Associated);
+    CHECK_EQ(hir->functions[0].return_generic_index, 0u);
+    CHECK(hir->functions[0].return_associated_name.eq(lit("Elem")));
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+}
+TEST(frontend, associated_type_projection_substitutes_generic_impl_binding) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+func maybeFirst<C>(c: C) -> C.Elem where Iterable(C) {
+    nil
+}
+route GET "/users" {
+    let x = maybeFirst(Box(value: 200))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+}
+TEST(frontend, associated_type_projection_concretizes_nested_generic_impl_binding) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Wrap<T> { value: T }
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = Wrap<T>
+}
+func maybeFirst<C>(c: C) -> C.Elem where Iterable(C) {
+    nil
+}
+route GET "/users" {
+    let x = maybeFirst(Box(value: 200))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    const auto& local = hir->routes[0].locals[0];
+    REQUIRE_EQ(local.type, HirTypeKind::Struct);
+    REQUIRE_LT(local.struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[local.struct_index];
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::I32);
+}
+TEST(frontend, associated_type_projection_concretizes_nested_generic_variant_impl_binding) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+variant Result<T> { ok(T), err }
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = Result<T>
+}
+func maybeFirst<C>(c: C) -> C.Elem where Iterable(C) {
+    nil
+}
+route GET "/users" {
+    let x = maybeFirst(Box(value: 200))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    const auto& local = hir->routes[0].locals[0];
+    REQUIRE_EQ(local.type, HirTypeKind::Variant);
+    REQUIRE_LT(local.variant_index, hir->variants.len);
+    const auto& resolved = hir->variants[local.variant_index];
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::I32);
+}
+
+TEST(frontend, associated_type_projection_concretizes_tuple_generic_impl_binding) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = (T, i32)
+}
+func maybeFirst<C>(c: C) -> C.Elem where Iterable(C) {
+    nil
+}
+route GET "/users" {
+    let x = maybeFirst(Box(value: 200))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    const auto& local = hir->routes[0].locals[0];
+    REQUIRE_EQ(local.type, HirTypeKind::Tuple);
+    REQUIRE_EQ(local.tuple_len, 2u);
+    CHECK_EQ(local.tuple_types[0], HirTypeKind::I32);
+    CHECK_EQ(local.tuple_types[1], HirTypeKind::I32);
+}
+TEST(frontend, function_param_type_supports_associated_type_projection) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+i32 impl Iterable {
+    type Elem = i32
+}
+func accept<C>(c: C, x: C.Elem) -> i32 where Iterable(C) {
+    200
+}
+route GET "/users" {
+    let y = accept(200, 201)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 2u);
+    CHECK_EQ(hir->functions[0].params[1].type, HirTypeKind::Associated);
+    CHECK_EQ(hir->functions[0].params[1].generic_index, 0u);
+    CHECK(hir->functions[0].params[1].associated_name.eq(lit("Elem")));
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+}
+
+TEST(frontend, analyze_rejects_binding_associated_type_to_generic_param) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+i32 impl Iterable {
+    type Elem = i32
+}
+func id<U>(x: U) -> U => x
+func pass<C>(x: C.Elem) -> C.Elem where Iterable(C) {
+    id(x)
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, analyze_rejects_associated_type_projection_as_generic_type_arg) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+i32 impl Iterable {
+    type Elem = i32
+}
+struct Wrap<T> { value: i32 }
+func accept<C>(x: Wrap<C.Elem>) -> i32 where Iterable(C) {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, type_match_alias_selects_protocol_arm_for_function_param) {
+    const auto src = R"rut(
+struct Inline<T> { value: T }
+struct Ref<T> { value: i32 }
+type Storage<T> match {
+    case T: Eq => Inline<T>
+    case _ => Ref<T>
+}
+func accept(x: Storage<i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(Inline(value: 201))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Inline")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::I32);
+}
+TEST(frontend, type_match_alias_uses_wildcard_when_protocol_arm_does_not_match) {
+    const auto src = R"rut(
+struct Inline<T> { value: i32 }
+struct Ref<T> { value: i32 }
+type Storage<T> match {
+    case T: Error => Inline<T>
+    case _ => Ref<T>
+}
+func accept(x: Storage<i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Ref")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::I32);
+}
+TEST(frontend, type_match_alias_selects_protocol_arm_for_constrained_generic_param) {
+    const auto src = R"rut(
+struct Inline<T> { value: T }
+struct Ref<T> { value: i32 }
+type Storage<T> match {
+    case T: Eq => Inline<T>
+    case _ => Ref<T>
+}
+func accept<T: Eq>(x: Storage<T>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Inline")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[0], 0u);
+}
+TEST(frontend, type_match_alias_selects_protocol_arm_for_where_constrained_generic_param) {
+    const auto src = R"rut(
+struct Inline<T> { value: T }
+struct Ref<T> { value: i32 }
+type Storage<T> match {
+    case T: Eq => Inline<T>
+    case _ => Ref<T>
+}
+func accept<T>(x: Storage<T>) -> i32 where Eq(T) {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Inline")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[0], 0u);
+}
+TEST(frontend, type_match_alias_uses_wildcard_for_unconstrained_generic_param) {
+    const auto src = R"rut(
+struct Inline<T> { value: T }
+struct Ref<T> { value: i32 }
+type Storage<T> match {
+    case T: Eq => Inline<T>
+    case _ => Ref<T>
+}
+func accept<T>(x: Storage<T>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Ref")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[0], 0u);
+}
+TEST(frontend, type_match_alias_selects_custom_protocol_arm_for_constrained_generic_param) {
+    const auto src = R"rut(
+protocol Hashable {}
+struct Inline<T> { value: T }
+struct Ref<T> { value: i32 }
+type Storage<T> match {
+    case T: Hashable => Inline<T>
+    case _ => Ref<T>
+}
+func accept<T: Hashable>(x: Storage<T>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Inline")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[0], 0u);
+}
+TEST(frontend, type_match_alias_expands_in_struct_field_type) {
+    const auto src = R"rut(
+struct Inline<T> { value: T }
+struct Ref<T> { value: i32 }
+type Storage<T> match {
+    case T: Eq => Inline<T>
+    case _ => Ref<T>
+}
+struct Holder {
+    value: Storage<i32>
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    u32 holder_index = hir->structs.len;
+    for (u32 si = 0; si < hir->structs.len; si++) {
+        if (hir->structs[si].name.eq(lit("Holder")) &&
+            hir->structs[si].template_struct_index == 0xffffffffu) {
+            holder_index = si;
+            break;
+        }
+    }
+    REQUIRE_LT(holder_index, hir->structs.len);
+    const auto& holder = hir->structs[holder_index];
+    REQUIRE_EQ(holder.fields.len, 1u);
+    CHECK_EQ(holder.fields[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(holder.fields[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[holder.fields[0].struct_index];
+    CHECK(resolved.name.eq(lit("Inline")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::I32);
+}
+TEST(frontend, type_match_alias_expands_in_variant_payload_type) {
+    const auto src = R"rut(
+struct Inline<T> { value: T }
+struct Ref<T> { value: i32 }
+type Storage<T> match {
+    case T: Eq => Inline<T>
+    case _ => Ref<T>
+}
+variant Event {
+    some(Storage<i32>)
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    u32 event_index = hir->variants.len;
+    for (u32 vi = 0; vi < hir->variants.len; vi++) {
+        if (hir->variants[vi].name.eq(lit("Event")) &&
+            hir->variants[vi].template_variant_index == 0xffffffffu) {
+            event_index = vi;
+            break;
+        }
+    }
+    REQUIRE_LT(event_index, hir->variants.len);
+    const auto& event = hir->variants[event_index];
+    REQUIRE_EQ(event.cases.len, 1u);
+    REQUIRE(event.cases[0].has_payload);
+    CHECK_EQ(event.cases[0].payload_type, HirTypeKind::Struct);
+    REQUIRE_LT(event.cases[0].payload_struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[event.cases[0].payload_struct_index];
+    CHECK(resolved.name.eq(lit("Inline")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::I32);
+}
+TEST(frontend, type_match_alias_type_equality_uses_struct_generic_param_in_field_type) {
+    const auto src = R"rut(
+struct Same<T> { value: T }
+struct Diff<T, U> { value: i32 }
+type Choice<T, U> match {
+    case T == U => Same<T>
+    case _ => Diff<T, U>
+}
+struct Holder<T> {
+    value: Choice<T, T>
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    u32 holder_index = hir->structs.len;
+    for (u32 si = 0; si < hir->structs.len; si++) {
+        if (hir->structs[si].name.eq(lit("Holder")) &&
+            hir->structs[si].template_struct_index == 0xffffffffu) {
+            holder_index = si;
+            break;
+        }
+    }
+    REQUIRE_LT(holder_index, hir->structs.len);
+    const auto& holder = hir->structs[holder_index];
+    REQUIRE_EQ(holder.fields.len, 1u);
+    CHECK_EQ(holder.fields[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(holder.fields[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[holder.fields[0].struct_index];
+    CHECK(resolved.name.eq(lit("Same")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[0], 0u);
+}
+TEST(frontend, type_match_alias_selects_type_equality_arm) {
+    const auto src = R"rut(
+struct Same<T> { value: T }
+struct Diff<T, U> { value: i32 }
+type Choice<T, U> match {
+    case T == U => Same<T>
+    case _ => Diff<T, U>
+}
+func accept(x: Choice<i32, i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(Same(value: 201))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Same")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::I32);
+}
+TEST(frontend, type_match_alias_uses_wildcard_when_type_equality_does_not_match) {
+    const auto src = R"rut(
+struct Same<T> { value: T }
+struct Diff<T, U> { value: i32 }
+type Choice<T, U> match {
+    case T == U => Same<T>
+    case _ => Diff<T, U>
+}
+func accept(x: Choice<i32, str>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Diff")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 2u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::I32);
+    CHECK_EQ(resolved.instance_type_args[1], HirTypeKind::Str);
+}
+
+TEST(frontend, type_match_alias_selects_type_equality_arm_for_same_generic_param) {
+    const auto src = R"rut(
+struct Same<T> { value: T }
+struct Diff<T, U> { value: i32 }
+type Choice<T, U> match {
+    case T == U => Same<T>
+    case _ => Diff<T, U>
+}
+func accept<T>(x: Choice<T, T>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Same")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[0], 0u);
+}
+TEST(frontend, type_match_alias_uses_wildcard_when_generic_params_differ) {
+    const auto src = R"rut(
+struct Same<T> { value: T }
+struct Diff<T, U> { value: i32 }
+type Choice<T, U> match {
+    case T == U => Same<T>
+    case _ => Diff<T, U>
+}
+func accept<T, U>(x: Choice<T, U>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Diff")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 2u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[0], 0u);
+    CHECK_EQ(resolved.instance_type_args[1], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[1], 1u);
+}
+TEST(frontend, type_match_alias_selects_associated_type_equality_arm) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+struct Hit<U> { value: U }
+struct Miss<C, U> { value: i32 }
+type Select<C, U> match {
+    case C.Elem == U => Hit<U>
+    case _ => Miss<C, U>
+}
+route GET "/users" {
+    let y: Select<Box<i32>, i32> = Hit(value: 201)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->routes[0].locals[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->routes[0].locals[0].struct_index];
+    CHECK(resolved.name.eq(lit("Hit")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::I32);
+}
+TEST(frontend, analyze_rejects_ambiguous_associated_type_alias_lookup) {
+    const auto src = R"rut(
+protocol First {
+    type Item
+}
+protocol Second {
+    type Item
+}
+struct Box { value: i32 }
+Box impl First {
+    type Item = i32
+}
+Box impl Second {
+    type Item = str
+}
+struct Hit { value: i32 }
+struct Miss { value: i32 }
+type Select<C> match {
+    case C.Item == i32 => Hit
+    case _ => Miss
+}
+func accept(x: Select<Box>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, type_match_alias_selects_associated_type_equality_arm_for_generic_impl_arg) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+struct Hit<U> { value: U }
+struct Miss<C, U> { value: i32 }
+type Select<C, U> match {
+    case C.Elem == U => Hit<U>
+    case _ => Miss<C, U>
+}
+func accept<T>(x: Select<Box<T>, T>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Hit")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[0], 0u);
+}
+
+TEST(frontend, type_match_alias_concretizes_tuple_generic_impl_associated_type) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = (T, i32)
+}
+struct Hit<U> { value: U }
+struct Miss<C, U> { value: i32 }
+type Select<C, U> match {
+    case C.Elem == U => Hit<U>
+    case _ => Miss<C, U>
+}
+func accept(x: Select<Box<i32>, (i32, i32)>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Hit")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    REQUIRE_EQ(resolved.instance_type_args[0], HirTypeKind::Tuple);
+    REQUIRE_EQ(resolved.instance_tuple_lens[0], 2u);
+    CHECK_EQ(resolved.instance_tuple_types[0][0], HirTypeKind::I32);
+    CHECK_EQ(resolved.instance_tuple_types[0][1], HirTypeKind::I32);
+}
+TEST(frontend, type_match_alias_uses_wildcard_for_different_generic_associated_type) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+struct Hit<U> { value: U }
+struct Miss<C, U> { value: i32 }
+type Select<C, U> match {
+    case C.Elem == U => Hit<U>
+    case _ => Miss<C, U>
+}
+func accept<T, U>(x: Select<Box<T>, U>) -> i32 {
+    200
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Miss")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 2u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Struct);
+    CHECK_EQ(resolved.instance_type_args[1], HirTypeKind::Generic);
+    CHECK_EQ(resolved.instance_generic_indices[1], 1u);
+}
+TEST(frontend, type_match_alias_selects_associated_type_equality_arm_in_function_param) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+struct Hit<U> { value: U }
+struct Miss<C, U> { value: i32 }
+type Select<C, U> match {
+    case C.Elem == U => Hit<U>
+    case _ => Miss<C, U>
+}
+func accept(x: Select<Box<i32>, i32>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(Hit(value: 201))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Hit")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 1u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::I32);
+}
+TEST(frontend, type_match_alias_selects_associated_type_equality_arm_in_function_return) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+struct Hit<U> { value: U }
+struct Miss<C, U> { value: i32 }
+type Select<C, U> match {
+    case C.Elem == U => Hit<U>
+    case _ => Miss<C, U>
+}
+func make() -> Select<Box<i32>, i32> {
+    Hit(value: 201)
+}
+route GET "/users" {
+    let y = make()
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(hir->functions[0].return_type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].return_struct_index, hir->structs.len);
+    const auto& fn_return = hir->structs[hir->functions[0].return_struct_index];
+    CHECK(fn_return.name.eq(lit("Hit")));
+    REQUIRE_EQ(fn_return.instance_type_arg_count, 1u);
+    CHECK_EQ(fn_return.instance_type_args[0], HirTypeKind::I32);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->routes[0].locals[0].struct_index, hir->structs.len);
+    const auto& local = hir->structs[hir->routes[0].locals[0].struct_index];
+    CHECK(local.name.eq(lit("Hit")));
+}
+TEST(frontend, type_match_alias_uses_wildcard_when_associated_type_equality_does_not_match) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+struct Hit<U> { value: U }
+struct Miss<C, U> { value: i32 }
+type Select<C, U> match {
+    case C.Elem == U => Hit<U>
+    case _ => Miss<C, U>
+}
+route GET "/users" {
+    let y: Select<Box<i32>, str> = Miss<Box<i32>, str>(value: 201)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->routes[0].locals[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->routes[0].locals[0].struct_index];
+    CHECK(resolved.name.eq(lit("Miss")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 2u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Struct);
+    CHECK_EQ(resolved.instance_type_args[1], HirTypeKind::Str);
+}
+TEST(frontend, type_match_alias_uses_wildcard_associated_type_equality_in_function_param) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+struct Hit<U> { value: U }
+struct Miss<C, U> { value: i32 }
+type Select<C, U> match {
+    case C.Elem == U => Hit<U>
+    case _ => Miss<C, U>
+}
+func accept(x: Select<Box<i32>, str>) -> i32 {
+    200
+}
+route GET "/users" {
+    let y = accept(Miss<Box<i32>, str>(value: 201))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].params[0].struct_index, hir->structs.len);
+    const auto& resolved = hir->structs[hir->functions[0].params[0].struct_index];
+    CHECK(resolved.name.eq(lit("Miss")));
+    REQUIRE_EQ(resolved.instance_type_arg_count, 2u);
+    CHECK_EQ(resolved.instance_type_args[0], HirTypeKind::Struct);
+    CHECK_EQ(resolved.instance_type_args[1], HirTypeKind::Str);
+}
+TEST(frontend, type_match_alias_uses_wildcard_associated_type_equality_in_function_return) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+struct Hit<U> { value: U }
+struct Miss<C, U> { value: i32 }
+type Select<C, U> match {
+    case C.Elem == U => Hit<U>
+    case _ => Miss<C, U>
+}
+func make() -> Select<Box<i32>, str> {
+    Miss<Box<i32>, str>(value: 201)
+}
+route GET "/users" {
+    let y = make()
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(hir->functions[0].return_type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->functions[0].return_struct_index, hir->structs.len);
+    const auto& fn_return = hir->structs[hir->functions[0].return_struct_index];
+    CHECK(fn_return.name.eq(lit("Miss")));
+    REQUIRE_EQ(fn_return.instance_type_arg_count, 2u);
+    CHECK_EQ(fn_return.instance_type_args[0], HirTypeKind::Struct);
+    CHECK_EQ(fn_return.instance_type_args[1], HirTypeKind::Str);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(hir->routes[0].locals[0].struct_index, hir->structs.len);
+    const auto& local = hir->structs[hir->routes[0].locals[0].struct_index];
+    CHECK(local.name.eq(lit("Miss")));
+}
+TEST(frontend, analyze_rejects_associated_type_projection_without_constraint) {
+    const auto src = R"rut(
+func maybeFirst<C>(c: C) -> C.Elem {
+    nil
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_impl_missing_required_associated_type) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box { value: i32 }
+Box impl Iterable {}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_impl_unknown_associated_type_binding) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box { value: i32 }
+Box impl Iterable {
+    type Key = i32
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_duplicate_protocol_associated_type) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+    type Elem
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
 TEST(frontend, protocol_method_requirement_shapes_are_recorded_in_hir) {
     const auto src = R"rut(
 protocol Boxed {
@@ -9586,6 +11340,118 @@ route GET "/users" { return 200 }
     CHECK(method.params[0].shape_index != 0xffffffffu);
     CHECK_EQ(method.return_type, HirTypeKind::I32);
     CHECK(method.return_shape_index != 0xffffffffu);
+}
+TEST(frontend, type_match_alias_expands_in_protocol_method_requirement_signature) {
+    const auto src = R"rut(
+struct Inline<T> { value: T }
+struct Ref<T> { value: i32 }
+type Storage<T> match {
+    case T: Eq => Inline<T>
+    case _ => Ref<T>
+}
+protocol Boxed {
+    func wrap(x: Storage<i32>) -> Storage<i32>
+}
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->protocols.len >= 1u);
+    const auto& proto = hir->protocols[hir->protocols.len - 1];
+    CHECK(proto.name.eq(lit("Boxed")));
+    REQUIRE_EQ(proto.methods.len, 1u);
+    const auto& method = proto.methods[0];
+    REQUIRE_EQ(method.params.len, 1u);
+    CHECK_EQ(method.params[0].type, HirTypeKind::Struct);
+    REQUIRE_LT(method.params[0].struct_index, hir->structs.len);
+    CHECK(hir->structs[method.params[0].struct_index].name.eq(lit("Inline")));
+    CHECK_EQ(method.return_type, HirTypeKind::Struct);
+    REQUIRE_LT(method.return_struct_index, hir->structs.len);
+    CHECK(hir->structs[method.return_struct_index].name.eq(lit("Inline")));
+}
+TEST(frontend, protocol_method_requirement_can_return_own_associated_type) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+    func first() -> Elem
+}
+i32 impl Iterable {
+    type Elem = i32
+    func first(self: i32) -> i32 => self
+}
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->protocols.len >= 1u);
+    const auto& proto = hir->protocols[hir->protocols.len - 1];
+    CHECK(proto.name.eq(lit("Iterable")));
+    REQUIRE_EQ(proto.methods.len, 1u);
+    const auto& method = proto.methods[0];
+    CHECK_EQ(method.return_type, HirTypeKind::Associated);
+    CHECK(method.return_associated_name.eq(lit("Elem")));
+    REQUIRE_EQ(hir->impls.len, 1u);
+    REQUIRE_EQ(hir->impls[0].methods.len, 1u);
+}
+TEST(frontend, generic_impl_method_requirement_can_return_associated_type_binding) {
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+    func first() -> Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+    func first(self: Box<T>) -> T => self.value
+}
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->impls.len, 1u);
+    REQUIRE_EQ(hir->impls[0].associated_types.len, 1u);
+    CHECK_EQ(hir->impls[0].associated_types[0].type, HirTypeKind::Generic);
+    CHECK_EQ(hir->impls[0].associated_types[0].generic_index, 0u);
+    REQUIRE_EQ(hir->impls[0].methods.len, 1u);
+}
+TEST(frontend, protocol_method_requirement_can_accept_own_associated_type_param) {
+    const auto src = R"rut(
+protocol Sink {
+    type Item
+    func send(x: Item) -> i32
+}
+i32 impl Sink {
+    type Item = str
+    func send(self: i32, x: str) -> i32 => 200
+}
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->protocols.len >= 1u);
+    const auto& proto = hir->protocols[hir->protocols.len - 1];
+    REQUIRE_EQ(proto.methods.len, 1u);
+    REQUIRE_EQ(proto.methods[0].params.len, 1u);
+    CHECK_EQ(proto.methods[0].params[0].type, HirTypeKind::Associated);
+    CHECK(proto.methods[0].params[0].associated_name.eq(lit("Item")));
+    REQUIRE_EQ(hir->impls.len, 1u);
+    REQUIRE_EQ(hir->impls[0].methods.len, 1u);
 }
 TEST(frontend, generic_protocol_constraint_survives_if_merge_in_hir) {
     const auto src = R"rut(
@@ -9886,6 +11752,23 @@ protocol Hashable {}
 func hash<T: Hashable>(x: T) -> i32 => 200
 route GET "/users" {
     if hash(200) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
+}
+TEST(frontend, analyze_rejects_unconstrained_generic_arg_for_custom_protocol_call) {
+    const auto src = R"rut(
+protocol Hashable {}
+func hash<T: Hashable>(x: T) -> i32 => 200
+func call<U>(x: U) -> i32 => hash(x)
+route GET "/users" {
+    return 200
 }
 )rut";
     auto lexed = lex(lit(src));
@@ -10503,6 +12386,86 @@ route GET "/users" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+}
+TEST(frontend, source_custom_protocol_default_method_supports_associated_type_param_and_return) {
+    const auto src = R"rut(
+protocol Identity {
+    type Item
+    func keep(x: Item) -> Item => x
+}
+i32 impl Identity {
+    type Item = str
+}
+route GET "/users" {
+    let value = 200.keep("ok")
+    if value == "ok" { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Str);
+}
+TEST(frontend, source_generic_receiver_default_method_supports_associated_type_param_and_return) {
+    const auto src = R"rut(
+protocol Identity {
+    type Item
+    func keep(x: Item) -> Item => x
+}
+i32 impl Identity {
+    type Item = str
+}
+func run<T>(x: T, value: T.Item) -> T.Item where Identity(T) {
+    x.keep(value)
+}
+route GET "/users" {
+    let value = run(200, "ok")
+    if value == "ok" { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Str);
+}
+TEST(frontend, analyze_rejects_ambiguous_associated_type_projection_in_call) {
+    const auto src = R"rut(
+protocol First {
+    type Item
+}
+protocol Second {
+    type Item
+}
+struct Box { value: i32 }
+Box impl First {
+    type Item = i32
+}
+Box impl Second {
+    type Item = str
+}
+func project<C: First, Second>(x: C, value: C.Item) -> i32 => 200
+route GET "/users" {
+    let value = project(Box(value: 7), 201)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
 TEST(frontend, source_generic_receiver_custom_protocol_default_method_supports_tuple_return) {
     const auto src = R"rut(
@@ -13148,6 +15111,55 @@ route GET "/users" {
     CHECK(hir->functions[0].body.kind == HirExprKind::Eq);
     CHECK(hir->functions[0].body.type == HirTypeKind::Bool);
 }
+TEST(frontend, source_generic_function_accepts_where_eq_constraint_and_equality) {
+    const auto src = R"rut(
+func same<T>(x: T, y: T) -> bool where Eq(T) => x == y
+route GET "/users" {
+    if same("a", "a") { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK(hir->functions[0].type_params[0].has_eq_constraint);
+    CHECK(hir->functions[0].body.kind == HirExprKind::Eq);
+    CHECK(hir->functions[0].body.type == HirTypeKind::Bool);
+}
+TEST(frontend, generic_function_call_accepts_where_custom_protocol_constraint) {
+    const auto src = R"rut(
+protocol Hashable {}
+i32 impl Hashable {}
+func hash<T>(x: T) -> i32 where Hashable(T) => 200
+route GET "/users" {
+    if hash(200) == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(hir->functions[0].type_params[0].custom_protocol_count, 1u);
+}
+TEST(frontend, parse_rejects_where_constraint_for_unknown_type_param) {
+    const auto src = R"rut(
+func same<T>(x: T, y: T) -> bool where Eq(U) => x == y
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK(ast.error().code == FrontendError::UnsupportedSyntax);
+}
 TEST(frontend, source_generic_function_accepts_eq_constraint_for_tuple) {
     const auto src = R"rut(
 func same<T: Eq>(x: T, y: T) -> bool => x == y
@@ -13993,6 +16005,73 @@ route GET "/users" {
     CHECK_EQ(body.tuple_types[0], HirTypeKind::Struct);
     CHECK_EQ(body.tuple_struct_indices[0], 0u);
 }
+
+TEST(frontend, source_function_tuple_literal_preserves_generic_slots) {
+    const auto src = R"(
+func pair<T, U>(x: T, y: U) -> (T, U) {
+    (x, y)
+}
+route GET "/users" {
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    const auto& body = hir->functions[0].body;
+    REQUIRE_EQ(body.type, HirTypeKind::Tuple);
+    REQUIRE_EQ(body.tuple_len, 2u);
+    CHECK_EQ(body.tuple_types[0], HirTypeKind::Generic);
+    CHECK_EQ(body.tuple_struct_indices[0], 0u);
+    CHECK_EQ(body.tuple_types[1], HirTypeKind::Generic);
+    CHECK_EQ(body.tuple_struct_indices[1], 1u);
+}
+
+TEST(frontend, source_pipe_tuple_slot_preserves_generic_index) {
+    const auto src = R"(
+func id<T>(x: T) -> T => x
+func first<T>(x: (T, i32)) -> T {
+    x | id(_1)
+}
+route GET "/users" {
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    const auto& body = hir->functions[1].body;
+    CHECK_EQ(body.type, HirTypeKind::Generic);
+    CHECK_EQ(body.generic_index, 0u);
+}
+
+TEST(frontend, analyze_rejects_eq_constraint_for_tuple_with_generic_slot) {
+    const auto src = R"(
+func same<T: Eq>(x: T, y: T) -> bool => x.eq(y)
+func compare<U: Eq>(a: (U, i32), b: (U, i32)) -> bool {
+    same(a, b)
+}
+route GET "/users" {
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, source_pipe_unwrapped_tuple_of_struct_preserves_param_shape) {
     const auto src = R"(
 struct Box { value: i32 }
@@ -14646,6 +16725,27 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
+
+TEST(frontend, analyze_rejects_conditional_pipe_missing_later_custom_constraint) {
+    const auto src = R"(
+protocol First {}
+protocol Second {}
+str impl First {}
+func requireBoth<T>(x: T) -> i32 where First(T), Second(T) => 200
+route GET "/users" {
+    let code = req.header("Host") | requireBoth(_)
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, source_pipe_runtime_error_lhs_flows_via_or) {
     const auto src = R"(
 func fail() -> i32 => error(.timeout)

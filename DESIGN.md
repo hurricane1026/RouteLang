@@ -5049,7 +5049,19 @@ Examples of the intended layering:
 - User-facing sugar: `func contains<T: Eq>(xs: [T], needle: T) -> bool`
 - Canonical semantic form: `func contains<T>(xs: [T], needle: T) -> bool where Eq(T)`
 
-The second form is the semantic core. The first is optional sugar.
+The second form is the semantic core. The first is optional sugar. The current
+front-end accepts both spellings for direct type-parameter predicates and
+normalizes them into the same HIR constraint metadata.
+
+First-stage `where` predicates are intentionally narrow:
+
+- `where Eq(T)`, `where Ord(T)`, `where Error(T)`
+- `where CustomProtocol(T)`
+- namespace-qualified protocol names, such as `where auth.Hashable(T)`
+- comma-separated predicates, such as `where Eq(T), Hashable(T)`
+
+They do not introduce arbitrary value expressions, overload selection rules, or
+C++-style substitution failure. A failed predicate is a normal type error.
 
 **Protocol Conformance and Default Implementations**
 
@@ -5110,6 +5122,117 @@ The intended order of exposure is:
 - only later, if truly needed, richer user-facing type-level expressions
 
 This keeps the implementation coherent while avoiding premature complexity in the surface language.
+
+#### 11.1.5A Associated Types and Type-Level Conditionals
+
+Rut should support the common library-design cases that C++ traits solve, but it
+should not inherit C++ template matching, partial specialization, SFINAE, or
+overload-ranking as the way to express type logic.
+
+The preferred model is explicit and predicate-based:
+
+```rut
+protocol Iterable {
+    type Elem
+    func first(self) -> Elem
+}
+
+Array<T> impl Iterable {
+    type Elem = T
+    func first(self: Array<T>) -> T { ... }
+}
+
+func head<C>(c: C) -> C.Elem where Iterable(C) {
+    c.first()
+}
+```
+
+Current implementation status: the front-end records protocol associated type
+requirements and validates matching `impl` bindings. Generic impl bindings may
+refer to the impl target's type parameters, such as `type Elem = T` in
+`Box<T> impl Iterable`. Protocol method requirements may use their own
+associated types directly, such as `func first() -> Elem` or
+`func push(x: Elem) -> i32`, and impl method signatures are checked against the
+impl's associated type bindings. Function return types and parameter types may
+project associated types with `C.Elem` when `C` has a matching protocol
+constraint; at call sites, concrete impl bindings and direct generic impl
+bindings such as `type Elem = T` are resolved through the receiver's instantiated
+type arguments.
+Bindings that wrap the target parameter in a generic struct or variant, such as
+`type Elem = Wrap<T>` or `type Elem = Result<T>`, are also concretized through
+the same receiver argument mapping.
+
+For conditional type-level decisions, Rut should expose explicit static
+branching rather than making failure-to-match part of overload resolution:
+
+```rut
+type Storage<T> match {
+case T: Copy => Inline<T>
+case T: MoveOnly => Box<T>
+case _ => Ref<T>
+}
+
+func clone_or_move<T>(x: T) -> T {
+    comptime if T: Clone {
+        x.clone()
+    } else {
+        x
+    }
+}
+```
+
+Rules for this family of features:
+
+- conditions are type predicates, such as `T: P`, `T == U`, or `T.Elem == U`
+- selected branches are fully type checked after generic binding
+- unselected branches may be syntax checked and deferred semantically
+- ambiguous matches are compile errors unless a construct explicitly defines order
+- these features must not participate in C++-style overload viability or ranking
+- implementation remains monomorphized; no trait objects or erased dispatch are implied
+
+Current implementation status: the first front-end slice supports top-level
+generic type aliases and ordered type-level `match` aliases:
+
+```rut
+type Storage<T> match {
+    case T: Eq => Inline<T>
+    case _ => Ref<T>
+}
+
+type Choice<T, U> match {
+    case T == U => Same<T>
+    case _ => Diff<T, U>
+}
+
+type Selected<C, U> match {
+    case C.Elem == U => Hit<U>
+    case _ => Miss<C, U>
+}
+```
+
+The implemented matcher currently supports generic type parameters,
+protocol-predicate arms (`case T: Eq => ...`, `case T: Error => ...`, and
+custom protocol predicates when conformance metadata is available), type
+equality arms (`case T == U => ...`), associated-type equality arms
+(`case C.Elem == U => ...`) once impl associated type bindings are available,
+and a wildcard fallback. Alias expansion works in ordinary type positions such
+as `let` annotations, function parameters, function return types, protocol method
+requirements, impl associated type bindings, struct fields, and variant payloads.
+Match selection works for concrete alias arguments and for
+generic arguments using the constraints available on those generics;
+unconstrained generics fall through to later arms such as `_`. Type equality and
+associated-type equality arms also work when the compared values contain generic
+parameters, including generic impl bindings such as
+`Box<T> impl Iterable { type Elem = T }`. Expansion preserves generic type
+parameters inside generic struct or variant targets. The front-end now
+pre-registers local impl conformance and associated-type binding metadata before
+function signature analysis, so associated-type equality arms are usable in
+function signatures as well as later expression-local type positions. Type match
+aliases are also
+imported through the ordinary relative/selective import path for library-defined
+traits-style helpers. Imported alias targets and custom protocol predicate arms
+are remapped through namespace aliases and selected-name renames. This remains a
+type-alias facility, not overload selection.
 
 #### 11.1.6 Pipeline Placeholder Rules
 

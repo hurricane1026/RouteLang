@@ -443,6 +443,46 @@ struct Builder {
         return TRY(emit(Opcode::ReqPath, ty, loc)).vid;
     }
 
+    Result<ValueId> emit_req_path_only(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Str));
+        return TRY(emit(Opcode::ReqPathOnly, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_req_body(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Str));
+        return TRY(emit(Opcode::ReqBody, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_req_keep_alive(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        return TRY(emit(Opcode::ReqKeepAlive, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_req_chunked(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        return TRY(emit(Opcode::ReqChunked, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_req_has_content_length(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        return TRY(emit(Opcode::ReqHasContentLength, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_req_http10(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        return TRY(emit(Opcode::ReqHttp10, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_req_http11(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        return TRY(emit(Opcode::ReqHttp11, ty, loc)).vid;
+    }
+
+    Result<ValueId> emit_req_http_version(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Str));
+        return TRY(emit(Opcode::ReqHttpVersion, ty, loc)).vid;
+    }
+
     Result<ValueId> emit_resume_event_kind(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::I32));
         return TRY(emit(Opcode::ResumeEventKind, ty, loc)).vid;
@@ -476,6 +516,20 @@ struct Builder {
         auto [inst, vid] = TRY(emit(Opcode::ReqCookie, ty, loc));
         inst->imm.str_val = name;
         return vid;
+    }
+
+    Result<ValueId> emit_req_query(Str name, SourceLoc loc = {}) {
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto [inst, vid] = TRY(emit(Opcode::ReqQuery, ty, loc));
+        inst->imm.str_val = name;
+        return vid;
+    }
+
+    Result<ValueId> emit_req_query_string(SourceLoc loc = {}) {
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        return TRY(emit(Opcode::ReqQueryString, ty, loc)).vid;
     }
 
     // ── Request mutation ────────────────────────────────────────────

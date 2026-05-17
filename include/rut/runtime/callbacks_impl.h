@@ -226,6 +226,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     conn.request_config = config;
     const RouteEntry* route = nullptr;
+    RouteParam route_params[kMaxRouteParams]{};
+    u32 route_param_count = 0;
     if (config) {
         const u8 kMethodKey = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
         // Use the parser-supplied canonical view (PR #50 round 7 path A)
@@ -237,7 +239,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // nullptr (miss) so those targets cannot fall into a "/" catchall.
         // {non-null ptr, len=0} remains a legitimate canonical view of
         // the origin-form root "/" and dispatches normally.
-        route = config->match_canonical(conn.req_path_canon, kMethodKey);
+        route = config->match_canonical(
+            conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
     }
 
     if (route && route->action == RouteAction::Proxy) {
@@ -283,12 +286,31 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
     } else if (route && route->action == RouteAction::JitHandler && route->fn) {
+        if (route->needs_req_body) {
+            if (conn.req_body_mode == BodyMode::Chunked) {
+                conn.state = ConnState::Sending;
+                conn.resp_status = 400;
+                format_static_response(conn, 400, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
+            if (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) {
+                conn.state = ConnState::ReadingBody;
+                conn.set_slots(&on_jit_request_body_recvd<Loop>, nullptr, nullptr, nullptr);
+                loop->submit_recv(conn);
+                return;
+            }
+        }
         conn.state = ConnState::ExecHandler;
         conn.handler_state = 0;  // entry state
         auto* ctx = conn.reset_jit_ctx();
         ctx->state = 0;
         ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
         ctx->resume_event_result = 0;
+        ctx->route_param_count = route_param_count;
+        for (u32 i = 0; i < route_param_count; i++) ctx->route_params[i] = route_params[i];
         auto outcome = invoke_jit_handler(route->fn,
                                           static_cast<void*>(&conn),
                                           *ctx,
@@ -308,6 +330,65 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
     }
+}
+
+template <typename Loop>
+void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+
+    if (ev.result <= 0) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    if (conn.req_body_mode != BodyMode::ContentLength || conn.req_body_remaining == 0) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    u32 consume = static_cast<u32>(ev.result);
+    if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
+    conn.req_body_remaining -= consume;
+    conn.req_size += consume;
+    conn.req_initial_send_len =
+        conn.req_header_end + (conn.req_content_length - conn.req_body_remaining);
+
+    if (conn.req_body_remaining > 0) {
+        conn.state = ConnState::ReadingBody;
+        conn.set_slots(&on_jit_request_body_recvd<Loop>, nullptr, nullptr, nullptr);
+        loop->submit_recv(conn);
+        return;
+    }
+
+    const RouteConfig* config = conn.request_config;
+    const RouteEntry* route = nullptr;
+    RouteParam route_params[kMaxRouteParams]{};
+    u32 route_param_count = 0;
+    if (config) {
+        const u8 kMethodKey = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
+        route = config->match_canonical(
+            conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
+    }
+    if (!route || route->action != RouteAction::JitHandler || !route->fn) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    conn.state = ConnState::ExecHandler;
+    conn.handler_state = 0;
+    auto* ctx = conn.reset_jit_ctx();
+    ctx->state = 0;
+    ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
+    ctx->resume_event_result = 0;
+    ctx->route_param_count = route_param_count;
+    for (u32 i = 0; i < route_param_count; i++) ctx->route_params[i] = route_params[i];
+    auto outcome = invoke_jit_handler(route->fn,
+                                      static_cast<void*>(&conn),
+                                      *ctx,
+                                      conn.recv_buf.data(),
+                                      conn.recv_buf.len(),
+                                      /*arena=*/nullptr);
+    handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, conn.keep_alive);
 }
 
 template <typename Loop>

@@ -147,6 +147,18 @@ static bool validate_manifest(const Manifest& manifest) {
     return true;
 }
 
+static bool rir_function_needs_req_body(const rir::Function& fn) {
+    if (fn.blocks == nullptr) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& block = fn.blocks[bi];
+        if (block.insts == nullptr) continue;
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            if (block.insts[ii].op == rir::Opcode::ReqBody) return true;
+        }
+    }
+    return false;
+}
+
 static bool copy_str_into_arena(MmapArena& arena, const char* src, u32 len, Str* out) {
     char* mem = arena.alloc_array<char>(len + 1);
     if (!mem) return false;
@@ -157,44 +169,122 @@ static bool copy_str_into_arena(MmapArena& arena, const char* src, u32 len, Str*
     return true;
 }
 
-static bool route_matches(const Engine::CompiledRoute& route, const char* path, u32 path_len) {
+static bool route_matches(const Engine::CompiledRoute& route,
+                          const char* path,
+                          u32 path_len,
+                          RouteParam* out_params = nullptr,
+                          u32* out_param_count = nullptr,
+                          u32 out_param_cap = 0,
+                          u32* out_depth = nullptr,
+                          u32* out_static_segments = nullptr,
+                          u64* out_static_mask = nullptr) {
     u32 pi = 0;
     u32 ri = 0;
+    u32 param_count = 0;
+    u32 stored_param_count = 0;
+    u32 depth = 0;
+    u32 static_segments = 0;
+    u64 static_mask = 0;
     while (ri < route.pattern_len) {
         const bool kParamSegment =
             route.pattern[ri] == ':' && (ri == 0 || route.pattern[ri - 1] == '/');
         if (kParamSegment) {
-            ri++;
+            depth++;
+            const u32 name_start = ri + 1;
+            ri = name_start;
             while (ri < route.pattern_len && route.pattern[ri] != '/') ri++;
+            const u32 name_len = ri - name_start;
             const u32 param_start = pi;
-            while (pi < path_len && path[pi] != '/' && path[pi] != '?') pi++;
+            while (pi < path_len && path[pi] != '/' && path[pi] != '?' && path[pi] != '#') pi++;
             if (pi == param_start) return false;
+            if (out_params && stored_param_count < out_param_cap) {
+                out_params[stored_param_count++] = {
+                    route.pattern + name_start, name_len, path + param_start, pi - param_start};
+            }
+            param_count++;
             continue;
         }
         if (pi >= path_len) return false;
-        if (path[pi] == '?') return false;
+        if (path[pi] == '?' || path[pi] == '#') return false;
         if (route.pattern[ri] != path[pi]) return false;
+        if ((ri == 0 || route.pattern[ri - 1] == '/') && route.pattern[ri] != '/') {
+            depth++;
+            static_segments++;
+            if (depth < 64) static_mask |= 1ull << (63 - depth);
+        }
         ri++;
         pi++;
     }
+    if (out_param_count) *out_param_count = out_params ? stored_param_count : param_count;
+    if (out_depth) *out_depth = depth;
+    if (out_static_segments) *out_static_segments = static_segments;
+    if (out_static_mask) *out_static_mask = static_mask;
     return true;
 }
 
 static const Engine::CompiledRoute* select_route(const Engine& engine,
                                                  u8 method_key,
                                                  const char* path,
-                                                 u32 path_len) {
+                                                 u32 path_len,
+                                                 RouteParam* out_params = nullptr,
+                                                 u32* out_param_count = nullptr,
+                                                 u32 out_param_cap = 0) {
+    const Engine::CompiledRoute* best = nullptr;
+    u32 best_depth = 0;
+    u32 best_static_segments = 0;
+    u64 best_static_mask = 0;
+    bool best_method_specific = false;
+    RouteParam best_params[kMaxRouteParams]{};
+    u32 best_param_count = 0;
+
     for (u32 i = 0; i < engine.route_count; i++) {
         const auto& route = engine.routes[i];
         if (route.method != 0 && route.method != method_key) continue;
-        if (route_matches(route, path, path_len)) return &route;
+        const bool method_specific = route.method != 0;
+        RouteParam candidate_params[kMaxRouteParams]{};
+        u32 param_count = 0;
+        u32 depth = 0;
+        u32 static_segments = 0;
+        u64 static_mask = 0;
+        if (route_matches(route,
+                          path,
+                          path_len,
+                          candidate_params,
+                          &param_count,
+                          kMaxRouteParams,
+                          &depth,
+                          &static_segments,
+                          &static_mask)) {
+            if (best == nullptr || depth > best_depth ||
+                (depth == best_depth && static_segments > best_static_segments) ||
+                (depth == best_depth && static_segments == best_static_segments &&
+                 static_mask > best_static_mask) ||
+                (depth == best_depth && static_segments == best_static_segments &&
+                 static_mask == best_static_mask && method_specific && !best_method_specific)) {
+                best = &route;
+                best_depth = depth;
+                best_static_segments = static_segments;
+                best_static_mask = static_mask;
+                best_method_specific = method_specific;
+                best_param_count = param_count < out_param_cap ? param_count : out_param_cap;
+                for (u32 j = 0; j < best_param_count; j++) best_params[j] = candidate_params[j];
+            }
+        }
     }
+    if (best) {
+        if (out_params) {
+            for (u32 i = 0; i < best_param_count; i++) out_params[i] = best_params[i];
+        }
+        if (out_param_count) *out_param_count = best_param_count;
+        return best;
+    }
+    if (out_param_count) *out_param_count = 0;
     return nullptr;
 }
 
 static u32 visible_path_len(Str path) {
     u32 n = 0;
-    while (n < path.len && path.ptr[n] != '?') n++;
+    while (n < path.len && path.ptr[n] != '?' && path.ptr[n] != '#') n++;
     return n;
 }
 
@@ -788,6 +878,7 @@ bool Engine::init(const rir::Module& module,
         for (u32 j = 0; j < route.pattern_len; j++) route.pattern[j] = fn.route_pattern.ptr[j];
         route.pattern[route.pattern_len] = '\0';
         route.fn = reinterpret_cast<jit::HandlerFn>(addr);
+        route.needs_req_body = rir_function_needs_req_body(fn);
     }
 
     for (u32 i = 0; i < next_route_count; i++) routes[i] = next_routes[i];
@@ -824,8 +915,15 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     for (u32 i = 0; i < copy_len; i++) result.path[i] = req.path.ptr[i];
     result.path[copy_len] = '\0';
 
-    const auto* route =
-        select_route(engine, http_route_method_key(req.method), req.path.ptr, kPathLen);
+    RouteParam route_params[kMaxRouteParams]{};
+    u32 route_param_count = 0;
+    const auto* route = select_route(engine,
+                                     http_route_method_key(req.method),
+                                     req.path.ptr,
+                                     kPathLen,
+                                     route_params,
+                                     &route_param_count,
+                                     kMaxRouteParams);
     if (!route) {
         result.action = jit::HandlerAction::ReturnStatus;
         result.actual_status = 200;
@@ -834,11 +932,17 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
                              : Verdict::Mismatch;
         return result;
     }
+    if (route->needs_req_body) {
+        result.verdict = Verdict::Unsupported;
+        return result;
+    }
 
     Connection conn;
     conn.reset();
     SimHandlerFrame frame;
     init_sim_handler_frame(frame);
+    frame.ctx.route_param_count = route_param_count;
+    for (u32 i = 0; i < route_param_count; i++) frame.ctx.route_params[i] = route_params[i];
 
     // Drive the handler's state machine to completion. Yields are the
     // handler's signal "I need I/O, resume me with state=next_state".

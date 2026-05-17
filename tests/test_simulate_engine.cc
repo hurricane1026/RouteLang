@@ -405,6 +405,27 @@ TEST(simulate_engine, wait_handler_drives_state_machine_to_terminal_status) {
     rir.destroy();
 }
 
+TEST(simulate_engine, req_body_route_is_unsupported_for_header_only_capture) {
+    const char* src =
+        "route POST \"/upload\" { if req.body == \"payload\" { return 204 } else { return 400 } "
+        "}\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    REQUIRE_EQ(engine.route_count, 1u);
+    CHECK(engine.routes[0].needs_req_body);
+
+    const auto result = simulate_one(
+        engine, make_entry("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Unsupported);
+    CHECK_EQ(result.actual_status, 0u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, let_before_wait_drives_to_terminal) {
     // Slice 1 acceptance: a let before a wait runs when the terminal
     // state reaches the entry block, and the yield chain still drives
@@ -893,6 +914,181 @@ TEST(simulate_engine, param_prefix_route_matches) {
     const auto result =
         simulate_one(engine, make_entry("GET /users/123/profile HTTP/1.1\r\nHost: x\r\n\r\n", 201));
     CHECK_EQ(result.verdict, Verdict::Match);
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
+TEST(simulate_engine, route_param_capture_feeds_jit_handler_ctx) {
+    ModuleContext ctx;
+    REQUIRE(ctx.init(1));
+
+    rir::Builder b;
+    b.init(&ctx.module);
+
+    auto fn_res = b.create_function(Str{"param_guard", 11}, Str{"/users/:id", 10}, kRouteMethodGet);
+    REQUIRE(fn_res);
+    auto* fn = fn_res.value();
+    auto entry_res = b.create_block(fn, Str{"entry", 5});
+    auto ok_res = b.create_block(fn, Str{"ok", 2});
+    auto reject_res = b.create_block(fn, Str{"reject", 6});
+    REQUIRE(entry_res);
+    REQUIRE(ok_res);
+    REQUIRE(reject_res);
+
+    auto entry = entry_res.value();
+    auto ok = ok_res.value();
+    auto reject = reject_res.value();
+
+    b.set_insert_point(fn, entry);
+    auto id = b.emit_req_param(Str{"id", 2});
+    REQUIRE(id);
+    auto want = b.emit_const_str(Str{"42", 2});
+    REQUIRE(want);
+    auto matches = b.emit_cmp(rir::Opcode::CmpEq, id.value(), want.value());
+    REQUIRE(matches);
+    REQUIRE(b.emit_br(matches.value(), ok, reject));
+
+    b.set_insert_point(fn, ok);
+    REQUIRE(b.emit_ret_status(201));
+
+    b.set_insert_point(fn, reject);
+    REQUIRE(b.emit_ret_status(404));
+
+    Engine engine;
+    REQUIRE(engine.init(ctx.module, nullptr, 0));
+
+    const auto hit =
+        simulate_one(engine, make_entry("GET /users/42 HTTP/1.1\r\nHost: x\r\n\r\n", 201));
+    CHECK_EQ(hit.verdict, Verdict::Match);
+    CHECK_EQ(hit.actual_status, 201u);
+
+    const auto miss =
+        simulate_one(engine, make_entry("GET /users/41 HTTP/1.1\r\nHost: x\r\n\r\n", 404));
+    CHECK_EQ(miss.verdict, Verdict::Match);
+    CHECK_EQ(miss.actual_status, 404u);
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
+TEST(simulate_engine, frontend_req_param_guard_matches_capture) {
+    const char* src =
+        "route GET \"/users/:id\" { if req.param(\"id\") == \"42\" { return 201 } else { return "
+        "404 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto hit =
+        simulate_one(engine, make_entry("GET /users/42 HTTP/1.1\r\nHost: x\r\n\r\n", 201));
+    CHECK_EQ(hit.verdict, Verdict::Match);
+    CHECK_EQ(hit.actual_status, 201u);
+
+    const auto miss =
+        simulate_one(engine, make_entry("GET /users/41 HTTP/1.1\r\nHost: x\r\n\r\n", 404));
+    CHECK_EQ(miss.verdict, Verdict::Match);
+    CHECK_EQ(miss.actual_status, 404u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, literal_route_takes_precedence_over_earlier_param_route) {
+    Manifest manifest{};
+    manifest.route_count = 2;
+    manifest.routes[0].method = kRouteMethodGet;
+    strcpy(manifest.routes[0].pattern, "/users/:id");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 201;
+    manifest.routes[1].method = kRouteMethodGet;
+    strcpy(manifest.routes[1].pattern, "/users/me");
+    manifest.routes[1].action = ManifestAction::ReturnStatus;
+    manifest.routes[1].status_code = 202;
+
+    ModuleContext ctx;
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+
+    const auto literal =
+        simulate_one(engine, make_entry("GET /users/me HTTP/1.1\r\nHost: x\r\n\r\n", 202));
+    CHECK_EQ(literal.verdict, Verdict::Match);
+    CHECK_EQ(literal.actual_status, 202u);
+
+    const auto param =
+        simulate_one(engine, make_entry("GET /users/42 HTTP/1.1\r\nHost: x\r\n\r\n", 201));
+    CHECK_EQ(param.verdict, Verdict::Match);
+    CHECK_EQ(param.actual_status, 201u);
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
+TEST(simulate_engine, earlier_literal_segment_takes_precedence_over_later_literal_segment) {
+    Manifest manifest{};
+    manifest.route_count = 2;
+    manifest.routes[0].method = kRouteMethodGet;
+    strcpy(manifest.routes[0].pattern, "/:a/x");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 201;
+    manifest.routes[1].method = kRouteMethodGet;
+    strcpy(manifest.routes[1].pattern, "/b/:y");
+    manifest.routes[1].action = ManifestAction::ReturnStatus;
+    manifest.routes[1].status_code = 202;
+
+    ModuleContext ctx;
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+
+    const auto result =
+        simulate_one(engine, make_entry("GET /b/x HTTP/1.1\r\nHost: x\r\n\r\n", 202));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 202u);
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
+TEST(simulate_engine, param_capture_stops_at_fragment_delimiter) {
+    const char* src =
+        "route GET \"/users/:id\" { if req.param(\"id\") == \"42\" { return 201 } else { return "
+        "404 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto hit =
+        simulate_one(engine, make_entry("GET /users/42#frag HTTP/1.1\r\nHost: x\r\n\r\n", 201));
+    CHECK_EQ(hit.verdict, Verdict::Match);
+    CHECK_EQ(hit.actual_status, 201u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, deep_param_route_matches_when_capture_buffer_fills) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = kRouteMethodGet;
+    strcpy(manifest.routes[0].pattern, "/:a/:b/:c/:d/:e/:f/:g/:h/:i/:j/:k/:l/:m/:n/:o/:p/:q");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 201;
+
+    ModuleContext ctx;
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+
+    const auto result =
+        simulate_one(engine,
+                     make_entry("GET /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17 HTTP/1.1\r\nHost: "
+                                "x\r\n\r\n",
+                                201));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 201u);
 
     engine.shutdown();
     ctx.destroy();

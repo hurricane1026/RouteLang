@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/runtime/route_params.h"
 
 namespace rut {
 namespace jit {
@@ -119,7 +120,7 @@ struct HandlerResult {
 // Per-request mutable context, allocated from the scratch Arena.
 // Holds the state machine index and live-across-yield values.
 //
-// Layout: [HandlerCtx header] [slot_0] [slot_1] ... [slot_N]
+// Layout: [HandlerCtx header + route params] [slot_0] [slot_1] ... [slot_N]
 // Each slot is 8-byte aligned. The number and types of slots are
 // determined at compile time by the state-splitting pass.
 
@@ -129,6 +130,9 @@ struct alignas(alignof(u64)) HandlerCtx {
     u32 slot_count;           // number of 8-byte slots following this header
     u32 resume_event_kind;    // YieldKind value that resumed this handler
     i32 resume_event_result;  // IoEvent::result for event waits
+    u32 route_param_count;    // number of populated route_params entries
+    u32 reserved0;
+    RouteParam route_params[kMaxRouteParams];
 
     // Access slot storage (8-byte aligned, immediately after header).
     u8* slots() { return reinterpret_cast<u8*>(this + 1); }
@@ -154,7 +158,8 @@ struct alignas(alignof(u64)) HandlerCtx {
     }
 };
 
-static_assert(sizeof(HandlerCtx) == 16, "HandlerCtx header must be 16 bytes");
+static_assert(sizeof(HandlerCtx) % alignof(RouteParam) == 0,
+              "HandlerCtx route params must preserve alignment");
 static_assert(alignof(HandlerCtx) >= alignof(u64), "HandlerCtx must be 8-byte aligned");
 static_assert(sizeof(HandlerCtx) % alignof(u64) == 0,
               "HandlerCtx slots must start at an 8-byte-aligned offset");

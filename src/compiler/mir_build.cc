@@ -37,14 +37,16 @@ static Str match_default_label() {
 }
 
 static MirTypeKind mir_type_kind(HirTypeKind kind) {
-    return kind == HirTypeKind::Bool      ? MirTypeKind::Bool
-           : kind == HirTypeKind::I32     ? MirTypeKind::I32
-           : kind == HirTypeKind::Str     ? MirTypeKind::Str
-           : kind == HirTypeKind::Method  ? MirTypeKind::Method
-           : kind == HirTypeKind::Variant ? MirTypeKind::Variant
-           : kind == HirTypeKind::Tuple   ? MirTypeKind::Tuple
-           : kind == HirTypeKind::Struct  ? MirTypeKind::Struct
-                                          : MirTypeKind::Unknown;
+    return kind == HirTypeKind::Bool       ? MirTypeKind::Bool
+           : kind == HirTypeKind::I32      ? MirTypeKind::I32
+           : kind == HirTypeKind::Str      ? MirTypeKind::Str
+           : kind == HirTypeKind::Method   ? MirTypeKind::Method
+           : kind == HirTypeKind::ByteSize ? MirTypeKind::ByteSize
+           : kind == HirTypeKind::IP       ? MirTypeKind::IP
+           : kind == HirTypeKind::Variant  ? MirTypeKind::Variant
+           : kind == HirTypeKind::Tuple    ? MirTypeKind::Tuple
+           : kind == HirTypeKind::Struct   ? MirTypeKind::Struct
+                                           : MirTypeKind::Unknown;
 }
 
 static bool expand_hir_flat_shape(const HirModule& module,
@@ -365,9 +367,85 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.str_value = expr.str_value;
         return v;
     }
+    if (expr.kind == HirExprKind::ReqParam) {
+        v.kind = MirValueKind::ReqParam;
+        v.type = MirTypeKind::Str;
+        v.str_value = expr.str_value;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqCookie) {
+        v.kind = MirValueKind::ReqCookie;
+        v.type = MirTypeKind::Str;
+        v.may_nil = true;
+        v.str_value = expr.str_value;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqQuery) {
+        v.kind = MirValueKind::ReqQuery;
+        v.type = MirTypeKind::Str;
+        v.may_nil = true;
+        v.str_value = expr.str_value;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqQueryString) {
+        v.kind = MirValueKind::ReqQueryString;
+        v.type = MirTypeKind::Str;
+        v.may_nil = true;
+        return v;
+    }
     if (expr.kind == HirExprKind::ReqPath) {
         v.kind = MirValueKind::ReqPath;
         v.type = MirTypeKind::Str;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqPathOnly) {
+        v.kind = MirValueKind::ReqPathOnly;
+        v.type = MirTypeKind::Str;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqBody) {
+        v.kind = MirValueKind::ReqBody;
+        v.type = MirTypeKind::Str;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqKeepAlive) {
+        v.kind = MirValueKind::ReqKeepAlive;
+        v.type = MirTypeKind::Bool;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqChunked) {
+        v.kind = MirValueKind::ReqChunked;
+        v.type = MirTypeKind::Bool;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqHasContentLength) {
+        v.kind = MirValueKind::ReqHasContentLength;
+        v.type = MirTypeKind::Bool;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqHttp10) {
+        v.kind = MirValueKind::ReqHttp10;
+        v.type = MirTypeKind::Bool;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqHttp11) {
+        v.kind = MirValueKind::ReqHttp11;
+        v.type = MirTypeKind::Bool;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqHttpVersion) {
+        v.kind = MirValueKind::ReqHttpVersion;
+        v.type = MirTypeKind::Str;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqContentLength) {
+        v.kind = MirValueKind::ReqContentLength;
+        v.type = MirTypeKind::ByteSize;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqRemoteAddr) {
+        v.kind = MirValueKind::ReqRemoteAddr;
+        v.type = MirTypeKind::IP;
         return v;
     }
     if (expr.kind == HirExprKind::ConstMethod) {

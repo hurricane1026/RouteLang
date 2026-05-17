@@ -145,11 +145,41 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqParam:
             buf.put_cstr("req.param");
             break;
+        case Opcode::ReqQuery:
+            buf.put_cstr("req.query");
+            break;
+        case Opcode::ReqQueryString:
+            buf.put_cstr("req.queryString");
+            break;
         case Opcode::ReqMethod:
             buf.put_cstr("req.method");
             break;
         case Opcode::ReqPath:
             buf.put_cstr("req.path");
+            break;
+        case Opcode::ReqPathOnly:
+            buf.put_cstr("req.pathOnly");
+            break;
+        case Opcode::ReqBody:
+            buf.put_cstr("req.body");
+            break;
+        case Opcode::ReqKeepAlive:
+            buf.put_cstr("req.keepAlive");
+            break;
+        case Opcode::ReqChunked:
+            buf.put_cstr("req.chunked");
+            break;
+        case Opcode::ReqHasContentLength:
+            buf.put_cstr("req.hasContentLength");
+            break;
+        case Opcode::ReqHttp10:
+            buf.put_cstr("req.http10");
+            break;
+        case Opcode::ReqHttp11:
+            buf.put_cstr("req.http11");
+            break;
+        case Opcode::ReqHttpVersion:
+            buf.put_cstr("req.httpVersion");
             break;
         case Opcode::ResumeEventKind:
             buf.put_cstr("resume.event_kind");
@@ -476,12 +506,17 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::ReqHeader:
         case Opcode::ReqParam:
+        case Opcode::ReqQuery:
         case Opcode::ReqCookie:
             buf.put(' ');
             print_quoted_str(buf, inst.imm.str_val);
             break;
         case Opcode::ReqMethod:
         case Opcode::ReqPath:
+        case Opcode::ReqPathOnly:
+        case Opcode::ReqBody:
+        case Opcode::ReqQueryString:
+        case Opcode::ReqHttpVersion:
         case Opcode::ResumeEventKind:
         case Opcode::ResumeEventResult:
             break;

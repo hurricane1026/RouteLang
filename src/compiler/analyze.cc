@@ -151,7 +151,8 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.array_elem_shape_index =
         type == HirTypeKind::Array ? array_elem_shape_index : 0xffffffffu;
     shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
-                        type == HirTypeKind::Str || type == HirTypeKind::Method;
+                        type == HirTypeKind::Str || type == HirTypeKind::Method ||
+                        type == HirTypeKind::ByteSize || type == HirTypeKind::IP;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -363,6 +364,8 @@ static bool hir_type_shape_satisfies_eq_constraint(const HirModule& mod,
         case HirTypeKind::I32:
         case HirTypeKind::Str:
         case HirTypeKind::Method:
+        case HirTypeKind::ByteSize:
+        case HirTypeKind::IP:
             return true;
         case HirTypeKind::Tuple:
             for (u32 i = 0; i < tuple_len; i++) {
@@ -1271,6 +1274,30 @@ static Str import_namespace_name(Str path, bool has_alias, Str alias) {
 static bool import_namespace_matches(Str path, bool has_alias, Str alias, Str ns) {
     const auto name = import_namespace_name(path, has_alias, alias);
     return name.eq(ns);
+}
+
+static bool is_route_param_name_byte(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+static bool route_path_has_param(Str path, Str name) {
+    u32 segment_start = 0;
+    while (segment_start < path.len) {
+        while (segment_start < path.len && path.ptr[segment_start] == '/') segment_start++;
+        u32 segment_end = segment_start;
+        while (segment_end < path.len && path.ptr[segment_end] != '/') segment_end++;
+        if (segment_end > segment_start && path.ptr[segment_start] == ':') {
+            const u32 name_start = segment_start + 1;
+            u32 name_end = name_start;
+            while (name_end < segment_end && is_route_param_name_byte(path.ptr[name_end]))
+                name_end++;
+            if (name_end == segment_end && name_end > name_start &&
+                Str{path.ptr + name_start, name_end - name_start}.eq(name))
+                return true;
+        }
+        segment_start = segment_end + 1;
+    }
+    return false;
 }
 
 static bool has_import_namespace(const HirModule& mod, Str ns) {
@@ -3113,6 +3140,33 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  u32 local_count,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs);
+static bool user_bound_req_name(const HirModule& mod,
+                                const HirLocal* locals,
+                                u32 local_count,
+                                const MatchPayloadBinding* binding) {
+    if (binding && binding->subject && binding->name.eq({"req", 3})) return true;
+    for (u32 i = 0; i < local_count; i++) {
+        if (locals[i].name.eq({"req", 3})) return true;
+    }
+    for (u32 i = 0; i < mod.variants.len; i++) {
+        if (mod.variants[i].name.eq({"req", 3})) return true;
+    }
+    if (find_function_index(mod, {"req", 3}) < mod.functions.len) return true;
+    if (find_struct_index(mod, {"req", 3}) < mod.structs.len) return true;
+    if (find_protocol_index(mod, {"req", 3}) < mod.protocols.len) return true;
+    if (find_type_alias(mod, {"req", 3}) != nullptr) return true;
+    return has_import_namespace(mod, {"req", 3});
+}
+
+static bool magic_req_receiver(const AstExpr& lhs,
+                               const HirModule& mod,
+                               const HirLocal* locals,
+                               u32 local_count,
+                               const MatchPayloadBinding* binding) {
+    return lhs.kind == AstExprKind::Ident && lhs.name.eq({"req", 3}) &&
+           !user_bound_req_name(mod, locals, local_count, binding);
+}
+
 static FrontendResult<HirExpr> analyze_method_call_expr(const AstExpr& expr,
                                                         HirRoute* route,
                                                         const HirModule& mod,
@@ -3164,6 +3218,31 @@ static FrontendResult<HirExpr> analyze_method_call_expr(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         auto variant = analyze_expr(variant_expr, route, mod, locals, local_count, binding);
         if (variant) return variant;
+    }
+    if (magic_req_receiver(*expr.lhs, mod, locals, local_count, binding) &&
+        (expr.name.eq({"header", 6}) || expr.name.eq({"param", 5}) || expr.name.eq({"cookie", 6}) ||
+         expr.name.eq({"query", 5}))) {
+        if (expr.args.len != 1 || expr.args[0] == nullptr ||
+            expr.args[0]->kind != AstExprKind::StrLit) {
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        }
+        HirExpr out{};
+        out.span = expr.span;
+        out.type = HirTypeKind::Str;
+        out.str_value = expr.args[0]->str_value;
+        if (expr.name.eq({"param", 5})) {
+            out.kind = HirExprKind::ReqParam;
+        } else if (expr.name.eq({"cookie", 6})) {
+            out.kind = HirExprKind::ReqCookie;
+            out.may_nil = true;
+        } else if (expr.name.eq({"query", 5})) {
+            out.kind = HirExprKind::ReqQuery;
+            out.may_nil = true;
+        } else {
+            out.kind = HirExprKind::ReqHeader;
+            out.may_nil = true;
+        }
+        return out;
     }
 
     auto build_cmp = [&](HirExprKind kind,
@@ -5190,40 +5269,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
     if (expr.kind == AstExprKind::MethodCall) {
         return analyze_method_call_expr(expr, route, mod, locals, local_count, binding);
     }
-    // `req.X` is magic only when the name `req` doesn't already
-    // resolve to something the user declared: a local binding, a
-    // variant name, or an import namespace alias. Any of those wins
-    // and we fall through to the generic Field handler below, which
-    // knows how to route variant construction / namespace members /
-    // local field access. Only when `req` resolves to nothing does
-    // the magic request-object path take over.
     if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
         expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq({"req", 3})) {
-        bool user_bound = false;
-        if (binding && binding->subject && binding->name.eq({"req", 3})) user_bound = true;
-        for (u32 i = 0; i < local_count; i++) {
-            if (locals[i].name.eq({"req", 3})) {
-                user_bound = true;
-                break;
-            }
-        }
-        if (!user_bound) {
-            for (u32 i = 0; i < mod.variants.len; i++) {
-                if (mod.variants[i].name.eq({"req", 3})) {
-                    user_bound = true;
-                    break;
-                }
-            }
-        }
-        if (!user_bound) {
-            Str ignored_qualified{};
-            if (resolve_import_namespace_member(mod, expr, ignored_qualified)) user_bound = true;
-        }
-        if (!user_bound) {
-            // Known fields: method (HttpMethod), path (str). `header` isn't reached via this
-            // path — the parser captures `req.header("...")` as the
-            // dedicated ReqHeader special form before generic Field
-            // parsing runs.
+        if (magic_req_receiver(*expr.lhs, mod, locals, local_count, binding)) {
             if (expr.name.eq({"method", 6})) {
                 out.kind = HirExprKind::ReqMethod;
                 out.type = HirTypeKind::Method;
@@ -5232,6 +5280,62 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (expr.name.eq({"path", 4})) {
                 out.kind = HirExprKind::ReqPath;
                 out.type = HirTypeKind::Str;
+                return out;
+            }
+            if (expr.name.eq({"pathOnly", 8})) {
+                out.kind = HirExprKind::ReqPathOnly;
+                out.type = HirTypeKind::Str;
+                return out;
+            }
+            if (expr.name.eq({"body", 4})) {
+                out.kind = HirExprKind::ReqBody;
+                out.type = HirTypeKind::Str;
+                return out;
+            }
+            if (expr.name.eq({"keepAlive", 9})) {
+                out.kind = HirExprKind::ReqKeepAlive;
+                out.type = HirTypeKind::Bool;
+                return out;
+            }
+            if (expr.name.eq({"chunked", 7})) {
+                out.kind = HirExprKind::ReqChunked;
+                out.type = HirTypeKind::Bool;
+                return out;
+            }
+            if (expr.name.eq({"hasContentLength", 16})) {
+                out.kind = HirExprKind::ReqHasContentLength;
+                out.type = HirTypeKind::Bool;
+                return out;
+            }
+            if (expr.name.eq({"http10", 6})) {
+                out.kind = HirExprKind::ReqHttp10;
+                out.type = HirTypeKind::Bool;
+                return out;
+            }
+            if (expr.name.eq({"http11", 6})) {
+                out.kind = HirExprKind::ReqHttp11;
+                out.type = HirTypeKind::Bool;
+                return out;
+            }
+            if (expr.name.eq({"httpVersion", 11})) {
+                out.kind = HirExprKind::ReqHttpVersion;
+                out.type = HirTypeKind::Str;
+                return out;
+            }
+            if (expr.name.eq({"contentLength", 13})) {
+                out.kind = HirExprKind::ReqContentLength;
+                out.type = HirTypeKind::ByteSize;
+                return out;
+            }
+            if (expr.name.eq({"remoteAddr", 10})) {
+                out.kind = HirExprKind::ReqRemoteAddr;
+                out.type = HirTypeKind::IP;
+                return out;
+            }
+            if (expr.name.eq({"queryString", 11})) {
+                out.kind = HirExprKind::ReqQueryString;
+                out.type = HirTypeKind::Str;
+                out.may_nil = true;
                 return out;
             }
             struct ReqHeaderAlias {
@@ -5262,6 +5366,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.type = HirTypeKind::Str;
                 out.may_nil = true;
                 out.str_value = alias.header;
+                return out;
+            }
+            if (route != nullptr && route_path_has_param(route->path, expr.name)) {
+                out.kind = HirExprKind::ReqParam;
+                out.type = HirTypeKind::Str;
+                out.str_value = expr.name;
                 return out;
             }
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
@@ -5691,6 +5801,32 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.type = HirTypeKind::Str;
         out.may_nil = true;
         out.str_value = expr.str_value;
+        return out;
+    }
+    if (expr.kind == AstExprKind::ReqParam) {
+        out.kind = HirExprKind::ReqParam;
+        out.type = HirTypeKind::Str;
+        out.str_value = expr.str_value;
+        return out;
+    }
+    if (expr.kind == AstExprKind::ReqCookie) {
+        out.kind = HirExprKind::ReqCookie;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
+        out.str_value = expr.str_value;
+        return out;
+    }
+    if (expr.kind == AstExprKind::ReqQuery) {
+        out.kind = HirExprKind::ReqQuery;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
+        out.str_value = expr.str_value;
+        return out;
+    }
+    if (expr.kind == AstExprKind::ReqQueryString) {
+        out.kind = HirExprKind::ReqQueryString;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
         return out;
     }
     if (expr.kind == AstExprKind::LitMethod) {

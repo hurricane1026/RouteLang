@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/route_method.h"
+#include "rut/runtime/route_params.h"
 
 namespace rut {
 
@@ -29,6 +30,8 @@ namespace rut {
 //   - Path is split on '/' into segments.
 //   - Empty segments are dropped (so "/api//v1" == "/api/v1", "/api/" == "/api").
 //   - Matching is case-sensitive (per RFC 3986).
+//   - Route segments beginning with ':' match one request segment.
+//     Callers may request captured (name, value) views for the matched route.
 //   - A route attached at the root ("/") acts as a catch-all for any request.
 //   - If multiple routes share a path, the first-inserted wins (build-order
 //     determinism for duplicate keys; the trie is built incrementally via
@@ -171,6 +174,15 @@ public:
     // legacy first-char normalization stays out of request dispatch.
     u16 match_key(Str path, u8 method_key) const;
 
+    // Same as match_key(), but also materializes route params from the
+    // winning dynamic route into caller-owned storage. `out_param_count`
+    // is set to 0 on miss and to the number copied on hit.
+    u16 match_key(Str path,
+                  u8 method_key,
+                  RouteParam* out_params,
+                  u32* out_param_count,
+                  u32 out_param_cap) const;
+
     // Introspection helpers (for tests / bench).
     u32 node_count() const { return nodes.len; }
 
@@ -209,6 +221,8 @@ private:
     // index on top — at our segment-length distribution it's a net
     // cost, not a savings.
     u16 find_child(u16 parent, Str segment) const;
+
+    static bool is_param_segment(Str segment);
 };
 
 }  // namespace rut

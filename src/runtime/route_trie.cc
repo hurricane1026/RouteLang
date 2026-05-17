@@ -71,6 +71,10 @@ u16 RouteTrie::find_child(u16 parent, Str segment) const {
     return TrieNode::kInvalidNodeIdx;
 }
 
+bool RouteTrie::is_param_segment(Str segment) {
+    return segment.len > 0 && segment.ptr[0] == ':';
+}
+
 bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     // Reject unsupported method bytes up-front. An earlier revision
     // fell back to slot 0 ("any") for unknown chars, which would
@@ -159,6 +163,15 @@ u16 RouteTrie::match(Str path, u8 method_char) const {
 }
 
 u16 RouteTrie::match_key(Str path, u8 method_key) const {
+    return match_key(path, method_key, nullptr, nullptr, 0);
+}
+
+u16 RouteTrie::match_key(Str path,
+                         u8 method_key,
+                         RouteParam* out_params,
+                         u32* out_param_count,
+                         u32 out_param_cap) const {
+    if (out_param_count) *out_param_count = 0;
     const u32 want_slot = method_key_slot(method_key);
     if (want_slot == kMethodSlotInvalid) return TrieNode::kInvalidRoute;
 
@@ -175,28 +188,105 @@ u16 RouteTrie::match_key(Str path, u8 method_key) const {
     // prefix route — insert() already rejects too-deep route configs,
     // so the trie never contains a terminal we'd miss.
     (void)tokenize_segments(path, segs);
-    u16 cur = 0;
-    // Track the deepest terminal we've seen that's compatible with the
-    // requested method. Initialize from the root so a route inserted at
-    // "/" acts as a catch-all even when the request has deeper segments
-    // not in the trie.
-    auto pick_terminal = [](const TrieNode& node, u32 slot) -> u16 {
+    struct Candidate {
+        u16 route_idx = TrieNode::kInvalidRoute;
+        u32 depth = 0;
+        u32 static_segments = 0;
+        u64 static_mask = 0;
+        bool method_specific = false;
+        FixedVec<RouteParam, kMaxRouteParams> params{};
+    };
+    Candidate best{};
+
+    struct Terminal {
+        u16 route_idx;
+        bool method_specific;
+    };
+    auto pick_terminal = [](const TrieNode& node, u32 slot) -> Terminal {
         // Prefer a method-specific slot; fall back to slot 0 ("any").
         if (slot != 0 && node.route_idx_by_method[slot] != TrieNode::kInvalidRoute) {
-            return node.route_idx_by_method[slot];
+            return {node.route_idx_by_method[slot], true};
         }
-        return node.route_idx_by_method[0];
+        return {node.route_idx_by_method[0], false};
     };
-    u16 best = pick_terminal(nodes[0], want_slot);
 
-    for (u32 i = 0; i < segs.len; i++) {
-        const u16 child = find_child(cur, segs[i]);
-        if (child == TrieNode::kInvalidNodeIdx) break;
-        cur = child;
-        const u16 candidate = pick_terminal(nodes[cur], want_slot);
-        if (candidate != TrieNode::kInvalidRoute) best = candidate;
+    auto consider = [&](Terminal terminal,
+                        u32 depth,
+                        u32 static_segments,
+                        u64 static_mask,
+                        const FixedVec<RouteParam, kMaxRouteParams>& params) {
+        if (terminal.route_idx == TrieNode::kInvalidRoute) return;
+        if (best.route_idx == TrieNode::kInvalidRoute || depth > best.depth ||
+            (depth == best.depth && static_segments > best.static_segments) ||
+            (depth == best.depth && static_segments == best.static_segments &&
+             static_mask > best.static_mask) ||
+            (depth == best.depth && static_segments == best.static_segments &&
+             static_mask == best.static_mask && terminal.method_specific &&
+             !best.method_specific)) {
+            best.route_idx = terminal.route_idx;
+            best.depth = depth;
+            best.static_segments = static_segments;
+            best.static_mask = static_mask;
+            best.method_specific = terminal.method_specific;
+            best.params = params;
+        }
+    };
+
+    struct Frame {
+        u16 node;
+        u32 seg_i;
+        u32 depth;
+        u32 static_segments;
+        u64 static_mask;
+        FixedVec<RouteParam, kMaxRouteParams> params;
+    };
+    FixedVec<Frame, kMaxNodes> stack{};
+    [[maybe_unused]] bool pushed = stack.push(Frame{});
+
+    while (stack.len > 0) {
+        const Frame frame = stack[stack.len - 1];
+        stack.len--;
+        consider(pick_terminal(nodes[frame.node], want_slot),
+                 frame.depth,
+                 frame.static_segments,
+                 frame.static_mask,
+                 frame.params);
+        if (frame.seg_i >= segs.len) continue;
+
+        const auto& node = nodes[frame.node];
+        for (u32 child_i = node.children.len; child_i > 0; child_i--) {
+            const u16 param_child = node.children[child_i - 1];
+            const Str name = nodes[param_child].segment;
+            if (!is_param_segment(name)) continue;
+            Frame next = frame;
+            next.node = param_child;
+            next.seg_i = frame.seg_i + 1;
+            next.depth = frame.depth + 1;
+            if (next.params.len < kMaxRouteParams) {
+                [[maybe_unused]] bool ok = next.params.push(RouteParam{
+                    name.ptr + 1, name.len - 1, segs[frame.seg_i].ptr, segs[frame.seg_i].len});
+            }
+            [[maybe_unused]] bool ok = stack.push(next);
+        }
+
+        const u16 literal_child = find_child(frame.node, segs[frame.seg_i]);
+        if (literal_child != TrieNode::kInvalidNodeIdx &&
+            !is_param_segment(nodes[literal_child].segment)) {
+            Frame next = frame;
+            next.node = literal_child;
+            next.seg_i = frame.seg_i + 1;
+            next.depth = frame.depth + 1;
+            next.static_segments = frame.static_segments + 1;
+            if (next.depth < 64) next.static_mask |= 1ull << (63 - next.depth);
+            [[maybe_unused]] bool ok = stack.push(next);
+        }
     }
-    return best;
+    if (out_params && out_param_count) {
+        const u32 n = best.params.len < out_param_cap ? best.params.len : out_param_cap;
+        for (u32 i = 0; i < n; i++) out_params[i] = best.params[i];
+        *out_param_count = n;
+    }
+    return best.route_idx;
 }
 
 }  // namespace rut

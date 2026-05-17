@@ -43,6 +43,72 @@ void rut_helper_req_path(const u8* req_data, u32 req_len, const char** out_ptr, 
     *out_len = i - path_start;
 }
 
+void rut_helper_req_path_only(const u8* req_data, u32 req_len, const char** out_ptr, u32* out_len) {
+    rut_helper_req_path(req_data, req_len, out_ptr, out_len);
+    if (!out_ptr || !out_len || !*out_ptr) return;
+    const char* path = *out_ptr;
+    const u32 path_len = *out_len;
+    for (u32 i = 0; i < path_len; i++) {
+        if (path[i] == '?' || path[i] == '#') {
+            *out_len = i;
+            return;
+        }
+    }
+}
+
+void rut_helper_req_body(const u8* req_data, u32 req_len, const char** out_ptr, u32* out_len) {
+    *out_ptr = "";
+    *out_len = 0;
+
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
+    if (!req.has_content_length || parser.header_end >= req_len || req.content_length == 0) return;
+
+    const u32 available = req_len - parser.header_end;
+    if (available < req.content_length) return;
+    *out_ptr = reinterpret_cast<const char*>(req_data + parser.header_end);
+    *out_len = req.content_length;
+}
+
+void rut_helper_req_http_version(const u8* req_data,
+                                 u32 req_len,
+                                 const char** out_ptr,
+                                 u32* out_len) {
+    *out_ptr = "";
+    *out_len = 0;
+
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
+
+    if (req.version == HttpVersion::Http10) {
+        *out_ptr = "HTTP/1.0";
+        *out_len = 8;
+        return;
+    }
+    if (req.version == HttpVersion::Http11) {
+        *out_ptr = "HTTP/1.1";
+        *out_len = 8;
+        return;
+    }
+}
+
+u8 rut_helper_req_flag(const u8* req_data, u32 req_len, u8 flag) {
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return 0;
+    if (flag == 0) return req.keep_alive ? 1 : 0;
+    if (flag == 1) return req.chunked ? 1 : 0;
+    if (flag == 2) return req.has_content_length ? 1 : 0;
+    if (flag == 3) return req.version == HttpVersion::Http10 ? 1 : 0;
+    if (flag == 4) return req.version == HttpVersion::Http11 ? 1 : 0;
+    return 0;
+}
+
 u8 rut_helper_req_method(const u8* req_data, u32 req_len) {
     HttpParser parser;
     ParsedRequest req;
@@ -96,9 +162,196 @@ void rut_helper_req_header(const u8* req_data,
     }
 }
 
+static bool ascii_header_name_eq(Str h, const char* name, u32 name_len) {
+    if (h.len != name_len) return false;
+    for (u32 j = 0; j < name_len; j++) {
+        u8 a = static_cast<u8>(h.ptr[j]);
+        u8 b = static_cast<u8>(name[j]);
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != b) return false;
+    }
+    return true;
+}
+
+void rut_helper_req_cookie(const u8* req_data,
+                           u32 req_len,
+                           const char* name,
+                           u32 name_len,
+                           u8* out_has_value,
+                           const char** out_ptr,
+                           u32* out_len) {
+    *out_has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    if (!name || name_len == 0) return;
+
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
+
+    for (u32 i = 0; i < req.header_count; i++) {
+        const auto& h = req.headers[i];
+        if (!ascii_header_name_eq(h.name, "Cookie", 6)) continue;
+        const char* p = h.value.ptr;
+        const u32 n = h.value.len;
+        u32 pos = 0;
+        while (pos < n) {
+            while (pos < n && (p[pos] == ' ' || p[pos] == '\t' || p[pos] == ';')) pos++;
+            const u32 key_start = pos;
+            while (pos < n && p[pos] != '=' && p[pos] != ';') pos++;
+            u32 key_end = pos;
+            while (key_end > key_start && (p[key_end - 1] == ' ' || p[key_end - 1] == '\t'))
+                key_end--;
+            if (pos >= n || p[pos] != '=') {
+                while (pos < n && p[pos] != ';') pos++;
+                continue;
+            }
+            pos++;
+            const u32 value_start = pos;
+            while (pos < n && p[pos] != ';') pos++;
+            u32 value_end = pos;
+            while (value_end > value_start && (p[value_end - 1] == ' ' || p[value_end - 1] == '\t'))
+                value_end--;
+            const u32 key_len = key_end - key_start;
+            if (key_len == name_len && memcmp(p + key_start, name, name_len) == 0) {
+                *out_has_value = 1;
+                *out_ptr = p + value_start;
+                *out_len = value_end - value_start;
+                return;
+            }
+        }
+    }
+}
+
+void rut_helper_req_query(const u8* req_data,
+                          u32 req_len,
+                          const char* name,
+                          u32 name_len,
+                          u8* out_has_value,
+                          const char** out_ptr,
+                          u32* out_len) {
+    *out_has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    if (!name || name_len == 0) return;
+
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
+    if (req.path.len == 0) return;
+
+    const char* path = req.path.ptr;
+    u32 path_len = req.path.len;
+    u32 path_pos = 0;
+    while (path_pos < path_len && path[path_pos] != '?' && path[path_pos] != '#') {
+        path_pos++;
+    }
+    if (path_pos >= path_len || path[path_pos] != '?') return;
+    if (path_pos + 1 >= path_len) return;
+
+    const char* query = path + path_pos + 1;
+    u32 query_len = path_len - path_pos - 1;
+    for (u32 i = 0; i < query_len; i++) {
+        if (query[i] == '#') {
+            query_len = i;
+            break;
+        }
+    }
+    u32 pos = 0;
+    while (pos < query_len) {
+        while (pos < query_len && query[pos] == '&') pos++;
+        const u32 key_start = pos;
+        while (pos < query_len && query[pos] != '&' && query[pos] != '=') pos++;
+        const u32 key_end = pos;
+        u32 val_start = key_end;
+        u32 val_end = key_end;
+        if (pos < query_len && query[pos] == '=') {
+            pos++;
+            val_start = pos;
+            while (pos < query_len && query[pos] != '&') pos++;
+            val_end = pos;
+        }
+        const u32 key_len = key_end - key_start;
+        if (key_len == name_len && memcmp(query + key_start, name, name_len) == 0) {
+            *out_has_value = 1;
+            *out_ptr = query + val_start;
+            *out_len = val_end - val_start;
+            return;
+        }
+    }
+}
+
+void rut_helper_req_query_string(
+    const u8* req_data, u32 req_len, u8* out_has_value, const char** out_ptr, u32* out_len) {
+    *out_has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
+    if (req.path.len == 0) return;
+
+    const char* path = req.path.ptr;
+    const u32 path_len = req.path.len;
+    u32 pos = 0;
+    while (pos < path_len && path[pos] != '?' && path[pos] != '#') pos++;
+    if (pos >= path_len || path[pos] != '?') return;
+
+    const char* query = path + pos + 1;
+    u32 query_len = path_len - pos - 1;
+    for (u32 i = 0; i < query_len; i++) {
+        if (query[i] == '#') {
+            query_len = i;
+            break;
+        }
+    }
+
+    *out_has_value = 1;
+    *out_ptr = query;
+    *out_len = query_len;
+}
+
+void rut_helper_req_param(
+    void* ctx, const char* name, u32 name_len, const char** out_ptr, u32* out_len) {
+    *out_ptr = "";
+    *out_len = 0;
+    if (!ctx || !name) return;
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
+    const u32 n =
+        hctx->route_param_count < kMaxRouteParams ? hctx->route_param_count : kMaxRouteParams;
+    for (u32 i = 0; i < n; i++) {
+        const RouteParam& p = hctx->route_params[i];
+        if (p.name_len != name_len) continue;
+        bool match = true;
+        for (u32 j = 0; j < name_len; j++) {
+            if (p.name[j] != name[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (!match) continue;
+        *out_ptr = p.value ? p.value : "";
+        *out_len = p.value ? p.value_len : 0;
+        return;
+    }
+}
+
 u32 rut_helper_req_remote_addr(void* conn) {
     auto* c = static_cast<Connection*>(conn);
     return c->peer_addr;
+}
+
+u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return 0;
+    return req.has_content_length ? req.content_length : 0;
 }
 
 // ── String Operations ──────────────────────────────────────────────

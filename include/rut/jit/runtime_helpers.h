@@ -22,6 +22,33 @@ void rut_helper_req_path(const rut::u8* req_data,
                          const char** out_ptr,
                          rut::u32* out_len);
 
+// Extract request path without query or fragment suffix from raw HTTP request.
+// Sets *out_ptr and *out_len to a string view pointing into req_data.
+void rut_helper_req_path_only(const rut::u8* req_data,
+                              rut::u32 req_len,
+                              const char** out_ptr,
+                              rut::u32* out_len);
+
+// Extract the declared request body bytes, bounded by Content-Length.
+// Returns an empty string if headers are incomplete, Content-Length is absent,
+// or req_data does not contain the full declared body yet.
+void rut_helper_req_body(const rut::u8* req_data,
+                         rut::u32 req_len,
+                         const char** out_ptr,
+                         rut::u32* out_len);
+
+// Extract the HTTP version token from the request line as "HTTP/1.0",
+// "HTTP/1.1", or an empty string when parsing fails.
+void rut_helper_req_http_version(const rut::u8* req_data,
+                                 rut::u32 req_len,
+                                 const char** out_ptr,
+                                 rut::u32* out_len);
+
+// Read parsed request flags. flag=0 returns keep-alive, flag=1 returns chunked,
+// flag=2 returns whether Content-Length was present, flag=3 returns HTTP/1.0,
+// flag=4 returns HTTP/1.1.
+rut::u8 rut_helper_req_flag(const rut::u8* req_data, rut::u32 req_len, rut::u8 flag);
+
 // Extract HTTP method from raw request. Returns HttpMethod enum value.
 rut::u8 rut_helper_req_method(const rut::u8* req_data, rut::u32 req_len);
 
@@ -36,8 +63,47 @@ void rut_helper_req_header(const rut::u8* req_data,
                            const char** out_ptr,
                            rut::u32* out_len);
 
+// Look up a cookie by name from the Cookie request header.
+// Returns Optional(Str): *out_has_value = 1 if found, 0 if not.
+// If found, *out_ptr / *out_len point into req_data.
+void rut_helper_req_cookie(const rut::u8* req_data,
+                           rut::u32 req_len,
+                           const char* name,
+                           rut::u32 name_len,
+                           rut::u8* out_has_value,
+                           const char** out_ptr,
+                           rut::u32* out_len);
+
+// Look up a query value by name from request target.
+// Returns Optional(Str): *out_has_value = 1 if found, 0 if not.
+// If found, *out_ptr / *out_len point into req_data.
+void rut_helper_req_query(const rut::u8* req_data,
+                          rut::u32 req_len,
+                          const char* name,
+                          rut::u32 name_len,
+                          rut::u8* out_has_value,
+                          const char** out_ptr,
+                          rut::u32* out_len);
+
+// Extract the raw query string from request target, excluding '?' and '#fragment'.
+// Returns Optional(Str): *out_has_value = 1 if a query component exists.
+// If found, *out_ptr / *out_len point into req_data.
+void rut_helper_req_query_string(const rut::u8* req_data,
+                                 rut::u32 req_len,
+                                 rut::u8* out_has_value,
+                                 const char** out_ptr,
+                                 rut::u32* out_len);
+
+// Look up a route parameter captured by SegmentTrie route matching.
+// Returns an empty Str when the parameter is not present.
+void rut_helper_req_param(
+    void* ctx, const char* name, rut::u32 name_len, const char** out_ptr, rut::u32* out_len);
+
 // Get remote address from Connection. Returns IPv4 in network order.
 rut::u32 rut_helper_req_remote_addr(void* conn);
+
+// Get parsed Content-Length from request bytes. Returns 0 when absent or malformed.
+rut::u64 rut_helper_req_content_length(const rut::u8* req_data, rut::u32 req_len);
 
 // ── String Operations ──────────────────────────────────────────────
 

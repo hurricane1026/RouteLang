@@ -9,10 +9,11 @@
 // function, which is orthogonal to the declarative content here.
 // Callers typically:
 //   1. jit::codegen(rir.module) → LLVM IR module
-//   2. engine.compile(...); engine.lookup("handler_route_N") for each
+//   2. engine.compile(...)
 //   3. populate_route_config(cfg, rir.module) for upstreams / bodies /
 //      header sets
-//   4. cfg.add_jit_handler(path, method, fn) per route
+//   4. register_jit_routes(cfg, rir.module, engine) to select the
+//      correct dispatcher and add every route handler
 //
 // Two supported preconditions on `cfg`:
 //
@@ -43,9 +44,64 @@
 // it rather than try to reuse it.
 
 #include "rut/compiler/rir.h"
+#include "rut/jit/codegen.h"
+#include "rut/jit/jit_engine.h"
 #include "rut/runtime/route_table.h"
 
 namespace rut {
+
+inline bool rir_function_needs_req_body(const rir::Function& fn) {
+    if (fn.blocks == nullptr) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& block = fn.blocks[bi];
+        if (block.insts == nullptr) continue;
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            if (block.insts[ii].op == rir::Opcode::ReqBody) return true;
+        }
+    }
+    return false;
+}
+
+inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
+    if (cfg.route_count != 0) return false;
+    if (mod.func_count > RouteConfig::kMaxRoutes) return false;
+    if (mod.func_count > 0 && mod.functions == nullptr) return false;
+
+    Str paths[RouteConfig::kMaxRoutes];
+    for (u32 i = 0; i < mod.func_count; i++) {
+        paths[i] = mod.functions[i].route_pattern;
+        if (paths[i].len > 0 && paths[i].ptr == nullptr) return false;
+    }
+
+    if (needs_segment_aware(paths, mod.func_count)) return cfg.use_segment_trie();
+    return cfg.use_art();
+}
+
+inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine) {
+    if (cfg.route_count != 0) return false;
+    if (!configure_route_dispatch(cfg, mod)) return false;
+
+    for (u32 i = 0; i < mod.func_count; i++) {
+        const auto& fn = mod.functions[i];
+        if (fn.route_pattern.len >= RouteEntry::kMaxPathLen) return false;
+        if (fn.route_pattern.len > 0 && fn.route_pattern.ptr == nullptr) return false;
+        if (fn.name.len > 0 && fn.name.ptr == nullptr) return false;
+
+        char path[RouteEntry::kMaxPathLen];
+        for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
+        path[fn.route_pattern.len] = '\0';
+
+        char symbol[256];
+        jit::format_handler_symbol(fn.name, symbol, sizeof(symbol));
+        auto* addr = engine.lookup(symbol);
+        if (!addr) return false;
+        auto handler = reinterpret_cast<jit::HandlerFn>(addr);
+        if (!cfg.add_jit_handler(path, fn.http_method, handler, rir_function_needs_req_body(fn)))
+            return false;
+    }
+
+    return true;
+}
 
 inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // Bodies / header sets / routes must always start empty — there's

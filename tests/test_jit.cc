@@ -196,6 +196,28 @@ TEST(jit, helpers_sanity) {
     CHECK(out_ptr != nullptr);
     CHECK(out_len == 14);
     CHECK(__builtin_memcmp(out_ptr, "/api/users?x=1", 14) == 0);
+
+    static const char fragment_req[] =
+        "GET /api/users?x=1#section HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "\r\n";
+    rut_helper_req_path_only(
+        reinterpret_cast<const u8*>(fragment_req), sizeof(fragment_req) - 1, &out_ptr, &out_len);
+    CHECK(out_ptr != nullptr);
+    CHECK(out_len == 10);
+    CHECK(__builtin_memcmp(out_ptr, "/api/users", 10) == 0);
+
+    static const char body_req[] =
+        "POST /api/users HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Length: 7\r\n"
+        "\r\n"
+        "payload";
+    rut_helper_req_body(
+        reinterpret_cast<const u8*>(body_req), sizeof(body_req) - 1, &out_ptr, &out_len);
+    CHECK(out_ptr != nullptr);
+    CHECK(out_len == 7);
+    CHECK(__builtin_memcmp(out_ptr, "payload", 7) == 0);
 }
 
 // Test: Simple handler that always returns 200.
@@ -274,6 +296,540 @@ TEST(jit, frontend_req_header_or_fallback) {
                                            nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_standard_header_alias_or_fallback) {
+    const char* src =
+        "route GET \"/users\" { let auth = or(req.authorization, \"\") let request = "
+        "or(req.xRequestId, \"\") if auth == \"Bearer root\" { if request == \"req-1\" { "
+        "return 204 } else { return 401 } } else { return 401 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char hit[] =
+        "GET /users HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer root\r\n"
+        "X-Request-ID: req-1\r\n\r\n";
+    auto r = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(hit), sizeof(hit) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    auto miss = HandlerResult::unpack(handler(nullptr,
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr));
+    CHECK(miss.action == HandlerAction::ReturnStatus);
+    CHECK(miss.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_remote_addr_read) {
+    const char* src = "route GET \"/addr\" { let addr = req.remoteAddr return 204 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    conn.peer_addr = 0x0100007F;
+    auto r = HandlerResult::unpack(handler(&conn,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_route_param_field_guard) {
+    const char* src =
+        "route GET \"/users/:id\" { if req.id == \"42\" { return 204 } else { return 401 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    static const char id_name[] = "id";
+    static const char id_hit[] = "42";
+    frame.ctx.route_param_count = 1;
+    frame.ctx.route_params[0] = {id_name, 2, id_hit, 2};
+
+    auto hit = HandlerResult::unpack(handler(nullptr,
+                                             &frame.ctx,
+                                             reinterpret_cast<const u8*>(kGetApiRequest),
+                                             sizeof(kGetApiRequest) - 1,
+                                             nullptr));
+    CHECK(hit.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(hit.status_code, 204u);
+
+    frame.ctx.route_params[0].value = "41";
+    auto miss = HandlerResult::unpack(handler(nullptr,
+                                              &frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr));
+    CHECK(miss.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(miss.status_code, 401u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_query_string_or_fallback) {
+    const char* src =
+        "route GET \"/search\" { let raw = or(req.queryString, \"\") if raw == "
+        "\"q=rut&empty=\" { return 204 } else { return 401 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char hit[] = "GET /search?q=rut&empty=#frag HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(hit), sizeof(hit) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    static const char miss[] = "GET /search HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(miss), sizeof(miss) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_path_only_ignores_query_and_fragment) {
+    const char* src =
+        "route GET \"/search\" { let path = req.pathOnly if path == \"/search\" { return 204 } "
+        "else { return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char hit[] = "GET /search?q=rut#frag HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(hit), sizeof(hit) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    static const char miss[] = "GET /other?q=rut#frag HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto miss_r = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(miss), sizeof(miss) - 1, nullptr));
+    CHECK(miss_r.action == HandlerAction::ReturnStatus);
+    CHECK(miss_r.status_code == 404);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_body_matches_content_length_bounded_bytes) {
+    const char* src =
+        "route POST \"/upload\" { let body = req.body if body == \"payload\" { return 204 } "
+        "else { return 400 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char hit[] =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\npayloadextra";
+    auto r = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(hit), sizeof(hit) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    static const char miss[] =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\npayload";
+    auto miss_r = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(miss), sizeof(miss) - 1, nullptr));
+    CHECK(miss_r.action == HandlerAction::ReturnStatus);
+    CHECK(miss_r.status_code == 400);
+
+    static const char partial[] =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\npayload";
+    auto partial_r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(partial), sizeof(partial) - 1, nullptr));
+    CHECK(partial_r.action == HandlerAction::ReturnStatus);
+    CHECK(partial_r.status_code == 400);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_request_flags_reflect_parsed_headers) {
+    const char* src =
+        "route POST \"/upload\" { if req.keepAlive { if req.chunked { return 204 } else { "
+        "return 400 } } else { return 408 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char hit[] =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+    auto r = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(hit), sizeof(hit) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    static const char not_chunked[] = "POST /upload HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto not_chunked_r = HandlerResult::unpack(handler(nullptr,
+                                                       nullptr,
+                                                       reinterpret_cast<const u8*>(not_chunked),
+                                                       sizeof(not_chunked) - 1,
+                                                       nullptr));
+    CHECK(not_chunked_r.action == HandlerAction::ReturnStatus);
+    CHECK(not_chunked_r.status_code == 400);
+
+    static const char close_req[] =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n";
+    auto close_r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(close_req), sizeof(close_req) - 1, nullptr));
+    CHECK(close_r.action == HandlerAction::ReturnStatus);
+    CHECK(close_r.status_code == 408);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_has_content_length_distinguishes_zero_from_absent) {
+    const char* src =
+        "route POST \"/upload\" { if req.hasContentLength { return 204 } else { return 411 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char zero_len[] =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(zero_len), sizeof(zero_len) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    static const char absent[] = "POST /upload HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(absent), sizeof(absent) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 411);
+
+    static const char nonzero[] =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(nonzero), sizeof(nonzero) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_http_version_flags_reflect_request_line) {
+    const char* src =
+        "route GET \"/version\" { if req.http10 { return 210 } else { if req.http11 { return 211 "
+        "} else { return 400 } } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char http10[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(http10), sizeof(http10) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 210);
+
+    static const char http11[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(http11), sizeof(http11) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 211);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_http_version_string_reflects_request_line) {
+    const char* src =
+        "route GET \"/version\" { let version = req.httpVersion if version == \"HTTP/1.0\" { "
+        "return 210 } else { if version == \"HTTP/1.1\" { return 211 } else { return 400 } } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char http10[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(http10), sizeof(http10) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 210);
+
+    static const char http11[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(http11), sizeof(http11) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 211);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_cookie_or_fallback) {
+    const char* src =
+        "route GET \"/session\" { let sid = or(req.cookie(\"sid\"), \"\") if sid == \"ok\" { "
+        "return 204 } else { return 401 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char hit[] =
+        "GET /session HTTP/1.1\r\nHost: localhost\r\nCookie: theme=dark; sid=ok; lang=en\r\n\r\n";
+    auto r = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(hit), sizeof(hit) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    static const char miss[] =
+        "GET /session HTTP/1.1\r\nHost: localhost\r\nCookie: theme=dark; sid=nope\r\n\r\n";
+    r = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(miss), sizeof(miss) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    r = HandlerResult::unpack(handler(nullptr,
+                                      nullptr,
+                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                      sizeof(kGetApiRequest) - 1,
+                                      nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
 
     engine.shutdown();
     rir.destroy();
@@ -4784,6 +5340,46 @@ TEST(helpers, req_method) {
     CHECK(m == 1);  // HttpMethod::POST = 1
 }
 
+TEST(helpers, req_flags_keep_alive_and_chunked) {
+    static const char chunked[] =
+        "POST / HTTP/1.1\r\n"
+        "Host: h\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n";
+    CHECK(rut_helper_req_flag(reinterpret_cast<const u8*>(chunked), sizeof(chunked) - 1, 0) == 1);
+    CHECK(rut_helper_req_flag(reinterpret_cast<const u8*>(chunked), sizeof(chunked) - 1, 1) == 1);
+    CHECK(rut_helper_req_flag(reinterpret_cast<const u8*>(chunked), sizeof(chunked) - 1, 2) == 0);
+    CHECK(rut_helper_req_flag(reinterpret_cast<const u8*>(chunked), sizeof(chunked) - 1, 3) == 0);
+    CHECK(rut_helper_req_flag(reinterpret_cast<const u8*>(chunked), sizeof(chunked) - 1, 4) == 1);
+
+    static const char close_req[] =
+        "POST / HTTP/1.1\r\n"
+        "Host: h\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    CHECK(rut_helper_req_flag(reinterpret_cast<const u8*>(close_req), sizeof(close_req) - 1, 0) ==
+          0);
+    CHECK(rut_helper_req_flag(reinterpret_cast<const u8*>(close_req), sizeof(close_req) - 1, 1) ==
+          0);
+
+    static const char zero_len_req[] =
+        "POST / HTTP/1.1\r\n"
+        "Host: h\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    CHECK(rut_helper_req_flag(
+              reinterpret_cast<const u8*>(zero_len_req), sizeof(zero_len_req) - 1, 2) == 1);
+
+    static const char http10_req[] =
+        "POST / HTTP/1.0\r\n"
+        "Host: h\r\n"
+        "\r\n";
+    CHECK(rut_helper_req_flag(reinterpret_cast<const u8*>(http10_req), sizeof(http10_req) - 1, 3) ==
+          1);
+    CHECK(rut_helper_req_flag(reinterpret_cast<const u8*>(http10_req), sizeof(http10_req) - 1, 4) ==
+          0);
+}
+
 TEST(helpers, req_header_case_insensitive) {
     static const char req[] =
         "GET / HTTP/1.1\r\n"
@@ -4813,6 +5409,379 @@ TEST(helpers, req_header_case_insensitive) {
     rut_helper_req_header(
         reinterpret_cast<const u8*>(req), sizeof(req) - 1, "X-Missing", 9, &has, &ptr, &len);
     CHECK(has == 0);
+}
+
+TEST(helpers, req_param_from_handler_ctx) {
+    TestHandlerCtxFrame frame{};
+    static const char id_name[] = "id";
+    static const char id_value[] = "42";
+    static const char book_name[] = "book";
+    static const char book_value[] = "rut";
+    frame.ctx.route_param_count = 2;
+    frame.ctx.route_params[0] = {id_name, 2, id_value, 2};
+    frame.ctx.route_params[1] = {book_name, 4, book_value, 3};
+
+    const char* ptr = nullptr;
+    u32 len = 0;
+    rut_helper_req_param(&frame.ctx, "book", 4, &ptr, &len);
+    REQUIRE(ptr != nullptr);
+    CHECK_EQ(len, 3u);
+    CHECK((Str{ptr, len}.eq(Str{"rut", 3})));
+
+    ptr = reinterpret_cast<const char*>(0x1);
+    len = 99;
+    rut_helper_req_param(&frame.ctx, "missing", 7, &ptr, &len);
+    CHECK(ptr != nullptr);
+    CHECK_EQ(len, 0u);
+}
+
+TEST(helpers, req_cookie_from_request_bytes) {
+    static const char req[] =
+        "GET / HTTP/1.1\r\n"
+        "Host: h\r\n"
+        "Cookie: theme=dark; sid=ok; empty=; spaced=value \t; malformed; lang=en\r\n"
+        "Cookie: other=second\r\n"
+        "\r\n";
+    u8 has = 0;
+    const char* ptr = nullptr;
+    u32 len = 0;
+
+    rut_helper_req_cookie(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "sid", 3, &has, &ptr, &len);
+    CHECK(has == 1);
+    CHECK_EQ(len, 2u);
+    CHECK((Str{ptr, len}.eq(Str{"ok", 2})));
+
+    has = 0;
+    ptr = nullptr;
+    len = 0;
+    rut_helper_req_cookie(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "empty", 5, &has, &ptr, &len);
+    CHECK(has == 1);
+    CHECK_EQ(len, 0u);
+    CHECK(ptr != nullptr);
+
+    has = 0;
+    ptr = nullptr;
+    len = 0;
+    rut_helper_req_cookie(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "spaced", 6, &has, &ptr, &len);
+    CHECK(has == 1);
+    CHECK_EQ(len, 5u);
+    CHECK((Str{ptr, len}.eq(Str{"value", 5})));
+
+    has = 0;
+    ptr = nullptr;
+    len = 0;
+    rut_helper_req_cookie(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "other", 5, &has, &ptr, &len);
+    CHECK(has == 1);
+    CHECK_EQ(len, 6u);
+    CHECK((Str{ptr, len}.eq(Str{"second", 6})));
+
+    has = 1;
+    ptr = reinterpret_cast<const char*>(0x1);
+    len = 99;
+    rut_helper_req_cookie(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "missing", 7, &has, &ptr, &len);
+    CHECK(has == 0);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+}
+
+TEST(helpers, req_query_from_request_bytes) {
+    static const char req[] =
+        "GET /search?q=rut&book=cpp&empty= HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "\r\n";
+    u8 has = 0;
+    const char* ptr = nullptr;
+    u32 len = 0;
+
+    rut_helper_req_query(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "q", 1, &has, &ptr, &len);
+    CHECK(has == 1);
+    CHECK(len == 3);
+    CHECK((Str{ptr, len}.eq(Str{"rut", 3})));
+
+    has = 0;
+    ptr = nullptr;
+    len = 0;
+    rut_helper_req_query(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "empty", 5, &has, &ptr, &len);
+    CHECK(has == 1);
+    CHECK(len == 0u);
+    CHECK(ptr != nullptr);
+
+    has = 1;
+    ptr = reinterpret_cast<const char*>(0x1);
+    len = 99;
+    rut_helper_req_query(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "missing", 7, &has, &ptr, &len);
+    CHECK(has == 0);
+    CHECK(len == 0u);
+}
+
+TEST(helpers, req_query_ignores_fragment_suffix) {
+    static const char req[] =
+        "GET /search?q=rut&empty=#section HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "\r\n";
+    u8 has = 0;
+    const char* ptr = nullptr;
+    u32 len = 0;
+
+    rut_helper_req_query(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "q", 1, &has, &ptr, &len);
+    CHECK(has == 1);
+    CHECK(len == 3u);
+    CHECK((Str{ptr, len}.eq(Str{"rut", 3})));
+
+    has = 0;
+    ptr = nullptr;
+    len = 99;
+    rut_helper_req_query(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "empty", 5, &has, &ptr, &len);
+    CHECK(has == 1);
+    CHECK(len == 0u);
+}
+
+TEST(helpers, req_query_ignores_question_mark_inside_fragment) {
+    static const char req[] =
+        "GET /search#frag?q=rut HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "\r\n";
+    u8 has = 1;
+    const char* ptr = reinterpret_cast<const char*>(0x1);
+    u32 len = 99;
+
+    rut_helper_req_query(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, "q", 1, &has, &ptr, &len);
+    CHECK(has == 0);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+}
+
+TEST(helpers, req_query_string_from_request_bytes) {
+    static const char req[] =
+        "GET /search?q=rut&empty=#section HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "\r\n";
+    u8 has = 0;
+    const char* ptr = nullptr;
+    u32 len = 0;
+
+    rut_helper_req_query_string(
+        reinterpret_cast<const u8*>(req), sizeof(req) - 1, &has, &ptr, &len);
+    CHECK(has == 1);
+    CHECK(len == 12u);
+    CHECK((Str{ptr, len}.eq(Str{"q=rut&empty=", 12})));
+
+    static const char no_query[] = "GET /search#section HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    has = 1;
+    ptr = reinterpret_cast<const char*>(0x1);
+    len = 99;
+    rut_helper_req_query_string(
+        reinterpret_cast<const u8*>(no_query), sizeof(no_query) - 1, &has, &ptr, &len);
+    CHECK(has == 0);
+    CHECK(ptr == nullptr);
+    CHECK(len == 0u);
+}
+
+TEST(helpers, req_content_length_from_request_bytes) {
+    static const char req[] =
+        "POST /upload HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Length: 123\r\n"
+        "\r\n";
+    CHECK_EQ(rut_helper_req_content_length(reinterpret_cast<const u8*>(req), sizeof(req) - 1),
+             123u);
+
+    static const char no_len[] = "POST /upload HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    CHECK_EQ(rut_helper_req_content_length(reinterpret_cast<const u8*>(no_len), sizeof(no_len) - 1),
+             0u);
+}
+
+TEST(jit, req_param_guard) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("param_guard"), lit("/users/:id"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok = V(b.create_block(fn, lit("ok")));
+    auto reject = V(b.create_block(fn, lit("reject")));
+
+    b.set_insert_point(fn, entry);
+    auto id = V(b.emit_req_param(lit("id")));
+    auto want = V(b.emit_const_str(lit("42")));
+    auto matches = V(b.emit_cmp(Opcode::CmpEq, id, want));
+    VOK(b.emit_br(matches, ok, reject));
+
+    b.set_insert_point(fn, ok);
+    VOK(b.emit_ret_status(200));
+
+    b.set_insert_point(fn, reject);
+    VOK(b.emit_ret_status(404));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_param_guard"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    static const char id_name[] = "id";
+    static const char id_value[] = "42";
+    frame.ctx.route_param_count = 1;
+    frame.ctx.route_params[0] = {id_name, 2, id_value, 2};
+
+    auto hit = HandlerResult::unpack(handler(nullptr,
+                                             &frame.ctx,
+                                             reinterpret_cast<const u8*>(kGetApiRequest),
+                                             sizeof(kGetApiRequest) - 1,
+                                             nullptr));
+    CHECK(hit.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(hit.status_code, 200u);
+
+    frame.ctx.route_params[0].value = "41";
+    auto miss = HandlerResult::unpack(handler(nullptr,
+                                              &frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr));
+    CHECK(miss.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(miss.status_code, 404u);
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, req_content_length_guard) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("content_length_guard"), lit("/upload"), 'P'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok = V(b.create_block(fn, lit("ok")));
+    auto reject = V(b.create_block(fn, lit("reject")));
+
+    b.set_insert_point(fn, entry);
+    auto len = V(b.emit_req_content_length());
+    auto want = V(b.emit_const_bytesize(123));
+    auto matches = V(b.emit_cmp(Opcode::CmpEq, len, want));
+    VOK(b.emit_br(matches, ok, reject));
+
+    b.set_insert_point(fn, ok);
+    VOK(b.emit_ret_status(200));
+
+    b.set_insert_point(fn, reject);
+    VOK(b.emit_ret_status(413));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_content_length_guard"));
+    REQUIRE(handler != nullptr);
+
+    static const char hit_req[] =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 123\r\n\r\n";
+    auto hit = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(hit_req), sizeof(hit_req) - 1, nullptr));
+    CHECK(hit.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(hit.status_code, 200u);
+
+    static const char miss_req[] =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 124\r\n\r\n";
+    auto miss = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(miss_req), sizeof(miss_req) - 1, nullptr));
+    CHECK(miss.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(miss.status_code, 413u);
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, req_query_guard) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+
+    auto* fn = V(b.create_function(lit("query_guard"), lit("/search"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok = V(b.create_block(fn, lit("ok")));
+    auto reject = V(b.create_block(fn, lit("reject")));
+    auto missing = V(b.create_block(fn, lit("missing")));
+    auto found = V(b.create_block(fn, lit("found")));
+
+    b.set_insert_point(fn, entry);
+    auto q = V(b.emit_req_query(lit("q")));
+    auto is_nil = V(b.emit_opt_is_nil(q));
+    VOK(b.emit_br(is_nil, missing, found));
+
+    b.set_insert_point(fn, missing);
+    VOK(b.emit_ret_status(404));
+
+    // Get the inner Str type for unwrap
+    auto str_ty = V(b.make_type(TypeKind::Str));
+
+    b.set_insert_point(fn, found);
+    auto val = V(b.emit_opt_unwrap(q, str_ty));
+    auto want = V(b.emit_const_str(lit("rut")));
+    auto matches = V(b.emit_cmp(Opcode::CmpEq, val, want));
+    VOK(b.emit_br(matches, ok, reject));
+
+    b.set_insert_point(fn, ok);
+    VOK(b.emit_ret_status(200));
+
+    b.set_insert_point(fn, reject);
+    VOK(b.emit_ret_status(404));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_query_guard"));
+    REQUIRE(handler != nullptr);
+
+    static const char hit_req[] =
+        "GET /search?q=rut HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "\r\n";
+    auto hit = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(hit_req), sizeof(hit_req) - 1, nullptr));
+    CHECK(hit.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(hit.status_code, 200u);
+
+    static const char miss_req[] =
+        "GET /search?q=cpp HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "\r\n";
+    auto miss = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(miss_req), sizeof(miss_req) - 1, nullptr));
+    CHECK(miss.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(miss.status_code, 404u);
+
+    engine.shutdown();
+    tc.destroy();
 }
 
 TEST(helpers, req_remote_addr) {

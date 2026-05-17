@@ -110,6 +110,7 @@ struct Engine {
         char pattern[128]{};
         u32 pattern_len = 0;
         jit::HandlerFn fn = nullptr;
+        bool needs_req_body = false;
     };
 
     CompiledRoute routes[kMaxRoutes];

@@ -85,6 +85,9 @@ template <typename Loop>
 void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
+void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev);
+
+template <typename Loop>
 void on_early_upstream_recvd(void* lp, Connection& conn, IoEvent ev);
 
 // JIT handler dispatch — invoked from timer.tick when pending_handler_fn
@@ -110,6 +113,7 @@ extern template void on_response_body_recvd<EpollEventLoop>(void*, Connection&, 
 extern template void on_response_body_sent<EpollEventLoop>(void*, Connection&, IoEvent);
 extern template void on_request_body_sent<EpollEventLoop>(void*, Connection&, IoEvent);
 extern template void on_request_body_recvd<EpollEventLoop>(void*, Connection&, IoEvent);
+extern template void on_jit_request_body_recvd<EpollEventLoop>(void*, Connection&, IoEvent);
 extern template void on_early_upstream_recvd<EpollEventLoop>(void*, Connection&, IoEvent);
 extern template void on_early_upstream_recvd_send_inflight<EpollEventLoop>(void*,
                                                                            Connection&,
@@ -127,6 +131,7 @@ extern template void on_response_body_recvd<IoUringEventLoop>(void*, Connection&
 extern template void on_response_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_request_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
+extern template void on_jit_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_early_upstream_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_early_upstream_recvd_send_inflight<IoUringEventLoop>(void*,
                                                                              Connection&,

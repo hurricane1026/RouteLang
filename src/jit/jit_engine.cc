@@ -43,9 +43,18 @@ struct HelperEntry {
 // Null-terminated table of runtime helper symbols.
 static const HelperEntry kHelpers[] = {
     {"rut_helper_req_path", reinterpret_cast<void*>(&rut_helper_req_path)},
+    {"rut_helper_req_path_only", reinterpret_cast<void*>(&rut_helper_req_path_only)},
+    {"rut_helper_req_body", reinterpret_cast<void*>(&rut_helper_req_body)},
+    {"rut_helper_req_http_version", reinterpret_cast<void*>(&rut_helper_req_http_version)},
+    {"rut_helper_req_flag", reinterpret_cast<void*>(&rut_helper_req_flag)},
     {"rut_helper_req_method", reinterpret_cast<void*>(&rut_helper_req_method)},
     {"rut_helper_req_header", reinterpret_cast<void*>(&rut_helper_req_header)},
+    {"rut_helper_req_cookie", reinterpret_cast<void*>(&rut_helper_req_cookie)},
+    {"rut_helper_req_query", reinterpret_cast<void*>(&rut_helper_req_query)},
+    {"rut_helper_req_query_string", reinterpret_cast<void*>(&rut_helper_req_query_string)},
+    {"rut_helper_req_param", reinterpret_cast<void*>(&rut_helper_req_param)},
     {"rut_helper_req_remote_addr", reinterpret_cast<void*>(&rut_helper_req_remote_addr)},
+    {"rut_helper_req_content_length", reinterpret_cast<void*>(&rut_helper_req_content_length)},
     {"rut_helper_str_has_prefix", reinterpret_cast<void*>(&rut_helper_str_has_prefix)},
     {"rut_helper_str_eq", reinterpret_cast<void*>(&rut_helper_str_eq)},
     {"rut_helper_str_cmp", reinterpret_cast<void*>(&rut_helper_str_cmp)},
@@ -82,7 +91,7 @@ bool JitEngine::init() {
     // If kHelpers ever grows past kMaxHelpers, fail loudly instead of
     // silently skipping helpers (which would produce opaque JIT link
     // failures at runtime).
-    static constexpr u32 kMaxHelpers = 16;
+    static constexpr u32 kMaxHelpers = 24;
     u32 count = 0;
     for (const auto* h = kHelpers; h->name; h++) count++;
     if (count > kMaxHelpers) {

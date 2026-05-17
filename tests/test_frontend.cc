@@ -911,6 +911,38 @@ route GET "/users" {
     // surface as an "unknown req field" analyze error.
 }
 
+TEST(frontend, parse_user_local_req_shadows_magic_method_accessors) {
+    const char* src = R"rut(
+protocol Accessors {
+    func header(name: str) -> i32
+    func param(name: str) -> i32
+    func cookie(name: str) -> i32
+    func query(name: str) -> i32
+}
+struct Box { value: i32 }
+Box impl Accessors {
+    func header(self: Box, name: str) -> i32 => self.value
+    func param(self: Box, name: str) -> i32 => self.value
+    func cookie(self: Box, name: str) -> i32 => self.value
+    func query(self: Box, name: str) -> i32 => self.value
+}
+route GET "/users/:id" {
+    let req = Box(value: 42)
+    guard req.header("Host") == 42 else { return 500 }
+    guard req.param("id") == 42 else { return 500 }
+    guard req.cookie("sid") == 42 else { return 500 }
+    guard req.query("q") == 42 else { return 500 }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 TEST(frontend, parse_user_variant_named_req_shadows_magic_path) {
     // A variant literally named `req` must take precedence so
     // `req.case` resolves as variant construction (VariantCase),
@@ -952,6 +984,28 @@ route GET "/users" { if req.ping() == 200 { return 200 } else { return 500 } }
     REQUIRE(ast);
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
+}
+
+TEST(frontend, parse_selective_import_alias_req_shadows_magic_method_accessors) {
+    const std::string dir = "/tmp/rut_selective_import_req_shadow_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/auth.rut", std::ios::binary);
+        out << "func imported() -> i32 => 200\n";
+    }
+    const auto src = R"rut(
+import { imported as req } from "auth.rut"
+route GET "/users/:id" {
+    let value = req.param("id")
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(!hir);
 }
 
 TEST(frontend, parse_match_payload_named_req_shadows_magic_path) {
@@ -8294,7 +8348,7 @@ TEST(frontend, req_header_flows_as_optional_str) {
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[0].route.statements.len, 3u);
     CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].expr.kind),
-             static_cast<u8>(AstExprKind::ReqHeader));
+             static_cast<u8>(AstExprKind::MethodCall));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
@@ -8451,6 +8505,441 @@ TEST(frontend, req_standard_header_alias_flows_as_optional_str) {
     CHECK(fn.blocks[0].insts[10].imm.str_val.eq({"X-Real-IP", 9}));
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[11].op), static_cast<u8>(rir::Opcode::ReqHeader));
     CHECK(fn.blocks[0].insts[11].imm.str_val.eq({"X-Request-ID", 12}));
+    rir.destroy();
+}
+
+TEST(frontend, req_param_flows_as_str) {
+    const char* src =
+        "route GET \"/users/:id\" { let id = req.param(\"id\") if id == \"42\" { return 200 } "
+        "else { return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
+    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].expr.kind),
+             static_cast<u8>(AstExprKind::MethodCall));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Str));
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqParam));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqParam));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ReqParam));
+    rir.destroy();
+}
+
+TEST(frontend, req_route_param_field_flows_as_str) {
+    const char* src =
+        "route GET \"/users/:id\" { let id = req.id if id == \"42\" { return 200 } else { "
+        "return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Str));
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqParam));
+    CHECK(hir->routes[0].locals[0].init.str_value.eq({"id", 2}));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqParam));
+    CHECK(mir->functions[0].locals[0].init.str_value.eq({"id", 2}));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ReqParam));
+    CHECK(fn.blocks[0].insts[0].imm.str_val.eq({"id", 2}));
+    rir.destroy();
+}
+
+TEST(frontend, req_route_param_field_requires_full_param_segment) {
+    const char* sources[] = {
+        "route GET \"/foo:bar\" { let value = req.bar return 200 }\n",
+        "route GET \"/:id-v2\" { let value = req.id return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(static_cast<u8>(hir.error().code),
+                 static_cast<u8>(FrontendError::UnsupportedSyntax));
+    }
+}
+
+TEST(frontend, req_query_flows_as_optional_str) {
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\") let value = or(q, \"\") if value == "
+        "\"rut\" { return 200 } else { "
+        "return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 3u);
+    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].expr.kind),
+             static_cast<u8>(AstExprKind::MethodCall));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Str));
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqQuery));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqQuery));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ReqQuery));
+    rir.destroy();
+}
+
+TEST(frontend, req_query_string_flows_as_optional_str) {
+    const char* src =
+        "route GET \"/search\" { let raw = req.queryString let value = or(raw, \"\") if value == "
+        "\"q=rut\" { return 200 } else { return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Str));
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqQueryString));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqQueryString));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op),
+             static_cast<u8>(rir::Opcode::ReqQueryString));
+    rir.destroy();
+}
+
+TEST(frontend, req_path_only_flows_as_str) {
+    const char* src =
+        "route GET \"/search\" { let path = req.pathOnly if path == \"/search\" { return 200 } "
+        "else { return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Str));
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqPathOnly));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].type), static_cast<u8>(MirTypeKind::Str));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqPathOnly));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ReqPathOnly));
+    rir.destroy();
+}
+
+TEST(frontend, req_body_flows_as_str) {
+    const char* src =
+        "route POST \"/upload\" { let body = req.body if body == \"ok\" { return 204 } else { "
+        "return 400 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Str));
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqBody));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].type), static_cast<u8>(MirTypeKind::Str));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqBody));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ReqBody));
+    rir.destroy();
+}
+
+TEST(frontend, req_request_flags_flow_as_bool) {
+    const char* src =
+        "route POST \"/upload\" { let ka = req.keepAlive let ch = req.chunked let has = "
+        "req.hasContentLength let h10 = req.http10 let h11 = req.http11 if ka { return 200 } "
+        "else { return 400 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqKeepAlive));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].type), static_cast<u8>(HirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::ReqChunked));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[2].type), static_cast<u8>(HirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[2].init.kind),
+             static_cast<u8>(HirExprKind::ReqHasContentLength));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[3].type), static_cast<u8>(HirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[3].init.kind),
+             static_cast<u8>(HirExprKind::ReqHttp10));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[4].type), static_cast<u8>(HirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[4].init.kind),
+             static_cast<u8>(HirExprKind::ReqHttp11));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 5u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].type), static_cast<u8>(MirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqKeepAlive));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].type), static_cast<u8>(MirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
+             static_cast<u8>(MirValueKind::ReqChunked));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[2].type), static_cast<u8>(MirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[2].init.kind),
+             static_cast<u8>(MirValueKind::ReqHasContentLength));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[3].type), static_cast<u8>(MirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[3].init.kind),
+             static_cast<u8>(MirValueKind::ReqHttp10));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[4].type), static_cast<u8>(MirTypeKind::Bool));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[4].init.kind),
+             static_cast<u8>(MirValueKind::ReqHttp11));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ReqKeepAlive));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[1].op), static_cast<u8>(rir::Opcode::ReqChunked));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[2].op),
+             static_cast<u8>(rir::Opcode::ReqHasContentLength));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[3].op), static_cast<u8>(rir::Opcode::ReqHttp10));
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[4].op), static_cast<u8>(rir::Opcode::ReqHttp11));
+    rir.destroy();
+}
+
+TEST(frontend, req_http_version_flows_as_str) {
+    const char* src =
+        "route GET \"/version\" { let version = req.httpVersion if version == \"HTTP/1.1\" { "
+        "return 200 } else { return 400 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Str));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqHttpVersion));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].type), static_cast<u8>(MirTypeKind::Str));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqHttpVersion));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op),
+             static_cast<u8>(rir::Opcode::ReqHttpVersion));
+    rir.destroy();
+}
+
+TEST(frontend, req_content_length_flows_as_bytesize) {
+    const char* src = "route POST \"/upload\" { let len = req.contentLength return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type),
+             static_cast<u8>(HirTypeKind::ByteSize));
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqContentLength));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].type),
+             static_cast<u8>(MirTypeKind::ByteSize));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqContentLength));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op),
+             static_cast<u8>(rir::Opcode::ReqContentLength));
+    rir.destroy();
+}
+
+TEST(frontend, req_remote_addr_flows_as_ip) {
+    const char* src = "route GET \"/addr\" { let addr = req.remoteAddr return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::IP));
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqRemoteAddr));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].type), static_cast<u8>(MirTypeKind::IP));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqRemoteAddr));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op),
+             static_cast<u8>(rir::Opcode::ReqRemoteAddr));
+    rir.destroy();
+}
+
+TEST(frontend, req_content_length_and_remote_addr_equality_lower_to_rir) {
+    const char* sources[] = {
+        "route POST \"/upload\" { if req.contentLength == req.contentLength { return 200 } else "
+        "{ return 500 } }\n",
+        "route GET \"/addr\" { if req.remoteAddr == req.remoteAddr { return 200 } else { return "
+        "500 } }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, req_cookie_flows_as_optional_str) {
+    const char* src =
+        "route GET \"/users\" { let sid = req.cookie(\"sid\") let value = or(sid, \"fallback\") "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 3u);
+    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].expr.kind),
+             static_cast<u8>(AstExprKind::MethodCall));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Str));
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqCookie));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqCookie));
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& fn = rir.module.functions[0];
+    CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[0].op), static_cast<u8>(rir::Opcode::ReqCookie));
     rir.destroy();
 }
 

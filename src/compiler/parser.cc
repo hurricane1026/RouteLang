@@ -396,22 +396,6 @@ struct Parser {
             expr.span = span_from(tok);
             return expr;
         }
-        if (cur().type == TokenType::Ident && cur().text.eq({"req", 3}) &&
-            peek().type == TokenType::Dot && peek(2).type == TokenType::Ident &&
-            peek(2).text.eq({"header", 6})) {
-            const Token start_tok = cur();
-            pos += 3;  // req . header
-            auto lparen = expect(TokenType::LParen);
-            if (!lparen) return core::make_unexpected(lparen.error());
-            auto name = expect(TokenType::StringLit);
-            if (!name) return core::make_unexpected(name.error());
-            auto rparen = expect(TokenType::RParen);
-            if (!rparen) return core::make_unexpected(rparen.error());
-            expr.kind = AstExprKind::ReqHeader;
-            expr.str_value = name.value()->text;
-            expr.span = Span{start_tok.start, rparen.value()->end, start_tok.line, start_tok.col};
-            return expr;
-        }
         // HTTP method literals as expressions (POST, GET, …). The
         // lexer already tokenizes these as KwGet/KwPost/etc.; until
         // now they were only consumed in route declarations. Map

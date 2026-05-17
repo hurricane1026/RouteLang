@@ -539,6 +539,16 @@ static FrontendResult<const rir::Type*> rir_type_for_shape(
         if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
         return ty.value();
     }
+    if (type == MirTypeKind::ByteSize) {
+        auto ty = b.make_type(rir::TypeKind::ByteSize);
+        if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
+        return ty.value();
+    }
+    if (type == MirTypeKind::IP) {
+        auto ty = b.make_type(rir::TypeKind::IP);
+        if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
+        return ty.value();
+    }
     if (type == MirTypeKind::Variant && variant_index != 0xffffffffu &&
         variant_infos[variant_index].struct_type != nullptr)
         return variant_infos[variant_index].struct_type;
@@ -683,7 +693,7 @@ static FrontendResult<rir::ValueId> emit_eq_for_shape(MirTypeKind type,
                                                       rir::Builder& b,
                                                       Span span) {
     if (type == MirTypeKind::Bool || type == MirTypeKind::I32 || type == MirTypeKind::Str ||
-        type == MirTypeKind::Method) {
+        type == MirTypeKind::Method || type == MirTypeKind::ByteSize || type == MirTypeKind::IP) {
         auto cmp = b.emit_cmp(rir::Opcode::CmpEq, lhs, rhs, {span.line, span.col});
         if (!cmp) return frontend_error(FrontendError::OutOfMemory, span);
         return cmp.value();
@@ -1411,8 +1421,78 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
+    if (value.kind == MirValueKind::ReqParam) {
+        auto v = b.emit_req_param(value.str_value, {span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqCookie) {
+        auto v = b.emit_req_cookie(value.str_value, {span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqQuery) {
+        auto v = b.emit_req_query(value.str_value, {span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqQueryString) {
+        auto v = b.emit_req_query_string({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
     if (value.kind == MirValueKind::ReqPath) {
         auto v = b.emit_req_path({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqPathOnly) {
+        auto v = b.emit_req_path_only({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqBody) {
+        auto v = b.emit_req_body({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqKeepAlive) {
+        auto v = b.emit_req_keep_alive({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqChunked) {
+        auto v = b.emit_req_chunked({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqHasContentLength) {
+        auto v = b.emit_req_has_content_length({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqHttp10) {
+        auto v = b.emit_req_http10({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqHttp11) {
+        auto v = b.emit_req_http11({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqHttpVersion) {
+        auto v = b.emit_req_http_version({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqContentLength) {
+        auto v = b.emit_req_content_length({span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqRemoteAddr) {
+        auto v = b.emit_req_remote_addr({span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }

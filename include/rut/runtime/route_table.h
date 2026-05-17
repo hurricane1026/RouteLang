@@ -65,6 +65,7 @@ struct RouteEntry {
     u16 upstream_id;              // index into RouteConfig::upstreams (if action == Proxy)
     u16 status_code;              // status code (if action == Static, e.g., 200, 404)
     jit::HandlerFn fn = nullptr;  // JIT-compiled handler (if action == JitHandler)
+    bool needs_req_body = false;  // JIT handler reads req.body and needs the full body buffered
 };
 
 // RouteConfig — immutable after construction, atomically swappable.
@@ -132,9 +133,8 @@ struct RouteConfig {
         SegmentTrie,  // segment-aware trie (boundary-sensitive overlap;
                       //   the only correct choice when
                       //   needs_segment_aware() returns true).
-                      //   Note: `:param` route paths are currently
-                      //   rejected at add_* time — runtime param capture
-                      //   is a future feature.
+                      //   `:param` route paths are supported here for
+                      //   dynamic segments and request-time capture.
     };
 
     DispatchKind dispatch_kind() const { return dispatch_kind_; }
@@ -282,7 +282,8 @@ struct RouteConfig {
         if (route_count >= kMaxRoutes) return false;
         if (upstream_id >= upstream_count) return false;
         if (!is_routable_path(path)) return false;
-        if (!has_no_param_segment(path)) return false;
+        if (!dispatch_accepts_path_shape(path)) return false;
+        if (!param_count_fits(path)) return false;
         const u8 method_key = route_method_key_from_legacy_char(method);
         if (route_method_slot(method_key) == kMethodSlotInvalid) return false;
         auto& r = routes[route_count];
@@ -298,6 +299,7 @@ struct RouteConfig {
         r.upstream_id = upstream_id;
         r.status_code = 0;
         r.fn = nullptr;
+        r.needs_req_body = false;
         if (!populate_dispatch_state(r)) {
             return false;  // active dispatch at capacity — fail loud
         }
@@ -310,7 +312,8 @@ struct RouteConfig {
     bool add_static(const char* path, u8 method, u16 status) {
         if (route_count >= kMaxRoutes) return false;
         if (!is_routable_path(path)) return false;
-        if (!has_no_param_segment(path)) return false;
+        if (!dispatch_accepts_path_shape(path)) return false;
+        if (!param_count_fits(path)) return false;
         const u8 method_key = route_method_key_from_legacy_char(method);
         if (route_method_slot(method_key) == kMethodSlotInvalid) return false;
         auto& r = routes[route_count];
@@ -326,6 +329,7 @@ struct RouteConfig {
         r.upstream_id = 0;
         r.status_code = status;
         r.fn = nullptr;
+        r.needs_req_body = false;
         if (!populate_dispatch_state(r)) {
             return false;
         }
@@ -336,11 +340,15 @@ struct RouteConfig {
     // Add a JIT-handler route. Handler is invoked on match; its HandlerResult
     // tells the runtime what to do next (return status, forward, or yield).
     // Same failure modes as add_proxy() plus null-fn check.
-    bool add_jit_handler(const char* path, u8 method, jit::HandlerFn fn) {
+    bool add_jit_handler(const char* path,
+                         u8 method,
+                         jit::HandlerFn fn,
+                         bool needs_req_body = false) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
         if (!is_routable_path(path)) return false;
-        if (!has_no_param_segment(path)) return false;
+        if (!dispatch_accepts_path_shape(path)) return false;
+        if (!param_count_fits(path)) return false;
         const u8 method_key = route_method_key_from_legacy_char(method);
         if (route_method_slot(method_key) == kMethodSlotInvalid) return false;
         auto& r = routes[route_count];
@@ -356,6 +364,7 @@ struct RouteConfig {
         r.upstream_id = 0;
         r.status_code = 0;
         r.fn = fn;
+        r.needs_req_body = needs_req_body;
         if (!populate_dispatch_state(r)) {
             return false;
         }
@@ -525,6 +534,15 @@ struct RouteConfig {
     // `method` must be a canonical route method key. Compatibility
     // callers with legacy first-char bytes should use match().
     const RouteEntry* match_canonical(Str canon, u8 method) const {
+        return match_canonical(canon, method, nullptr, nullptr, 0);
+    }
+
+    const RouteEntry* match_canonical(Str canon,
+                                      u8 method,
+                                      RouteParam* out_params,
+                                      u32* out_param_count,
+                                      u32 out_param_cap) const {
+        if (out_param_count) *out_param_count = 0;
         if (canon.ptr == nullptr) return nullptr;
         u16 idx;
         switch (dispatch_kind_) {
@@ -533,7 +551,7 @@ struct RouteConfig {
                                   : art_state.match_canonical_key(canon, method);
                 break;
             case DispatchKind::SegmentTrie:
-                idx = trie.match_key(canon, method);
+                idx = trie.match_key(canon, method, out_params, out_param_count, out_param_cap);
                 break;
             default:
                 __builtin_unreachable();
@@ -543,20 +561,31 @@ struct RouteConfig {
     }
 
 private:
-    // Returns true iff `path` contains no `:param`-style segment (a
-    // segment starting with ':'). Used by add_* to gate registration:
-    // if the path has a param segment the call returns false (the
-    // misconfiguration is surfaced loudly at startup rather than
-    // producing silent route misses at request time, because neither
-    // current dispatcher implements runtime parameter capture —
-    // registered "/users/:id" would store ":id" literally and
-    // "/users/42" would silently miss. Runtime parameter capture is
-    // a future feature; route_select.h's path_has_param_segment
-    // helper detects the shape).
-    bool has_no_param_segment(const char* path) const {
+    // ART is byte-prefix based and cannot interpret `:param` segments, so
+    // reject dynamic routes there. SegmentTrie supports dynamic segments
+    // and request-time capture.
+    bool dispatch_accepts_path_shape(const char* path) const {
         u32 plen = 0;
         while (path[plen]) plen++;
-        return !path_has_param_segment(Str{path, plen});
+        if (!path_has_param_segment(Str{path, plen})) return true;
+        return dispatch_kind_ == DispatchKind::SegmentTrie;
+    }
+
+    bool param_count_fits(const char* path) const {
+        u32 count = 0;
+        bool at_start = true;
+        for (u32 i = 0; path[i]; i++) {
+            if (path[i] == '/') {
+                at_start = true;
+                continue;
+            }
+            if (at_start && path[i] == ':') {
+                count++;
+                if (count > kMaxRouteParams) return false;
+            }
+            at_start = false;
+        }
+        return true;
     }
 
     // Tagged-union discriminator. Default is ArtJit since most

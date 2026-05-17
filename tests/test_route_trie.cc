@@ -104,6 +104,114 @@ TEST(route_trie, catchall_root_matches_unrouted_paths) {
     CHECK_EQ(canon_match(t, S("/"), 0), 99u);         // root path hits catchall
 }
 
+TEST(route_trie, param_segment_matches_one_request_segment) {
+    RouteTrie t;
+    const Insert items[] = {{"/users/:id", 0, 11}};
+    REQUIRE(build_ok(t, items, 1));
+    CHECK_EQ(canon_match(t, S("/users/42"), 0), 11u);
+    CHECK_EQ(canon_match(t, S("/users/alice"), 0), 11u);
+    CHECK_EQ(canon_match(t, S("/users"), 0), TrieNode::kInvalidRoute);
+}
+
+TEST(route_trie, literal_segment_wins_over_param_at_same_depth) {
+    RouteTrie t;
+    const Insert items[] = {{"/users/:id", 0, 11}, {"/users/me", 0, 12}};
+    REQUIRE(build_ok(t, items, 2));
+    CHECK_EQ(canon_match(t, S("/users/me"), 0), 12u);
+    CHECK_EQ(canon_match(t, S("/users/42"), 0), 11u);
+}
+
+TEST(route_trie, param_branch_can_win_when_literal_branch_dead_ends) {
+    RouteTrie t;
+    const Insert items[] = {{"/users/me", 0, 12}, {"/users/:id/settings", 0, 13}};
+    REQUIRE(build_ok(t, items, 2));
+    CHECK_EQ(canon_match(t, S("/users/me/settings"), 0), 13u);
+}
+
+TEST(route_trie, distinct_param_names_keep_distinct_dynamic_children) {
+    RouteTrie t;
+    const Insert items[] = {{"/users/:id/settings", 0, 21}, {"/users/:name/profile", 0, 22}};
+    REQUIRE(build_ok(t, items, 2));
+    CHECK_EQ(canon_match(t, S("/users/42/settings"), 0), 21u);
+    CHECK_EQ(canon_match(t, S("/users/alice/profile"), 0), 22u);
+
+    RouteParam params[kMaxRouteParams]{};
+    u32 param_count = 0;
+    CHECK_EQ(
+        t.match_key(canonicalize_request(S("/users/alice/profile")), 0, params, &param_count, 16),
+        22u);
+    REQUIRE_EQ(param_count, 1u);
+    CHECK((Str{params[0].name, params[0].name_len}.eq(S("name"))));
+    CHECK((Str{params[0].value, params[0].value_len}.eq(S("alice"))));
+}
+
+TEST(route_trie, earlier_param_sibling_wins_equal_precedence_tie) {
+    RouteTrie t;
+    const Insert items[] = {{"/users/:id", 0, 41}, {"/users/:name", 0, 42}};
+    REQUIRE(build_ok(t, items, 2));
+
+    RouteParam params[kMaxRouteParams]{};
+    u32 param_count = 0;
+    CHECK_EQ(t.match_key(canonicalize_request(S("/users/alice")), 0, params, &param_count, 16),
+             41u);
+    REQUIRE_EQ(param_count, 1u);
+    CHECK((Str{params[0].name, params[0].name_len}.eq(S("id"))));
+    CHECK((Str{params[0].value, params[0].value_len}.eq(S("alice"))));
+}
+
+TEST(route_trie, earlier_literal_position_wins_same_depth_static_count_tie) {
+    RouteTrie t;
+    const Insert items[] = {{"/:a/:x/z", 0, 51}, {"/:b/x/:z", 0, 52}};
+    REQUIRE(build_ok(t, items, 2));
+
+    RouteParam params[kMaxRouteParams]{};
+    u32 param_count = 0;
+    CHECK_EQ(t.match_key(canonicalize_request(S("/foo/x/z")), 0, params, &param_count, 16), 52u);
+    REQUIRE_EQ(param_count, 2u);
+    CHECK((Str{params[0].name, params[0].name_len}.eq(S("b"))));
+    CHECK((Str{params[0].value, params[0].value_len}.eq(S("foo"))));
+    CHECK((Str{params[1].name, params[1].name_len}.eq(S("z"))));
+    CHECK((Str{params[1].value, params[1].value_len}.eq(S("z"))));
+}
+
+TEST(route_trie, param_child_is_not_reused_as_literal_match_for_colon_segment) {
+    RouteTrie t;
+    const Insert items[] = {{"/:id/:x", 0, 61}, {"/:name/y", 0, 62}};
+    REQUIRE(build_ok(t, items, 2));
+
+    RouteParam params[kMaxRouteParams]{};
+    u32 param_count = 0;
+    CHECK_EQ(t.match_key(canonicalize_request(S("/:id/y")), 0, params, &param_count, 16), 62u);
+    REQUIRE_EQ(param_count, 1u);
+    CHECK((Str{params[0].name, params[0].name_len}.eq(S("name"))));
+    CHECK((Str{params[0].value, params[0].value_len}.eq(S(":id"))));
+}
+
+TEST(route_trie, param_capture_reports_names_and_values_for_winning_route) {
+    RouteTrie t;
+    const Insert items[] = {{"/users/:id/books/:book", 0, 31}, {"/users/me/books/:book", 0, 32}};
+    REQUIRE(build_ok(t, items, 2));
+
+    RouteParam params[kMaxRouteParams]{};
+    u32 param_count = 99;
+    const u16 route =
+        t.match_key(canonicalize_request(S("/users/42/books/rust")), 0, params, &param_count, 16);
+    CHECK_EQ(route, 31u);
+    REQUIRE_EQ(param_count, 2u);
+    CHECK((Str{params[0].name, params[0].name_len}.eq(S("id"))));
+    CHECK((Str{params[0].value, params[0].value_len}.eq(S("42"))));
+    CHECK((Str{params[1].name, params[1].name_len}.eq(S("book"))));
+    CHECK((Str{params[1].value, params[1].value_len}.eq(S("rust"))));
+
+    param_count = 99;
+    const u16 literal =
+        t.match_key(canonicalize_request(S("/users/me/books/rut")), 0, params, &param_count, 16);
+    CHECK_EQ(literal, 32u);
+    REQUIRE_EQ(param_count, 1u);
+    CHECK((Str{params[0].name, params[0].name_len}.eq(S("book"))));
+    CHECK((Str{params[0].value, params[0].value_len}.eq(S("rut"))));
+}
+
 TEST(route_trie, longest_match_wins_regardless_of_insert_order) {
     // Two orderings of the same routes must produce the same match — the
     // whole point of moving off the linear first-match-wins scan.

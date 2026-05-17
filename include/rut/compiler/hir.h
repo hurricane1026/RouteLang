@@ -91,7 +91,21 @@ enum class HirExprKind : u8 {
     StructInit,
     Field,
     ReqHeader,
+    ReqParam,
+    ReqCookie,
+    ReqQuery,
+    ReqQueryString,
     ReqPath,
+    ReqPathOnly,
+    ReqBody,
+    ReqKeepAlive,
+    ReqChunked,
+    ReqHasContentLength,
+    ReqHttp10,
+    ReqHttp11,
+    ReqHttpVersion,
+    ReqContentLength,
+    ReqRemoteAddr,
     // HTTP method literal — int_value holds the HttpMethod enum
     // value (0=GET, 1=POST, …, matching rut/runtime/http_parser.h).
     ConstMethod,
@@ -126,6 +140,8 @@ enum class HirTypeKind : u8 {
     Tuple,
     Struct,
     Method,
+    ByteSize,
+    IP,
     // Homogeneous fixed-size sequence. Carrier for `for x in <arr>` iteration.
     // Type-shape info lives in HirTypeShape via `array_elem_shape_index`
     // alone; length is a *value* property on `HirExpr.array_len` so two

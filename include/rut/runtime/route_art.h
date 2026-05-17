@@ -64,7 +64,7 @@
 // ByteRadixTrie and the trie/hash family.
 //
 // What's intentionally NOT supported (matches ByteRadix):
-//   - `:param` segment capture — that's SegmentTrie's contract.
+//   - `:param` dynamic segment routing/capture — that's SegmentTrie's contract.
 //   - Segment-boundary-aware matching — selector won't pick this
 //     dispatch when boundary semantics are needed.
 

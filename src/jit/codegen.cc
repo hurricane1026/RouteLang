@@ -83,9 +83,18 @@ struct Ctx {
 
     // Lazily declared runtime helpers
     LLVMValueRef fn_req_path;
+    LLVMValueRef fn_req_path_only;
+    LLVMValueRef fn_req_body;
+    LLVMValueRef fn_req_http_version;
+    LLVMValueRef fn_req_flag;
     LLVMValueRef fn_req_method;
     LLVMValueRef fn_req_header;
+    LLVMValueRef fn_req_cookie;
+    LLVMValueRef fn_req_query;
+    LLVMValueRef fn_req_query_string;
+    LLVMValueRef fn_req_param;
     LLVMValueRef fn_req_remote_addr;
+    LLVMValueRef fn_req_content_length;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
     LLVMValueRef fn_str_cmp;
@@ -162,6 +171,46 @@ struct Ctx {
         return fn_req_path;
     }
 
+    // void rut_helper_req_path_only(ptr, i32, ptr, ptr)
+    LLVMValueRef get_req_path_only() {
+        if (!fn_req_path_only) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
+            fn_req_path_only = LLVMAddFunction(llvm_mod, "rut_helper_req_path_only", ft);
+        }
+        return fn_req_path_only;
+    }
+
+    // void rut_helper_req_body(ptr, i32, ptr, ptr)
+    LLVMValueRef get_req_body() {
+        if (!fn_req_body) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
+            fn_req_body = LLVMAddFunction(llvm_mod, "rut_helper_req_body", ft);
+        }
+        return fn_req_body;
+    }
+
+    // void rut_helper_req_http_version(ptr, i32, ptr, ptr)
+    LLVMValueRef get_req_http_version() {
+        if (!fn_req_http_version) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
+            fn_req_http_version = LLVMAddFunction(llvm_mod, "rut_helper_req_http_version", ft);
+        }
+        return fn_req_http_version;
+    }
+
+    // u8 rut_helper_req_flag(ptr, i32, i8)
+    LLVMValueRef get_req_flag() {
+        if (!fn_req_flag) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, i8_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 3, 0);
+            fn_req_flag = LLVMAddFunction(llvm_mod, "rut_helper_req_flag", ft);
+        }
+        return fn_req_flag;
+    }
+
     // u8 rut_helper_req_method(ptr, i32)
     LLVMValueRef get_req_method() {
         if (!fn_req_method) {
@@ -182,6 +231,46 @@ struct Ctx {
         return fn_req_header;
     }
 
+    // void rut_helper_req_cookie(ptr, i32, ptr, i32, ptr, ptr, ptr)
+    LLVMValueRef get_req_cookie() {
+        if (!fn_req_cookie) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 7, 0);
+            fn_req_cookie = LLVMAddFunction(llvm_mod, "rut_helper_req_cookie", ft);
+        }
+        return fn_req_cookie;
+    }
+
+    // void rut_helper_req_query(ptr, i32, ptr, i32, ptr, ptr, ptr)
+    LLVMValueRef get_req_query() {
+        if (!fn_req_query) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 7, 0);
+            fn_req_query = LLVMAddFunction(llvm_mod, "rut_helper_req_query", ft);
+        }
+        return fn_req_query;
+    }
+
+    // void rut_helper_req_query_string(ptr, i32, ptr, ptr, ptr)
+    LLVMValueRef get_req_query_string() {
+        if (!fn_req_query_string) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 5, 0);
+            fn_req_query_string = LLVMAddFunction(llvm_mod, "rut_helper_req_query_string", ft);
+        }
+        return fn_req_query_string;
+    }
+
+    // void rut_helper_req_param(ptr, ptr, i32, ptr, ptr)
+    LLVMValueRef get_req_param() {
+        if (!fn_req_param) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 5, 0);
+            fn_req_param = LLVMAddFunction(llvm_mod, "rut_helper_req_param", ft);
+        }
+        return fn_req_param;
+    }
+
     // u32 rut_helper_req_remote_addr(ptr)
     LLVMValueRef get_req_remote_addr() {
         if (!fn_req_remote_addr) {
@@ -190,6 +279,16 @@ struct Ctx {
             fn_req_remote_addr = LLVMAddFunction(llvm_mod, "rut_helper_req_remote_addr", ft);
         }
         return fn_req_remote_addr;
+    }
+
+    // u64 rut_helper_req_content_length(ptr, i32)
+    LLVMValueRef get_req_content_length() {
+        if (!fn_req_content_length) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i64_ty, params, 2, 0);
+            fn_req_content_length = LLVMAddFunction(llvm_mod, "rut_helper_req_content_length", ft);
+        }
+        return fn_req_content_length;
     }
 
     // u8 rut_helper_str_has_prefix(ptr, i32, ptr, i32)
@@ -507,6 +606,83 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, strval);
             break;
         }
+        case rir::Opcode::ReqPathOnly: {
+            LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "path_only.ptr");
+            LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "path_only.len");
+            LLVMValueRef args[] = {c.param_req_data, c.param_req_len, out_ptr, out_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_path_only()),
+                           c.get_req_path_only(),
+                           args,
+                           4,
+                           "");
+            LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "path_only.p");
+            LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "path_only.l");
+            LLVMValueRef strval = LLVMGetUndef(c.str_ty);
+            strval = LLVMBuildInsertValue(c.builder, strval, p, 0, "path_only.s.ptr");
+            strval = LLVMBuildInsertValue(c.builder, strval, l, 1, "path_only.s.len");
+            c.set_value(inst.result, strval);
+            break;
+        }
+        case rir::Opcode::ReqBody: {
+            LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "body.ptr");
+            LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "body.len");
+            LLVMValueRef args[] = {c.param_req_data, c.param_req_len, out_ptr, out_len};
+            LLVMBuildCall2(
+                c.builder, LLVMGlobalGetValueType(c.get_req_body()), c.get_req_body(), args, 4, "");
+            LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "body.p");
+            LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "body.l");
+            LLVMValueRef strval = LLVMGetUndef(c.str_ty);
+            strval = LLVMBuildInsertValue(c.builder, strval, p, 0, "body.s.ptr");
+            strval = LLVMBuildInsertValue(c.builder, strval, l, 1, "body.s.len");
+            c.set_value(inst.result, strval);
+            break;
+        }
+        case rir::Opcode::ReqHttpVersion: {
+            LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "http_version.ptr");
+            LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "http_version.len");
+            LLVMValueRef args[] = {c.param_req_data, c.param_req_len, out_ptr, out_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_http_version()),
+                           c.get_req_http_version(),
+                           args,
+                           4,
+                           "");
+            LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "http_version.p");
+            LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "http_version.l");
+            LLVMValueRef strval = LLVMGetUndef(c.str_ty);
+            strval = LLVMBuildInsertValue(c.builder, strval, p, 0, "http_version.s.ptr");
+            strval = LLVMBuildInsertValue(c.builder, strval, l, 1, "http_version.s.len");
+            c.set_value(inst.result, strval);
+            break;
+        }
+        case rir::Opcode::ReqKeepAlive:
+        case rir::Opcode::ReqChunked:
+        case rir::Opcode::ReqHasContentLength:
+        case rir::Opcode::ReqHttp10:
+        case rir::Opcode::ReqHttp11: {
+            const u8 flag = inst.op == rir::Opcode::ReqKeepAlive          ? 0
+                            : inst.op == rir::Opcode::ReqChunked          ? 1
+                            : inst.op == rir::Opcode::ReqHasContentLength ? 2
+                            : inst.op == rir::Opcode::ReqHttp10           ? 3
+                                                                          : 4;
+            LLVMValueRef args[] = {
+                c.param_req_data, c.param_req_len, LLVMConstInt(c.i8_ty, flag, 0)};
+            LLVMValueRef v = LLVMBuildCall2(c.builder,
+                                            LLVMGlobalGetValueType(c.get_req_flag()),
+                                            c.get_req_flag(),
+                                            args,
+                                            3,
+                                            flag == 0   ? "keep_alive"
+                                            : flag == 1 ? "chunked"
+                                            : flag == 2 ? "has_content_length"
+                                            : flag == 3 ? "http10"
+                                                        : "http11");
+            LLVMValueRef b =
+                LLVMBuildICmp(c.builder, LLVMIntNE, v, LLVMConstInt(c.i8_ty, 0, 0), "req.flag");
+            c.set_value(inst.result, b);
+            break;
+        }
         case rir::Opcode::ReqMethod: {
             LLVMValueRef args[] = {c.param_req_data, c.param_req_len};
             LLVMValueRef v = LLVMBuildCall2(c.builder,
@@ -608,6 +784,98 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, opt);
             break;
         }
+        case rir::Opcode::ReqParam: {
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, "param.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "param.ptr");
+            LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "param.len");
+            LLVMValueRef args[] = {c.param_ctx, name_ptr, name_len, out_ptr, out_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_param()),
+                           c.get_req_param(),
+                           args,
+                           5,
+                           "");
+            LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "p");
+            LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "l");
+            LLVMValueRef strval = LLVMGetUndef(c.str_ty);
+            strval = LLVMBuildInsertValue(c.builder, strval, p, 0, "param.s.ptr");
+            strval = LLVMBuildInsertValue(c.builder, strval, l, 1, "param.s.len");
+            c.set_value(inst.result, strval);
+            break;
+        }
+        case rir::Opcode::ReqCookie: {
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, "cookie.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "cookie.has");
+            LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "cookie.ptr");
+            LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "cookie.len");
+            LLVMValueRef args[] = {
+                c.param_req_data, c.param_req_len, name_ptr, name_len, out_has, out_ptr, out_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_cookie()),
+                           c.get_req_cookie(),
+                           args,
+                           7,
+                           "");
+            LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "cookie.h");
+            LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "cookie.p");
+            LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "cookie.l");
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, h, 0, "cookie.opt.has");
+            opt = LLVMBuildInsertValue(c.builder, opt, p, 1, "cookie.opt.ptr");
+            opt = LLVMBuildInsertValue(c.builder, opt, l, 2, "cookie.opt.len");
+            c.set_value(inst.result, opt);
+            break;
+        }
+        case rir::Opcode::ReqQuery: {
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, "query.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "query.has");
+            LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "query.ptr");
+            LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "query.len");
+            LLVMValueRef args[] = {
+                c.param_req_data, c.param_req_len, name_ptr, name_len, out_has, out_ptr, out_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_query()),
+                           c.get_req_query(),
+                           args,
+                           7,
+                           "");
+            LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "query.h");
+            LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "query.p");
+            LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "query.l");
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, h, 0, "query.opt.has");
+            opt = LLVMBuildInsertValue(c.builder, opt, p, 1, "query.opt.ptr");
+            opt = LLVMBuildInsertValue(c.builder, opt, l, 2, "query.opt.len");
+            c.set_value(inst.result, opt);
+            break;
+        }
+        case rir::Opcode::ReqQueryString: {
+            LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "query_string.has");
+            LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "query_string.ptr");
+            LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "query_string.len");
+            LLVMValueRef args[] = {c.param_req_data, c.param_req_len, out_has, out_ptr, out_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_query_string()),
+                           c.get_req_query_string(),
+                           args,
+                           5,
+                           "");
+            LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "query_string.h");
+            LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "query_string.p");
+            LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "query_string.l");
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, h, 0, "query_string.opt.has");
+            opt = LLVMBuildInsertValue(c.builder, opt, p, 1, "query_string.opt.ptr");
+            opt = LLVMBuildInsertValue(c.builder, opt, l, 2, "query_string.opt.len");
+            c.set_value(inst.result, opt);
+            break;
+        }
         case rir::Opcode::ReqRemoteAddr: {
             LLVMValueRef args[] = {c.param_conn};
             LLVMValueRef v = LLVMBuildCall2(c.builder,
@@ -616,6 +884,17 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                                             args,
                                             1,
                                             "addr");
+            c.set_value(inst.result, v);
+            break;
+        }
+        case rir::Opcode::ReqContentLength: {
+            LLVMValueRef args[] = {c.param_req_data, c.param_req_len};
+            LLVMValueRef v = LLVMBuildCall2(c.builder,
+                                            LLVMGlobalGetValueType(c.get_req_content_length()),
+                                            c.get_req_content_length(),
+                                            args,
+                                            2,
+                                            "content_length");
             c.set_value(inst.result, v);
             break;
         }
@@ -1172,9 +1451,18 @@ CodegenResult codegen(const rir::Module& rir_mod) {
 
     // Zero out lazy helper pointers
     c.fn_req_path = nullptr;
+    c.fn_req_path_only = nullptr;
+    c.fn_req_body = nullptr;
+    c.fn_req_http_version = nullptr;
+    c.fn_req_flag = nullptr;
     c.fn_req_method = nullptr;
     c.fn_req_header = nullptr;
+    c.fn_req_cookie = nullptr;
+    c.fn_req_query = nullptr;
+    c.fn_req_query_string = nullptr;
+    c.fn_req_param = nullptr;
     c.fn_req_remote_addr = nullptr;
+    c.fn_req_content_length = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;
     c.fn_str_cmp = nullptr;

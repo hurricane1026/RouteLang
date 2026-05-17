@@ -1,6 +1,7 @@
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
 #include "fault_injection.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/route_table.h"
@@ -9,6 +10,7 @@
 #include "rut/runtime/upstream_pool.h"
 #include "test.h"
 #include "test_helpers.h"
+#include <memory>
 
 #include <errno.h>
 #include <sys/socket.h>
@@ -480,7 +482,7 @@ TEST(copilot, has_buf_distinguishes_no_buffer) {
     CHECK_EQ(no_buf.buf_id, 0u);
 
     // Event with buffer id 0 (valid)
-    IoEvent with_buf = {0, 100, 0, 1, IoEventType::Recv};
+    IoEvent with_buf = {0, 100, 0, 1, IoEventType::Recv, 0};
     CHECK_EQ(with_buf.has_buf, 1u);
     CHECK_EQ(with_buf.buf_id, 0u);
 
@@ -1338,14 +1340,14 @@ TEST(uring_buf, recv_without_has_buf) {
 // Verify that provided buffer events with has_buf=1 still include buf_id
 // (This tests the IoEvent structure itself)
 TEST(uring_buf, event_preserves_buf_id) {
-    IoEvent ev = {5, 100, 42, 1, IoEventType::Recv};
+    IoEvent ev = {5, 100, 42, 1, IoEventType::Recv, 0};
     CHECK_EQ(ev.conn_id, 5u);
     CHECK_EQ(ev.result, 100);
     CHECK_EQ(ev.buf_id, 42u);
     CHECK_EQ(ev.has_buf, 1u);
 
     // After io_uring wait() processes it: has_buf=0, buf_id=0 (buffer returned)
-    IoEvent processed = {5, 100, 0, 0, IoEventType::Recv};
+    IoEvent processed = {5, 100, 0, 0, IoEventType::Recv, 0};
     CHECK_EQ(processed.has_buf, 0u);
     CHECK_EQ(processed.buf_id, 0u);
 }
@@ -2270,25 +2272,75 @@ TEST(route, use_segment_trie_swaps_dispatch_pre_add) {
     CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::ArtJit);
 }
 
-TEST(route, add_refuses_param_path) {
-    // Neither ArtJit (byte-prefix) nor SegmentTrie (literal-segment)
-    // currently implements runtime ":param" capture — a registered
-    // "/users/:id" would be stored under the literal ":id" segment
-    // in either dispatcher and "/users/42" would silently miss.
-    // add_*() refuses param paths so the misconfiguration surfaces
-    // at startup instead of at request time.
+TEST(route, add_refuses_param_path_under_art_dispatch) {
+    // ArtJit is byte-prefix based and cannot interpret ":param" segments.
+    // Dynamic route paths must use SegmentTrie so request segments are
+    // compared one segment at a time.
     RouteConfig cfg;
     CHECK(!cfg.add_static("/users/:id", 0, 200));
-    // Refusal is consistent under explicit SegmentTrie too — it
-    // stores ":v" literally, so "/api/v1/users" still wouldn't
-    // match.
-    RouteConfig cfg2;
-    REQUIRE(cfg2.use_segment_trie());
-    CHECK(!cfg2.add_static("/api/:v/users", 0, 200));
-    // Routes without ":param" segments are unaffected.
-    RouteConfig cfg3;
-    CHECK(cfg3.add_static("/users/me", 0, 200));
-    CHECK(cfg3.add_static("/api/v1/users", 0, 200));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, configure_route_dispatch_selects_segment_trie_for_param_route) {
+    rir::Function funcs[1]{};
+    funcs[0].route_pattern = Str{"/users/:id", 10};
+    rir::Module mod{};
+    mod.functions = funcs;
+    mod.func_count = 1;
+
+    RouteConfig cfg;
+    CHECK(configure_route_dispatch(cfg, mod));
+    CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::SegmentTrie);
+    CHECK(cfg.add_static("/users/:id", 0, 200));
+}
+
+TEST(route, configure_route_dispatch_selects_segment_trie_for_boundary_overlap) {
+    rir::Function funcs[2]{};
+    funcs[0].route_pattern = Str{"/api", 4};
+    funcs[1].route_pattern = Str{"/apix", 5};
+    rir::Module mod{};
+    mod.functions = funcs;
+    mod.func_count = 2;
+
+    RouteConfig cfg;
+    CHECK(configure_route_dispatch(cfg, mod));
+    CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::SegmentTrie);
+}
+
+TEST(route, configure_route_dispatch_refuses_after_route_add) {
+    rir::Function funcs[1]{};
+    funcs[0].route_pattern = Str{"/users/:id", 10};
+    rir::Module mod{};
+    mod.functions = funcs;
+    mod.func_count = 1;
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/health", 0, 200));
+    CHECK(!configure_route_dispatch(cfg, mod));
+    CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::ArtJit);
+}
+
+TEST(route, segment_trie_matches_param_path) {
+    RouteConfig cfg;
+    REQUIRE(cfg.use_segment_trie());
+    CHECK(cfg.add_static("/users/:id", 0, 201));
+    CHECK(cfg.add_static("/users/me", 0, 202));
+    auto* dynamic = cfg.match(reinterpret_cast<const u8*>("/users/42"), 9, 0);
+    REQUIRE(dynamic != nullptr);
+    CHECK_EQ(dynamic->status_code, 201u);
+    auto* literal = cfg.match(reinterpret_cast<const u8*>("/users/me"), 9, 0);
+    REQUIRE(literal != nullptr);
+    CHECK_EQ(literal->status_code, 202u);
+
+    RouteParam params[kMaxRouteParams]{};
+    u32 param_count = 0;
+    auto* captured =
+        cfg.match_canonical(Str{"users/42", 8}, 0, params, &param_count, kMaxRouteParams);
+    REQUIRE(captured != nullptr);
+    CHECK_EQ(captured->status_code, 201u);
+    REQUIRE_EQ(param_count, 1u);
+    CHECK((Str{params[0].name, params[0].name_len}.eq(Str{"id", 2})));
+    CHECK((Str{params[0].value, params[0].value_len}.eq(Str{"42", 2})));
 }
 
 TEST(route, use_dispatch_refuses_after_first_add) {
@@ -5078,11 +5130,13 @@ TEST(streaming, request_body_cl_multi_chunk_send_recv) {
     u32 hdr_end = 57;    // offset past \r\n\r\n
     u32 body_in_buf = 12;
     u32 req_len = hdr_end + body_in_buf;
+    u32 available = static_cast<u32>(sizeof(req) - 1);
+    u32 copy_len = req_len < available ? req_len : available;
 
     c->recv_buf.reset();
     u8* dst = c->recv_buf.write_ptr();
-    for (u32 j = 0; j < req_len; j++) dst[j] = static_cast<u8>(req[j]);
-    c->recv_buf.commit(req_len);
+    for (u32 j = 0; j < copy_len; j++) dst[j] = static_cast<u8>(req[j]);
+    c->recv_buf.commit(copy_len);
 
     IoEvent recv_ev = make_ev(c->id, IoEventType::Recv, static_cast<i32>(req_len));
     loop.backend.inject(recv_ev);
@@ -7899,70 +7953,70 @@ static u64 state_invariant_wait_recv_then_status(
     void*, jit::HandlerCtx* ctx, const u8*, u32, void*);
 
 TEST(legacy_loop, alloc_upstream_buf) {
-    EventLoop<MockBackend> loop;
-    auto initialized = loop.init(0, -1);
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
     REQUIRE(initialized);
-    auto* c = loop.alloc_conn();
+    auto* c = loop->alloc_conn();
     REQUIRE(c != nullptr);
 
-    CHECK(loop.alloc_upstream_buf(*c));
+    CHECK(loop->alloc_upstream_buf(*c));
     CHECK(c->upstream_recv_slice != nullptr);
-    CHECK(loop.alloc_upstream_buf(*c));
+    CHECK(loop->alloc_upstream_buf(*c));
 
-    loop.free_conn(*c);
-    loop.shutdown();
+    loop->free_conn(*c);
+    loop->shutdown();
 }
 
 TEST(legacy_loop, sync_submit_and_close_paths) {
-    EventLoop<MockBackend> loop;
-    auto initialized = loop.init(0, -1);
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
     REQUIRE(initialized);
     ShardMetrics metrics;
     metrics.init();
     metrics.connections_active = 1;
     metrics.requests_active = 1;
-    loop.metrics = &metrics;
+    loop->metrics = &metrics;
     ShardEpoch epoch;
     epoch.epoch.store(0, std::memory_order_relaxed);
-    loop.epoch = &epoch;
+    loop->epoch = &epoch;
 
-    auto* c = loop.alloc_conn();
+    auto* c = loop->alloc_conn();
     REQUIRE(c != nullptr);
     c->fd = dup(2);
     REQUIRE(c->fd >= 0);
     c->upstream_fd = dup(2);
     REQUIRE(c->upstream_fd >= 0);
     c->req_start_us = 1;
-    CHECK(loop.alloc_upstream_buf(*c));
+    CHECK(loop->alloc_upstream_buf(*c));
 
     static const u8 kBody[] = {'o', 'k'};
     sockaddr_in addr{};
-    CHECK(loop.submit_recv(*c));
-    loop.submit_send(*c, kBody, sizeof(kBody));
-    CHECK(loop.submit_connect(*c, &addr, sizeof(addr)));
-    CHECK(loop.submit_send_upstream(*c, kBody, sizeof(kBody)));
-    CHECK(loop.submit_recv_upstream(*c));
+    CHECK(loop->submit_recv(*c));
+    loop->submit_send(*c, kBody, sizeof(kBody));
+    CHECK(loop->submit_connect(*c, &addr, sizeof(addr)));
+    CHECK(loop->submit_send_upstream(*c, kBody, sizeof(kBody)));
+    CHECK(loop->submit_recv_upstream(*c));
 
-    loop.backend.fail_connect = true;
-    CHECK(!loop.submit_connect(*c, &addr, sizeof(addr)));
-    loop.backend.fail_upstream_send = true;
-    CHECK(!loop.submit_send_upstream(*c, kBody, sizeof(kBody)));
-    loop.backend.fail_upstream_recv = true;
-    CHECK(!loop.submit_recv_upstream(*c));
+    loop->backend.fail_connect = true;
+    CHECK(!loop->submit_connect(*c, &addr, sizeof(addr)));
+    loop->backend.fail_upstream_send = true;
+    CHECK(!loop->submit_send_upstream(*c, kBody, sizeof(kBody)));
+    loop->backend.fail_upstream_recv = true;
+    CHECK(!loop->submit_recv_upstream(*c));
 
-    loop.close_conn(*c);
+    loop->close_conn(*c);
     CHECK_EQ(metrics.connections_closed, 1u);
     CHECK_EQ(metrics.connections_active, 0u);
     CHECK_EQ(metrics.requests_active, 0u);
     CHECK_EQ(epoch.epoch.load(std::memory_order_relaxed), 1u);
-    loop.shutdown();
+    loop->shutdown();
 }
 
 TEST(legacy_loop, async_submit_and_close_paths) {
-    EventLoop<AsyncMockBackend> loop;
-    auto initialized = loop.init(0, -1);
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    auto initialized = loop->init(0, -1);
     REQUIRE(initialized);
-    auto* c = loop.alloc_conn();
+    auto* c = loop->alloc_conn();
     REQUIRE(c != nullptr);
     c->fd = dup(2);
     REQUIRE(c->fd >= 0);
@@ -7971,50 +8025,50 @@ TEST(legacy_loop, async_submit_and_close_paths) {
 
     static const u8 kBody[] = {'o', 'k'};
     sockaddr_in addr{};
-    CHECK(loop.submit_recv(*c));
-    CHECK(loop.submit_recv(*c));
-    loop.submit_send(*c, kBody, sizeof(kBody));
-    CHECK(loop.submit_connect(*c, &addr, sizeof(addr)));
-    CHECK(loop.submit_send_upstream(*c, kBody, sizeof(kBody)));
-    CHECK(loop.submit_recv_upstream(*c));
-    CHECK(loop.submit_recv_upstream(*c));
+    CHECK(loop->submit_recv(*c));
+    CHECK(loop->submit_recv(*c));
+    loop->submit_send(*c, kBody, sizeof(kBody));
+    CHECK(loop->submit_connect(*c, &addr, sizeof(addr)));
+    CHECK(loop->submit_send_upstream(*c, kBody, sizeof(kBody)));
+    CHECK(loop->submit_recv_upstream(*c));
+    CHECK(loop->submit_recv_upstream(*c));
     CHECK(c->pending_ops > 0);
     CHECK(c->recv_armed);
     CHECK(c->send_armed);
     CHECK(c->upstream_recv_armed);
     CHECK(c->upstream_send_armed);
 
-    loop.close_conn(*c);
-    CHECK_EQ(loop.pending_free_count, 1u);
-    CHECK_EQ(loop.backend.count_ops(MockOp::Cancel), 1u);
-    loop.shutdown();
+    loop->close_conn(*c);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Cancel), 1u);
+    loop->shutdown();
 }
 
 TEST(legacy_loop, event_yield_fails_fast) {
-    EventLoop<MockBackend> loop;
-    auto initialized = loop.init(0, -1);
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
     REQUIRE(initialized);
-    auto* c = loop.alloc_conn();
+    auto* c = loop->alloc_conn();
     REQUIRE(c != nullptr);
     c->fd = 42;
-    loop.timer.add(c, loop.keepalive_timeout);
+    loop->timer.add(c, loop->keepalive_timeout);
 
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::EventYield;
     outcome.next_state = 7;
     outcome.yield_kind = jit::YieldKind::Recv;
-    loop.backend.clear_ops();
+    loop->backend.clear_ops();
     handle_jit_outcome<EventLoop<MockBackend>>(
-        &loop, *c, outcome, &state_invariant_wait_recv_then_status, true);
+        loop.get(), *c, outcome, &state_invariant_wait_recv_then_status, true);
 
     CHECK_EQ(c->pending_handler_fn, nullptr);
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->resp_status, 500);
     CHECK_EQ(c->on_send, &on_response_sent<EventLoop<MockBackend>>);
-    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Send), 1u);
 
-    loop.free_conn(*c);
-    loop.shutdown();
+    loop->free_conn(*c);
+    loop->shutdown();
 }
 
 // === Slot state machine tests: on_body_send_with_early_response ===
@@ -8866,6 +8920,111 @@ static jit::HandlerResult g_state_invariant_jit_result = jit::HandlerResult::mak
 
 static u64 state_invariant_configured_jit_result(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return g_state_invariant_jit_result.pack();
+}
+
+static u64 state_invariant_req_body_payload(
+    void*, jit::HandlerCtx*, const u8* req, u32 len, void*) {
+    const u8 needle[] = {'\r', '\n', '\r', '\n'};
+    u32 body_start = len;
+    for (u32 i = 0; i + sizeof(needle) <= len; i++) {
+        if (__builtin_memcmp(req + i, needle, sizeof(needle)) == 0) {
+            body_start = i + sizeof(needle);
+            break;
+        }
+    }
+    const bool match =
+        body_start + 7 <= len && __builtin_memcmp(req + body_start, "payload", 7) == 0;
+    return jit::HandlerResult::make_status(match ? 204 : 400).pack();
+}
+
+TEST(state_invariant, jit_content_length_body_waits_until_full_buffer) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/upload", 'P', &state_invariant_req_body_payload, true));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    auto append_and_dispatch = [&](const char* data, u32 len) {
+        u8* dst = c->recv_buf.write_ptr();
+        for (u32 i = 0; i < len; i++) dst[i] = static_cast<u8>(data[i]);
+        c->recv_buf.commit(len);
+        loop.backend.inject(make_ev(c->id, IoEventType::Recv, static_cast<i32>(len)));
+        IoEvent events[8];
+        u32 n = loop.backend.wait(events, 8);
+        for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    };
+
+    static const char kHeadAndPartial[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
+    append_and_dispatch(kHeadAndPartial, sizeof(kHeadAndPartial) - 1);
+
+    CHECK_EQ(c->state, ConnState::ReadingBody);
+    CHECK_EQ(c->on_recv, &on_jit_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_send, nullptr);
+    CHECK_EQ(c->req_body_remaining, 4u);
+
+    append_and_dispatch("load", 4);
+
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->resp_status, 204u);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+}
+
+TEST(state_invariant, jit_content_length_without_body_dependency_runs_immediately) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/upload", 'P', &state_invariant_configured_jit_result));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    static const char kHeadAndPartial[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 i = 0; i < sizeof(kHeadAndPartial) - 1; i++)
+        dst[i] = static_cast<u8>(kHeadAndPartial[i]);
+    c->recv_buf.commit(sizeof(kHeadAndPartial) - 1);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->resp_status, 204u);
+    CHECK_EQ(c->on_recv, nullptr);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+}
+
+TEST(state_invariant, jit_req_body_chunked_request_is_rejected) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/upload", 'P', &state_invariant_req_body_payload, true));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    static const char kChunkedHead[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 i = 0; i < sizeof(kChunkedHead) - 1; i++) dst[i] = static_cast<u8>(kChunkedHead[i]);
+    c->recv_buf.commit(sizeof(kChunkedHead) - 1);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kChunkedHead) - 1));
+
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->resp_status, 400u);
+    CHECK_EQ(c->keep_alive, false);
+    CHECK_EQ(c->on_recv, nullptr);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
 TEST(state_invariant, static_dispatch_keeps_slots_consistent) {

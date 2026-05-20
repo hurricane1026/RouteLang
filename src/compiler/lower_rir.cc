@@ -2525,7 +2525,26 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                                          local_count,
                                          term.span);
             if (!rhs) return core::make_unexpected(rhs.error());
-            if (term.lhs.may_error && term.lhs.error_variant_index != 0xffffffffu) {
+            if (term.lhs.kind == MirValueKind::Error &&
+                term.lhs.error_variant_index != 0xffffffffu) {
+                auto i32_ty_result = b.make_type(rir::TypeKind::I32);
+                if (!i32_ty_result) return frontend_error(FrontendError::OutOfMemory, term.span);
+                auto* i32_ty = i32_ty_result.value();
+                rir::ValueId rhs_tag = rhs.value();
+                if (rhs_shape.type == MirTypeKind::Variant &&
+                    rhs_shape.variant_index < mir.variants.len &&
+                    variant_infos[rhs_shape.variant_index].struct_type != nullptr) {
+                    auto rhs_tag_field = b.emit_struct_field(
+                        rhs.value(), lit("tag"), i32_ty, {term.span.line, term.span.col});
+                    if (!rhs_tag_field)
+                        return frontend_error(FrontendError::OutOfMemory, term.span);
+                    rhs_tag = rhs_tag_field.value();
+                }
+                auto cmp = b.emit_cmp(
+                    rir::Opcode::CmpEq, lhs.value(), rhs_tag, {term.span.line, term.span.col});
+                if (!cmp) return frontend_error(FrontendError::OutOfMemory, term.span);
+                cond_id = cmp.value();
+            } else if (term.lhs.may_error && term.lhs.error_variant_index != 0xffffffffu) {
                 auto& err_info = error_info_for(lhs_shape,
                                                 term.lhs.error_struct_index,
                                                 error_scalar_infos,

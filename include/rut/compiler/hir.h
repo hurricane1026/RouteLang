@@ -78,9 +78,9 @@ enum class HirExprKind : u8 {
     RegexMatch,
     Tuple,
     // Array literal: elements stored in `args`. analyze rejects heterogeneous
-    // arrays and empty `[]` (Rutlang has no push/append so size + element
-    // type must be compile-time known; contextual inference from annotations
-    // is deferred — empty literals currently error even with an annotation).
+    // arrays and bare empty `[]`; typed empty route locals are currently
+    // accepted only when their `let xs: [T] = []` binding is used solely as a
+    // static for-loop iterator.
     // Element count is a value property on `HirExpr.array_len`, not a type
     // property; the result's HirTypeShape carries only `array_elem_shape_index`.
     ArrayLit,
@@ -678,7 +678,9 @@ struct HirGuardBody {
         If,
     };
 
+    static constexpr u32 kMaxLocals = 4;
     BodyKind body_kind = BodyKind::Direct;
+    FixedVec<HirLocal, kMaxLocals> locals;
     HirExpr cond{};
     HirTerminator then_term{};
     HirTerminator else_term{};
@@ -756,20 +758,90 @@ struct HirControl {
     HirTerminator direct_term{};
 };
 
-// Body of a `for ... in` loop. Phase 3b MVP: body is `guard*` plus an
-// optional terminator (return / forward). Lets, nested for-loops, and
-// arbitrary if/match are deferred to later phases. The body's guards carry
-// inline HirExpr cond subtrees whose lhs/rhs/args* point into the parent
+struct HirForLoopIf {
+    Span span{};
+    HirExpr cond{};
+    HirTerminator then_term{};
+    HirTerminator else_term{};
+};
+
+struct HirForLoopMatchArm {
+    enum class BodyKind : u8 {
+        Direct,
+        If,
+    };
+
+    Span span{};
+    bool is_wildcard = false;
+    HirExpr pattern{};
+    bool bind_payload = false;
+    Str bind_name{};
+    HirTypeKind bind_type = HirTypeKind::Unknown;
+    u32 bind_variant_index = 0xffffffffu;
+    u32 bind_struct_index = 0xffffffffu;
+    u32 bind_tuple_len = 0;
+    HirTypeKind bind_tuple_types[kMaxTupleSlots]{};
+    u32 bind_tuple_variant_indices[kMaxTupleSlots]{};
+    u32 bind_tuple_struct_indices[kMaxTupleSlots]{};
+    bool has_arm_guard = false;
+    HirExpr arm_guard{};
+    BodyKind body_kind = BodyKind::Direct;
+    static constexpr u32 kMaxLocals = 4;
+    static constexpr u32 kMaxPreludeGuards = 2;
+    FixedVec<HirLocal, kMaxLocals> locals;
+    FixedVec<HirGuard, kMaxPreludeGuards> guards;
+    HirExpr cond{};
+    HirTerminator then_term{};
+    HirTerminator else_term{};
+    HirTerminator direct_term{};
+};
+
+struct HirForLoopMatch {
+    Span span{};
+    static constexpr u32 kMaxMatchArms = 8;
+    HirExpr match_expr{};
+    FixedVec<HirForLoopMatchArm, kMaxMatchArms> arms;
+};
+
+// Body of a `for ... in` loop. The current compile-time unroll path supports
+// body-local lets, body guards, and an optional terminating control (return /
+// forward / if with terminal branches / simple match with terminal arms).
+// Nested for-loops and richer match forms are represented in the HIR body.
+// The body's guards, local inits, if conds, and match exprs/patterns carry
+// inline HirExpr subtrees whose lhs/rhs/args* point into the parent
 // HirRoute::exprs pool; HirRoute::rebase_from must walk them. HirTerminator
 // has no HirExpr pointers (only status_code / upstream_index / response
 // strings), so it doesn't participate in rebase.
 struct HirForLoopBody {
+    struct Step {
+        enum class Kind : u8 {
+            Let,
+            Guard,
+            If,
+            Match,
+            For,
+            Term,
+        };
+        Kind kind = Kind::Let;
+        u32 index = 0;
+        Span span{};
+    };
+    // Body-local lets are compile-time-expanded with each iteration. Keep
+    // this small: each HirLocal carries an inline HirExpr init.
+    static constexpr u32 kMaxLocals = 4;
     // 2 guards cover the canonical DESIGN.md examples (1 guard short-circuits
     // the request, rarely 2 for compound checks). Each HirGuard is ~4.5 KB
     // inline, so raising this directly grows HirRoute on the stack — see
     // HirExpr::kMaxArgs comment for the recursive-analyze stack budget.
     static constexpr u32 kMaxGuards = 2;
+    static constexpr u32 kMaxIfs = 1;
+    static constexpr u32 kMaxMatches = 1;
+    static constexpr u32 kMaxSteps = kMaxLocals + kMaxGuards + kMaxIfs + kMaxMatches + 2;
+    FixedVec<Step, kMaxSteps> steps;
+    FixedVec<HirLocal, kMaxLocals> locals;
     FixedVec<HirGuard, kMaxGuards> guards;
+    FixedVec<HirForLoopIf, kMaxIfs> ifs;
+    FixedVec<HirForLoopMatch, kMaxMatches> matches;
     HirTerminator term{};
     bool has_term = false;
 };
@@ -922,22 +994,47 @@ private:
         }
     }
 
+    void rebase_guard(HirGuard& guard, const HirRoute& other) {
+        rebase_expr(guard.cond, other);
+        rebase_expr(guard.fail_match_expr, other);
+        for (u32 li = 0; li < guard.fail_body.locals.len; li++) {
+            rebase_expr(guard.fail_body.locals[li].init, other);
+        }
+        rebase_expr(guard.fail_body.cond, other);
+    }
+
     void rebase_from(const HirRoute& other) {
         for (u32 i = 0; i < exprs.len; i++) rebase_expr(exprs[i], other);
         for (u32 i = 0; i < locals.len; i++) rebase_expr(locals[i].init, other);
         for (u32 i = 0; i < guards.len; i++) {
-            rebase_expr(guards[i].cond, other);
-            rebase_expr(guards[i].fail_match_expr, other);
-            rebase_expr(guards[i].fail_body.cond, other);
+            rebase_guard(guards[i], other);
         }
         // For-loops: iter_expr and the body's guard conds all point into
         // `exprs`, so rebase them the same way as top-level guards.
         for (u32 i = 0; i < for_loops.len; i++) {
             rebase_expr(for_loops[i].iter_expr, other);
+            for (u32 li = 0; li < for_loops[i].body.locals.len; li++) {
+                rebase_expr(for_loops[i].body.locals[li].init, other);
+            }
             for (u32 gi = 0; gi < for_loops[i].body.guards.len; gi++) {
-                rebase_expr(for_loops[i].body.guards[gi].cond, other);
-                rebase_expr(for_loops[i].body.guards[gi].fail_match_expr, other);
-                rebase_expr(for_loops[i].body.guards[gi].fail_body.cond, other);
+                rebase_guard(for_loops[i].body.guards[gi], other);
+            }
+            for (u32 ii = 0; ii < for_loops[i].body.ifs.len; ii++) {
+                rebase_expr(for_loops[i].body.ifs[ii].cond, other);
+            }
+            for (u32 mi = 0; mi < for_loops[i].body.matches.len; mi++) {
+                rebase_expr(for_loops[i].body.matches[mi].match_expr, other);
+                for (u32 ai = 0; ai < for_loops[i].body.matches[mi].arms.len; ai++) {
+                    rebase_expr(for_loops[i].body.matches[mi].arms[ai].pattern, other);
+                    rebase_expr(for_loops[i].body.matches[mi].arms[ai].arm_guard, other);
+                    for (u32 li = 0; li < for_loops[i].body.matches[mi].arms[ai].locals.len; li++) {
+                        rebase_expr(for_loops[i].body.matches[mi].arms[ai].locals[li].init, other);
+                    }
+                    for (u32 gi = 0; gi < for_loops[i].body.matches[mi].arms[ai].guards.len; gi++) {
+                        rebase_guard(for_loops[i].body.matches[mi].arms[ai].guards[gi], other);
+                    }
+                    rebase_expr(for_loops[i].body.matches[mi].arms[ai].cond, other);
+                }
             }
         }
         rebase_expr(control.cond, other);
@@ -946,7 +1043,7 @@ private:
             rebase_expr(control.match_arms[i].pattern, other);
             rebase_expr(control.match_arms[i].arm_guard, other);
             for (u32 gi = 0; gi < control.match_arms[i].guards.len; gi++) {
-                rebase_expr(control.match_arms[i].guards[gi].cond, other);
+                rebase_guard(control.match_arms[i].guards[gi], other);
             }
             rebase_expr(control.match_arms[i].cond, other);
         }

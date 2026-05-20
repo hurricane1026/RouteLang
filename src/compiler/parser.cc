@@ -1143,7 +1143,13 @@ struct Parser {
             stmt.span = Span{start.start, else_stmt->span.end, start.line, start.col};
             return stmt;
         }
-        if (take(TokenType::KwFor)) {
+        const bool is_inline_for = cur().type == TokenType::Ident && cur().text.eq({"inline", 6}) &&
+                                   peek().type == TokenType::KwFor;
+        if (is_inline_for || cur().type == TokenType::KwFor) {
+            const bool is_inline = is_inline_for;
+            if (is_inline) pos++;
+            if (auto for_kw = expect(TokenType::KwFor); !for_kw)
+                return core::make_unexpected(for_kw.error());
             auto var_name = expect(TokenType::Ident);
             if (!var_name) return core::make_unexpected(var_name.error());
             auto in_kw = expect(TokenType::KwIn);
@@ -1158,6 +1164,9 @@ struct Parser {
             if (!body_ptr) return core::make_unexpected(body_ptr.error());
             AstStatement stmt{};
             stmt.kind = AstStmtKind::For;
+            // Keep the spelling for source fidelity; static unroll decisions
+            // are made later from the analyzed iterator/body shape.
+            stmt.is_inline = is_inline;
             stmt.name = var_name.value()->text;
             stmt.expr = iter_expr.value();
             stmt.then_stmt = body_ptr.value();

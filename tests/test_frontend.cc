@@ -115,6 +115,16 @@ TEST(frontend, lex_emits_at_token_for_decorator_prefix) {
     CHECK(lexed->tokens[1].text.eq(lit("auth")));
 }
 
+TEST(frontend, lex_keeps_inline_contextual) {
+    const char* src = "inline for";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 3u);
+    CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::Ident));
+    CHECK(lexed->tokens[0].text.eq(lit("inline")));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::KwFor));
+}
+
 TEST(frontend, lex_recognizes_lowercase_http_methods) {
     const char* src = "get post put delete patch head options";
     auto lexed = lex(lit(src));
@@ -1995,10 +2005,35 @@ TEST(frontend, analyze_rejects_parameterized_wait_any_arms_until_rich_payloads) 
 
 TEST(frontend, analyze_rejects_wait_after_for_loop) {
     const char* sources[] = {
+        "route GET \"/x\" { inline for item in [1] { guard item > 0 else { return 400 } } "
+        "wait(50) return 204 }\n",
+        "route GET \"/x\" { inline for item in [1] { guard item > 0 else { return 400 } } "
+        "let ev = wait(downstream.recv()) return 204 }\n",
         "route GET \"/x\" { for item in [1] { guard item > 0 else { return 400 } } "
         "wait(50) return 204 }\n",
         "route GET \"/x\" { for item in [1] { guard item > 0 else { return 400 } } "
         "let ev = wait(downstream.recv()) return 204 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+    }
+}
+
+TEST(frontend, analyze_rejects_for_loop_after_wait) {
+    const char* sources[] = {
+        "route GET \"/x\" { wait(50) inline for item in [1] { guard item > 0 else { return 400 } "
+        "} return 204 }\n",
+        "route GET \"/x\" { let ev = wait(downstream.recv()) inline for item in [1] { guard item "
+        "> 0 else { return 400 } } return 204 }\n",
+        "route GET \"/x\" { wait(50) for item in [1] { guard item > 0 else { return 400 } "
+        "} return 204 }\n",
+        "route GET \"/x\" { let ev = wait(downstream.recv()) for item in [1] { guard item "
+        "> 0 else { return 400 } } return 204 }\n",
     };
     for (const char* src : sources) {
         auto lexed = lex(lit(src));
@@ -5401,6 +5436,27 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard) {
     REQUIRE(lowered);
     rir.destroy();
 }
+TEST(frontend, match_arm_block_guard_else_local_named_error_gets_hidden_variant) {
+    const char* src =
+        "variant Result { ok, err }\n"
+        "route GET \"/users\" { let state = Result.ok match state { case .ok: { guard false else "
+        "{ let failed = error(.timeout) if true { return 401 } else { return 402 } } return 200 } "
+        "case .err: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->variants.len, 2u);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    REQUIRE_EQ(hir->routes[0].control.match_arms[0].guards.len, 1u);
+    REQUIRE_EQ(hir->routes[0].control.match_arms[0].guards[0].fail_body.locals.len, 1u);
+    const auto& local = hir->routes[0].control.match_arms[0].guards[0].fail_body.locals[0];
+    CHECK_EQ(local.error_variant_index, hir->routes[0].error_variant_index);
+    CHECK_EQ(local.init.error_variant_index, hir->routes[0].error_variant_index);
+    CHECK_EQ(local.init.error_case_index, 0u);
+}
 TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
@@ -8241,6 +8297,24 @@ TEST(frontend, guard_else_block_with_let_is_supported) {
     CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].fail_body.body_kind),
              static_cast<u8>(HirGuardBody::BodyKind::If));
 }
+TEST(frontend, guard_else_block_local_named_error_gets_hidden_variant) {
+    const char* src =
+        "route GET \"/users\" { guard false else { let failed = error(.timeout) if true { return "
+        "401 } else { return 500 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->variants.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards[0].fail_body.locals.len, 1u);
+    const auto& local = hir->routes[0].guards[0].fail_body.locals[0];
+    CHECK_EQ(local.error_variant_index, 0u);
+    CHECK_EQ(local.init.error_variant_index, 0u);
+    CHECK_EQ(local.init.error_case_index, 0u);
+}
 TEST(frontend, guard_let_binds_success_value) {
     const char* src =
         "route GET \"/users\" { guard let code = 200 else { return 401 } if code == 200 { return "
@@ -9429,6 +9503,37 @@ TEST(frontend, analyze_rejects_route_nested_match_duplicate_bool_case) {
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
+
+TEST(frontend, analyze_rejects_route_nested_match_duplicate_int_case) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let code = 1 match auth { case .ok: match "
+        "code { case 1: return 200 case 1: return 201 case _: return 404 } case .denied: return "
+        "403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_route_nested_match_duplicate_string_case) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: "
+        "match path { case \"/users\": return 200 case \"/users\": return 201 case _: return "
+        "404 } case .denied: return 403 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, analyze_rejects_route_nested_match_duplicate_outer_bool_case) {
     const char* src =
         "route GET \"/users\" { let ok = true let allowed = true match ok { case true: match "
@@ -9612,6 +9717,25 @@ TEST(frontend, guard_match_lowers_to_fail_side_match_arms) {
     REQUIRE(mir);
     CHECK(mir->functions[0].blocks.len >= 5u);
 }
+
+TEST(frontend, lower_to_rir_supports_guard_match_known_error_fail_side) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
+        ".timeout: return 503 case _: return 500 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, parse_rejects_guard_match_arm_guard) {
     const char* src =
         "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
@@ -9682,9 +9806,196 @@ TEST(frontend, analyze_rejects_match_arm_block_guard_match_on_non_error_value) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
+    REQUIRE_FALSE(hir);
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
+
+TEST(frontend, analyze_rejects_route_guard_match_on_non_error_value) {
+    const char* src =
+        "route GET \"/users\" { let code = 200 guard match code else { case true: return 401 "
+        "case _: return 402 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_route_array_local_used_outside_for_iter) {
+    const char* src = "route GET \"/x\" { let nums = [1, 2, 3] let second = nums return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_typed_empty_array_local_used_outside_for_iter) {
+    const char* src = "route GET \"/x\" { let nums: [i32] = [] let second = nums return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_array_local_alias_chain_used_outside_for_iter) {
+    const char* src =
+        "route GET \"/x\" { let nums = [1, 2, 3] let second = nums let third = second return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_alias_chain_partially_used_outside_for_iter) {
+    const char* src =
+        "route GET \"/x\" { let nums = [1, 2, 3] let alias = nums inline for item in alias "
+        "{ return 200 } let leaked = nums return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_plain_for_rejects_alias_chain_partially_used_outside_for_iter) {
+    const char* src =
+        "route GET \"/x\" { let nums = [1, 2, 3] let alias = nums for item in alias "
+        "{ return 200 } let leaked = nums return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_for_rejects_alias_chain_partially_used_outside_for_iter) {
+    const char* src =
+        "route GET \"/x\" { let nums = [1, 2, 3] let alias = nums inline for item in alias "
+        "{ return 200 } let leaked = nums return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_typed_array_local_call_as_for_iter) {
+    const char* src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { let xs: [i32] = make() inline for item in xs { return 200 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_plain_for_rejects_typed_array_local_call_as_for_iter) {
+    const char* src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { let xs: [i32] = make() for item in xs { return 200 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_for_rejects_typed_array_local_call_as_for_iter) {
+    const char* src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { let xs: [i32] = make() inline for item in xs { return 200 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_accepts_typed_array_alias_chain_for_for_iter) {
+    const char* src =
+        "route GET \"/x\" { let xs: [i32] = [1, 2, 3] let ys = xs inline for item in ys { return "
+        "200 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_plain_for_accepts_typed_array_alias_chain_for_for_iter) {
+    const char* src =
+        "route GET \"/x\" { let xs: [i32] = [1, 2, 3] let ys = xs for item in ys { return "
+        "200 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_for_accepts_typed_array_alias_chain_for_for_iter) {
+    const char* src =
+        "route GET \"/x\" { let xs: [i32] = [1, 2, 3] let ys = xs inline for item in ys { return "
+        "200 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, analyze_rejects_match_without_wildcard) {
     const char* src =
         "route GET \"/users\" { let code = 200 match code { case 200: return 200 } }\n";
@@ -17616,11 +17927,12 @@ TEST(frontend, parse_array_lit_nested_type) {
 }
 
 TEST(frontend, parse_for_loop_basic) {
-    // `for item in xs { return 200 }` — loop variable stored in `name`,
+    // `inline for item in xs { return 200 }` — loop variable stored in `name`,
     // iteration source in `expr`, body block in `then_stmt`. Intentionally
     // parse-only: asserts AST shape independent of analyze (full-pipeline
     // coverage lives in analyze_for_loop_* tests below).
-    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -17629,6 +17941,7 @@ TEST(frontend, parse_for_loop_basic) {
     REQUIRE_EQ(route.statements.len, 2u);
     const auto& for_stmt = route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("item")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
     REQUIRE_EQ(for_stmt.expr.args.len, 3u);
@@ -17639,10 +17952,58 @@ TEST(frontend, parse_for_loop_basic) {
     CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
 }
 
+TEST(frontend, parse_plain_for_loop_basic) {
+    // `for item in [1, 2, 3] { return 200 }` — same AST shape as inline, except
+    // the `is_inline` marker stays false.
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    const auto& for_stmt = route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(!for_stmt.is_inline);
+    CHECK(for_stmt.name.eq(lit("item")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
+    REQUIRE_EQ(for_stmt.expr.args.len, 3u);
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    // Body is single-stmt `return 200` in parse representation.
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
+}
+
+TEST(frontend, parse_inline_identifier_is_not_reserved) {
+    const char* src =
+        "route GET \"/x\" { let inline = 1 guard inline == 1 else { return 400 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 TEST(frontend, parse_for_loop_field_access_source) {
-    // `for server in up.servers` — iteration source is a field access expr,
+    // `inline for server in up.servers` — iteration source is a field access expr,
     // not a literal. Exercises parse_expr → parse_primary_expr → Field path
     // inside the for's iter-expr slot.
+    const char* src =
+        "route GET \"/x\" { inline for server in up.servers { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& for_stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(for_stmt.is_inline);
+    CHECK(for_stmt.name.eq(lit("server")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
+}
+
+TEST(frontend, parse_plain_for_field_access_source) {
     const char* src = "route GET \"/x\" { for server in up.servers { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -17650,6 +18011,34 @@ TEST(frontend, parse_for_loop_field_access_source) {
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(!for_stmt.is_inline);
+    CHECK(for_stmt.name.eq(lit("server")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
+}
+
+TEST(frontend, parse_for_field_access_source) {
+    const char* src =
+        "route GET \"/x\" { inline for server in up.servers { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& for_stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(for_stmt.is_inline);
+    CHECK(for_stmt.name.eq(lit("server")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
+}
+
+TEST(frontend, parse_plain_for_loop_field_access_source) {
+    const char* src = "route GET \"/x\" { for server in up.servers { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& for_stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(!for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("server")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
 }
@@ -17658,13 +18047,15 @@ TEST(frontend, parse_for_loop_multi_stmt_body) {
     // Body with multiple statements — parse_braced_stmt_body returns a Block
     // wrapping them; then_stmt points to that Block.
     const char* src =
-        "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 } } "
+        "route GET \"/x\" { inline for item in [1, 2] { let n = item guard n > 0 else { return 400 "
+        "} } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
+    CHECK(for_stmt.is_inline);
     REQUIRE(for_stmt.then_stmt != nullptr);
     CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
     REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
@@ -17674,13 +18065,108 @@ TEST(frontend, parse_for_loop_multi_stmt_body) {
              static_cast<u8>(AstStmtKind::Guard));
 }
 
-TEST(frontend, analyze_array_lit_at_let_rhs_rejected) {
-    // ArrayLit at let RHS is rejected in analyze because MIR cannot yet
-    // lower array values as constants (no indexing, no const-folded array
-    // locals). Inline `for x in [1,2,3] { ... }` is allowed at analyze
-    // level, but Phase 4a's mir_build also rejects any route with
-    // `for_loops.len > 0` — so no for-loop-bearing program compiles end
-    // to end until Phase 4b implements MIR unroll.
+TEST(frontend, parse_plain_for_without_inline_marker) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 } } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& for_stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(!for_stmt.is_inline);
+    CHECK(for_stmt.name.eq(lit("item")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
+    REQUIRE_EQ(for_stmt.expr.args.len, 2u);
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
+    REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[0]->kind),
+             static_cast<u8>(AstStmtKind::Let));
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[1]->kind),
+             static_cast<u8>(AstStmtKind::Guard));
+}
+
+TEST(frontend, parse_for_without_inline_marker) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2] { let n = item guard n > 0 else { return 400 "
+        "} } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& for_stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(for_stmt.is_inline);
+    CHECK(for_stmt.name.eq(lit("item")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
+    REQUIRE_EQ(for_stmt.expr.args.len, 2u);
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
+    REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[0]->kind),
+             static_cast<u8>(AstStmtKind::Let));
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[1]->kind),
+             static_cast<u8>(AstStmtKind::Guard));
+}
+
+TEST(frontend, parse_plain_for_single_stmt_body) {
+    const char* src = "route GET \"/x\" { for item in [1] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& for_stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(!for_stmt.is_inline);
+    CHECK(for_stmt.name.eq(lit("item")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
+}
+
+TEST(frontend, parse_for_single_stmt_body) {
+    const char* src = "route GET \"/x\" { inline for item in [1] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& for_stmt = ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(for_stmt.is_inline);
+    CHECK(for_stmt.name.eq(lit("item")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
+}
+
+TEST(frontend, parse_plain_for_loop_multi_stmt_body) {
+    // Plain `for` keeps multi-statement block behavior identical to inline.
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 } } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& for_stmt = ast->items[0].route.statements[0];
+    CHECK(for_stmt.is_inline == false);
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
+    REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[0]->kind),
+             static_cast<u8>(AstStmtKind::Let));
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[1]->kind),
+             static_cast<u8>(AstStmtKind::Guard));
+}
+
+TEST(frontend, analyze_rejects_array_lit_at_route_let_rhs) {
+    // A route-level array `let` is only accepted when used as a later
+    // inlined `for` as static iterable source.
     const char* src = "route GET \"/x\" { let xs: [i32] = [1, 2, 3] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -17703,8 +18189,19 @@ TEST(frontend, analyze_array_lit_heterogeneous_rejected) {
 }
 
 TEST(frontend, analyze_array_lit_empty_rejected) {
-    // `[]` leaves element type unresolvable with Rutlang's no-push rule.
-    // Contextual inference from annotation is future work; MVP rejects.
+    // Bare `[]` leaves element type unresolvable with Rutlang's no-push rule.
+    const char* src = "route GET \"/x\" { inline for item in [] { return 201 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_rejects_typed_empty_array_at_route_let_rhs) {
+    // Typed empty array `let` at route level is also rejected unless fed to
+    // `for` iteration.
     const char* src = "route GET \"/x\" { let xs: [i32] = [] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -17714,20 +18211,22 @@ TEST(frontend, analyze_array_lit_empty_rejected) {
     CHECK(!hir);
 }
 
-// NOTE: a former `analyze_array_annotation_type_mismatch_rejected` test used
-// `let xs: [str] = [1, 2, 3]` to exercise `apply_declared_type_to_expr` /
-// `same_hir_type_shape` for Array. That path is unreachable in Phase 3a/3b
-// because any ArrayLit at a let RHS is rejected earlier (see
-// `analyze_array_lit_at_let_rhs_rejected`). The Array-shape comparison path
-// will regain test coverage once Phase 5 adds struct fields / function
-// params typed as `Array<T>`, which route `resolve_func_type_ref` through
-// positions where the ArrayLit-at-let gate doesn't fire first.
+TEST(frontend, analyze_array_annotation_type_mismatch_rejected) {
+    const char* src = "route GET \"/x\" { let xs: [str] = [1, 2, 3] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
 
 TEST(frontend, analyze_for_loop_terminator_body) {
     // Phase 3b: body is a single `return` terminator. Analyze must produce a
     // HirForLoop on route.for_loops with iter_expr typed Array<I32>, loop_var
     // bound to I32, and body.term populated (has_term = true).
-    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -17750,12 +18249,508 @@ TEST(frontend, analyze_for_loop_terminator_body) {
              static_cast<u8>(HirTerminatorKind::ReturnStatus));
 }
 
+TEST(frontend, analyze_plain_for_loop_terminator_body) {
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.for_loops.len, 1u);
+    const auto& fl = route.for_loops[0];
+    CHECK(fl.loop_var_name.eq(lit("item")));
+    CHECK_EQ(static_cast<u8>(fl.loop_var_type), static_cast<u8>(HirTypeKind::I32));
+    CHECK_EQ(static_cast<u8>(fl.iter_expr.type), static_cast<u8>(HirTypeKind::Array));
+    CHECK_EQ(fl.iter_expr.array_len, 3u);
+    CHECK(fl.body.has_term);
+    CHECK_EQ(static_cast<u8>(fl.body.term.kind), static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(fl.body.term.status_code, 200);
+    CHECK_EQ(static_cast<u8>(route.control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+}
+
+TEST(frontend, analyze_plain_for_static_array_uses_compiler_unroll_path) {
+    const char* src = "route GET \"/x\" { for item in [1, 2] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK(hir->routes[0].for_loops[0].loop_var_name.eq(lit("item")));
+}
+
+TEST(frontend, analyze_for_static_array_uses_compiler_unroll_path) {
+    const char* src = "route GET \"/x\" { inline for item in [1, 2] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK(hir->routes[0].for_loops[0].loop_var_name.eq(lit("item")));
+}
+
+TEST(frontend, mir_unrolls_plain_for_from_static_array_alias) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2] let ys = xs for item in ys { guard item > 0 else { "
+        "return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const i32 expected[] = {1, 2};
+    for (u32 i = 0; i < 2; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_from_static_array_alias) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2] let ys = xs inline for item in ys { guard item > 0 "
+        "else { "
+        "return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const i32 expected[] = {1, 2};
+    for (u32 i = 0; i < 2; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_skips_plain_for_from_typed_empty_array_alias) {
+    const char* src =
+        "route GET \"/x\" { let base: [i32] = [] let xs = base for item in xs { return 201 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].iter_expr.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+    if (mir->functions[0].blocks[0].term.status_code != 200u) {
+        const auto msg = std::string("mir status code ") +
+                         std::to_string(mir->functions[0].blocks[0].term.status_code);
+        FAIL(msg.c_str());
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_skips_for_from_typed_empty_array_alias) {
+    const char* src =
+        "route GET \"/x\" { let base: [i32] = [] let xs = base inline for item in xs { return 201 "
+        "} "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].iter_expr.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+    if (mir->functions[0].blocks[0].term.status_code != 200u) {
+        const auto msg = std::string("mir status code ") +
+                         std::to_string(mir->functions[0].blocks[0].term.status_code);
+        FAIL(msg.c_str());
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_static_array_alias_outside_for_iter) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1] guard xs == xs else { return 400 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_guard_fail_body_local_scoped_to_fail_body) {
+    const char* src =
+        "route GET \"/x\" { guard false else { let hidden = 1 return 400 } "
+        "guard hidden == 1 else { return 401 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, mir_for_loop_wildcard_only_match_enters_prelude_guard) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case _: { guard false else { "
+        "return 400 } return 200 } } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 4u);
+    const auto& entry = mir->functions[0].blocks[0].term;
+    CHECK_EQ(static_cast<u8>(entry.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(entry.then_block, 1u);
+    const auto& guard = mir->functions[0].blocks[1].term;
+    CHECK_EQ(static_cast<u8>(guard.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(guard.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 400u);
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_wildcard_only_match_enters_prelude_guard) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case _: { guard false else { return 400 "
+        "} "
+        "return 200 } } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 4u);
+    const auto& entry = mir->functions[0].blocks[0].term;
+    CHECK_EQ(static_cast<u8>(entry.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(entry.then_block, 1u);
+    const auto& guard = mir->functions[0].blocks[1].term;
+    CHECK_EQ(static_cast<u8>(guard.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(guard.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 400u);
+}
+
+TEST(frontend, mir_unrolls_for_loop_wildcard_only_match_enters_prelude_guard) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case _: { guard false else { "
+        "return 400 } "
+        "return 200 } } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 4u);
+    const auto& entry = mir->functions[0].blocks[0].term;
+    CHECK_EQ(static_cast<u8>(entry.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(entry.then_block, 1u);
+    const auto& guard = mir->functions[0].blocks[1].term;
+    CHECK_EQ(static_cast<u8>(guard.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(guard.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 400u);
+}
+
+TEST(frontend, mir_for_loop_wildcard_fallthrough_enters_prelude_guard) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [2] { match item { case 1: return 201 case _: { "
+        "guard false else { return 400 } return 200 } } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const auto& entry = mir->functions[0].blocks[0].term;
+    CHECK_EQ(static_cast<u8>(entry.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(entry.else_block, 1u);
+    const auto& guard = mir->functions[0].blocks[1].term;
+    CHECK_EQ(static_cast<u8>(guard.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(guard.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 400u);
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_wildcard_fallthrough_enters_prelude_guard) {
+    const char* src =
+        "route GET \"/x\" { for item in [2] { match item { case 1: return 201 case _: { "
+        "guard false else { return 400 } return 200 } } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const auto& entry = mir->functions[0].blocks[0].term;
+    CHECK_EQ(static_cast<u8>(entry.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(entry.else_block, 1u);
+    const auto& guard = mir->functions[0].blocks[1].term;
+    CHECK_EQ(static_cast<u8>(guard.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(guard.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 400u);
+}
+
+TEST(frontend, mir_unrolls_for_loop_wildcard_fallthrough_enters_prelude_guard) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [2] { match item { case 1: return 201 case _: { "
+        "guard false else { return 400 } return 200 } } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const auto& entry = mir->functions[0].blocks[0].term;
+    CHECK_EQ(static_cast<u8>(entry.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(entry.else_block, 1u);
+    const auto& guard = mir->functions[0].blocks[1].term;
+    CHECK_EQ(static_cast<u8>(guard.kind), static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(guard.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 400u);
+}
+
+TEST(frontend, analyze_for_loop_body_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { let ok: bool = error(.timeout) inline for item in [1] { if ok { "
+        "return 200 } else { return 400 } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_body_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { if ok { "
+        "return 200 } else { return 400 } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_body_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { if ok { return 200 } "
+        "else { return 400 } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_body_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { let ok: bool = error(.timeout) inline for item in [1] { if ok { return "
+        "200 } "
+        "else { return 400 } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_match_arm_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { let ok: bool = error(.timeout) inline for item in [1] { match item { "
+        "case _: if ok { return 200 } else { return 400 } } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_match_arm_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { match item { "
+        "case _: if ok { return 200 } else { return 400 } } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_match_arm_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { match item { "
+        "case _: if ok { return 200 } else { return 400 } } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_match_arm_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { let ok: bool = error(.timeout) inline for item in [1] { match item { "
+        "case _: if ok { return 200 } else { return 400 } } } return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_nested_match_arm_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let ok: bool = error(.timeout) match item { "
+        "case 1: match item { case 1: if ok { return 200 } else { return 400 } case _: return 404 "
+        "} "
+        "case _: return 204 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_nested_match_arm_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let ok: bool = error(.timeout) match item { "
+        "case 1: match item { case 1: if ok { return 200 } else { return 400 } case _: return 404 "
+        "} "
+        "case _: return 204 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_nested_match_arm_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let ok: bool = error(.timeout) match item { "
+        "case 1: match item { case 1: if ok { return 200 } else { return 400 } case _: return 404 "
+        "} "
+        "case _: return 204 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_nested_match_arm_if_rejects_fallible_bool) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let ok: bool = error(.timeout) match item { "
+        "case 1: match item { case 1: if ok { return 200 } else { return 400 } case _: return 404 "
+        "} "
+        "case _: return 204 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
 TEST(frontend, analyze_for_loop_guard_body) {
     // Canonical Phase 3b use: iterate an allowlist-style array with a guard
     // that short-circuits the handler. The loop var (`n`) must be in scope
     // inside the guard's condition.
     const char* src =
-        "route GET \"/x\" { for n in [1, 2, 3] { guard n > 0 else { return 400 } } return 200 }\n";
+        "route GET \"/x\" { inline for n in [1, 2, 3] { guard n > 0 else { return 400 } } return "
+        "200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -17774,7 +18769,43 @@ TEST(frontend, analyze_for_loop_guard_body) {
     CHECK(!fl.body.has_term);
 }
 
+TEST(frontend, analyze_plain_for_loop_guard_body) {
+    // Same guard-only shape as inline form, but using plain `for`.
+    const char* src =
+        "route GET \"/x\" { for n in [1, 2, 3] { guard n > 0 else { return 400 } } return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.for_loops.len, 1u);
+    const auto& fl = route.for_loops[0];
+    CHECK(fl.loop_var_name.eq(lit("n")));
+    REQUIRE_EQ(fl.body.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(fl.body.guards[0].fail_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(fl.body.guards[0].fail_term.status_code, 400);
+    CHECK(!fl.body.has_term);
+}
+
 TEST(frontend, analyze_for_loop_var_scoped_to_body) {
+    // The loop variable must NOT leak to code after the for-loop. Writing
+    // `item` in a post-loop let should fail to resolve (Ident unknown).
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } "
+        "let x = item return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_var_scoped_to_body) {
     // The loop variable must NOT leak to code after the for-loop. Writing
     // `item` in a post-loop let should fail to resolve (Ident unknown).
     const char* src =
@@ -17788,7 +18819,64 @@ TEST(frontend, analyze_for_loop_var_scoped_to_body) {
     CHECK(!hir);
 }
 
+TEST(frontend, analyze_plain_for_var_scoped_to_body) {
+    // `item` bound by plain `for` must remain inaccessible after the loop body.
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { return 200 } let x = item return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_var_scoped_to_body) {
+    // The loop variable must NOT leak to code after the for-loop. Writing
+    // `item` in a post-loop let should fail to resolve (Ident unknown).
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } "
+        "let x = item return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_iter_not_array_rejected) {
+    const char* src = "route GET \"/x\" { for item in 42 { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_iter_not_array_rejected) {
+    const char* src = "route GET \"/x\" { inline for item in 42 { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
 TEST(frontend, analyze_for_loop_iter_not_array_rejected) {
+    // Iter source must be Array<T>; iterating a scalar is a type error.
+    const char* src = "route GET \"/x\" { inline for item in 42 { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_iter_not_array_rejected) {
     // Iter source must be Array<T>; iterating a scalar is a type error.
     const char* src = "route GET \"/x\" { for item in 42 { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
@@ -17797,6 +18885,122 @@ TEST(frontend, analyze_for_loop_iter_not_array_rejected) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     CHECK(!hir);
+}
+
+TEST(frontend, analyze_rejects_non_static_for_loop_iter) {
+    const char* src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { inline for item in make() { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_plain_for_rejects_non_static_for_loop_iter) {
+    const char* src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { for item in make() { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_for_rejects_non_static_for_loop_iter) {
+    const char* src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { inline for item in make() { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_rejects_non_static_for_loop_iter_via_alias_chain) {
+    const char* src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { let xs = make() let ys = xs inline for item in ys { return 200 } "
+        "return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_plain_for_rejects_non_static_for_loop_iter_via_alias_chain) {
+    const char* src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { let xs = make() let ys = xs for item in ys { return 200 } return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_for_rejects_non_static_for_loop_iter_via_alias_chain) {
+    const char* src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { let xs = make() let ys = xs inline for item in ys { return 200 } "
+        "return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_rejects_field_access_for_loop_iter) {
+    const char* src =
+        "struct Upstream { servers: [i32] }\n"
+        "route GET \"/x\" { let up = Upstream(servers: [1, 2, 3]) inline for server in up.servers "
+        "{ return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_plain_for_rejects_field_access_for_loop_iter) {
+    const char* src =
+        "struct Upstream { servers: [i32] }\n"
+        "route GET \"/x\" { let up = Upstream(servers: [1, 2, 3]) for server in up.servers "
+        "{ return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_for_rejects_field_access_for_loop_iter) {
+    const char* src =
+        "struct Upstream { servers: [i32] }\n"
+        "route GET \"/x\" { let up = Upstream(servers: [1, 2, 3]) inline for server in up.servers "
+        "{ return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
 }
 
 TEST(frontend, mir_unrolls_for_loop_scope_a_basic) {
@@ -17808,7 +19012,7 @@ TEST(frontend, mir_unrolls_for_loop_scope_a_basic) {
     //   block[4..6] = fail blocks (`return 400` from the body guard's else)
     // Total: 7 blocks.
     const char* src =
-        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
+        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -17822,15 +19026,86 @@ TEST(frontend, mir_unrolls_for_loop_scope_a_basic) {
     CHECK_EQ(mir->functions[0].blocks.len, 7u);
 }
 
+TEST(frontend, mir_unrolls_plain_for_loop_scope_a_basic) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else { return 400 } } return "
+        "200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks.len, 7u);
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_into_route_if_control) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2] { guard item > 0 else { return 400 } } "
+        "if true { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.cond.kind),
+             static_cast<u8>(MirValueKind::BoolConst));
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 200u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 500u);
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_into_route_match_control) {
+    const char* src =
+        "route GET \"/x\" { let path = \"/x\" for item in [1, 2] { guard item > 0 else "
+        "{ return 400 } } match path { case \"/x\": return 200 case _: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK(mir->functions[0].blocks[2].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 200u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+}
+
 TEST(frontend, mir_unrolls_for_loop_substitutes_element_in_cond) {
     // The heart of the unroll: each iteration's virtual guard should test
     // the element value directly, not a LocalRef to the loop variable.
-    // For `for item in [1, 2, 3] { guard item > 0 ...}`, block[0].term.cond
+    // For `inline for item in [1, 2, 3] { guard item > 0 ...}`, block[0].term.cond
     // must be Gt with lhs = IntConst(1), block[1] lhs = IntConst(2),
     // block[2] lhs = IntConst(3). A regression that forgets to substitute
     // would leave lhs as a LocalRef to the loop var's synthetic init.
     const char* src =
-        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
+        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -17851,11 +19126,95 @@ TEST(frontend, mir_unrolls_for_loop_substitutes_element_in_cond) {
     }
 }
 
-TEST(frontend, mir_rejects_for_loop_with_body_terminator) {
-    // Scope A excludes body terminators (iteration 0 would short-circuit
-    // unconditionally, making later iterations dead). Analyze accepts this
-    // shape (Phase 3b), but MIR rejects until Scope B. Assertion: MIR fails
-    // cleanly instead of silently dropping the loop.
+TEST(frontend, mir_unrolls_for_substitutes_element_in_cond) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_plain_for_substitutes_element_in_cond) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else { return 400 } } return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_substitutes_element_in_cond) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else { return 400 } } return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_for_loop_with_body_terminator) {
+    // A body terminator exits the route during the first iteration, so later
+    // iterations are unreachable under normal loop semantics.
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_with_body_terminator) {
     const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -17864,7 +19223,68 @@ TEST(frontend, mir_rejects_for_loop_with_body_terminator) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
-    CHECK(!mir);
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+}
+
+TEST(frontend, mir_unrolls_for_loop_guard_before_body_terminator) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else "
+        "{ return 400 } return 200 } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    REQUIRE(mir->functions[0].blocks[0].term.cond.lhs != nullptr);
+    CHECK_EQ(mir->functions[0].blocks[0].term.cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+    CHECK_EQ(mir->functions[0].blocks[1].term.status_code, 200u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 400u);
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_guard_before_body_terminator) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else { return 400 } return 200 "
+        "} "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    REQUIRE(mir->functions[0].blocks[0].term.cond.lhs != nullptr);
+    CHECK_EQ(mir->functions[0].blocks[0].term.cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+    CHECK_EQ(mir->functions[0].blocks[1].term.status_code, 200u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 400u);
 }
 
 TEST(frontend, mir_for_loop_lowers_through_rir_without_synthetic_local) {
@@ -17877,7 +19297,7 @@ TEST(frontend, mir_for_loop_lowers_through_rir_without_synthetic_local) {
     // zero locals (the only HIR local was the loop var, which must have
     // been skipped).
     const char* src =
-        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
+        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -17895,13 +19315,668 @@ TEST(frontend, mir_for_loop_lowers_through_rir_without_synthetic_local) {
     rir.destroy();
 }
 
+TEST(frontend, mir_unrolls_plain_for_loop_lowers_through_rir_without_synthetic_local) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else { return 400 } } return "
+        "200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_lowers_through_rir_without_synthetic_local) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
+        "return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_from_array_local) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2, 3] inline for item in xs { guard item > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].name.eq(lit("xs")));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Array));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_from_array_local) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2, 3] for item in xs { guard item > 0 else { return 400 } "
+        "} return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].name.eq(lit("xs")));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Array));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_from_array_local_alias) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2, 3] let ys = xs inline for item in ys { guard item > "
+        "0 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK(hir->routes[0].locals[1].name.eq(lit("ys")));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_from_array_local_alias) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2, 3] let ys = xs for item in ys { guard item > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK(hir->routes[0].locals[1].name.eq(lit("ys")));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_over_struct_array_field_access) {
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "route GET \"/x\" { let boxes = [Box(value: 1), Box(value: 2)] inline for box in boxes { "
+        "guard box.value > 0 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].loop_var_type, HirTypeKind::Struct);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    for (u32 i = 0; i < 2; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::Field));
+        REQUIRE(cond.lhs->lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->lhs->kind), static_cast<u8>(MirValueKind::StructInit));
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_over_struct_array_field_access) {
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "route GET \"/x\" { let boxes = [Box(value: 1), Box(value: 2)] for box in boxes { "
+        "guard box.value > 0 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].loop_var_type, HirTypeKind::Struct);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    for (u32 i = 0; i < 2; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::Field));
+        REQUIRE(cond.lhs->lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->lhs->kind), static_cast<u8>(MirValueKind::StructInit));
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_over_variant_array_match) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for state in [Result.ok(1)] { match state { case .ok(code): "
+        "return 201 case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].loop_var_type, HirTypeKind::Variant);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.lhs.kind),
+             static_cast<u8>(MirValueKind::VariantCase));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.rhs.kind),
+             static_cast<u8>(MirValueKind::VariantCase));
+    CHECK_EQ(mir->functions[0].blocks[1].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_over_variant_array_match) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for state in [Result.ok(1)] { match state { case .ok(code): "
+        "return 201 case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].loop_var_type, HirTypeKind::Variant);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.lhs.kind),
+             static_cast<u8>(MirValueKind::VariantCase));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.rhs.kind),
+             static_cast<u8>(MirValueKind::VariantCase));
+    CHECK_EQ(mir->functions[0].blocks[1].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_over_tuple_array_pipe_slots) {
+    const char* src =
+        "func second(a: i32, b: i32) -> i32 => b\n"
+        "route GET \"/x\" { inline for pair in [(200, 1), (200, 2)] { let code = pair | "
+        "second(_2, _1) guard code == 200 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].loop_var_type, HirTypeKind::Tuple);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    for (u32 i = 0; i < 2; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Eq));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::TupleSlot));
+        REQUIRE(cond.lhs->lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->lhs->kind), static_cast<u8>(MirValueKind::Tuple));
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_over_tuple_array_pipe_slots) {
+    const char* src =
+        "func second(a: i32, b: i32) -> i32 => b\n"
+        "route GET \"/x\" { for pair in [(200, 1), (200, 2)] { let code = pair | "
+        "second(_2, _1) guard code == 200 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].loop_var_type, HirTypeKind::Tuple);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    for (u32 i = 0; i < 2; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Eq));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::TupleSlot));
+        REQUIRE(cond.lhs->lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->lhs->kind), static_cast<u8>(MirValueKind::Tuple));
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_skips_zero_iteration_for_loop_from_typed_empty_array) {
+    const char* src =
+        "route GET \"/x\" { let xs: [i32] = [] inline for item in xs { return 201 } return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].iter_expr.array_len, 0u);
+    CHECK(hir->routes[0].for_loops[0].body.has_term);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+    if (mir->functions[0].blocks[0].term.status_code != 200u) {
+        const auto msg = std::string("mir status code ") +
+                         std::to_string(mir->functions[0].blocks[0].term.status_code);
+        FAIL(msg.c_str());
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_skips_zero_iteration_plain_for_loop_from_typed_empty_array) {
+    const char* src =
+        "route GET \"/x\" { let xs: [i32] = [] for item in xs { return 201 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].iter_expr.array_len, 0u);
+    CHECK(hir->routes[0].for_loops[0].body.has_term);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+    if (mir->functions[0].blocks[0].term.status_code != 200u) {
+        const auto msg = std::string("mir status code ") +
+                         std::to_string(mir->functions[0].blocks[0].term.status_code);
+        FAIL(msg.c_str());
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_from_array_local_alias_chain) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2, 3] let ys = xs let zs = ys inline for item in zs { "
+        "guard "
+        "item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[2].name.eq(lit("zs")), true);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[2].init.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_from_array_local_alias_chain) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2, 3] let ys = xs let zs = ys for item in zs { guard "
+        "item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[2].name.eq(lit("zs")), true);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[2].init.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_skips_zero_iteration_plain_for_loop_from_typed_empty_array_alias) {
+    const char* src =
+        "route GET \"/x\" { let base: [i32] = [] let xs = base for item in xs { return 201 } "
+        "return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].iter_expr.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+    CHECK_EQ(mir->functions[0].blocks[0].term.status_code, 200u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_skips_zero_iteration_for_loop_from_typed_empty_array_alias) {
+    const char* src =
+        "route GET \"/x\" { let base: [i32] = [] let xs = base inline for item in xs { return "
+        "201 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].iter_expr.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+    CHECK_EQ(mir->functions[0].blocks[0].term.status_code, 200u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_multiple_for_loops) {
+    const char* src =
+        "route GET \"/x\" { "
+        "inline for a in [1, 2] { guard a > 0 else { return 400 } } "
+        "inline for b in [3, 4] { guard b > 0 else { return 401 } } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 9u);
+    const i32 expected[] = {1, 2, 3, 4};
+    for (u32 i = 0; i < 4; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_multiple_for_loops) {
+    const char* src =
+        "route GET \"/x\" { "
+        "for a in [1, 2] { guard a > 0 else { return 400 } } "
+        "for b in [3, 4] { guard b > 0 else { return 401 } } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 9u);
+    const i32 expected[] = {1, 2, 3, 4};
+    for (u32 i = 0; i < 4; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_multiple_for_loops) {
+    const char* src =
+        "route GET \"/x\" { "
+        "inline for a in [1, 2] { guard a > 0 else { return 400 } } "
+        "inline for b in [3, 4] { guard b > 0 else { return 401 } } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 9u);
+    const i32 expected[] = {1, 2, 3, 4};
+    for (u32 i = 0; i < 4; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, mir_rejects_for_loop_exceeding_block_budget) {
     // A Scope-A-shape program (one for-loop, body guards only, Direct
     // control, no route guards) that unrolls to more than MirFunction::
-    // kMaxBlocks (16) blocks must reject cleanly at the for-loop span
+    // kMaxBlocks (16) blocks must reject cleanly at the overflowing step span
     // rather than fail mid-emission with a TooManyItems buried inside a
     // later `fn.blocks.push`. N=8, M=1 → 2T+1 = 17 > 16. Analyze accepts
     // this shape (kMaxArgs=8), so the reject must live in MIR's pre-check.
+    const char* src =
+        "route GET \"/x\" { inline for n in [1, 2, 3, 4, 5, 6, 7, 8] { "
+        "guard n > 0 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(!mir);
+    CHECK_EQ(mir.error().code, FrontendError::TooManyItems);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
+    CHECK_EQ(mir.error().span.start, hir->routes[0].for_loops[0].body.guards[0].span.start);
+}
+
+TEST(frontend, mir_rejects_plain_for_loop_exceeding_block_budget) {
     const char* src =
         "route GET \"/x\" { for n in [1, 2, 3, 4, 5, 6, 7, 8] { "
         "guard n > 0 else { return 400 } } return 200 }\n";
@@ -17912,15 +19987,22 @@ TEST(frontend, mir_rejects_for_loop_exceeding_block_budget) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
-    CHECK(!mir);
+    REQUIRE(!mir);
+    CHECK_EQ(mir.error().code, FrontendError::TooManyItems);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
+    CHECK_EQ(mir.error().span.start, hir->routes[0].for_loops[0].body.guards[0].span.start);
 }
 
-TEST(frontend, mir_rejects_for_loop_with_route_level_guard) {
-    // Scope A excludes routes that mix for-loops with sibling route-level
-    // guards (span-ordered interleaving is deferred to Scope C).
+TEST(frontend, mir_unrolls_for_loop_with_route_level_guard) {
+    // Route-level guards and for-loop guards are emitted as one
+    // source-ordered guard chain. For one route guard plus three virtual
+    // loop guards, lowering produces:
+    //   block[0..3] = guard chain
+    //   block[4]    = route terminal
+    //   block[5..8] = one fail block per guard
     const char* src =
         "route GET \"/x\" { guard true else { return 403 } "
-        "for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
+        "inline for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -17929,7 +20011,245 @@ TEST(frontend, mir_rejects_for_loop_with_route_level_guard) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
-    CHECK(!mir);
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks.len, 9u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.cond.kind),
+             static_cast<u8>(MirValueKind::BoolConst));
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i + 1].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_with_route_level_guard) {
+    // Same guard-chain ordering as inline form, but with plain `for`.
+    const char* src =
+        "route GET \"/x\" { guard true else { return 403 } for item in [1, 2, 3] { guard item > "
+        "0 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks.len, 9u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.cond.kind),
+             static_cast<u8>(MirValueKind::BoolConst));
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i + 1].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_for_loop_before_later_route_level_guard) {
+    // The mixed chain is sorted by source span, so a route guard after the
+    // loop runs after every virtual loop guard.
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2] { guard item > 0 else { return 400 } } "
+        "guard true else { return 403 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.cond.kind),
+             static_cast<u8>(MirValueKind::BoolConst));
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_before_later_route_level_guard) {
+    // Guard ordering is sorted by source span even with plain `for`.
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2] { guard item > 0 else { return 400 } } "
+        "guard true else { return 403 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.cond.kind),
+             static_cast<u8>(MirValueKind::BoolConst));
+}
+
+TEST(frontend, mir_unrolls_for_loop_into_route_if_control) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2] { guard item > 0 else { return 400 } } "
+        "if true { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.cond.kind),
+             static_cast<u8>(MirValueKind::BoolConst));
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 200u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 500u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_into_route_match_control) {
+    const char* src =
+        "route GET \"/x\" { let path = \"/x\" inline for item in [1, 2] { guard item > 0 else "
+        "{ return 400 } } match path { case \"/x\": return 200 case _: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK(mir->functions[0].blocks[2].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 200u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_into_route_match_arm_guard) {
+    const char* src =
+        "route GET \"/x\" { let path = \"/x\" let allow = true inline for item in [1, 2] { guard "
+        "item > 0 else { return 400 } } match path { case \"/x\" if allow: return 200 case _: "
+        "return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_into_route_match_arm_guard) {
+    const char* src =
+        "route GET \"/x\" { let path = \"/x\" let allow = true for item in [1, 2] { guard "
+        "item > 0 else { return 400 } } match path { case \"/x\" if allow: return 200 case _: "
+        "return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    CHECK(hir->routes[0].control.match_arms[0].has_arm_guard);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_into_route_match_arm_if_body) {
+    const char* src =
+        "route GET \"/x\" { let path = \"/x\" let allow = true inline for item in [1, 2] { guard "
+        "item > 0 else { return 400 } } match path { case \"/x\": if allow { return 200 } else { "
+        "return 201 } case _: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.match_arms[0].body_kind),
+             static_cast<u8>(HirMatchArm::BodyKind::If));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_into_route_match_arm_if_body) {
+    const char* src =
+        "route GET \"/x\" { let path = \"/x\" let allow = true for item in [1, 2] { guard "
+        "item > 0 else { return 400 } } match path { case \"/x\": if allow { return 200 } else { "
+        "return 201 } case _: return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.match_arms[0].body_kind),
+             static_cast<u8>(HirMatchArm::BodyKind::If));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
 }
 
 TEST(frontend, analyze_array_lit_at_nested_let_rhs_rejected) {
@@ -17967,7 +20287,48 @@ TEST(frontend, analyze_for_loop_rejects_guard_after_terminator) {
     // of the already-fired return. Analyze rejects to preserve source
     // semantics until lowering is order-aware.
     const char* src =
+        "route GET \"/x\" { inline for x in [1] { return 200 guard x > 0 else "
+        "{ return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_rejects_guard_after_terminator) {
+    // HirForLoopBody stores guards and terminator in separate fields (no
+    // source-ordered stmt list), so accepting a guard after a terminator
+    // would let MIR unroll silently reorder an unreachable guard in front
+    // of the already-fired return. Analyze rejects to preserve source
+    // semantics until lowering is order-aware.
+    const char* src =
         "route GET \"/x\" { for x in [1] { return 200 guard x > 0 else "
+        "{ return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_rejects_guard_after_terminator) {
+    const char* src =
+        "route GET \"/x\" { for x in [1] { return 200 guard x > 0 else "
+        "{ return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_rejects_guard_after_terminator) {
+    const char* src =
+        "route GET \"/x\" { inline for x in [1] { return 200 guard x > 0 else "
         "{ return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -17983,6 +20344,22 @@ TEST(frontend, analyze_for_loop_rejects_shadowing_outer_local) {
     // binding win in the body — producing wrong guard behavior under MIR
     // unroll. Analyze rejects the collision outright.
     const char* src =
+        "route GET \"/x\" { let item = 1 inline for item in [2, 3] { guard item > 1 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_rejects_shadowing_outer_local) {
+    // Ident resolution scans route.locals by name from index 0 upward, so a
+    // loop var that shares its name with an outer local would let the outer
+    // binding win in the body — producing wrong guard behavior under MIR
+    // unroll. Analyze rejects the collision outright.
+    const char* src =
         "route GET \"/x\" { let item = 1 for item in [2, 3] { guard item > 1 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
@@ -17993,12 +20370,3990 @@ TEST(frontend, analyze_for_loop_rejects_shadowing_outer_local) {
     CHECK(!hir);
 }
 
-TEST(frontend, analyze_for_loop_rejects_let_in_body) {
-    // Phase 3b MVP: body allows `guard*` + optional terminator. A nested let
-    // inside the body is an explicit scope restriction — future phases may
-    // relax this, but for now we fail loudly.
+TEST(frontend, analyze_plain_for_rejects_shadowing_outer_local) {
     const char* src =
-        "route GET \"/x\" { for item in [1, 2, 3] { let y = 7 return 200 } return 200 }\n";
+        "route GET \"/x\" { let item = 1 for item in [2, 3] { guard item > 1 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_rejects_shadowing_outer_local) {
+    const char* src =
+        "route GET \"/x\" { let item = 1 inline for item in [2, 3] { guard item > 1 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_let) {
+    // Body-local lets are expanded per iteration and can feed later guards.
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { let n = item guard n > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    CHECK(hir->routes[0].for_loops[0].body.locals[0].name.eq(lit("n")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_let) {
+    // Body-local lets are expanded per iteration and can feed later guards.
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { let n = item guard n > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    CHECK(hir->routes[0].for_loops[0].body.locals[0].name.eq(lit("n")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_allows_for_loop_body_let_only_as_noop) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { let n = item } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.steps.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[0].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::Let));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+}
+
+TEST(frontend, mir_allows_plain_for_loop_body_let_only_as_noop) {
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { let n = item } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.steps.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[0].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::Let));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::ReturnStatus));
+}
+
+TEST(frontend, analyze_for_loop_body_local_named_error_gets_hidden_variant) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let failed = error(.timeout) } return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->variants.len, 1u);
+    CHECK(hir->variants[0].name.eq(lit("__error_route")));
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    const auto& local = hir->routes[0].for_loops[0].body.locals[0];
+    CHECK_EQ(local.error_variant_index, 0u);
+    CHECK_EQ(local.init.error_variant_index, 0u);
+    CHECK_EQ(local.init.error_case_index, 0u);
+}
+
+TEST(frontend, analyze_plain_for_loop_body_local_named_error_gets_hidden_variant) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let failed = error(.timeout) } return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->variants.len, 1u);
+    CHECK(hir->variants[0].name.eq(lit("__error_route")));
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    const auto& local = hir->routes[0].for_loops[0].body.locals[0];
+    CHECK_EQ(local.error_variant_index, 0u);
+    CHECK_EQ(local.init.error_variant_index, 0u);
+    CHECK_EQ(local.init.error_case_index, 0u);
+}
+
+TEST(frontend, analyze_plain_for_body_local_named_error_gets_hidden_variant) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let failed = error(.timeout) } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->variants.len, 1u);
+    CHECK(hir->variants[0].name.eq(lit("__error_route")));
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    const auto& local = hir->routes[0].for_loops[0].body.locals[0];
+    CHECK_EQ(local.error_variant_index, 0u);
+}
+
+TEST(frontend, analyze_for_body_local_named_error_gets_hidden_variant) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let failed = error(.timeout) } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->variants.len, 1u);
+    CHECK(hir->variants[0].name.eq(lit("__error_route")));
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    const auto& local = hir->routes[0].for_loops[0].body.locals[0];
+    CHECK_EQ(local.error_variant_index, 0u);
+    CHECK_EQ(local.init.error_variant_index, 0u);
+    CHECK_EQ(local.init.error_case_index, 0u);
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_let_chain) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { let n = item let m = n guard m > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_let_chain) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { let n = item let m = n guard m > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+    }
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_guard_let) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard let n = item else { return 400 } guard n "
+        "> 0 "
+        "else { return 401 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 2u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.steps.len, 3u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[0].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::Guard));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[1].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::Let));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[2].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::Guard));
+    CHECK(hir->routes[0].for_loops[0].body.locals[0].name.eq(lit("n")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 13u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& bind_cond = mir->functions[0].blocks[i * 2].term.cond;
+        CHECK_EQ(static_cast<u8>(bind_cond.kind), static_cast<u8>(MirValueKind::BoolConst));
+        CHECK(bind_cond.bool_value);
+
+        const auto& guard_cond = mir->functions[0].blocks[i * 2 + 1].term.cond;
+        CHECK_EQ(static_cast<u8>(guard_cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(guard_cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(guard_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(guard_cond.lhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_if_with_body_local_cond) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2] { let n = item if n > 0 { return 201 } else { "
+        "return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.ifs.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.steps.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[1].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::If));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    const auto& cond = mir->functions[0].blocks[0].term.cond;
+    CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 402u);
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_with_body_local_subject) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2] { let n = item match n { case 1: return 201 case _: "
+        "return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.steps.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[1].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::Match));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.lhs.kind),
+             static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(mir->functions[0].blocks[0].term.lhs.int_value, 1);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.rhs.kind),
+             static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(mir->functions[0].blocks[0].term.rhs.int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_guard_let) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { guard let n = item else "
+        "{ return 400 } guard n > 0 else { return 401 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 2u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.steps.len, 3u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[0].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::Guard));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[1].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::Let));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[2].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::Guard));
+    CHECK(hir->routes[0].for_loops[0].body.locals[0].name.eq(lit("n")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 13u);
+    const i32 expected[] = {1, 2, 3};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& bind_cond = mir->functions[0].blocks[i * 2].term.cond;
+        CHECK_EQ(static_cast<u8>(bind_cond.kind), static_cast<u8>(MirValueKind::BoolConst));
+        CHECK(bind_cond.bool_value);
+
+        const auto& guard_cond = mir->functions[0].blocks[i * 2 + 1].term.cond;
+        CHECK_EQ(static_cast<u8>(guard_cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(guard_cond.lhs != nullptr);
+        CHECK_EQ(static_cast<u8>(guard_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(guard_cond.lhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_guard_fail_if_with_loop_var) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { guard item < 0 else { if item > 0 "
+        "{ return 401 } else { return 402 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.guards[0].fail_kind),
+             static_cast<u8>(HirGuard::FailKind::Body));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    const auto& fail_cond = mir->functions[0].blocks[2].term.cond;
+    CHECK_EQ(static_cast<u8>(fail_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(fail_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(fail_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(fail_cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 401u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_guard_fail_if_with_loop_var) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { guard item < 0 else { if item > 0 "
+        "{ return 401 } else { return 402 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.guards[0].fail_kind),
+             static_cast<u8>(HirGuard::FailKind::Body));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    const auto& fail_cond = mir->functions[0].blocks[2].term.cond;
+    CHECK_EQ(static_cast<u8>(fail_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(fail_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(fail_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(fail_cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 401u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_guard_fail_block_let) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { guard item < 0 else { let code = item if code "
+        "> 0 { return 401 } else { return 402 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards[0].fail_body.locals.len, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    const auto& fail_cond = mir->functions[0].blocks[2].term.cond;
+    CHECK_EQ(static_cast<u8>(fail_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(fail_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(fail_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(fail_cond.lhs->int_value, 1);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_guard_fail_block_let) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { guard item < 0 else { let code = item if code "
+        "> 0 { return 401 } else { return 402 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards[0].fail_body.locals.len, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    const auto& fail_cond = mir->functions[0].blocks[2].term.cond;
+    CHECK_EQ(static_cast<u8>(fail_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(fail_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(fail_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(fail_cond.lhs->int_value, 1);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_if_with_body_local_cond) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2] { let n = item if n > 0 { return 201 } else "
+        "{ return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.ifs.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.steps.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[1].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::If));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    const auto& cond = mir->functions[0].blocks[0].term.cond;
+    CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 402u);
+}
+
+TEST(frontend, analyze_for_loop_rejects_statement_after_body_if) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { if item > 0 { return 201 } else { return 402 "
+        "} guard item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_rejects_statement_after_body_if) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { if item > 0 { return 201 } else { return 402 "
+        "} guard item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_rejects_statement_after_body_if) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { if item > 0 { return 201 } else { return 402 "
+        "} guard item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_rejects_statement_after_body_if) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { if item > 0 { return 201 } else { return 402 "
+        "} guard item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_with_body_local_subject) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2] { let n = item match n { case 1: return 201 "
+        "case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.steps.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.steps[1].kind),
+             static_cast<u8>(HirForLoopBody::Step::Kind::Match));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.lhs.kind),
+             static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(mir->functions[0].blocks[0].term.lhs.int_value, 1);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.rhs.kind),
+             static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(mir->functions[0].blocks[0].term.rhs.int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_for_loop_rejects_statement_after_body_match) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case 1: return 201 case _: "
+        "return 402 } guard item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_rejects_statement_after_body_match) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case _: "
+        "return 402 } guard item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_rejects_statement_after_body_match) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case 1: return 201 case _: "
+        "return 402 } guard item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_rejects_statement_after_body_match) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case _: "
+        "return 402 } guard item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_rejects_statement_after_terminating_nested_for) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { inline for inner in [2] { return 200 } "
+        "return 201 } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_rejects_statement_after_terminating_nested_for) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { for inner in [2] { return 200 } return 201 } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_allows_statement_after_empty_terminating_nested_for) {
+    const char* src =
+        "route GET \"/x\" { let xs: [i32] = [] inline for item in [1] { inline for inner in xs { "
+        "return 200 } guard item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+}
+
+TEST(frontend, analyze_plain_for_loop_allows_statement_after_empty_terminating_nested_for) {
+    const char* src =
+        "route GET \"/x\" { let xs: [i32] = [] for item in [1] { for inner in xs { return 200 } "
+        "guard item > 0 else { return 400 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+}
+
+TEST(frontend, mir_unrolls_nested_for_loop_uses_outer_and_inner_vars) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2] { inline for inner in [3, 4] { "
+        "guard inner > item else { return 400 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 9u);
+    const i32 expected_lhs[] = {3, 4, 3, 4};
+    const i32 expected_rhs[] = {1, 1, 2, 2};
+    for (u32 i = 0; i < 4; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        REQUIRE(cond.rhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(static_cast<u8>(cond.rhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected_lhs[i]);
+        CHECK_EQ(cond.rhs->int_value, expected_rhs[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_plain_nested_for_loop_uses_outer_and_inner_vars) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2] { for inner in [3, 4] { "
+        "guard inner > item else { return 400 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 9u);
+    const i32 expected_lhs[] = {3, 4, 3, 4};
+    const i32 expected_rhs[] = {1, 1, 2, 2};
+    for (u32 i = 0; i < 4; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+        REQUIRE(cond.lhs != nullptr);
+        REQUIRE(cond.rhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(static_cast<u8>(cond.rhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected_lhs[i]);
+        CHECK_EQ(cond.rhs->int_value, expected_rhs[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_nested_for_iter_with_outer_loop_var) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2] { inline for inner in [item] { "
+        "guard inner == item else { return 400 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const i32 expected[] = {1, 2};
+    for (u32 i = 0; i < 2; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Eq));
+        REQUIRE(cond.lhs != nullptr);
+        REQUIRE(cond.rhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(static_cast<u8>(cond.rhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+        CHECK_EQ(cond.rhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, mir_unrolls_plain_nested_for_iter_with_outer_loop_var) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2] { for inner in [item] { guard inner == item else "
+        "{ return 400 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const i32 expected[] = {1, 2};
+    for (u32 i = 0; i < 2; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Eq));
+        REQUIRE(cond.lhs != nullptr);
+        REQUIRE(cond.rhs != nullptr);
+        CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(static_cast<u8>(cond.rhs->kind), static_cast<u8>(MirValueKind::IntConst));
+        CHECK_EQ(cond.lhs->int_value, expected[i]);
+        CHECK_EQ(cond.rhs->int_value, expected[i]);
+    }
+}
+
+TEST(frontend, analyze_accepts_array_local_used_by_nested_for_iter) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2] inline for outer in [0] { inline for item in xs { "
+        "guard "
+        "item > outer else { return 400 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+}
+
+TEST(frontend, analyze_plain_for_accepts_array_local_used_by_nested_for_iter) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2] for outer in [0] { for item in xs { guard item > outer "
+        "else { return 400 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 2u);
+}
+
+TEST(frontend, mir_preserves_nested_for_before_later_parent_guard) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { inline for inner in [1] { guard inner == 2 "
+        "else { return 401 } } guard item == 2 else { return 402 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_GE(mir->functions[0].blocks.len, 2u);
+    u32 first_child_fail = 0xffffffffu;
+    u32 first_parent_fail = 0xffffffffu;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const u32 status = mir->functions[0].blocks[bi].term.status_code;
+        if (status == 401u && first_child_fail == 0xffffffffu) first_child_fail = bi;
+        if (status == 402u && first_parent_fail == 0xffffffffu) first_parent_fail = bi;
+    }
+    REQUIRE_NE(first_child_fail, 0xffffffffu);
+    REQUIRE_NE(first_parent_fail, 0xffffffffu);
+    CHECK_LT(first_child_fail, first_parent_fail);
+}
+
+TEST(frontend, mir_plain_for_preserves_nested_for_before_later_parent_guard) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { for inner in [1] { guard inner == 2 else { return "
+        "401 } } guard item == 2 else { return 402 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_GE(mir->functions[0].blocks.len, 2u);
+    u32 first_child_fail = 0xffffffffu;
+    u32 first_parent_fail = 0xffffffffu;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const u32 status = mir->functions[0].blocks[bi].term.status_code;
+        if (status == 401u && first_child_fail == 0xffffffffu) first_child_fail = bi;
+        if (status == 402u && first_parent_fail == 0xffffffffu) first_parent_fail = bi;
+    }
+    REQUIRE_NE(first_child_fail, 0xffffffffu);
+    REQUIRE_NE(first_parent_fail, 0xffffffffu);
+    CHECK_LT(first_child_fail, first_parent_fail);
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_if) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2] { let n = item match n { case 1: if n > 0 "
+        "{ return 201 } else { return 202 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.matches[0].arms[0].body_kind),
+             static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 4u);
+    const auto& arm_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(arm_cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_if) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2] { let n = item match n { case 1: if n > 0 "
+        "{ return 201 } else { return 202 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.matches[0].arms[0].body_kind),
+             static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 4u);
+    const auto& arm_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(arm_cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_if) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1: { let ok = n "
+        "> 0 if ok { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    CHECK(arm.locals[0].name.eq(lit("ok")));
+    CHECK_EQ(static_cast<u8>(arm.body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    CHECK_EQ(static_cast<u8>(arm.cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 4u);
+    const auto& arm_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(arm_cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_if) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
+        "> 0 if ok { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    CHECK(arm.locals[0].name.eq(lit("ok")));
+    CHECK_EQ(static_cast<u8>(arm.body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    CHECK_EQ(static_cast<u8>(arm.cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 4u);
+    const auto& arm_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(arm_cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_block_let_if) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): { let ok = code > 0 if ok { return 201 } else { return 202 } } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    CHECK(arm.bind_payload);
+    REQUIRE_EQ(arm.locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(arm.locals[0].init.kind), static_cast<u8>(HirExprKind::Gt));
+    REQUIRE(arm.locals[0].init.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.locals[0].init.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK_EQ(static_cast<u8>(arm.cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const auto& arm_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_cond.lhs->kind), static_cast<u8>(MirValueKind::MatchPayload));
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_block_let_if) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): { let ok = code > 0 if ok { return 201 } else { return 202 } } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    CHECK(arm.bind_payload);
+    REQUIRE_EQ(arm.locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(arm.locals[0].init.kind), static_cast<u8>(HirExprKind::Gt));
+    REQUIRE(arm.locals[0].init.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.locals[0].init.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK_EQ(static_cast<u8>(arm.cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const auto& arm_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_cond.lhs->kind), static_cast<u8>(MirValueKind::MatchPayload));
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_chain_if) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1: { let a = n "
+        "let ok = a > 0 if ok { return 201 } else { return 202 } } case _: return 402 } } return "
+        "500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 2u);
+    CHECK(arm.locals[0].name.eq(lit("a")));
+    CHECK(arm.locals[1].name.eq(lit("ok")));
+    CHECK_EQ(static_cast<u8>(arm.locals[1].init.kind), static_cast<u8>(HirExprKind::Gt));
+    REQUIRE(arm.locals[1].init.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.locals[1].init.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(arm.cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const auto& arm_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(arm_cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_chain_if) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let a = n "
+        "let ok = a > 0 if ok { return 201 } else { return 202 } } case _: return 402 } } return "
+        "500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 2u);
+    CHECK(arm.locals[0].name.eq(lit("a")));
+    CHECK(arm.locals[1].name.eq(lit("ok")));
+    CHECK_EQ(static_cast<u8>(arm.locals[1].init.kind), static_cast<u8>(HirExprKind::Gt));
+    REQUIRE(arm.locals[1].init.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.locals[1].init.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(arm.cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const auto& arm_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_cond.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(arm_cond.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_prefix) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1: { let ok = n "
+        "> 0 guard ok else { return 499 } if ok { return 201 } else { return 202 } } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    REQUIRE_EQ(arm.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(arm.guards[0].cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(arm.body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 5u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_prefix) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
+        "> 0 guard ok else { return 499 } if ok { return 201 } else { return 202 } } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    REQUIRE_EQ(arm.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(arm.guards[0].cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(arm.body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 5u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.cond.kind),
+             static_cast<u8>(MirValueKind::Gt));
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_block_guard_prefix) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): { let ok = code > 0 guard ok else { return 499 } if ok { return 201 } "
+        "else { return 202 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    CHECK(arm.bind_payload);
+    REQUIRE_EQ(arm.locals.len, 1u);
+    REQUIRE_EQ(arm.guards.len, 1u);
+    REQUIRE(arm.locals[0].init.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.locals[0].init.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK_EQ(static_cast<u8>(arm.guards[0].cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const auto& guard_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(guard_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(guard_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(guard_cond.lhs->kind), static_cast<u8>(MirValueKind::MatchPayload));
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_block_guard_prefix) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): { let ok = code > 0 guard ok else { return 499 } if ok { return 201 } "
+        "else { return 202 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    CHECK(arm.bind_payload);
+    REQUIRE_EQ(arm.locals.len, 1u);
+    REQUIRE_EQ(arm.guards.len, 1u);
+    REQUIRE(arm.locals[0].init.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.locals[0].init.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK_EQ(static_cast<u8>(arm.guards[0].cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    const auto& guard_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(guard_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(guard_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(guard_cond.lhs->kind), static_cast<u8>(MirValueKind::MatchPayload));
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_let_prefix) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case 1: { guard let n = item "
+        "else { return 498 } if n == 1 { return 201 } else { return 202 } } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    REQUIRE_EQ(arm.guards.len, 1u);
+    CHECK(arm.locals[0].name.eq(lit("n")));
+    CHECK_EQ(arm.locals[0].type, HirTypeKind::I32);
+    CHECK_EQ(static_cast<u8>(arm.locals[0].init.kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(arm.cond.kind), static_cast<u8>(HirExprKind::Eq));
+    REQUIRE(arm.cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.cond.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 498u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_let_prefix) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: { guard let n = item "
+        "else { return 498 } if n == 1 { return 201 } else { return 202 } } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    REQUIRE_EQ(arm.guards.len, 1u);
+    CHECK(arm.locals[0].name.eq(lit("n")));
+    CHECK_EQ(arm.locals[0].type, HirTypeKind::I32);
+    CHECK_EQ(static_cast<u8>(arm.locals[0].init.kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(arm.cond.kind), static_cast<u8>(HirExprKind::Eq));
+    REQUIRE(arm.cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.cond.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 498u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_match_prefix) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case 1: { let failed = "
+        "error(.timeout) guard match failed else { case .timeout: return 498 case _: return 499 } "
+        "if item == 1 { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    REQUIRE_EQ(arm.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(arm.locals[0].init.kind), static_cast<u8>(HirExprKind::Error));
+    CHECK_EQ(static_cast<u8>(arm.guards[0].fail_kind), static_cast<u8>(HirGuard::FailKind::Match));
+    CHECK_EQ(static_cast<u8>(arm.guards[0].fail_match_expr.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 9u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    CHECK(mir->functions[0].blocks[6].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[6].term.then_block, 7u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.else_block, 8u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 498u);
+    CHECK_EQ(mir->functions[0].blocks[8].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_match_prefix) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let failed = "
+        "error(.timeout) guard match failed else { case .timeout: return 498 case _: return 499 } "
+        "if item == 1 { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    REQUIRE_EQ(arm.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(arm.locals[0].init.kind), static_cast<u8>(HirExprKind::Error));
+    CHECK_EQ(static_cast<u8>(arm.guards[0].fail_kind), static_cast<u8>(HirGuard::FailKind::Match));
+    CHECK_EQ(static_cast<u8>(arm.guards[0].fail_match_expr.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 9u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    CHECK(mir->functions[0].blocks[6].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[6].term.then_block, 7u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.else_block, 8u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 498u);
+    CHECK_EQ(mir->functions[0].blocks[8].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_for_loop_body_guard_match_on_non_error_value) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { guard match item > 0 else { case true: return "
+        "498 case _: return 499 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_plain_for_rejects_for_loop_body_guard_match_on_non_error_value) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { guard match item > 0 else { case true: return "
+        "498 case _: return 499 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_for_rejects_for_loop_body_guard_match_on_non_error_value) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { guard match item > 0 else { case true: return "
+        "498 case _: return 499 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_for_loop_after_loop_body_return) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { return 200 inline for other in [2] { return "
+        "201 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_plain_for_rejects_for_loop_after_loop_body_return) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { return 200 for other in [2] { return 201 } } return "
+        "500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_fail_body) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case 1: { let ok = item > 1 "
+        "guard ok else { let fail = item == 1 if fail { return 498 } else { return 499 } } "
+        "return 201 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    REQUIRE_EQ(arm.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(arm.guards[0].fail_kind), static_cast<u8>(HirGuard::FailKind::Body));
+    CHECK_EQ(static_cast<u8>(arm.guards[0].fail_body.body_kind),
+             static_cast<u8>(HirGuardBody::BodyKind::If));
+    REQUIRE_EQ(arm.guards[0].fail_body.locals.len, 1u);
+    CHECK(arm.guards[0].fail_body.locals[0].name.eq(lit("fail")));
+    CHECK_EQ(static_cast<u8>(arm.guards[0].fail_body.locals[0].init.kind),
+             static_cast<u8>(HirExprKind::Eq));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.then_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 498u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_fail_body) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let ok = item > 1 "
+        "guard ok else { let fail = item == 1 if fail { return 498 } else { return 499 } } "
+        "return 201 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    REQUIRE_EQ(arm.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(arm.guards[0].fail_kind), static_cast<u8>(HirGuard::FailKind::Body));
+    CHECK_EQ(static_cast<u8>(arm.guards[0].fail_body.body_kind),
+             static_cast<u8>(HirGuardBody::BodyKind::If));
+    REQUIRE_EQ(arm.guards[0].fail_body.locals.len, 1u);
+    CHECK(arm.guards[0].fail_body.locals[0].name.eq(lit("fail")));
+    CHECK_EQ(static_cast<u8>(arm.guards[0].fail_body.locals[0].init.kind),
+             static_cast<u8>(HirExprKind::Eq));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.then_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 498u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case \"/users\": return 201 case _: return 404 } case _: return 402 } } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.kind), static_cast<u8>(HirExprKind::Eq));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK_FALSE(arms[1].is_wildcard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case \"/users\": return 201 case _: return 404 } case _: return 402 } } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.kind), static_cast<u8>(HirExprKind::Eq));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK_FALSE(arms[1].is_wildcard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match_if) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case \"/users\": if item == 1 { return 201 } else { return 202 } case _: "
+        "return 404 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 8u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 7u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match_if) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case \"/users\": if item == 1 { return 201 } else { return 202 } case _: "
+        "return 404 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 8u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 7u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_for_loop_body_nested_match_preserves_outer_arm_guard) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case 1 if false: match item { "
+        "case 1: return 201 case _: return 202 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.kind), static_cast<u8>(HirExprKind::IfElse));
+    CHECK(arms[1].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[1].arm_guard.kind), static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_FALSE(arms[1].arm_guard.bool_value);
+    CHECK(arms[2].is_wildcard);
+    CHECK_FALSE(arms[2].has_arm_guard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_plain_for_loop_body_nested_match_preserves_outer_arm_guard) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1 if false: match item { "
+        "case 1: return 201 case _: return 202 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.kind), static_cast<u8>(HirExprKind::IfElse));
+    CHECK(arms[1].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[1].arm_guard.kind), static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_FALSE(arms[1].arm_guard.bool_value);
+    CHECK(arms[2].is_wildcard);
+    CHECK_FALSE(arms[2].has_arm_guard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_for_loop_nested_match_rejects_guard_match_on_non_error_value) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case 1: match item { case 1: { "
+        "guard match item > 0 else { case true: return 401 case _: return 402 } return 201 } case "
+        "_: return 404 } case _: return 500 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_plain_for_loop_nested_match_rejects_guard_match_on_non_error_value) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: match item { case 1: { guard "
+        "match item > 0 else { case true: return 401 case _: return 402 } return 201 } case _: "
+        "return 404 } case _: return 500 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_variant_match) {
+    const char* src =
+        "variant Result { ok, err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok match item { case 1: "
+        "match state { case .ok: return 201 case _: return 404 } case _: return 402 } } return "
+        "500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.kind), static_cast<u8>(HirExprKind::Eq));
+    REQUIRE(arms[0].arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.lhs->kind),
+             static_cast<u8>(HirExprKind::VariantTag));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_variant_match) {
+    const char* src =
+        "variant Result { ok, err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
+        "match state { case .ok: return 201 case _: return 404 } case _: return 402 } } return "
+        "500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.kind), static_cast<u8>(HirExprKind::Eq));
+    REQUIRE(arms[0].arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.lhs->kind),
+             static_cast<u8>(HirExprKind::VariantTag));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_arm_guard) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case \"/users\" if true: return 201 case _: return 404 } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_inner_arm_guard) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case \"/users\" if true: return 201 case _: return 404 } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_payload_binding) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match item { "
+        "case 1: match state { case .ok(code): return 201 case _: return 404 } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_inner_payload_binding) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match item { "
+        "case 1: match state { case .ok(code): return 201 case _: return 404 } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_missing_inner_wildcard) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case \"/users\": return 201 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_missing_inner_wildcard) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case \"/users\": return 201 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_wildcard_before_last) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case _: return 404 case \"/users\": return 201 } case _: return 402 } } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend,
+     analyze_plain_for_loop_body_match_arm_nested_match_rejects_inner_wildcard_before_last) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case _: return 404 case \"/users\": return 201 } case _: return 402 } } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_bool_case) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let allowed = true match item { case 1: "
+        "match allowed { case true: return 201 case true: return 202 case _: return 404 } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend,
+     analyze_plain_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_bool_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let allowed = true match item { case 1: "
+        "match allowed { case true: return 201 case true: return 202 case _: return 404 } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_int_case) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let code = 1 match item { case 1: "
+        "match code { case 1: return 201 case 1: return 202 case _: return 404 } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend,
+     analyze_plain_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_int_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let code = 1 match item { case 1: "
+        "match code { case 1: return 201 case 1: return 202 case _: return 404 } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_string_case) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case \"/users\": return 201 case \"/users\": return 202 case _: return "
+        "404 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend,
+     analyze_plain_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_string_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
+        "match path { case \"/users\": return 201 case \"/users\": return 202 case _: return "
+        "404 } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_variant_case) {
+    const char* src =
+        "variant Result { ok, err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok match item { case 1: "
+        "match state { case .ok: return 201 case .ok: return 202 case _: return 404 } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend,
+     analyze_plain_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_variant_case) {
+    const char* src =
+        "variant Result { ok, err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
+        "match state { case .ok: return 201 case .ok: return 202 case _: return 404 } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_foreign_inner_variant_case) {
+    const char* src =
+        "variant Result { ok, err }\n"
+        "variant Other { ok, err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok match item { case 1: "
+        "match state { case Other.ok: return 201 case _: return 404 } case _: return 402 } } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend,
+     analyze_plain_for_loop_body_match_arm_nested_match_rejects_foreign_inner_variant_case) {
+    const char* src =
+        "variant Result { ok, err }\n"
+        "variant Other { ok, err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
+        "match state { case Other.ok: return 201 case _: return 404 } case _: return 402 } } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_fallible_inner_subject) {
+    const char* src =
+        "func maybe_path(ok: bool) -> str { if ok { \"/users\" } else { error(.timeout) } }\n"
+        "route GET \"/x\" { inline for item in [1] { let path = maybe_path(false) match item { "
+        "case 1: match path { case \"/users\": return 201 case _: return 404 } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_fallible_inner_subject) {
+    const char* src =
+        "func maybe_path(ok: bool) -> str { if ok { \"/users\" } else { error(.timeout) } }\n"
+        "route GET \"/x\" { for item in [1] { let path = maybe_path(false) match item { "
+        "case 1: match path { case \"/users\": return 201 case _: return 404 } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_match) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case 1: { let path = "
+        "\"/users\" match path { case \"/users\": return 201 case _: return 404 } } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    REQUIRE_EQ(arms[0].locals.len, 1u);
+    CHECK(arms[0].locals[0].name.eq(lit("path")));
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.kind), static_cast<u8>(HirExprKind::Eq));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK_FALSE(arms[1].is_wildcard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_match) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
+        "\"/users\" match path { case \"/users\": return 201 case _: return 404 } } case _: "
+        "return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    REQUIRE_EQ(arms[0].locals.len, 1u);
+    CHECK(arms[0].locals[0].name.eq(lit("path")));
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.kind), static_cast<u8>(HirExprKind::Eq));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK_FALSE(arms[1].is_wildcard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_variant_match) {
+    const char* src =
+        "variant Result { ok, err }\n"
+        "route GET \"/x\" { inline for item in [1] { match item { case 1: { let state = Result.ok "
+        "match state { case .ok: return 201 case _: return 404 } } case _: return 402 } } return "
+        "500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    REQUIRE_EQ(arms[0].locals.len, 1u);
+    CHECK(arms[0].locals[0].name.eq(lit("state")));
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.kind), static_cast<u8>(HirExprKind::Eq));
+    REQUIRE(arms[0].arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.lhs->kind),
+             static_cast<u8>(HirExprKind::VariantTag));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_variant_match) {
+    const char* src =
+        "variant Result { ok, err }\n"
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let state = Result.ok "
+        "match state { case .ok: return 201 case _: return 404 } } case _: return 402 } } return "
+        "500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    REQUIRE_EQ(arms[0].locals.len, 1u);
+    CHECK(arms[0].locals[0].name.eq(lit("state")));
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.kind), static_cast<u8>(HirExprKind::Eq));
+    REQUIRE(arms[0].arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.lhs->kind),
+             static_cast<u8>(HirExprKind::VariantTag));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_match_if) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case 1: { let path = "
+        "\"/users\" match path { case \"/users\": if item == 1 { return 201 } else { return 202 } "
+        "case _: return 404 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    REQUIRE_EQ(arms[0].locals.len, 1u);
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 8u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 7u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_match_if) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
+        "\"/users\" match path { case \"/users\": if item == 1 { return 201 } else { return 202 } "
+        "case _: return 404 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    REQUIRE_EQ(arms[0].locals.len, 1u);
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 8u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 7u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_nested_match_on_payload) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): { match code { case 1: return 201 case _: return 404 } } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].bind_payload);
+    CHECK(arms[0].has_arm_guard);
+    REQUIRE(arms[0].arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK(arms[1].bind_payload);
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_nested_match_on_payload) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): { match code { case 1: return 201 case _: return 404 } } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].bind_payload);
+    CHECK(arms[0].has_arm_guard);
+    REQUIRE(arms[0].arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK(arms[1].bind_payload);
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match_on_payload) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): match code { case 1: return 201 case _: return 404 } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].bind_payload);
+    CHECK(arms[0].has_arm_guard);
+    REQUIRE(arms[0].arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK(arms[1].bind_payload);
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match_on_payload) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): match code { case 1: return 201 case _: return 404 } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].bind_payload);
+    CHECK(arms[0].has_arm_guard);
+    REQUIRE(arms[0].arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK(arms[1].bind_payload);
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_payload_then_nested_match) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): { guard code > 0 else { return 499 } match code { case 1: return 201 "
+        "case _: return 404 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].bind_payload);
+    REQUIRE_EQ(arms[0].guards.len, 1u);
+    REQUIRE(arms[0].guards[0].cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].guards[0].cond.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK(arms[0].has_arm_guard);
+    REQUIRE(arms[0].arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK(arms[1].bind_payload);
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    bool saw_payload_guard = false;
+    bool saw_201 = false;
+    bool saw_402 = false;
+    bool saw_404 = false;
+    bool saw_499 = false;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& term = mir->functions[0].blocks[bi].term;
+        if (term.cond.kind == MirValueKind::Gt && term.cond.lhs != nullptr &&
+            term.cond.lhs->kind == MirValueKind::MatchPayload)
+            saw_payload_guard = true;
+        if (term.status_code == 201) saw_201 = true;
+        if (term.status_code == 402) saw_402 = true;
+        if (term.status_code == 404) saw_404 = true;
+        if (term.status_code == 499) saw_499 = true;
+    }
+    CHECK(saw_payload_guard);
+    CHECK(saw_201);
+    CHECK(saw_402);
+    CHECK(saw_404);
+    CHECK(saw_499);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_payload_then_nested_match) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): { guard code > 0 else { return 499 } match code { case 1: return 201 "
+        "case _: return 404 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].bind_payload);
+    REQUIRE_EQ(arms[0].guards.len, 1u);
+    REQUIRE(arms[0].guards[0].cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].guards[0].cond.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK(arms[0].has_arm_guard);
+    REQUIRE(arms[0].arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].arm_guard.lhs->kind),
+             static_cast<u8>(HirExprKind::MatchPayload));
+    CHECK(arms[1].bind_payload);
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    bool saw_payload_guard = false;
+    bool saw_201 = false;
+    bool saw_402 = false;
+    bool saw_404 = false;
+    bool saw_499 = false;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& term = mir->functions[0].blocks[bi].term;
+        if (term.cond.kind == MirValueKind::Gt && term.cond.lhs != nullptr &&
+            term.cond.lhs->kind == MirValueKind::MatchPayload)
+            saw_payload_guard = true;
+        if (term.status_code == 201) saw_201 = true;
+        if (term.status_code == 402) saw_402 = true;
+        if (term.status_code == 404) saw_404 = true;
+        if (term.status_code == 499) saw_499 = true;
+    }
+    CHECK(saw_payload_guard);
+    CHECK(saw_201);
+    CHECK(saw_402);
+    CHECK(saw_404);
+    CHECK(saw_499);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_nested_match_if_uses_payload) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): { let path = \"/users\" match path { case \"/users\": if code > 0 { "
+        "return 201 } else { return 202 } case _: return 404 } } case _: return 402 } } return "
+        "500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].bind_payload);
+    REQUIRE_EQ(arms[0].locals.len, 1u);
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    REQUIRE(arms[0].cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].cond.lhs->kind), static_cast<u8>(HirExprKind::MatchPayload));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 8u);
+    const auto& payload_cond = mir->functions[0].blocks[3].term.cond;
+    CHECK_EQ(static_cast<u8>(payload_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(payload_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(payload_cond.lhs->kind), static_cast<u8>(MirValueKind::MatchPayload));
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_nested_match_if_uses_payload) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): { let path = \"/users\" match path { case \"/users\": if code > 0 { "
+        "return 201 } else { return 202 } case _: return 404 } } case _: return 402 } } return "
+        "500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    CHECK(arms[0].bind_payload);
+    REQUIRE_EQ(arms[0].locals.len, 1u);
+    CHECK(arms[0].has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arms[0].body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    REQUIRE(arms[0].cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arms[0].cond.lhs->kind), static_cast<u8>(HirExprKind::MatchPayload));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 8u);
+    const auto& payload_cond = mir->functions[0].blocks[3].term.cond;
+    CHECK_EQ(static_cast<u8>(payload_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(payload_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(payload_cond.lhs->kind), static_cast<u8>(MirValueKind::MatchPayload));
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_nested_match) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: { "
+        "guard item == 1 else { return 499 } match path { case \"/users\": return 201 case _: "
+        "return 404 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    REQUIRE_EQ(arms[0].guards.len, 1u);
+    CHECK(arms[0].has_arm_guard);
+    REQUIRE_EQ(arms[1].guards.len, 1u);
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 10u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 7u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.then_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.else_block, 8u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.then_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.else_block, 9u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[8].term.status_code, 499u);
+    CHECK_EQ(mir->functions[0].blocks[9].term.status_code, 499u);
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_nested_match) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: { "
+        "guard item == 1 else { return 499 } match path { case \"/users\": return 201 case _: "
+        "return 404 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    REQUIRE_EQ(arms[0].guards.len, 1u);
+    CHECK(arms[0].has_arm_guard);
+    REQUIRE_EQ(arms[1].guards.len, 1u);
+    CHECK_FALSE(arms[1].has_arm_guard);
+    CHECK(arms[2].is_wildcard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 10u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 7u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.then_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.else_block, 8u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.then_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.else_block, 9u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 404u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[8].term.status_code, 499u);
+    CHECK_EQ(mir->functions[0].blocks[9].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend,
+     analyze_for_loop_body_match_arm_block_nested_match_rejects_duplicate_inner_int_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let code = 1 match "
+        "code { case 1: return 201 case 1: return 202 case _: return 404 } } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend,
+     analyze_for_loop_body_match_arm_block_nested_match_rejects_duplicate_inner_string_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
+        "\"/users\" match path { case \"/users\": return 201 case \"/users\": return 202 case _: "
+        "return 404 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend,
+     analyze_plain_for_loop_body_match_arm_block_nested_match_rejects_duplicate_inner_int_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let code = 1 match "
+        "code { case 1: return 201 case 1: return 202 case _: return 404 } } case _: return "
+        "402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend,
+     analyze_plain_for_loop_body_match_arm_block_nested_match_rejects_duplicate_inner_string_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
+        "\"/users\" match path { case \"/users\": return 201 case \"/users\": return 202 case _: "
+        "return 404 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_multiple_guard_prefixes) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1: { let ok = n "
+        "> 0 let still_ok = ok guard ok else { return 498 } guard still_ok else { return 499 } if "
+        "still_ok { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 2u);
+    REQUIRE_EQ(arm.guards.len, 2u);
+    CHECK_EQ(static_cast<u8>(arm.guards[0].cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(arm.guards[1].cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 9u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 7u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 8u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 498u);
+    CHECK_EQ(mir->functions[0].blocks[8].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_multiple_guard_prefixes) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
+        "> 0 let still_ok = ok guard ok else { return 498 } guard still_ok else { return 499 } if "
+        "still_ok { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 2u);
+    REQUIRE_EQ(arm.guards.len, 2u);
+    CHECK_EQ(static_cast<u8>(arm.guards[0].cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(arm.guards[1].cond.kind), static_cast<u8>(HirExprKind::LocalRef));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 9u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 6u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 7u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 8u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[6].term.status_code, 402u);
+    CHECK_EQ(mir->functions[0].blocks[7].term.status_code, 498u);
+    CHECK_EQ(mir->functions[0].blocks[8].term.status_code, 499u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_if) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): if code > 0 { return 201 } else { return 202 } case _: return 402 } } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    CHECK(arm.bind_payload);
+    CHECK(arm.bind_name.eq(lit("code")));
+    CHECK_EQ(arm.bind_type, HirTypeKind::I32);
+    CHECK_EQ(static_cast<u8>(arm.body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    CHECK_EQ(static_cast<u8>(arm.cond.kind), static_cast<u8>(HirExprKind::Gt));
+    REQUIRE(arm.cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.cond.lhs->kind), static_cast<u8>(HirExprKind::MatchPayload));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const auto& arm_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_cond.lhs->kind), static_cast<u8>(MirValueKind::MatchPayload));
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_if) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code): if code > 0 { return 201 } else { return 202 } case _: return 402 } } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    CHECK(arm.bind_payload);
+    CHECK(arm.bind_name.eq(lit("code")));
+    CHECK_EQ(arm.bind_type, HirTypeKind::I32);
+    CHECK_EQ(static_cast<u8>(arm.body_kind), static_cast<u8>(HirForLoopMatchArm::BodyKind::If));
+    CHECK_EQ(static_cast<u8>(arm.cond.kind), static_cast<u8>(HirExprKind::Gt));
+    REQUIRE(arm.cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.cond.lhs->kind), static_cast<u8>(HirExprKind::MatchPayload));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    const auto& arm_cond = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_cond.lhs->kind), static_cast<u8>(MirValueKind::MatchPayload));
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_arm_guard) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1 if n > 0: "
+        "return 201 case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].has_arm_guard);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 4u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 3u);
+    const auto& arm_guard = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_guard.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_guard.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(arm_guard.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_guard) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1 if n > 0: "
+        "return 201 case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].has_arm_guard);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 4u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 3u);
+    const auto& arm_guard = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_guard.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_guard.lhs->kind), static_cast<u8>(MirValueKind::IntConst));
+    CHECK_EQ(arm_guard.lhs->int_value, 1);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_guard) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code) if code > 0: return 201 case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    CHECK(arm.bind_payload);
+    CHECK(arm.bind_name.eq(lit("code")));
+    CHECK(arm.has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arm.arm_guard.kind), static_cast<u8>(HirExprKind::Gt));
+    REQUIRE(arm.arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.arm_guard.lhs->kind), static_cast<u8>(HirExprKind::MatchPayload));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 4u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 3u);
+    const auto& arm_guard = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_guard.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_guard.lhs->kind), static_cast<u8>(MirValueKind::MatchPayload));
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_guard) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code) if code > 0: return 201 case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 2u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    CHECK(arm.bind_payload);
+    CHECK(arm.bind_name.eq(lit("code")));
+    CHECK(arm.has_arm_guard);
+    CHECK_EQ(static_cast<u8>(arm.arm_guard.kind), static_cast<u8>(HirExprKind::Gt));
+    REQUIRE(arm.arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm.arm_guard.lhs->kind), static_cast<u8>(HirExprKind::MatchPayload));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 4u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 3u);
+    const auto& arm_guard = mir->functions[0].blocks[1].term.cond;
+    CHECK_EQ(static_cast<u8>(arm_guard.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(arm_guard.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(arm_guard.lhs->kind), static_cast<u8>(MirValueKind::MatchPayload));
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 402u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_for_loop_body_match_rejects_payload_binding_on_payloadless_case) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.err match state { "
+        "case .err(code): return 201 case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_body_match_rejects_payload_binding_on_payloadless_case) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.err match state { "
+        "case .err(code): return 201 case _: return 402 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_guarded_variant_case_falls_through_to_same_case) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code) if code > 200: return 200 case .ok(code): return 201 case _: return 404 "
+        "} } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].has_arm_guard);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].bind_payload);
+    CHECK_FALSE(hir->routes[0].for_loops[0].body.matches[0].arms[1].has_arm_guard);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[1].bind_payload);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 200u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 404u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend,
+     mir_unrolls_plain_for_loop_body_match_guarded_variant_case_falls_through_to_same_case) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
+        "case .ok(code) if code > 200: return 200 case .ok(code): return 201 case _: return 404 "
+        "} } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].has_arm_guard);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].bind_payload);
+    CHECK_FALSE(hir->routes[0].for_loops[0].body.matches[0].arms[1].has_arm_guard);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[1].bind_payload);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 200u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 404u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_guarded_bool_case_falls_through_to_same_case) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let flag = true match flag { case true if "
+        "item > 1: return 201 case true: return 202 case _: return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].has_arm_guard);
+    CHECK_FALSE(hir->routes[0].for_loops[0].body.matches[0].arms[1].has_arm_guard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 404u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_guarded_bool_case_falls_through_to_same_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let flag = true match flag { case true if "
+        "item > 1: return 201 case true: return 202 case _: return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].has_arm_guard);
+    CHECK_FALSE(hir->routes[0].for_loops[0].body.matches[0].arms[1].has_arm_guard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[2].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 404u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_guarded_int_case_falls_through_to_same_case) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1 if item > 1: "
+        "return 201 case 1: return 202 case _: return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].has_arm_guard);
+    CHECK_FALSE(hir->routes[0].for_loops[0].body.matches[0].arms[1].has_arm_guard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 404u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_match_guarded_int_case_falls_through_to_same_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1 if item > 1: "
+        "return 201 case 1: return 202 case _: return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].has_arm_guard);
+    CHECK_FALSE(hir->routes[0].for_loops[0].body.matches[0].arms[1].has_arm_guard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 404u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_for_loop_body_match_rejects_unguarded_duplicate_string_case) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let s = \"a\" match s { case \"a\": return "
+        "201 case \"a\": return 202 case _: return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_body_match_rejects_unguarded_duplicate_string_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { case \"a\": return "
+        "201 case \"a\": return 202 case _: return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_match_guarded_string_case_falls_through_to_same_case) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let s = \"a\" match s { case \"a\" if item "
+        "> 1: return 201 case \"a\": return 202 case _: return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].has_arm_guard);
+    CHECK_FALSE(hir->routes[0].for_loops[0].body.matches[0].arms[1].has_arm_guard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 404u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend,
+     mir_unrolls_plain_for_loop_body_match_guarded_string_case_falls_through_to_same_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { case \"a\" if item "
+        "> 1: return 201 case \"a\": return 202 case _: return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms.len, 3u);
+    CHECK(hir->routes[0].for_loops[0].body.matches[0].arms[0].has_arm_guard);
+    CHECK_FALSE(hir->routes[0].for_loops[0].body.matches[0].arms[1].has_arm_guard);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 6u);
+    CHECK(mir->functions[0].blocks[0].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[0].term.then_block, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 1u);
+    CHECK(mir->functions[0].blocks[1].term.use_cmp);
+    CHECK_EQ(mir->functions[0].blocks[1].term.then_block, 4u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.else_block, 5u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.then_block, 3u);
+    CHECK_EQ(mir->functions[0].blocks[2].term.else_block, 1u);
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 201u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 202u);
+    CHECK_EQ(mir->functions[0].blocks[5].term.status_code, 404u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_for_loop_body_match_rejects_unguarded_duplicate_int_case) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { match item { case 1: return 201 case 1: "
+        "return 202 case _: return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_body_match_rejects_unguarded_duplicate_int_case) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case 1: "
+        "return 202 case _: return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, mir_unrolls_for_loop_body_guard_match_with_body_local_subject) {
+    const char* src = R"(
+route GET "/x" {
+    inline for item in [1] {
+        let failed = error(.timeout)
+        guard match failed else { case .timeout: return 401 case _: return 402 }
+    }
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.guards[0].fail_kind),
+             static_cast<u8>(HirGuard::FailKind::Match));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    const auto& fail_test = mir->functions[0].blocks[2].term;
+    CHECK(fail_test.use_cmp);
+    CHECK_EQ(static_cast<u8>(fail_test.lhs.kind), static_cast<u8>(MirValueKind::Error));
+    CHECK_EQ(static_cast<u8>(fail_test.rhs.kind), static_cast<u8>(MirValueKind::VariantCase));
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 401u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+}
+
+TEST(frontend, mir_unrolls_plain_for_loop_body_guard_match_with_body_local_subject) {
+    const char* src = R"(
+route GET "/x" {
+    for item in [1] {
+        let failed = error(.timeout)
+        guard match failed else { case .timeout: return 401 case _: return 402 }
+    }
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].for_loops[0].body.guards[0].fail_kind),
+             static_cast<u8>(HirGuard::FailKind::Match));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 5u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.else_block, 2u);
+    const auto& fail_test = mir->functions[0].blocks[2].term;
+    CHECK(fail_test.use_cmp);
+    CHECK_EQ(static_cast<u8>(fail_test.lhs.kind), static_cast<u8>(MirValueKind::Error));
+    CHECK_EQ(static_cast<u8>(fail_test.rhs.kind), static_cast<u8>(MirValueKind::VariantCase));
+    CHECK_EQ(mir->functions[0].blocks[3].term.status_code, 401u);
+    CHECK_EQ(mir->functions[0].blocks[4].term.status_code, 402u);
+}
+
+TEST(frontend, analyze_for_loop_body_let_scoped_to_body) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1] { let n = item guard n > 0 else "
+        "{ return 400 } } let x = n return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_plain_for_loop_body_let_scoped_to_body) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let n = item guard n > 0 else "
+        "{ return 400 } } let x = n return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -18008,7 +24363,16 @@ TEST(frontend, analyze_for_loop_rejects_let_in_body) {
 }
 
 TEST(frontend, parse_for_loop_rejects_missing_in) {
-    // `for item <missing in> [1, 2, 3]` — expect must see KwIn, else unexpected-token.
+    // `inline for item <missing in> [1, 2, 3]` — expect must see KwIn, else unexpected-token.
+    const char* src = "route GET \"/x\" { inline for item [1, 2, 3] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    CHECK(!ast);
+}
+
+TEST(frontend, parse_plain_for_loop_rejects_missing_in) {
+    // `for item <missing in> [1, 2, 3]` — parse should fail before analysis.
     const char* src = "route GET \"/x\" { for item [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);

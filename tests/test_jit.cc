@@ -4718,8 +4718,9 @@ TEST(jit, frontend_guard_match_routes_fail_and_success_paths) {
 
     {
         const char* src =
-            "route GET \"/users\" { let ok = 200 guard match ok else { case .timeout: return 503 "
-            "case _: return 500 } return 200 }\n";
+            "func maybefail(ok: bool) -> i32 { if ok { 200 } else { error(.timeout) } }\n"
+            "route GET \"/users\" { let ok = maybefail(true) guard match ok else { case .timeout: "
+            "return 503 case _: return 500 } return 200 }\n";
 
         auto lexed = lex(lit(src));
         REQUIRE(lexed);

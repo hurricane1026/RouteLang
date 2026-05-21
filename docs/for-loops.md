@@ -98,7 +98,7 @@ route GET "/result" {
         match state {
         case .ok(code):
             return code
-        case .err:
+        case _:
             return 500
         }
     }
@@ -156,8 +156,9 @@ route GET "/nested" {
 }
 ```
 
-`match` inside a loop supports ordinary route match checks, including arm guards
-and payload bindings:
+`match` inside a loop supports the current static-loop match subset, including
+arm guards and payload bindings. This subset is stricter than ordinary route
+`match` today; include a wildcard arm even when the cases look exhaustive.
 
 ```rut
 variant Result { ok(i32), err }
@@ -170,7 +171,7 @@ route GET "/guarded" {
             return 200
         case .ok(_):
             return 422
-        case .err:
+        case _:
             return 500
         }
     }
@@ -215,6 +216,8 @@ Static `for` loops are intentionally narrow today:
 - field access iterators such as `up.servers` are parsed but rejected by current
   analysis
 - loop variables cannot shadow existing route locals
+- empty loop bodies, or bodies that produce no supported lowering steps, are
+  rejected
 - statements after a loop-body terminator are rejected
 - routes that combine `wait(...)` and static for-loop lowering are rejected
 - block-budget overflow reports the overflowing loop step, guard, or arm

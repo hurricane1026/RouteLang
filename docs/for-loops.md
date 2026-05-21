@@ -2,8 +2,9 @@
 
 Rut currently supports route-local static `for` loops. They are a compile-time
 lowering feature: the compiler proves the iterator is a static array, then
-unrolls the loop body into ordinary route control flow before MIR/RIR emission.
-There is no runtime loop carrier or dynamic iterator state for this feature.
+unrolls the loop body into ordinary route control flow during MIR construction,
+before RIR lowering. There is no runtime loop carrier or dynamic iterator state
+for this feature.
 
 ## Syntax
 

@@ -1553,7 +1553,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 // be lowered.
                 const bool supported = fl.body.steps.len != 0 && iter_array != nullptr;
                 if (!supported || fl.loop_var_ref_index == 0xffffffffu) {
-                    return frontend_error(FrontendError::UnsupportedSyntax, fl.span);
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        fl.span,
+                        lit_str("static for-loop body must contain at least one supported step"));
                 }
                 const u32 iter_count =
                     fl.body.has_term && iter_array->args.len != 0 ? 1u : iter_array->args.len;
@@ -1839,7 +1842,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     &fail_cursor, guard_fail_block_count(*steps[si].guard), steps[si].span);
             }
             if (fail_cursor > MirFunction::kMaxBlocks)
-                return frontend_error(FrontendError::TooManyItems, block_budget_span);
+                return frontend_error(FrontendError::TooManyItems,
+                                      block_budget_span,
+                                      lit_str("static for-loop block budget exceeded"));
 
             auto extend_for_loop_match_arm_ctx =
                 [&](const HirForLoopMatchArm& arm,

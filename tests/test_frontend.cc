@@ -2021,6 +2021,9 @@ TEST(frontend, analyze_rejects_wait_after_for_loop) {
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE(!hir);
+        CHECK_EQ(static_cast<u8>(hir.error().code),
+                 static_cast<u8>(FrontendError::UnsupportedSyntax));
+        CHECK(hir.error().detail.eq(lit("wait cannot be used after a static for-loop")));
     }
 }
 
@@ -2042,6 +2045,7 @@ TEST(frontend, analyze_rejects_for_loop_after_wait) {
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE(!hir);
+        CHECK(hir.error().detail.eq(lit("static for-loop cannot be combined with wait")));
     }
 }
 
@@ -9843,6 +9847,8 @@ TEST(frontend, analyze_rejects_typed_empty_array_local_used_outside_for_iter) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir);
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(
+        hir.error().detail.eq(lit("array locals are only supported as static for-loop iterators")));
 }
 
 TEST(frontend, analyze_rejects_array_local_alias_chain_used_outside_for_iter) {
@@ -18600,7 +18606,9 @@ TEST(frontend, analyze_for_loop_body_if_rejects_fallible_bool) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("static for-loop if condition must be a non-fallible bool")));
 }
 
 TEST(frontend, analyze_plain_for_loop_body_if_rejects_fallible_bool) {
@@ -18649,7 +18657,10 @@ TEST(frontend, analyze_for_loop_match_arm_if_rejects_fallible_bool) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(
+        lit("static for-loop match-arm if condition must be a non-fallible bool")));
 }
 
 TEST(frontend, analyze_plain_for_loop_match_arm_if_rejects_fallible_bool) {
@@ -18767,6 +18778,18 @@ TEST(frontend, analyze_for_loop_guard_body) {
     CHECK_EQ(fl.body.guards[0].fail_term.status_code, 400);
     // No body terminator — control falls through to the next iteration.
     CHECK(!fl.body.has_term);
+}
+
+TEST(frontend, analyze_for_loop_unsupported_body_stmt_has_clear_detail) {
+    const char* src = "route GET \"/x\" { for item in [1] { wait(1) } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("unsupported statement in static for-loop body")));
 }
 
 TEST(frontend, analyze_plain_for_loop_guard_body) {
@@ -18921,6 +18944,40 @@ TEST(frontend, analyze_for_rejects_non_static_for_loop_iter) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_for_loop_reject_details_name_iterator_shape) {
+    struct Case {
+        const char* label;
+        const char* src;
+        Str detail;
+    };
+    const Case cases[] = {
+        {"shadowing loop var",
+         "route GET \"/x\" { let item = 1 for item in [2] { return 200 } return 200 }\n",
+         lit("static for-loop variable cannot shadow a local")},
+        {"known-error guard let",
+         "route GET \"/x\" { for item in [1] { guard let code = error(.timeout) else { return "
+         "400 } } return 200 }\n",
+         lit("guard let inside static for-loop cannot bind a known error")},
+        {"non-array iterator",
+         "route GET \"/x\" { for item in 42 { return 200 } return 200 }\n",
+         lit("static for-loop iterator must be an array")},
+        {"non-static iterator",
+         "route GET \"/x\" { for item in make() { return 200 } return 200 }\n",
+         lit("static for-loop iterator must be a compile-time array literal or alias")},
+    };
+    for (const auto& tc : cases) {
+        auto lexed = lex(lit(tc.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(static_cast<u8>(hir.error().code),
+                 static_cast<u8>(FrontendError::UnsupportedSyntax));
+        CHECK_MSG(hir.error().detail.eq(tc.detail), tc.label);
+    }
 }
 
 TEST(frontend, analyze_rejects_non_static_for_loop_iter_via_alias_chain) {
@@ -19972,6 +20029,7 @@ TEST(frontend, mir_rejects_for_loop_exceeding_block_budget) {
     auto mir = build_mir_heap(hir.value());
     REQUIRE(!mir);
     CHECK_EQ(mir.error().code, FrontendError::TooManyItems);
+    CHECK(mir.error().detail.eq(lit("static for-loop block budget exceeded")));
     REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
     CHECK_EQ(mir.error().span.start, hir->routes[0].for_loops[0].body.guards[0].span.start);
 }
@@ -19989,6 +20047,7 @@ TEST(frontend, mir_rejects_plain_for_loop_exceeding_block_budget) {
     auto mir = build_mir_heap(hir.value());
     REQUIRE(!mir);
     CHECK_EQ(mir.error().code, FrontendError::TooManyItems);
+    CHECK(mir.error().detail.eq(lit("static for-loop block budget exceeded")));
     REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
     CHECK_EQ(mir.error().span.start, hir->routes[0].for_loops[0].body.guards[0].span.start);
 }
@@ -20351,7 +20410,8 @@ TEST(frontend, analyze_for_loop_rejects_shadowing_outer_local) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(lit("static for-loop variable cannot shadow a local")));
 }
 
 TEST(frontend, analyze_plain_for_loop_rejects_shadowing_outer_local) {
@@ -22010,6 +22070,7 @@ TEST(frontend, analyze_rejects_for_loop_body_guard_match_on_non_error_value) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir);
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("guard match inside static for-loop requires an error value")));
 }
 
 TEST(frontend, analyze_plain_for_rejects_for_loop_body_guard_match_on_non_error_value) {

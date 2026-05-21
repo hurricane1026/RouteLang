@@ -5744,7 +5744,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         return out;
     }
     if (expr.kind == AstExprKind::ArrayLit) {
-        if (!allow_array_lit) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        if (!allow_array_lit)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("array literals are only supported as static for-loop iterators"));
         // Empty array `[]` has no inferable element type; Rutlang has no
         // push/append so the element type can't be resolved later either.
         // Future: contextual inference from a declared type annotation can
@@ -6130,7 +6134,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return tuple;
             }
             if (locals[i].type == HirTypeKind::Array && !allow_array_lit)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("array locals are only supported as static for-loop iterators"));
             out.kind = HirExprKind::LocalRef;
             out.type = locals[i].type;
             out.is_wait_result = locals[i].is_wait_result;
@@ -9429,13 +9436,25 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
 static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                             HirRoute* route,
                                             HirModule& mod) {
+    if (stmt.expr.kind == AstExprKind::Call || stmt.expr.kind == AstExprKind::MethodCall ||
+        stmt.expr.kind == AstExprKind::Field || stmt.expr.kind == AstExprKind::Pipe)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.expr.span,
+            lit_str("static for-loop iterator must be a compile-time array literal or alias"));
+
     auto iter =
         analyze_array_iter_expr(stmt.expr, route, mod, route->locals.data, route->locals.len);
     if (!iter) return core::make_unexpected(iter.error());
     if (iter->type != HirTypeKind::Array || iter->shape_index >= mod.type_shapes.len)
-        return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.expr.span,
+                              lit_str("static for-loop iterator must be an array"));
     if (!is_static_for_iter_expr(iter.value(), route->locals.data, route->locals.len, 0))
-        return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.expr.span,
+            lit_str("static for-loop iterator must be a compile-time array literal or alias"));
 
     const auto& iter_shape = mod.type_shapes[iter->shape_index];
     if (iter_shape.array_elem_shape_index >= mod.type_shapes.len)
@@ -9444,7 +9463,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
 
     for (u32 li = 0; li < route->locals.len; li++) {
         if (route->locals[li].name.len != 0 && route->locals[li].name.eq(stmt.name))
-            return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("static for-loop variable cannot shadow a local"));
     }
 
     const u32 locals_saved = route->locals.len;
@@ -9511,9 +9532,15 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             (body->kind == AstStmtKind::Block) ? *body->block_stmts[bi] : *body;
         if (bstmt.kind == AstStmtKind::Let) {
             if (loop.body.has_term)
-                return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("static for-loop body cannot continue after a route terminator"));
             if (bstmt.expr.kind == AstExprKind::Wait || bstmt.expr.kind == AstExprKind::ArrayLit)
-                return frontend_error(FrontendError::UnsupportedSyntax, bstmt.expr.span);
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    lit_str("static for-loop body locals cannot be wait or array literals"));
             for (u32 li = 0; li < route->locals.len; li++) {
                 if (route->locals[li].name.len != 0 && route->locals[li].name.eq(bstmt.name))
                     return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
@@ -9569,7 +9596,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
         }
         if (bstmt.kind == AstStmtKind::Guard) {
             if (loop.body.has_term)
-                return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("static for-loop body cannot continue after a route terminator"));
             if (bstmt.match_arms.len == 0 && bstmt.else_stmt == nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
             HirGuard guard{};
@@ -9595,7 +9625,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                &guard);
                     if (!fail_match) return core::make_unexpected(fail_match.error());
                 } else {
-                    return frontend_error(FrontendError::UnsupportedSyntax, bstmt.expr.span);
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        bstmt.expr.span,
+                        lit_str("guard match inside static for-loop requires an error value"));
                 }
             } else if (bstmt.else_stmt->kind == AstStmtKind::ReturnStatus ||
                        bstmt.else_stmt->kind == AstStmtKind::ForwardUpstream) {
@@ -9625,7 +9658,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             if (bstmt.bind_value) {
                 if (known_value_state(bound.value(), route->locals.data, route->locals.len, 0) ==
                     KnownValueState::Error)
-                    return frontend_error(FrontendError::UnsupportedSyntax, bstmt.expr.span);
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        bstmt.expr.span,
+                        lit_str("guard let inside static for-loop cannot bind a known error"));
                 for (u32 li = 0; li < route->locals.len; li++) {
                     if (route->locals[li].name.len != 0 && route->locals[li].name.eq(bstmt.name))
                         return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
@@ -9676,7 +9712,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
         }
         if (bstmt.kind == AstStmtKind::ReturnStatus || bstmt.kind == AstStmtKind::ForwardUpstream) {
             if (loop.body.has_term)
-                return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("static for-loop body cannot continue after a route terminator"));
             auto t = analyze_term(bstmt, mod);
             if (!t) return core::make_unexpected(t.error());
             loop.body.term = t.value();
@@ -9690,7 +9729,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
         }
         if (bstmt.kind == AstStmtKind::If) {
             if (loop.body.has_term)
-                return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("static for-loop body cannot continue after a route terminator"));
             const auto simple_branch = [](const AstStatement& branch) {
                 return branch.kind == AstStmtKind::ReturnStatus ||
                        branch.kind == AstStmtKind::ForwardUpstream;
@@ -9704,7 +9746,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!cond) return core::make_unexpected(cond.error());
             if (cond->type != HirTypeKind::Bool || cond->may_nil || cond->may_error)
-                return frontend_error(FrontendError::UnsupportedSyntax, bstmt.expr.span);
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    lit_str("static for-loop if condition must be a non-fallible bool"));
             body_if.cond = cond.value();
             auto then_term = analyze_term(*bstmt.then_stmt, mod);
             if (!then_term) return core::make_unexpected(then_term.error());
@@ -9726,7 +9771,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
         }
         if (bstmt.kind == AstStmtKind::Match) {
             if (loop.body.has_term)
-                return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("static for-loop body cannot continue after a route terminator"));
             HirForLoopMatch body_match{};
             body_match.span = bstmt.span;
             auto subject = analyze_expr(
@@ -9961,8 +10009,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             if (!cond_expr) return core::make_unexpected(cond_expr.error());
                             if (cond_expr->type != HirTypeKind::Bool || cond_expr->may_nil ||
                                 cond_expr->may_error)
-                                return frontend_error(FrontendError::UnsupportedSyntax,
-                                                      inner_arm.stmt->expr.span);
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner_arm.stmt->expr.span,
+                                    lit_str("static for-loop match-arm if condition must be a "
+                                            "non-fallible bool"));
                             auto then_term = analyze_term(*inner_arm.stmt->then_stmt, mod);
                             if (!then_term) return core::make_unexpected(then_term.error());
                             auto else_term = analyze_term(*inner_arm.stmt->else_stmt, mod);
@@ -10207,8 +10258,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     if (!fail_match)
                                         return core::make_unexpected(fail_match.error());
                                 } else {
-                                    return frontend_error(FrontendError::UnsupportedSyntax,
-                                                          inner.expr.span);
+                                    return frontend_error(
+                                        FrontendError::UnsupportedSyntax,
+                                        inner.expr.span,
+                                        lit_str("guard match inside static for-loop requires an "
+                                                "error value"));
                                 }
                             } else {
                                 if (inner.else_stmt->kind == AstStmtKind::ReturnStatus ||
@@ -10465,8 +10519,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                      arm_binding_ptr);
                             if (!cond) return core::make_unexpected(cond.error());
                             if (cond->type != HirTypeKind::Bool || cond->may_nil || cond->may_error)
-                                return frontend_error(FrontendError::UnsupportedSyntax,
-                                                      inner_ast_arm.stmt->expr.span);
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner_ast_arm.stmt->expr.span,
+                                    lit_str("static for-loop match-arm if condition must be a "
+                                            "non-fallible bool"));
                             auto then_term = analyze_term(*inner_ast_arm.stmt->then_stmt, mod);
                             if (!then_term) return core::make_unexpected(then_term.error());
                             auto else_term = analyze_term(*inner_ast_arm.stmt->else_stmt, mod);
@@ -10505,8 +10562,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         arm_stmt->expr, route, mod, arm_locals, arm_local_count, arm_binding_ptr);
                     if (!cond) return core::make_unexpected(cond.error());
                     if (cond->type != HirTypeKind::Bool || cond->may_nil || cond->may_error)
-                        return frontend_error(FrontendError::UnsupportedSyntax,
-                                              arm_stmt->expr.span);
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            arm_stmt->expr.span,
+                            lit_str("static for-loop match-arm if condition must be a "
+                                    "non-fallible bool"));
                     auto then_term = analyze_term(*arm_stmt->then_stmt, mod);
                     if (!then_term) return core::make_unexpected(then_term.error());
                     auto else_term = analyze_term(*arm_stmt->else_stmt, mod);
@@ -10541,7 +10601,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
         }
         if (bstmt.kind == AstStmtKind::For) {
             if (loop.body.has_term)
-                return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("static for-loop body cannot continue after a route terminator"));
             auto nested = analyze_for_stmt(bstmt, route, mod);
             if (!nested) return core::make_unexpected(nested.error());
             HirForLoopBody::Step step{};
@@ -10562,11 +10625,21 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 loop.body.has_term = true;
             continue;
         }
-        return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              bstmt.span,
+                              lit_str("unsupported statement in static for-loop body"));
     }
 
     if (route->locals.len < locals_saved + 1)
-        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str("static for-loop body must contain at least one supported step"));
+    if (loop.body.steps.len == 0)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str("static for-loop body must contain at least one supported step"));
     for (u32 li = locals_saved; li < route->locals.len; li++) route->locals[li].name = {};
     return for_index;
 }
@@ -13724,7 +13797,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         for (u32 si = 0; si < item.route.statements.len; si++) {
             const auto& stmt = item.route.statements[si];
             if (stmt.kind == AstStmtKind::Wait) {
-                if (seen_for) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                if (seen_for)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          stmt.span,
+                                          lit_str("wait cannot be used after a static for-loop"));
                 auto wait_spec = analyze_wait_stmt_spec(stmt, mod);
                 if (!wait_spec) return core::make_unexpected(wait_spec.error());
                 if (wait_spec->kind == WaitEventKind::Timer && wait_spec->payload == 0)
@@ -13820,11 +13896,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (init.value().type == HirTypeKind::Array) {
                     if (!used_for_iter || !is_static_for_iter_expr(
                                               init.value(), route.locals.data, route.locals.len, 0))
-                        return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.expr.span,
+                            lit_str(
+                                "array locals are only supported as static for-loop iterators"));
                 }
                 if (init->kind == HirExprKind::WaitResult) {
                     if (seen_for)
-                        return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.expr.span,
+                            lit_str("wait cannot be used after a static for-loop"));
                     HirRoute::Wait w{};
                     w.span = stmt.expr.span;
                     w.event_kind = init->wait_event_kind;
@@ -13955,7 +14038,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 continue;
             }
             if (stmt.kind == AstStmtKind::WaitAny) {
-                if (seen_for) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                if (seen_for)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          stmt.span,
+                                          lit_str("wait cannot be used after a static for-loop"));
                 auto wait_any = analyze_wait_any_stmt_control(stmt, route, mod);
                 if (!wait_any) return core::make_unexpected(wait_any.error());
                 seen_wait = true;
@@ -13965,7 +14051,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 break;
             }
             if (stmt.kind == AstStmtKind::For) {
-                if (seen_wait) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                if (seen_wait)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          stmt.span,
+                                          lit_str("static for-loop cannot be combined with wait"));
                 seen_for = true;
                 auto loop = analyze_for_stmt(stmt, &route, mod);
                 if (!loop) return core::make_unexpected(loop.error());

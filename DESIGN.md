@@ -204,6 +204,7 @@ Rut keeps a small set of branching constructs with clear roles:
 - `if` — the lightweight boolean branch
 - `guard` — fail-fast branch for error handling
 - `match` — the general multi-branch construct
+- `for` — bounded iteration over finite collections
 
 `switch` is not a language keyword. Where a traditional switch would normally be
 used, Rut uses `match`.
@@ -228,6 +229,10 @@ construct.
 - `match const` is the compile-time form for branching on compile-time-known values
 
 Likewise, `if const` is the lightweight compile-time boolean branch.
+
+The current implementation covers the route-local static array subset and lowers
+supported shapes by compile-time unrolling. For that implemented subset, see
+[docs/for-loops.md](docs/for-loops.md).
 
 ### 3.3 Type System
 

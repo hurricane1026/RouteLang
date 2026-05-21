@@ -321,6 +321,10 @@ Decorator guards run before the first timer yield is armed. Decorated wait
 routes currently reject user `let` bindings, user top-level guards, for-loops,
 and non-direct terminal control such as `if` / `match`.
 
+For the current static for-loop subset, including the route-level restriction
+that rejects mixing `wait(...)` with static loop lowering, see
+[for-loops.md](for-loops.md).
+
 ## Current Gaps
 
 The following are future work rather than current behavior:

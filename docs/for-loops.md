@@ -198,8 +198,11 @@ route GET "/x" {
 }
 ```
 
-If a loop body terminates, each unrolled iteration contributes that terminal
-control in source order. A zero-iteration loop contributes no body control.
+For non-terminating loop bodies, each iteration contributes its generated
+control in source order. If the loop body contains a route terminator, lowering
+only needs the first iteration's terminal path because the route exits there;
+later iterations are unreachable and are not emitted. A zero-iteration loop
+contributes no body control.
 
 ## Current Limits
 

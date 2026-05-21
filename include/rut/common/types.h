@@ -40,6 +40,11 @@ struct Str {
     [[nodiscard]] Str slice(u32 start, u32 end) const { return {ptr + start, end - start}; }
 };
 
+template <size_t N>
+constexpr Str lit_str(const char (&s)[N]) {
+    return {s, static_cast<u32>(N - 1)};
+}
+
 // Fixed-capacity vector, no heap allocation
 template <typename T, u32 Cap>
 struct FixedVec {
